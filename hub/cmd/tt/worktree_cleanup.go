@@ -76,6 +76,10 @@ const (
 	// A built test binary a matrix run's test-binaries.json lists, removed
 	// once its item is released (see "Matrix output binaries" below).
 	kindMatrixBinary = "matrix-binary"
+	// Untracked scratch in a finished item's artifact folder or a bound
+	// agent's, removed once the item is released or dismissed long enough
+	// (see "Artifact scratch" below).
+	kindArtifactScratch = "artifact-scratch"
 )
 
 // defaultArtifactAcceptedAfter is how long an accepted, unreleased item keeps
@@ -201,6 +205,10 @@ type worktreeCleanupInputs struct {
 	// listed agent is bound to, by agent ID. Nil skips the pass.
 	MatrixCommits map[string][]matrixCommitItem
 	VerifierItems map[string]string
+	// AgentFolders, with Trim, names the agent folders under the artifacts
+	// root whose scratch the artifact scratch pass judges: folder name to the
+	// one item every agent of that name is bound to (agentScratchFolders).
+	AgentFolders map[string]string
 }
 
 // exclusive runs act under in.Exclusive, or directly without one. inUse is
@@ -1029,6 +1037,11 @@ func cleanupWorktrees(ctx context.Context, in worktreeCleanupInputs) ([]worktree
 	homes, homeErr := cleanupVerifierHomes(ctx, in, common, main, eligible, inUse, linked, art, now)
 	decisions = append(decisions, homes...)
 	decisions = append(decisions, cleanupMatrixBinaries(in, art, inUse)...)
+	// Scratch goes last: every path an earlier pass decided stays with it.
+	decisions, scratchErr := cleanupArtifactScratch(ctx, in, common, main, decisions, inUse, cleared, touched, art, now)
+	if homeErr == nil {
+		homeErr = scratchErr
+	}
 	if in.Apply {
 		for i := range decisions {
 			recorded, err := recordWorktreeDecision(in.Receipt, decisions[i], now)
@@ -1576,10 +1589,15 @@ func (a *artifactPass) itemTexts(item string) ([]worktreeEvidence, string) {
 	if a == nil || !artifactItemIDPattern.MatchString(item) {
 		return nil, ""
 	}
-	if texts, ok := a.texts[item]; ok {
-		return texts, a.textFault[item]
+	return a.folderTexts(filepath.Join(a.root, item))
+}
+
+// folderTexts reads the receipt and plan files of one folder under the
+// artifacts root, an item's folder or an agent's, by itemTexts' rules.
+func (a *artifactPass) folderTexts(root string) ([]worktreeEvidence, string) {
+	if texts, ok := a.texts[root]; ok {
+		return texts, a.textFault[root]
 	}
-	root := filepath.Join(a.root, item)
 	var texts []worktreeEvidence
 	fault := ""
 	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
@@ -1622,7 +1640,7 @@ func (a *artifactPass) itemTexts(item string) ([]worktreeEvidence, string) {
 		texts = append(texts, worktreeEvidence{Source: p, Text: string(data)})
 		return nil
 	})
-	a.texts[item], a.textFault[item] = texts, fault
+	a.texts[root], a.textFault[root] = texts, fault
 	return texts, fault
 }
 
@@ -2772,6 +2790,7 @@ func runWorktreeSweep(ctx context.Context, state sweepHubState, host string, o s
 		Trim: finishedTrimSet(host, state.entries, state.agents), Tombstones: o.Apply,
 		TempHomes:     func() bool { return claimVerifyHomeTempPass(o.Now) },
 		MatrixCommits: matrixCommitItems(state.entries), VerifierItems: agentItems(state.agents),
+		AgentFolders: agentScratchFolders(state.agents),
 	}
 	if o.Matrix != nil {
 		// A matrix run keeps the checkout, output and record folders it holds.
@@ -2798,7 +2817,7 @@ func cmdTeamQueueSweepWorktrees(e env, args []string) error {
 	fs := flag.NewFlagSet("team queue sweep-worktrees", flag.ContinueOnError)
 	hub := fs.String("hub", e.hub, "hub URL")
 	cwd := fs.String("cwd", "", "any worktree of the repository (default: current directory)")
-	apply := fs.Bool("apply", false, "remove the would-remove worktrees, session temp folders and verifier homes, trim the would-trim caches and prune missing worktrees")
+	apply := fs.Bool("apply", false, "remove the would-remove worktrees, session temp folders, verifier homes and artifact scratch, trim the would-trim caches and prune missing worktrees")
 	jsonOut := fs.Bool("json", false, "print JSON")
 	minIdle := fs.Duration("min-idle", 24*time.Hour, "keep worktrees whose Git state changed more recently, and session temp folders changed more recently")
 	acceptedAfter := fs.Duration("accepted-after", defaultArtifactAcceptedAfter, "remove an accepted, unreleased item's verifier checkouts once its acceptance is this old (default: no wait)")
@@ -2924,7 +2943,7 @@ func cmdTeamQueueSweepWorktrees(e env, args []string) error {
 		fmt.Printf("session temp kept only because the artifacts root cannot cite it: %d %s, %s; check --artifacts or TAILTERM_ARTIFACTS\n", u.Folders, noun, humanBytes(u.Bytes))
 	}
 	if !*apply {
-		fmt.Println("dry run: nothing changed; rerun with --apply to remove the would-remove worktrees, session temp folders and verifier homes and trim the would-trim caches")
+		fmt.Println("dry run: nothing changed; rerun with --apply to remove the would-remove worktrees, session temp folders, verifier homes and artifact scratch and trim the would-trim caches")
 	}
 	return err
 }
@@ -2943,6 +2962,8 @@ func worktreeLabel(d worktreeDecision) string {
 		return "verifier home cache; " + d.Detail
 	case kindMatrixBinary:
 		return "matrix test binary; " + d.Detail
+	case kindArtifactScratch:
+		return "artifact scratch; " + d.Detail
 	}
 	label := "detached " + shortSHA(d.Head)
 	if d.Branch != "" {
@@ -3318,8 +3339,8 @@ func trimCheckoutCache(in worktreeCleanupInputs, w gitWorktree, admin string, ch
 // tombstone in the same directory, and nothing else.
 type detachIntent struct {
 	At string `json:"at"`
-	// Kind is the decision kind: cache, session-temp, verify-home or
-	// home-cache.
+	// Kind is the decision kind: cache, session-temp, verify-home,
+	// home-cache or artifact-scratch.
 	Kind string `json:"kind"`
 	// Parent is the pinned directory's canonical path and Root the worktrees,
 	// artifacts or session temp root it was recorded under.
@@ -3539,7 +3560,7 @@ func finishDetach(intent detachIntent) (string, bool) {
 		return "the intent is malformed", false
 	}
 	switch intent.Kind {
-	case kindCache, kindSessionTemp, kindVerifyHome, kindHomeCache:
+	case kindCache, kindSessionTemp, kindVerifyHome, kindHomeCache, kindArtifactScratch:
 	default:
 		return "the intent has an unknown kind", false
 	}
@@ -5130,6 +5151,474 @@ func removeMatrixBinary(in worktreeCleanupInputs, art *artifactPass, folder stri
 			return
 		}
 		if err := pinned.Remove(name); err != nil {
+			reason, why = keepFailed, err.Error()
+		}
+	})
+	if held != "" {
+		return held, note, ""
+	}
+	if reason != "" {
+		return reason, why, ""
+	}
+	return "", "", note
+}
+
+// Artifact scratch.
+//
+// An item's artifact folder, <artifacts>/<itemId>/, and the folders of the
+// agents bound to it, <artifacts>/<agent>/, also collect untracked scratch:
+// built binaries, private homes, module caches and copies a run left behind.
+// The sweep (never closeout) removes it once the item's queue entry has been
+// released, or the item dismissed, for artifactScratchRetention (owner
+// #44358). Evidence is never scratch: logs folders, receipts, records and
+// notes, checkouts, verifier homes and every path another pass of the same
+// sweep decided stay, and so does anything in use, changed within the idle
+// age, on the never-touch list, or cited by a tracked document, queue
+// evidence or the item's or agent's receipt and plan files.
+
+// artifactScratchRetention is how long after its release or dismissal a
+// finished item keeps its scratch (owner #44358).
+const artifactScratchRetention = 72 * time.Hour
+
+// scratchCitationChunk bounds the paths of one tracked-document lookup, so a
+// folder of loose files cannot overflow git grep's argument list.
+const scratchCitationChunk = 200
+
+// agentScratchFolders maps each agent name to the item every agent of that
+// name is bound to. A name any agent holds with a role, unbound, or bound to
+// another item is left out, as is a name that is an item ID, holds a slash
+// or starts with a dot: such a folder is never judged.
+func agentScratchFolders(agents []api.Agent) map[string]string {
+	out := map[string]string{}
+	refused := map[string]bool{}
+	for _, a := range agents {
+		name := a.Name
+		if name == "" || refused[name] {
+			continue
+		}
+		item := ""
+		if a.WorkItem != nil {
+			item = a.WorkItem.ItemID
+		}
+		if a.Role != "" || !artifactItemIDPattern.MatchString(item) || artifactItemIDPattern.MatchString(name) || strings.ContainsAny(name, "/\\") || strings.HasPrefix(name, ".") || (out[name] != "" && out[name] != item) {
+			refused[name] = true
+			delete(out, name)
+			continue
+		}
+		out[name] = item
+	}
+	return out
+}
+
+// scratchGate returns the reason an item's scratch may go, released or
+// dismissed, with its detail: its newest finished entry is released, or the
+// item is dismissed, at least artifactScratchRetention ago. It returns ""
+// while the item runs, when it has neither (no record, or accepted only), or
+// inside the window; a release time that cannot be read keeps it too.
+func (a *artifactPass) scratchGate(item string) (string, string) {
+	st, recorded := a.items[item]
+	if recorded && st.State == artifactItemRunning {
+		return "", ""
+	}
+	reason, at := "", time.Time{}
+	if recorded && st.State == artifactItemReleased {
+		t, err := time.Parse(time.RFC3339Nano, st.BasisAt)
+		if err != nil {
+			return "", ""
+		}
+		reason, at = artifactItemReleased, t
+	} else if t, ok := a.dismissed[item]; ok && !t.IsZero() {
+		reason, at = artifactItemDismissed, t
+	} else {
+		return "", ""
+	}
+	age := a.now.Sub(at)
+	if age < artifactScratchRetention {
+		return "", ""
+	}
+	return reason, fmt.Sprintf("item %s %s %s ago; window %s", item, reason, shortDuration(age), shortDuration(artifactScratchRetention))
+}
+
+// scratchFolder is one folder directly under the artifacts root whose
+// scratch may go: an item's own (agent "") or a bound agent's.
+type scratchFolder struct {
+	path, item, agent string
+	reason, detail    string
+}
+
+// scratchFolders lists the real directories directly under the root whose
+// item passes scratchGate.
+func (a *artifactPass) scratchFolders(agents map[string]string) []scratchFolder {
+	entries, err := os.ReadDir(a.root)
+	if err != nil {
+		return nil
+	}
+	var out []scratchFolder
+	for _, e := range entries {
+		name := e.Name()
+		item, agent := name, ""
+		if !artifactItemIDPattern.MatchString(name) {
+			if agents[name] == "" {
+				continue
+			}
+			item, agent = agents[name], name
+		}
+		path := filepath.Join(a.root, name)
+		if info, err := os.Lstat(path); err != nil || !info.IsDir() {
+			continue
+		}
+		reason, detail := a.scratchGate(item)
+		if reason == "" {
+			continue
+		}
+		if agent != "" {
+			detail += "; agent folder " + agent
+		}
+		out = append(out, scratchFolder{path: path, item: item, agent: agent, reason: reason, detail: detail})
+	}
+	return out
+}
+
+// scratchLogsName reports a logs folder's name: logs, logs-* or *-logs.
+func scratchLogsName(name string) bool {
+	return name == "logs" || strings.HasPrefix(name, "logs-") || strings.HasSuffix(name, "-logs")
+}
+
+// scratchHolder reports a directory the pass never enters: it holds a .git
+// entry (a checkout, listed or not, or a repository) or a verifier home
+// marker, or either cannot be checked.
+func scratchHolder(dir string) bool {
+	for _, inside := range []string{".git", homeMarkerName} {
+		if _, err := os.Lstat(filepath.Join(dir, inside)); !errors.Is(err, fs.ErrNotExist) {
+			return true
+		}
+	}
+	return false
+}
+
+// scratchWhole reports a directory judged whole, never descended: a Go build
+// or module cache or a node_modules tree, whose own notes and package files
+// are not evidence.
+func scratchWhole(dir string) bool {
+	return filepath.Base(dir) == trimCacheName || goCacheKind(dir) != ""
+}
+
+// scratchKeeps reports an entry that is never scratch and never removed as
+// part of a folder holding it: a path an earlier pass decided, a .git entry,
+// a tombstone, a logs folder, a folder scratchHolder refuses, a file whose name is a
+// receipt, record, log or note (matrixEvidenceName), or anything that is not
+// a directory, regular file or symlink.
+func scratchKeeps(p string, e fs.DirEntry, decided map[string]bool) bool {
+	name := e.Name()
+	switch {
+	case decided[p], name == ".git", strings.HasPrefix(name, tombstonePrefix):
+		return true
+	case e.IsDir():
+		return scratchLogsName(name) || scratchHolder(p)
+	case e.Type().IsRegular() || e.Type()&fs.ModeSymlink != 0:
+		return matrixEvidenceName(name)
+	}
+	return true
+}
+
+// decidedWithin reports a decided path inside dir.
+func decidedWithin(dir string, decided map[string]bool) bool {
+	for p := range decided {
+		if pathWithin(p, dir) {
+			return true
+		}
+	}
+	return false
+}
+
+// scratchWalk returns the scratch candidates in dir, each a maximal entry
+// holding nothing scratchKeeps refuses, and whether dir holds anything
+// refused. It never follows a link; a directory it cannot read counts as
+// refused.
+func scratchWalk(dir string, decided map[string]bool) ([]string, bool) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, true
+	}
+	var out []string
+	kept := false
+	for _, e := range entries {
+		p := filepath.Join(dir, e.Name())
+		switch {
+		case scratchKeeps(p, e, decided):
+			kept = true
+		case e.IsDir() && !(scratchWhole(p) && !decidedWithin(p, decided)):
+			inner, innerKept := scratchWalk(p, decided)
+			if innerKept {
+				kept = true
+				out = append(out, inner...)
+			} else {
+				out = append(out, p)
+			}
+		default:
+			out = append(out, p)
+		}
+	}
+	return out, kept
+}
+
+// supersededCacheReport is the home pass's size report of an unmarked Go
+// cache, which a scratch decision replaces when it covers the cache.
+func supersededCacheReport(d worktreeDecision) bool {
+	return d.Kind == kindCache && d.Action == "kept" && d.Reason == keepUnproven && strings.HasPrefix(d.Detail, "no provenance marker")
+}
+
+// scratchCandidate is one entry the walk found, with its folder.
+type scratchCandidate struct {
+	path   string
+	info   os.FileInfo
+	whole  bool
+	folder scratchFolder
+}
+
+// cleanupArtifactScratch is the sweep's last pass: it decides the scratch of
+// every folder scratchFolders lists and, when applying, removes it. It
+// returns decisions with its own appended, less the unmarked cache reports
+// they cover. When the tracked-document lookup fails it decides nothing.
+func cleanupArtifactScratch(ctx context.Context, in worktreeCleanupInputs, common, main string, decisions []worktreeDecision, inUse []string, cleared map[string]bool, touched dirTouches, art *artifactPass, now time.Time) ([]worktreeDecision, error) {
+	if in.Trim == nil || art == nil {
+		return decisions, nil
+	}
+	folders := art.scratchFolders(in.AgentFolders)
+	if len(folders) == 0 {
+		return decisions, nil
+	}
+	decided := map[string]bool{}
+	for _, d := range decisions {
+		if !supersededCacheReport(d) {
+			decided[canonicalPath(d.Path)] = true
+		}
+	}
+	var candidates []scratchCandidate
+	var paths []string
+	for _, f := range folders {
+		if decided[f.path] || scratchHolder(f.path) {
+			continue
+		}
+		// The folder itself stays, even when everything in it goes.
+		found, _ := scratchWalk(f.path, decided)
+		for _, p := range found {
+			info, err := os.Lstat(p)
+			if err != nil {
+				continue
+			}
+			candidates = append(candidates, scratchCandidate{path: p, info: info, whole: info.IsDir() && scratchWhole(p), folder: f})
+			paths = append(paths, p)
+		}
+	}
+	cited := map[string]string{}
+	for start := 0; start < len(paths); start += scratchCitationChunk {
+		chunk, err := docsCitations(ctx, common, main, paths[start:min(start+scratchCitationChunk, len(paths))], nil, art)
+		if err != nil {
+			return decisions, fmt.Errorf("artifact scratch evidence lookup: %w", err)
+		}
+		for p, file := range chunk {
+			cited[p] = file
+		}
+	}
+	var scratch []worktreeDecision
+	for _, c := range candidates {
+		d := worktreeDecision{Path: c.path, Kind: kindArtifactScratch, Item: c.folder.item}
+		if reason, detail := classifyArtifactScratch(in, main, c, inUse, cited, cleared, touched, art, now); reason != "" {
+			d.Action, d.Reason, d.Detail = "kept", reason, detail
+			scratch = append(scratch, d)
+			continue
+		}
+		d.Action, d.Reason, d.Detail, d.Bytes = "would-remove", c.folder.reason, c.folder.detail, worktreeBytes(c.path, nil)
+		if in.Apply {
+			if reason, why, note := removeArtifactScratch(in, art, c); reason != "" {
+				d.Action, d.Reason, d.Detail, d.Bytes = "kept", reason, why, 0
+			} else {
+				d.Action = "removed"
+				if note != "" {
+					d.Detail += "; " + note
+				}
+			}
+		}
+		scratch = append(scratch, d)
+	}
+	covered := func(p string) bool {
+		for _, d := range scratch {
+			if d.Path == p || (d.Action != "kept" && pathWithin(p, d.Path)) {
+				return true
+			}
+		}
+		return false
+	}
+	out := make([]worktreeDecision, 0, len(decisions)+len(scratch))
+	for _, d := range decisions {
+		if supersededCacheReport(d) && covered(canonicalPath(d.Path)) {
+			continue
+		}
+		out = append(out, d)
+	}
+	return append(out, scratch...), nil
+}
+
+// classifyArtifactScratch returns the first keep reason for a candidate, or
+// "": in use, changed within the idle age, on the never-touch list, or cited
+// by a tracked document, queue evidence, or the receipt and plan files of
+// the item's folder or the agent's.
+func classifyArtifactScratch(in worktreeCleanupInputs, main string, c scratchCandidate, inUse []string, cited map[string]string, cleared map[string]bool, touched dirTouches, art *artifactPass, now time.Time) (string, string) {
+	for _, p := range inUse {
+		if detail := matrixFolderInUse(art, c.path, p); detail != "" {
+			return keepInUse, detail
+		}
+	}
+	if in.MinIdle > 0 {
+		if idle := sessionTempIdle(c.path, now, cleared, touched); idle < in.MinIdle {
+			return keepRecent, fmt.Sprintf("changed %s ago", idle.Round(time.Minute))
+		}
+	}
+	if deny := neverTouch(c.path, c.info); deny != "" {
+		return keepProtected, c.path + " touches the never-touch path " + deny
+	}
+	if file := cited[c.path]; file != "" {
+		return keepEvidence, "cited by " + file
+	}
+	evidence := append([]worktreeEvidence(nil), in.Evidence...)
+	texts, fault := art.itemTexts(c.folder.item)
+	if c.folder.agent != "" {
+		agentTexts, agentFault := art.folderTexts(c.folder.path)
+		texts = append(texts, agentTexts...)
+		if fault == "" {
+			fault = agentFault
+		}
+	}
+	if fault != "" {
+		return keepFailed, "receipt scan: " + fault
+	}
+	spellings := []string{c.path}
+	if s := art.configuredSpelling(c.path); s != "" {
+		spellings = append(spellings, s)
+	}
+	for _, ev := range append(evidence, texts...) {
+		for _, s := range spellings {
+			for _, pattern := range worktreeEvidencePatterns(s, main) {
+				if strings.Contains(ev.Text, pattern) {
+					return keepEvidence, "cited by " + ev.Source
+				}
+			}
+		}
+	}
+	return "", ""
+}
+
+// scratchRecheck says why a candidate, opened through its pinned parent, is
+// no longer scratch, or "": something scratchKeeps refuses appeared in it. A
+// whole cache is checked at its top only.
+func scratchRecheck(parent *os.Root, name string, info os.FileInfo, whole bool) string {
+	if !info.IsDir() {
+		return ""
+	}
+	if whole {
+		for _, inside := range []string{".git", homeMarkerName} {
+			if _, err := parent.Lstat(filepath.Join(name, inside)); !errors.Is(err, fs.ErrNotExist) {
+				return name + " now holds " + inside
+			}
+		}
+		return ""
+	}
+	why := ""
+	err := fs.WalkDir(parent.FS(), name, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		base := d.Name()
+		switch {
+		case base == ".git" || base == homeMarkerName || strings.HasPrefix(base, tombstonePrefix):
+			why = p + " appeared"
+		case d.IsDir():
+			if p != name && scratchLogsName(base) {
+				why = "logs folder " + p + " appeared"
+			}
+		case d.Type().IsRegular() || d.Type()&fs.ModeSymlink != 0:
+			if matrixEvidenceName(base) {
+				why = "evidence file " + p + " appeared"
+			}
+		default:
+			why = p + " is not a regular file, folder or link"
+		}
+		if why != "" {
+			return fs.SkipAll
+		}
+		return nil
+	})
+	if err != nil && why == "" {
+		why = "cannot read " + name + ": " + err.Error()
+	}
+	return why
+}
+
+// removeArtifactScratch removes one candidate through its pinned parent
+// inside the pinned artifacts root, after checking again that it is the
+// entry classified and still holds nothing to keep. A directory is detached
+// to a tombstone and deleted; a file or link is removed itself, and a link's
+// target is never read. It returns the keep reason and detail, or the
+// exclusion's note.
+func removeArtifactScratch(in worktreeCleanupInputs, art *artifactPass, c scratchCandidate) (string, string, string) {
+	rel, err := filepath.Rel(art.root, filepath.Dir(c.path))
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, "../") {
+		return keepMoved, "not inside a folder of the artifacts root " + art.root, ""
+	}
+	rootInfo, err := os.Lstat(art.root)
+	if err != nil || !rootInfo.IsDir() {
+		return keepMoved, "the artifacts root is not a directory", ""
+	}
+	root, err := os.OpenRoot(art.root)
+	if err != nil {
+		return keepMoved, "the artifacts root cannot be opened: " + err.Error(), ""
+	}
+	defer root.Close()
+	if got, err := root.Stat("."); err != nil || !os.SameFile(got, rootInfo) {
+		return keepMoved, "the artifacts root was replaced", ""
+	}
+	want, err := root.Lstat(rel)
+	if err != nil || !want.IsDir() {
+		return keepMoved, "the parent is not a real directory", ""
+	}
+	parent, err := root.OpenRoot(rel)
+	if err != nil {
+		return keepMoved, "the parent cannot be opened: " + err.Error(), ""
+	}
+	defer parent.Close()
+	parentInfo, err := parent.Stat(".")
+	if err != nil || !os.SameFile(want, parentInfo) {
+		return keepMoved, "the parent was replaced", ""
+	}
+	name := filepath.Base(c.path)
+	check := func() (string, string) {
+		got, err := parent.Lstat(name)
+		if err != nil || !os.SameFile(got, c.info) {
+			return keepMoved, "the entry was replaced since it was classified"
+		}
+		if deny := neverTouch(c.path, parentInfo, got); deny != "" {
+			return keepProtected, c.path + " touches the never-touch path " + deny
+		}
+		if why := scratchRecheck(parent, name, got, c.whole); why != "" {
+			return keepMoved, why
+		}
+		return "", ""
+	}
+	if reason, detail := check(); reason != "" {
+		return reason, detail, ""
+	}
+	inUse := func(p string) string { return matrixFolderInUse(art, c.path, p) }
+	if c.info.IsDir() {
+		reason, detail := detachAndDelete(in, parent, parentInfo, filepath.Join(art.root, rel), art.root, name, kindArtifactScratch, inUse, check)
+		return reason, detail, ""
+	}
+	var reason, why string
+	held, note := in.exclusive(inUse, func() {
+		if reason, why = check(); reason != "" {
+			return
+		}
+		if err := parent.Remove(name); err != nil {
 			reason, why = keepFailed, err.Error()
 		}
 	})

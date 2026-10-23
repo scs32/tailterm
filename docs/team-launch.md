@@ -391,9 +391,9 @@ tt team queue sweep-worktrees [--apply] [--json] [--min-idle 24h] [--accepted-af
 tt team queue sweep-worktrees --journal [--limit 20] [--json]
 ```
 
-- `--apply` removes the `would-remove` worktrees and session temp folders,
-  trims the `would-trim` caches and prunes missing worktrees; without it the
-  sweep is a dry run.
+- `--apply` removes the `would-remove` worktrees, session temp folders and
+  artifact scratch, trims the `would-trim` caches and prunes missing
+  worktrees; without it the sweep is a dry run.
 - `--journal` prints the scheduled sweep's journal instead (see "Scheduled
   sweep"). It reads only this host's file, and cannot be combined with
   `--apply`.
@@ -434,6 +434,35 @@ pinned ref, and its manifest marks nothing tracked. The dry run lists it as
 the journal counts it in `treesRemoved`. A `.git` directory, a record that
 exists or belongs to another repository, a symlink and anything outside the
 artifacts root are left alone.
+
+Untracked scratch of a finished item goes too, three days after its release
+(owner #44358). The sweep, never closeout, looks in the item's folder
+`<artifacts>/<itemId>/` and in the folder `<artifacts>/<agent>/` of each agent
+bound to it. An agent folder counts only when every agent of that name is
+bound, with no role, to that one item; a persistent role's folder or a name
+shared by two items is never judged. The three days start at the release
+recorded on the item's newest finished queue entry (its owner integration
+time, else the entry's last update), or, for an item with no release, at its
+dismissal (its last update). A folder whose item runs, has neither (no queue
+record, or only an acceptance), or is inside the window is not walked, nor is a
+symlinked folder. Inside an eligible folder the
+sweep never touches a `logs`, `logs-*` or `*-logs` folder, a file named like
+evidence (`*.md`, `*.json`, `*.jsonl`, `*.log`, `*.txt` and dot files), a
+checkout or any folder holding `.git`, a verifier home, or a path another pass
+of the same sweep decided. Everything else is scratch, judged as the largest
+entries that hold none of those: a folder holding only scratch is one entry, a
+Go cache or `node_modules` is one entry, and the item or agent folder itself
+stays. An entry is kept while a path in it is in use, while anything in it
+changed within `--min-idle`, when it touches a never-touch cache, and when a
+tracked document on `tasks-hub`, queue evidence or a receipt or plan file of
+the item's or agent's folder cites it or anything in it. Removal goes
+through the pinned artifacts root: a folder is renamed to a tombstone and
+deleted, a file or link is removed itself, and a link's target is never read.
+The dry run lists each entry as `would-remove <path> (artifact scratch; item
+<itemId> released <age> ago; window 72h; <size>)`, `dismissed` for a dismissed
+item and the agent folder named when it came from one, and its JSON rows have
+kind `artifact-scratch` with the item, reason and bytes. The journal counts
+removed entries in `treesRemoved` and their bytes in `bytesFreed`.
 
 Run it from any worktree of the repository (or pass `--cwd`). It first reads
 every project's roster and team queue from the hub and exits non-zero, having
@@ -523,8 +552,8 @@ first try that saves sweeps and writes its line.
 ```
 
 `outcome` is `swept`, `skipped` or `failed`, with the cause in `reason` and
-`detail`. `treesRemoved` counts worktrees, verifier checkouts and verifier
-homes, `foldersRemoved` session temp folders, and `binariesRemoved` matrix test
+`detail`. `treesRemoved` counts worktrees, verifier checkouts, verifier
+homes and artifact scratch entries, `foldersRemoved` session temp folders, and `binariesRemoved` matrix test
 binaries; lines written before `binariesRemoved` existed lack it and counted
 those binaries in `treesRemoved`. `bytesFreed` covers all of them. `at` is the
 `at` of that run's lines in `worktree-cleanup.jsonl`. `freeBytesAfter` is the least free space over each

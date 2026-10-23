@@ -6157,3 +6157,523 @@ func TestWorktreeCleanupOrphanedCheckoutSweepAndJournal(t *testing.T) {
 		t.Fatalf("receipt %+v", rec)
 	}
 }
+
+// Artifact scratch fixtures: items released, dismissed, accepted and running
+// relative to the fixture's clock.
+const (
+	scratchItemRel  = "wi_5c5c5c5c5c5c0001"
+	scratchItemNew  = "wi_5c5c5c5c5c5c0002"
+	scratchItemDis  = "wi_5c5c5c5c5c5c0003"
+	scratchItemAcc  = "wi_5c5c5c5c5c5c0004"
+	scratchItemLive = "wi_5c5c5c5c5c5c0005"
+	scratchItemNone = "wi_5c5c5c5c5c5c0006"
+	scratchItemBusy = "wi_5c5c5c5c5c5c0007"
+)
+
+// releasedScratchEntry is a finished entry of item released at at.
+func releasedScratchEntry(item string, at time.Time) api.TeamQueueEntry {
+	q := releasedArtifactEntry(item)
+	q.ID, q.Host, q.TaskID = "tqe_scr_"+item[len(item)-4:], trimHost, "tsk_c1ea0c1ea0c1ea10"
+	q.UpdatedAt = at.UTC().Format(time.RFC3339Nano)
+	q.Acceptance.AcceptedAt = at.Add(-time.Hour).UTC().Format(time.RFC3339Nano)
+	return q
+}
+
+// scratchTree is a folder's fixture content: the entries the pass must find
+// as scratch, and the evidence it must keep byte for byte.
+type scratchTree struct {
+	scratch []string
+	kept    map[string]string
+}
+
+// writeScratchTree fills dir with a build folder (a binary and a read-only
+// module cache), a loose file, a logs folder, notes, a receipt and a plan,
+// and sub/ holding a note beside a big file.
+func writeScratchTree(t *testing.T, dir string) scratchTree {
+	t.Helper()
+	tree := scratchTree{kept: map[string]string{}}
+	writeFixtureFile(t, filepath.Join(dir, "build", "tt-test"), strings.Repeat("b", 3000))
+	module := filepath.Join(dir, "build", "gomod")
+	writeFixtureFile(t, filepath.Join(module, "cache", "download", "example.com", "m", "@v", "v1.0.0.zip"), strings.Repeat("z", 2000))
+	readOnlyTree(t, module)
+	t.Cleanup(func() { _, _ = makeWorktreeWritable(module) })
+	writeFixtureFile(t, filepath.Join(dir, "loose.bin"), strings.Repeat("l", 1000))
+	writeFixtureFile(t, filepath.Join(dir, "sub", "big.bin"), strings.Repeat("g", 4000))
+	tree.scratch = []string{filepath.Join(dir, "build"), filepath.Join(dir, "loose.bin"), filepath.Join(dir, "sub", "big.bin")}
+	for name, content := range map[string]string{
+		"logs-x/run.out": "a log without an extension\n", "logs-x/build": "built\n", "notes.md": "# Notes\n",
+		"receipt.json": "{\"ok\":true}\n", "plan.json": "{\"plan\":1}\n", "sub/keep.md": "keep\n",
+	} {
+		path := filepath.Join(dir, name)
+		writeFixtureFile(t, path, content)
+		tree.kept[path] = content
+	}
+	return tree
+}
+
+func (s scratchTree) requireKept(t *testing.T) {
+	t.Helper()
+	for path, want := range s.kept {
+		if got, err := os.ReadFile(path); err != nil || string(got) != want {
+			t.Fatalf("evidence %s changed: %q %v", path, got, err)
+		}
+	}
+}
+
+// scratchDecisions are the artifact scratch decisions, by path.
+func scratchDecisions(got map[string]worktreeDecision) map[string]worktreeDecision {
+	out := map[string]worktreeDecision{}
+	for p, d := range got {
+		if d.Kind == kindArtifactScratch {
+			out[p] = d
+		}
+	}
+	return out
+}
+
+// requireNoScratchUnder fails on any scratch decision at or below the roots.
+func requireNoScratchUnder(t *testing.T, got map[string]worktreeDecision, roots ...string) {
+	t.Helper()
+	for p := range scratchDecisions(got) {
+		for _, root := range roots {
+			if pathWithin(p, root) {
+				t.Fatalf("scratch decision under %s: %+v", root, got[p])
+			}
+		}
+	}
+}
+
+// t1 (a1, a2, a3): a released item's scratch is listed by the dry run, one
+// row per maximal entry with its size and reason, and nothing changes; the
+// applying sweep removes exactly those, read-only module cache included,
+// keeps logs, notes, receipts and plans, writes a receipt each and leaves no
+// tombstone. A later sweep is quiet.
+func TestWorktreeCleanupArtifactScratchRemovedAfterRelease(t *testing.T) {
+	f := newHomeFixture(t)
+	dir := filepath.Join(f.artifacts(), scratchItemRel)
+	tree := writeScratchTree(t, dir)
+	state := sweepHubState{entries: []api.TeamQueueEntry{releasedScratchEntry(scratchItemRel, f.now.Add(-96*time.Hour))}}
+	before := fixtureTree(t, f.root)
+	dry := scratchDecisions(f.sweep(t, state, false))
+	if len(dry) != len(tree.scratch) {
+		t.Fatalf("dry scratch decisions %+v, want %v", dry, tree.scratch)
+	}
+	for _, p := range tree.scratch {
+		d := requireHomeDecision(t, dry, p, "would-remove", artifactItemReleased, kindArtifactScratch, "item "+scratchItemRel+" released 96h ago; window 72h")
+		if d.Item != scratchItemRel || d.Bytes <= 0 {
+			t.Fatalf("dry decision %+v", d)
+		}
+	}
+	if d := dry[filepath.Join(dir, "build")]; d.Bytes != 5000 {
+		t.Fatalf("build folder bytes %d, want 5000", d.Bytes)
+	}
+	if fixtureTree(t, f.root) != before {
+		t.Fatal("the dry run changed the tree")
+	}
+	if len(readCleanupReceipts(t)) != 0 {
+		t.Fatal("the dry run wrote receipts")
+	}
+	requireNoTombstones(t, dir)
+	got := scratchDecisions(f.sweep(t, state, true))
+	for _, p := range tree.scratch {
+		d := requireHomeDecision(t, got, p, "removed", artifactItemReleased, kindArtifactScratch, "item "+scratchItemRel+" released")
+		requireExists(t, p, false)
+		r := homeReceipt(t, p, "removed")
+		if r.Kind != kindArtifactScratch || r.ItemID != scratchItemRel || r.Bytes != d.Bytes || r.Bytes <= 0 || r.Reason != artifactItemReleased || r.Source != "sweep" {
+			t.Fatalf("receipt %+v for %+v", r, d)
+		}
+	}
+	tree.requireKept(t)
+	requireExists(t, filepath.Join(dir, "sub"), true)
+	requireNoTombstones(t, dir, filepath.Join(dir, "sub"))
+	if again := scratchDecisions(f.sweepAt(t, state, true, f.now.Add(time.Minute), nil)); len(again) != 0 {
+		t.Fatalf("second sweep decisions %+v", again)
+	}
+	tree.requireKept(t)
+}
+
+// t2 (a1): scratch waits out the window from the release, from a dismissal
+// with no queue record, and from a dismissal of an item only accepted.
+func TestWorktreeCleanupArtifactScratchWaitsForWindow(t *testing.T) {
+	f := newHomeFixture(t)
+	event := f.now.Add(-48 * time.Hour)
+	released := filepath.Join(f.artifacts(), scratchItemRel, "out.bin")
+	dismissed := filepath.Join(f.artifacts(), scratchItemDis, "out.bin")
+	acceptedDismissed := filepath.Join(f.artifacts(), scratchItemAcc, "out.bin")
+	for _, p := range []string{released, dismissed, acceptedDismissed} {
+		writeFixtureFile(t, p, "scratch\n")
+	}
+	state := sweepHubState{
+		entries:   []api.TeamQueueEntry{releasedScratchEntry(scratchItemRel, event), f.accepted(scratchItemAcc)},
+		dismissed: map[string]time.Time{scratchItemDis: event, scratchItemAcc: event},
+	}
+	for _, at := range []time.Time{f.now, event.Add(artifactScratchRetention - time.Minute)} {
+		if got := scratchDecisions(f.sweepAt(t, state, true, at, nil)); len(got) != 0 {
+			t.Fatalf("inside the window at %s: %+v", at, got)
+		}
+	}
+	for _, p := range []string{released, dismissed, acceptedDismissed} {
+		requireExists(t, p, true)
+	}
+	got := f.sweepAt(t, state, true, event.Add(artifactScratchRetention+time.Minute), nil)
+	requireHomeDecision(t, got, released, "removed", artifactItemReleased, kindArtifactScratch, "released 72h1m ago")
+	requireHomeDecision(t, got, dismissed, "removed", artifactItemDismissed, kindArtifactScratch, "item "+scratchItemDis+" dismissed 72h1m ago")
+	requireHomeDecision(t, got, acceptedDismissed, "removed", artifactItemDismissed, kindArtifactScratch, "dismissed")
+	for _, p := range []string{released, dismissed, acceptedDismissed} {
+		requireExists(t, p, false)
+	}
+}
+
+// t3 (a1): a running item (an active entry, or a bound agent not closed over
+// an old release), an item with no record and one accepted but never
+// released are not walked and keep everything.
+func TestWorktreeCleanupArtifactScratchKeepsUnfinishedItems(t *testing.T) {
+	f := newHomeFixture(t)
+	old := f.now.Add(-30 * 24 * time.Hour)
+	var dirs []string
+	for _, item := range []string{scratchItemLive, scratchItemBusy, scratchItemNone, scratchItemAcc} {
+		dir := filepath.Join(f.artifacts(), item)
+		writeScratchTree(t, dir)
+		dirs = append(dirs, dir)
+	}
+	accepted := acceptedArtifactEntry(scratchItemAcc, old)
+	state := sweepHubState{
+		entries: []api.TeamQueueEntry{
+			{ID: "tqe_scr_live", ItemID: scratchItemLive, State: "running", Host: "other-host", Position: 2},
+			releasedScratchEntry(scratchItemBusy, old), accepted,
+		},
+		agents: []api.Agent{boundAgent("agt_scr_busy", scratchItemBusy, api.AgentRunning)},
+		// A dismissal never outranks a running entry or agent.
+		dismissed: map[string]time.Time{scratchItemLive: old, scratchItemBusy: old},
+	}
+	before := fixtureTree(t, dirs...)
+	got := f.sweep(t, state, true)
+	requireNoScratchUnder(t, got, dirs...)
+	if fixtureTree(t, dirs...) != before {
+		t.Fatal("an unfinished item's folder changed")
+	}
+}
+
+// t4 (a1): an agent folder is judged only when every agent of its name is
+// bound, with no role, to the one item; then its scratch goes with that
+// item's.
+func TestWorktreeCleanupArtifactScratchAgentFolders(t *testing.T) {
+	f := newHomeFixture(t)
+	old := f.now.Add(-96 * time.Hour)
+	folder := func(name string) string { return filepath.Join(f.artifacts(), name) }
+	bound := writeScratchTree(t, folder("lead-1234abcd"))
+	var untouched []string
+	for _, name := range []string{"builder-twoitems", "lead-unbound", "db-handler-r9", "lead-live1234", "helper-noagent"} {
+		writeScratchTree(t, folder(name))
+		untouched = append(untouched, folder(name))
+	}
+	role := boundAgent("agt_scr_role", scratchItemRel, api.AgentClosed)
+	role.Name, role.Role = "db-handler-r9", "database_handler"
+	unbound := api.Agent{ID: "agt_scr_unbound", Name: "lead-unbound", Status: api.AgentClosed}
+	twoA, twoB := boundAgent("agt_scr_two_a", scratchItemRel, api.AgentClosed), boundAgent("agt_scr_two_b", scratchItemDis, api.AgentClosed)
+	twoA.Name, twoB.Name = "builder-twoitems", "builder-twoitems"
+	lead := boundAgent("agt_scr_lead", scratchItemRel, api.AgentClosed)
+	lead.Name = "lead-1234abcd"
+	unboundTwin := boundAgent("agt_scr_unbound2", scratchItemRel, api.AgentClosed)
+	unboundTwin.Name = "lead-unbound"
+	live := boundAgent("agt_scr_live", scratchItemLive, api.AgentRunning)
+	live.Name = "lead-live1234"
+	state := sweepHubState{
+		entries:   []api.TeamQueueEntry{releasedScratchEntry(scratchItemRel, old), releasedScratchEntry(scratchItemLive, old)},
+		agents:    []api.Agent{lead, role, unbound, unboundTwin, twoA, twoB, live},
+		dismissed: map[string]time.Time{scratchItemDis: old},
+	}
+	before := fixtureTree(t, untouched...)
+	got := f.sweep(t, state, true)
+	for _, p := range bound.scratch {
+		requireHomeDecision(t, got, p, "removed", artifactItemReleased, kindArtifactScratch, "item "+scratchItemRel+" released 96h ago; window 72h; agent folder lead-1234abcd")
+		requireExists(t, p, false)
+	}
+	bound.requireKept(t)
+	requireNoScratchUnder(t, got, untouched...)
+	if fixtureTree(t, untouched...) != before {
+		t.Fatal("an unbound agent folder changed")
+	}
+	folders := agentScratchFolders([]api.Agent{lead, role, unbound, unboundTwin, twoA, twoB, live,
+		boundAgent(scratchItemRel, scratchItemRel, api.AgentClosed), boundAgent(".hidden", scratchItemRel, api.AgentClosed)})
+	if !reflect.DeepEqual(folders, map[string]string{"lead-1234abcd": scratchItemRel, "lead-live1234": scratchItemLive}) {
+		t.Fatalf("agent folders %v", folders)
+	}
+}
+
+// t5 (a1): scratch a tracked document, a receipt or queue evidence cites, a
+// path in use, a file changed within the idle age and a never-touch cache are
+// kept.
+func TestWorktreeCleanupArtifactScratchKeepsCitedInUseAndRecent(t *testing.T) {
+	f := newHomeFixture(t)
+	dir := filepath.Join(f.artifacts(), scratchItemRel)
+	docCited := filepath.Join(dir, "measure")
+	writeFixtureFile(t, filepath.Join(docCited, "bin", "out.bin"), "measured\n")
+	receiptCited := filepath.Join(dir, "cited.bin")
+	writeFixtureFile(t, receiptCited, "cited\n")
+	writeFixtureFile(t, filepath.Join(dir, "run-receipt.json"), "{\"artifact\":\""+receiptCited+"\"}\n")
+	queueCited := filepath.Join(dir, "queue-cited.bin")
+	writeFixtureFile(t, queueCited, "cited by acceptance\n")
+	inUse := filepath.Join(dir, "work")
+	writeFixtureFile(t, filepath.Join(inUse, "in-use", "data.bin"), "busy\n")
+	recent := filepath.Join(dir, "fresh.bin")
+	writeFixtureFile(t, recent, "fresh\n")
+	if err := os.Chtimes(recent, f.now.Add(-time.Hour), f.now.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	plain := filepath.Join(dir, "plain.bin")
+	writeFixtureFile(t, plain, "plain\n")
+	shared := filepath.Join(dir, "shared-mod")
+	writeFixtureFile(t, filepath.Join(shared, "pkg.bin"), "a shared cache\n")
+	t.Setenv("GOMODCACHE", shared)
+	writeFixtureFile(t, filepath.Join(f.main, "docs", "evidence.md"), "Measured in `"+filepath.Join(docCited, "bin", "out.bin")+"`.\n")
+	cleanupGit(t, f.main, "add", "docs/evidence.md")
+	cleanupGit(t, f.main, "commit", "-q", "-m", "cite a measurement")
+	released := releasedScratchEntry(scratchItemRel, f.now.Add(-96*time.Hour))
+	released.Acceptance.Evidence = "kept output " + queueCited
+	running := api.TeamQueueEntry{ID: "tqe_scr_work", ItemID: scratchItemLive, State: "running", Host: trimHost, Cwd: filepath.Join(inUse, "in-use"), Position: 3}
+	state := sweepHubState{entries: []api.TeamQueueEntry{released, running}}
+	dry := f.sweep(t, state, false)
+	requireHomeDecision(t, dry, shared, "kept", keepProtected, kindArtifactScratch, "touches the never-touch path "+shared)
+	requireHomeDecision(t, dry, plain, "would-remove", artifactItemReleased, kindArtifactScratch, "released")
+	got := f.sweep(t, state, true)
+	requireHomeDecision(t, got, docCited, "kept", keepEvidence, kindArtifactScratch, "cited by docs/evidence.md")
+	requireHomeDecision(t, got, receiptCited, "kept", keepEvidence, kindArtifactScratch, "cited by "+filepath.Join(dir, "run-receipt.json"))
+	requireHomeDecision(t, got, queueCited, "kept", keepEvidence, kindArtifactScratch, "acceptance evidence")
+	requireHomeDecision(t, got, inUse, "kept", keepInUse, kindArtifactScratch, "in use at "+filepath.Join(inUse, "in-use"))
+	requireHomeDecision(t, got, recent, "kept", keepRecent, kindArtifactScratch, "changed 1h0m0s ago")
+	requireHomeDecision(t, got, plain, "removed", artifactItemReleased, kindArtifactScratch, "released")
+	requireHomeDecision(t, got, shared, "kept", keepProtected, kindArtifactScratch, "touches the never-touch path "+shared)
+	for _, p := range []string{docCited, receiptCited, queueCited, inUse, recent, shared} {
+		requireExists(t, p, true)
+	}
+	requireExists(t, plain, false)
+}
+
+// t6 (a1, a2): checkouts, listed and orphaned, a marked verifier home and a
+// matrix run's evidence stay with their own passes; a link is removed itself
+// and nothing outside the artifacts root changes, a symlinked item folder
+// included.
+func TestWorktreeCleanupArtifactScratchNeverTouchesOtherPassesOrOutside(t *testing.T) {
+	f := newHomeFixture(t)
+	dir := filepath.Join(f.artifacts(), trimItemRel)
+	listed := f.verifierCheckout(t, trimItemRel, "verifier-listed")
+	writeFixtureFile(t, filepath.Join(f.main, "docs", "keep.md"), "Kept: `"+filepath.Join(listed, "dist", "app.js")+"`.\n")
+	cleanupGit(t, f.main, "add", "docs/keep.md")
+	cleanupGit(t, f.main, "commit", "-q", "-m", "cite a checkout")
+	orphan := f.orphanCheckout(t, trimItemRel, "verifier-orphan")
+	home := writeHome(t, filepath.Join(dir, "verifier", "home"), runMarker(trimItemRel, false, filepath.Join(dir, "verifier"), f.now.Add(-96*time.Hour)))
+	run := writeMatrixRun(t, filepath.Join(dir, "verifier", "matrix-1a1a1a1"), matrixCommitRel, "", "tailterm-hub-test")
+	outside := filepath.Join(f.root, "outside")
+	writeFixtureFile(t, filepath.Join(outside, "target.bin"), "outside target\n")
+	writeFixtureFile(t, filepath.Join(outside, "dir", "inner.bin"), "outside inner\n")
+	fileLink, dirLink := filepath.Join(dir, "link-file"), filepath.Join(dir, "link-dir")
+	for link, target := range map[string]string{fileLink: filepath.Join(outside, "target.bin"), dirLink: filepath.Join(outside, "dir")} {
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+	}
+	linkedItem := filepath.Join(f.artifacts(), scratchItemRel)
+	if err := os.Symlink(outside, linkedItem); err != nil {
+		t.Fatal(err)
+	}
+	// An item folder that is itself a repository is never entered.
+	repoItem := filepath.Join(f.artifacts(), scratchItemNew)
+	writeFixtureFile(t, filepath.Join(repoItem, "scratch.bin"), "untracked in a repository\n")
+	cleanupGit(t, repoItem, "init", "-q")
+	repoBefore := fixtureTree(t, repoItem)
+	old := f.now.Add(-96 * time.Hour)
+	entry := releasedMatrixEntry(trimItemRel, matrixCommitRel)
+	entry.UpdatedAt = old.UTC().Format(time.RFC3339Nano)
+	state := sweepHubState{entries: []api.TeamQueueEntry{entry, releasedScratchEntry(scratchItemRel, old), releasedScratchEntry(scratchItemNew, old)}}
+	outsideBefore := fixtureTree(t, outside)
+	dry := f.sweep(t, state, false)
+	requireNoScratchUnder(t, dry, listed, orphan, home, run.dir, linkedItem, repoItem)
+	if d := dry[listed]; d.Kind != kindArtifactCheckout || d.Action != "kept" {
+		t.Fatalf("listed checkout %+v", d)
+	}
+	if d := dry[orphan]; d.Kind != kindArtifactCheckout || d.Action != "would-remove" {
+		t.Fatalf("orphaned checkout %+v", d)
+	}
+	if want := []string{dirLink, fileLink}; !reflect.DeepEqual(sortedKeys(scratchDecisions(dry)), want) {
+		t.Fatalf("scratch decisions %+v, want %v", scratchDecisions(dry), want)
+	}
+	got := f.sweep(t, state, true)
+	requireNoScratchUnder(t, got, listed, home, run.dir, linkedItem, repoItem)
+	if fixtureTree(t, repoItem) != repoBefore {
+		t.Fatal("the sweep changed a repository item folder")
+	}
+	requireHomeDecision(t, got, fileLink, "removed", artifactItemReleased, kindArtifactScratch, "released")
+	requireHomeDecision(t, got, dirLink, "removed", artifactItemReleased, kindArtifactScratch, "released")
+	for _, link := range []string{fileLink, dirLink} {
+		if _, err := os.Lstat(link); !os.IsNotExist(err) {
+			t.Fatalf("link %s: %v", link, err)
+		}
+	}
+	if fixtureTree(t, outside) != outsideBefore {
+		t.Fatal("the sweep changed a tree outside the artifacts root")
+	}
+	requireExists(t, filepath.Join(listed, "dist", "app.js"), true)
+	requireExists(t, filepath.Join(home, homeMarkerName), true)
+	run.requireEvidenceKept(t)
+}
+
+func sortedKeys(m map[string]worktreeDecision) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// t7 (a2): the scheduled sweep journals scratch removals as treesRemoved and
+// their bytes as bytesFreed.
+func TestWorktreeCleanupArtifactScratchJournal(t *testing.T) {
+	f := newSweepFixture(t)
+	scratch := filepath.Join(f.r.artifacts(), sweepItem, "scratch", "out.bin")
+	writeFixtureFile(t, scratch, strings.Repeat("s", 2500))
+	if !f.attempt() {
+		t.Fatal("no attempt")
+	}
+	requireExists(t, filepath.Dir(scratch), false)
+	line := lastSweepLine(t)
+	if line.Outcome != "swept" || line.TreesRemoved != 1 || line.BytesFreed != 2500 || line.FoldersRemoved != 0 || line.BinariesRemoved != 0 {
+		t.Fatalf("line %+v", line)
+	}
+	r := homeReceipt(t, filepath.Dir(scratch), "removed")
+	if r.Kind != kindArtifactScratch || r.Source != "sweep" || r.Bytes != 2500 {
+		t.Fatalf("receipt %+v", r)
+	}
+}
+
+// t8 (a1): a scratch folder detached by a pass that died before the delete is
+// deleted by the next pass, and its intent cleared.
+func TestWorktreeCleanupArtifactScratchFinishesInterruptedRemoval(t *testing.T) {
+	f := newHomeFixture(t)
+	dir := filepath.Join(f.artifacts(), scratchItemRel)
+	scratch := filepath.Join(dir, "measure")
+	writeFixtureFile(t, filepath.Join(scratch, "home", "bin", "tool"), "tool\n")
+	readOnlyTree(t, filepath.Join(scratch, "home"))
+	t.Cleanup(func() { _, _ = makeWorktreeWritable(dir) })
+	state := sweepHubState{entries: []api.TeamQueueEntry{releasedScratchEntry(scratchItemRel, f.now.Add(-96*time.Hour))}}
+	detachCrashAt = func(at string) bool { return at == "renamed" }
+	t.Cleanup(func() { detachCrashAt = nil })
+	first := f.sweep(t, state, true)
+	detachCrashAt = nil
+	requireHomeDecision(t, first, scratch, "kept", keepFailed, kindArtifactScratch, "interrupted after the rename")
+	intents, err := loadDetachIntents()
+	if err != nil || len(intents) != 1 || intents[0].Kind != kindArtifactScratch || intents[0].Parent != dir || intents[0].Root != f.artifacts() || intents[0].Source != "measure" {
+		t.Fatalf("intents %+v %v", intents, err)
+	}
+	requireExists(t, scratch, false)
+	requireExists(t, filepath.Join(dir, intents[0].Tombstone, "home", "bin", "tool"), true)
+	got := f.sweepAt(t, state, true, f.now.Add(time.Minute), nil)
+	if d := requireDecision(t, got, scratch, "removed", ""); d.Kind != kindArtifactScratch || !strings.Contains(d.Detail, "finished an interrupted sweep") {
+		t.Fatalf("recovery %+v", d)
+	}
+	requireNoTombstones(t, dir)
+}
+
+// t9 (a1): an unmarked Go cache in an eligible folder is scratch, with one
+// decision; one in a running item's folder keeps its size report.
+func TestWorktreeCleanupArtifactScratchSupersedesUnmarkedCacheReport(t *testing.T) {
+	f := newHomeFixture(t)
+	eligible := writeBuildCache(t, filepath.Join(f.artifacts(), scratchItemRel, "gocache"), 3000)
+	running := writeBuildCache(t, filepath.Join(f.artifacts(), scratchItemLive, "gocache"), 3000)
+	state := sweepHubState{entries: []api.TeamQueueEntry{
+		releasedScratchEntry(scratchItemRel, f.now.Add(-96*time.Hour)),
+		{ID: "tqe_scr_live", ItemID: scratchItemLive, State: "running", Host: "other-host", Position: 2},
+	}}
+	dry := f.sweep(t, state, false)
+	if d := requireHomeDecision(t, dry, eligible, "would-remove", artifactItemReleased, kindArtifactScratch, "released"); d.Bytes <= 3000 {
+		t.Fatalf("cache bytes %+v", d)
+	}
+	requireHomeDecision(t, dry, running, "kept", keepUnproven, kindCache, "no provenance marker")
+	got := f.sweep(t, state, true)
+	requireHomeDecision(t, got, eligible, "removed", artifactItemReleased, kindArtifactScratch, "released")
+	requireExists(t, eligible, false)
+	requireExists(t, running, true)
+}
+
+// The tracked-document lookup runs in chunks, so a folder with more loose
+// files than one chunk is still judged, citations in a later chunk
+// included.
+func TestWorktreeCleanupArtifactScratchCitationChunks(t *testing.T) {
+	f := newHomeFixture(t)
+	dir := filepath.Join(f.artifacts(), scratchItemRel)
+	n := scratchCitationChunk + 5
+	var files []string
+	for i := 0; i < n; i++ {
+		p := filepath.Join(dir, fmt.Sprintf("part-%03d.bin", i))
+		writeFixtureFile(t, p, "part\n")
+		files = append(files, p)
+	}
+	cited := files[n-2]
+	writeFixtureFile(t, filepath.Join(f.main, "docs", "parts.md"), "See `"+cited+"`.\n")
+	cleanupGit(t, f.main, "add", "docs/parts.md")
+	cleanupGit(t, f.main, "commit", "-q", "-m", "cite a part")
+	state := sweepHubState{entries: []api.TeamQueueEntry{releasedScratchEntry(scratchItemRel, f.now.Add(-96*time.Hour))}}
+	got := scratchDecisions(f.sweep(t, state, false))
+	if len(got) != n {
+		t.Fatalf("%d scratch decisions, want %d", len(got), n)
+	}
+	requireHomeDecision(t, got, cited, "kept", keepEvidence, kindArtifactScratch, "cited by docs/parts.md")
+	requireHomeDecision(t, got, files[0], "would-remove", artifactItemReleased, kindArtifactScratch, "released")
+}
+
+// a2: the manual dry run prints each would-remove scratch path with its
+// reason and size, and its JSON rows carry kind, item, reason and bytes.
+func TestWorktreeCleanupArtifactScratchSweepCommandReportsRows(t *testing.T) {
+	f := newHomeFixture(t)
+	scratch := filepath.Join(f.artifacts(), trimItemRel, "out.bin")
+	writeFixtureFile(t, scratch, strings.Repeat("o", 2048))
+	task := "tsk_c1ea0c1ea0c1ea10"
+	entry := releasedArtifactEntry(trimItemRel)
+	entry.TaskID = task
+	hub := &cleanupHub{
+		tasks:   []api.Task{{ID: task, Status: api.TaskOpen}},
+		details: map[string]api.TaskDetail{task: {Task: api.Task{ID: task, Status: api.TaskOpen}}},
+		queues:  map[string]api.TeamQueueList{task: {Entries: []api.TeamQueueEntry{entry}}},
+	}
+	server := httptest.NewServer(hub)
+	defer server.Close()
+	e := env{hub: server.URL}
+	out, err := captureSweepStdout(t, func() error {
+		return cmdTeamQueueSweepWorktrees(e, []string{"--cwd", f.main, "--min-idle", "0s", "--json"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rows struct {
+		Worktrees []map[string]any `json:"worktrees"`
+	}
+	if err := json.Unmarshal([]byte(out), &rows); err != nil {
+		t.Fatalf("json %q: %v", out, err)
+	}
+	found := false
+	for _, row := range rows.Worktrees {
+		if row["path"] == scratch {
+			found = true
+			if row["kind"] != kindArtifactScratch || row["action"] != "would-remove" || row["item"] != trimItemRel || row["reason"] != artifactItemReleased || row["bytes"].(float64) != 2048 {
+				t.Fatalf("json row %v", row)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("json lacks the scratch row: %s", out)
+	}
+	dry, err := captureSweepStdout(t, func() error {
+		return cmdTeamQueueSweepWorktrees(e, []string{"--cwd", f.main, "--min-idle", "0s"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "would-remove " + scratch + " (artifact scratch; item " + trimItemRel + " released "; !strings.Contains(dry, want) || !strings.Contains(dry, "; window 72h; 2.0 KiB)") {
+		t.Fatalf("dry output lacks %q:\n%s", want, dry)
+	}
+	requireExists(t, scratch, true)
+	if len(readCleanupReceipts(t)) != 0 || len(hub.writes) != 0 {
+		t.Fatalf("the dry run wrote: %+v %v", readCleanupReceipts(t), hub.writes)
+	}
+}
