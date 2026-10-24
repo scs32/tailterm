@@ -1833,11 +1833,12 @@ test("concurrent checks keep plan-ordered receipts and record the job count", as
     f.cwd,
   );
   const receipt = await runPlan(plan, f.cwd, tempDir(t, "verification-parallel-"), {
+    // npm-unit holds three slots, so two browser lanes fit beside it at 5.
     minFreeBytes: 0,
-    jobs: 4,
+    jobs: 5,
   });
   assert.deepEqual(receipt.checks.map((c) => c.id), plan.checks.map((c) => c.id));
-  assert.equal(receipt.environment.VERIFICATION_JOBS, "4");
+  assert.equal(receipt.environment.VERIFICATION_JOBS, "5");
   assert.deepEqual(overlapViolations(receipt.checks), []);
   const slow = receipt.checks.find((c) => c.id === "tests/slow-browser.mjs"),
     fast = receipt.checks.find((c) => c.id === "tests/fast-browser.mjs");
@@ -1976,6 +1977,53 @@ test("go-race holds two job slots so fewer checks run beside it", async () => {
     2,
     "a weight never exceeds the job count",
   );
+});
+// wi_2a368cb26f29ec41: npm-unit holds three slots. simulateLoad weighs every
+// check but go-race as one slot, so this reads overlap from spans on a counter
+// that ticks at each start and end, which timer ties cannot reorder.
+test("npm-unit holds three job slots so at most two checks run beside it", async () => {
+  const npmUnit = fakeCheck("npm-unit", { argv: ["npm", "test"] });
+  assert.equal(matrixRunner.checkWeight(npmUnit, 5), 3);
+  assert.equal(matrixRunner.checkWeight(npmUnit, 8), 3);
+  assert.equal(matrixRunner.checkWeight(npmUnit, 2), 2, "capped at the job count");
+  assert.equal(matrixRunner.checkWeight(npmUnit, 1), 1);
+  assert.equal(NON_GO_NICE, 10, "npm-unit keeps the non-Go priority");
+  const run = async (checks, jobs, duration) => {
+    let tick = 0;
+    const starts = [];
+    const results = await runScheduled(checks, { jobs }, async (check) => {
+      starts.push(check.id);
+      const start = tick++,
+        startedAt = new Date().toISOString();
+      await new Promise((resolve) => setTimeout(resolve, duration(check)));
+      return { ...check, start, end: tick++, startedAt, endedAt: new Date().toISOString() };
+    });
+    const unit = results.find((r) => r.id === "npm-unit");
+    const others = results.filter((r) => r !== unit && r.start < unit.end && unit.start < r.end);
+    const most = Math.max(
+      0,
+      ...[unit, ...others]
+        .map((r) => Math.max(r.start, unit.start))
+        .map((t) => others.filter((r) => r.start <= t && t < r.end).length),
+    );
+    return { results, starts, others: others.map((r) => r.id), most };
+  };
+  const noGo = [
+    fakeCheck("00-static-build", { argv: ["npm", "run", "build:static"] }),
+    fakeCheck("01-static-release-verify", { argv: ["npm", "run", "verify:release"] }),
+    npmUnit,
+    ...Array.from({ length: 8 }, (_, i) => fakeCheck(`tests/s${i}.mjs`)),
+  ];
+  const browsers = await run(noGo, 5, (c) => (c.id === "npm-unit" ? 60 : 10));
+  assert.equal(browsers.most, 2, `two browser lanes beside npm-unit at 5 jobs, saw ${browsers.most}`);
+  assert.deepEqual(overlapViolations(browsers.results), []);
+  const withGo = await run(criticalPathPlan(), 5, (c) =>
+    c.id === "go-race" ? 120 : c.id === "npm-unit" ? 30 : c.id === "go-vet" ? 2 : 10,
+  );
+  assert.deepEqual(withGo.others, ["go-race"], "only go-race runs beside npm-unit");
+  assert.deepEqual(overlapViolations(withGo.results), []);
+  const serial = await run(criticalPathPlan(), 1, () => 2);
+  assert.deepEqual(serial.starts, criticalPathPlan().map((c) => c.id), "one job runs in plan order");
 });
 test("overlap scan exempts Go checks from barriers but not from the Go lane", () => {
   const at = (s) => new Date(Date.UTC(2026, 8, 29, 0, 0, s)).toISOString();

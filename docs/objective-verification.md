@@ -883,6 +883,19 @@ is saturated. Those timings are history: by 2026-10-06 the store package alone
 took 27 to 31 minutes under race, and it now runs as shards (see "Store race
 shards").
 
+npm-unit holds three job slots (`wi_2a368cb26f29ec41`), or the job count when
+that is lower. It runs its test files 12 at once, so like go-race it is a
+multi-process load. In the two b0c3ad03 receipts, a run with no Go checks,
+npm-unit started beside four browser lanes and took 330367 and 382389 ms of its
+480000 ms timeout (69% and 80%), against 178–250 s alone. Every one of those
+checks ran at `nice` 10, so priority could not separate them. With three slots,
+two browser lanes run beside npm-unit at 5 jobs when there are no Go checks.
+When Go checks are present, go-race's two slots and npm-unit's three fill 5
+jobs, so nothing but go-race runs beside npm-unit. The weight changes only how
+many checks run beside npm-unit. npm-unit still runs at `nice` 10 like every
+other non-Go check, and the Go-first order and Go lane are unchanged. So non-Go
+work beside go-race still holds at most three slots at the lower priority.
+
 Scheduling alone cannot keep the store package under 600 s beside other work.
 The owner therefore chose (#15114) to put the package timeout in the matrix.
 `goTestFlags` is inserted into only the `go-test` and `go-race` argv, before
