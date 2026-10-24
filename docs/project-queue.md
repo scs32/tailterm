@@ -1736,9 +1736,13 @@ same journal.
 
 Without `--apply` it is a dry run that writes nothing: no manifest, no
 receipt, no ref. It lists each verifier checkout and session temp folder with
-what it would do and, for a `would-remove` row, its size. `--apply` removes
-exactly what the dry run under the same rules reports. Never run `--apply`
-as a check; it deletes.
+what it would do and, for a `would-remove` row, its size. The sweep's dry run
+also lists each artifact scratch entry, as `would-remove <path> (artifact
+scratch; item <itemId> released <age> ago; window 72h; <size>)` (`dismissed`
+for a dismissed item) or `kept` with its reason, and its JSON rows have kind
+`artifact-scratch` with the item, reason and bytes. `--apply` removes exactly
+what the dry run under the same rules reports. Never run `--apply` as a
+check; it deletes.
 
 ### Verifier checkouts
 
