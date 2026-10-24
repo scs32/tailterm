@@ -678,6 +678,123 @@ func queueCorrectionRunner(t *testing.T, f teamFixture, members int) teamRunner 
 	}
 }
 
+// w1-w3 (wi_6a36a19047db7f81): launch moves a clean, detached queue worktree
+// to the tasks-hub tip, fast-forward only, records the base in the frozen
+// launch JSON and names it in every member's briefing. A dirty, non-ancestor
+// or shared checkout is left alone with a named reason; a current one is not
+// touched.
+func TestTeamRunnerLaunchMovesStaleQueueWorktreeToTasksHub(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		at      func(c1, c2, c3 string) string
+		dirty   bool
+		shared  bool
+		outcome string
+		reason  string
+	}{
+		{name: "stale clean", at: func(c1, _, _ string) string { return c1 }, outcome: "advanced"},
+		{name: "dirty", at: func(c1, _, _ string) string { return c1 }, dirty: true, outcome: "left", reason: "uncommitted changes in 2 paths"},
+		{name: "non-ancestor", at: func(_, _, c3 string) string { return c3 }, outcome: "left", reason: "commits not on tasks-hub"},
+		{name: "already current", at: func(_, c2, _ string) string { return c2 }, outcome: "current"},
+		{name: "shared checkout", at: func(c1, _, _ string) string { return c1 }, shared: true, outcome: "left", reason: "not the entry's own queue worktree"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newTeamFixture(t, true)
+			ctx := context.Background()
+			repo, c1, c2 := queueTasksHubRepo(t)
+			c3 := queueChildCommit(t, repo, c2, "c3")
+			start := tc.at(c1, c2, c3)
+			cwd := repo
+			if !tc.shared {
+				cwd = queueWorktreeFor(repo, f.item.ID)
+				queueGit(t, repo, "worktree", "add", "--detach", cwd, start)
+			}
+			var edited []byte
+			if tc.dirty {
+				edited = []byte("edited\n")
+				if err := os.WriteFile(filepath.Join(cwd, "tracked.txt"), edited, 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(cwd, "untracked.txt"), []byte("new\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			reflog := queueGit(t, cwd, "reflog", "show", "--format=%H", "HEAD")
+			q, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "add", Operation: "add", ItemID: f.item.ID, OrderMessageSeq: f.order, Host: "fixture", Cwd: cwd, Repository: filepath.Join(repo, ".git"), BaseCommit: start, Serial: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			r := queueCorrectionRunner(t, f, 2)
+			spawnMember := r.spawn
+			var prompts []string
+			r.spawn = func(e env, args []string) error {
+				for i := 0; i+1 < len(args); i += 2 {
+					if args[i] == "--prompt" {
+						prompts = append(prompts, args[i+1])
+					}
+				}
+				return spawnMember(e, args)
+			}
+			if err := r.tick(ctx, f.e, f.c, "fixture"); err != nil {
+				t.Fatal(err)
+			}
+			q, err = f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+			if err != nil || q.State != "running" {
+				t.Fatalf("entry %+v %v", q, err)
+			}
+			var record struct {
+				Base *queueLaunchBase `json:"base"`
+			}
+			if err := json.Unmarshal(q.LaunchJSON, &record); err != nil || record.Base == nil {
+				t.Fatalf("launch record %s: %v", q.LaunchJSON, err)
+			}
+			b := *record.Base
+			want := start
+			if tc.outcome == "advanced" {
+				want = c2
+			}
+			if b.Entry != start || b.Before != start || b.After != want || b.Tip != c2 || b.Branch != "tasks-hub" || b.Outcome != tc.outcome || !strings.Contains(b.Reason, tc.reason) || (tc.reason == "") != (b.Reason == "") {
+				t.Fatalf("launch base %+v, want entry/before %s after %s tip %s outcome %s reason %q", b, start, want, c2, tc.outcome, tc.reason)
+			}
+			if head := queueGit(t, cwd, "rev-parse", "HEAD"); head != want {
+				t.Fatalf("HEAD %s, want %s", head, want)
+			}
+			if !tc.shared {
+				if branch := queueGit(t, cwd, "rev-parse", "--abbrev-ref", "HEAD"); branch != "HEAD" {
+					t.Fatalf("worktree is on %s, not detached", branch)
+				}
+			}
+			if tc.outcome != "advanced" {
+				if got := queueGit(t, cwd, "reflog", "show", "--format=%H", "HEAD"); got != reflog {
+					t.Fatalf("reflog changed:\n%s\nwas\n%s", got, reflog)
+				}
+			}
+			if tc.dirty {
+				if got, err := os.ReadFile(filepath.Join(cwd, "tracked.txt")); err != nil || string(got) != string(edited) {
+					t.Fatalf("tracked file %q %v", got, err)
+				}
+				if _, err := os.Stat(filepath.Join(cwd, "untracked.txt")); err != nil {
+					t.Fatalf("untracked file: %v", err)
+				}
+			}
+			if len(prompts) != 2 {
+				t.Fatalf("spawned prompts %d, want 2", len(prompts))
+			}
+			for i, prompt := range prompts {
+				if !strings.Contains(prompt, "\n\nLAUNCH BASE\n") || !strings.Contains(prompt, want) || !strings.Contains(prompt, "entry base "+start) {
+					t.Fatalf("member %d prompt lacks the launch base: %q", i, prompt)
+				}
+				if tc.outcome == "left" && (!strings.Contains(prompt, tc.reason) || !strings.Contains(prompt, "tasks-hub tip at launch is "+c2)) {
+					t.Fatalf("member %d prompt lacks the reason and tip: %q", i, prompt)
+				}
+			}
+			if tc.outcome == "left" && tc.at(c1, c2, c3) == c1 && !strings.Contains(prompts[0], "1 commit ahead") {
+				t.Fatalf("lead prompt does not say how far behind: %q", prompts[0])
+			}
+		})
+	}
+}
+
 func TestTeamRunnerWaitsForCloseObligationAndRefreshesSnapshot(t *testing.T) {
 	for _, changedSnapshot := range []bool{false, true} {
 		name := "open-obligation"

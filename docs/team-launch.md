@@ -146,8 +146,16 @@ lease. Existing one-at-a-time projects retain their primary handler.
 Use one canonical worktree per parallel item. In a parallel project, `add`
 without `--cwd` creates one: from the invoking Git worktree root it runs
 `git worktree add --detach <repository root>/.build/worktrees/queue-<first 8
-hex of the item ID> HEAD` and queues that folder, so the repository, base and
-ownership checks apply unchanged. It checks ownership first, refuses an existing path
+hex of the item ID> <tasks-hub tip>` and queues that folder, so the repository, base and
+ownership checks apply unchanged. The new worktree and the entry's base are the
+tip of `refs/heads/tasks-hub`, never the caller's HEAD, so an add from a main
+checkout that is behind tasks-hub, or from a deployer's detached integration
+checkout ahead of it, still starts on tasks-hub (wi_6a36a19047db7f81); add
+prints `base SHA`. `--base REV` picks another commit for the new worktree; it
+must be on tasks-hub, and one that is not is refused, naming the commit and the
+tasks-hub tip, before any worktree or entry exists. `--base` is refused with
+`--cwd` or `--no-new-worktree`. A repository with no tasks-hub branch keeps
+HEAD (or `--base`). It checks ownership first, refuses an existing path
 (queue from it with `--cwd` instead), and removes the new worktree on any
 failure before the hub saves the entry, so the add can be retried. `--new-worktree` does the
 same in a serial project; `--no-new-worktree` keeps the current checkout.
@@ -198,6 +206,26 @@ entry keeps its slot and posts one durable owner escalation. Unrelated teams
 continue; ownership blocked by the failed entry waits for an explicit verified
 release. Pausing the project stops launch ticks. The deliberate agent Queue is
 separate.
+
+Launch base. Before it prepares a team's plan, the runner moves a stale queue
+worktree to the tasks-hub tip, fast-forward only, so a team never starts on
+the commit its entry was added at. It moves the folder only when it is the
+entry's own `queue-<item8>` worktree, detached, with no uncommitted or
+untracked changes, and its HEAD is an ancestor of tasks-hub; a main or shared
+checkout, a branch, a dirty worktree or a HEAD with commits not on tasks-hub is
+left alone with a named reason. The frozen launch JSON (`tt team queue list
+--item wi_ID --json`, `launch`) records a `base` object: `entry` (the entry's
+admission base), `before` and `after` (the worktree HEAD), `tip`, `branch`,
+`outcome` (`advanced`, `current` or `left`), and for `left` the `reason` and how
+many commits it is `behind`. Every member's briefing, lead included, ends with a
+`LAUNCH BASE` paragraph naming that base, so branching from tasks-hub needs no
+manual base check; a left worktree's paragraph gives the reason and the tip,
+and the lead decides the base before planning. A launch that is already frozen
+never moves the worktree again. The entry's `baseCommit` keeps its admission
+value until acceptance takes the verification plan base. After a launch move a
+plain `requeue` is refused because the worktree HEAD is no longer the entry's
+base; `requeue --cwd` with the same worktree path takes its tasks-hub HEAD as
+the base.
 
 The exact assigned database handler records the accepted builder worktree,
 branch and full SHA in the same save that marks the item done:

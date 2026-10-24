@@ -91,15 +91,62 @@ func addQueueWorktree(checkout, item, commit string) (string, error) {
 	return path, nil
 }
 
+// queueIntegrationRef is the project's integration branch. New queue
+// worktrees start at its tip and the runner moves a stale one there at
+// launch (wi_6a36a19047db7f81). A repository without it keeps HEAD.
+const queueIntegrationRef = "refs/heads/tasks-hub"
+
+// queueIntegrationTip resolves the integration branch tip in dir, or "" when
+// the repository has no such branch.
+func queueIntegrationTip(dir string) string {
+	output, err := exec.Command("git", "-C", dir, "rev-parse", "--verify", "--quiet", queueIntegrationRef+"^{commit}").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(output))
+}
+
+// queueAddBase is the commit tt team queue add cuts a new worktree from: the
+// tasks-hub tip, never the caller's HEAD. An explicit base must be on
+// tasks-hub; a refusal comes before any worktree or hub write. A repository
+// with no tasks-hub branch keeps the explicit base, or HEAD.
+func queueAddBase(checkout, explicit string) (string, error) {
+	if strings.HasPrefix(explicit, "-") {
+		return "", fmt.Errorf("--base %s is not a commit; no worktree or entry was created", explicit)
+	}
+	tip := queueIntegrationTip(checkout)
+	if tip == "" {
+		if explicit == "" {
+			return "HEAD", nil
+		}
+		return explicit, nil
+	}
+	if explicit == "" {
+		return tip, nil
+	}
+	output, err := exec.Command("git", "-C", checkout, "rev-parse", "--verify", "--quiet", explicit+"^{commit}").Output()
+	if err != nil {
+		return "", fmt.Errorf("--base %s is not a commit in %s; no worktree or entry was created", explicit, checkout)
+	}
+	commit := strings.TrimSpace(string(output))
+	err = exec.Command("git", "-C", checkout, "merge-base", "--is-ancestor", commit, queueIntegrationRef).Run()
+	if err == nil {
+		return commit, nil
+	}
+	if gitExitCode(err) != 1 {
+		return "", fmt.Errorf("check --base %s against tasks-hub: %w", explicit, err)
+	}
+	return "", fmt.Errorf("--base %s (%s) is not an ancestor of tasks-hub (tip %s); no worktree or entry was created; drop --base to use the tasks-hub tip", explicit, commit, tip)
+}
+
 // requeueHeadOnTasksHub refuses a requeue checkout whose HEAD has commits not
 // on refs/heads/tasks-hub. A repository with no tasks-hub branch is not
 // checked.
 func requeueHeadOnTasksHub(dir, head string) error {
-	const ref = "refs/heads/tasks-hub"
-	if exec.Command("git", "-C", dir, "rev-parse", "--verify", "--quiet", ref+"^{commit}").Run() != nil {
+	if queueIntegrationTip(dir) == "" {
 		return nil
 	}
-	err := exec.Command("git", "-C", dir, "merge-base", "--is-ancestor", head, ref).Run()
+	err := exec.Command("git", "-C", dir, "merge-base", "--is-ancestor", head, queueIntegrationRef).Run()
 	if err == nil {
 		return nil
 	}
@@ -109,11 +156,17 @@ func requeueHeadOnTasksHub(dir, head string) error {
 	return fmt.Errorf("HEAD %s of %s has commits not on tasks-hub, which may be a failed attempt's unreviewed work; create a fresh worktree at the current tasks-hub tip (git worktree add --detach DIR tasks-hub) and pass --cwd DIR, or pass --unmerged-head to take that HEAD as the base", head, dir)
 }
 
+// queueWorktreeTarget is the entry's own queue worktree path under its
+// repository root.
+func queueWorktreeTarget(q api.TeamQueueEntry) string {
+	return filepath.Join(filepath.Dir(q.Repository), ".build", "worktrees", "queue-"+strings.TrimPrefix(q.ItemID, "wi_")[:8])
+}
+
 // repairQueueWorktree recreates an entry's missing queue worktree, detached at
 // its frozen base, when the entry's cwd is exactly that worktree's path.
 func repairQueueWorktree(q api.TeamQueueEntry, ownership []string) (string, error) {
 	root := filepath.Dir(q.Repository)
-	target := filepath.Join(root, ".build", "worktrees", "queue-"+strings.TrimPrefix(q.ItemID, "wi_")[:8])
+	target := queueWorktreeTarget(q)
 	if filepath.Clean(q.Cwd) != target {
 		return "", fmt.Errorf("entry %s names a missing checkout %s that is not its queue worktree %s", q.ID, q.Cwd, target)
 	}
@@ -181,6 +234,7 @@ func cmdTeamQueue(e env, args []string) error {
 	noNewWorktree := fs.Bool("no-new-worktree", false, "add: use the current checkout in a parallel project")
 	serial := fs.Bool("serial", false, "add: declare no ownership; the entry runs alone")
 	unmergedHead := fs.Bool("unmerged-head", false, "requeue --cwd: take a HEAD with commits not on tasks-hub as the base")
+	addBase := fs.String("base", "", "add: commit for the new worktree, on tasks-hub (default: the tasks-hub tip)")
 	reason := fs.String("reason", "", "fail: why the owner is failing this entry; wait clear: why the wait is cleared")
 	waitOn := fs.String("on", "", "wait: the predecessor queue entry ID")
 	waitUntil := fs.String("until", "", "wait set: the condition, accepted, done or released")
@@ -221,6 +275,9 @@ func cmdTeamQueue(e env, args []string) error {
 	}
 	if *unmergedHead && (sub != "requeue" || *cwd == "") {
 		return errors.New("--unmerged-head applies only to tt team queue requeue --cwd DIR")
+	}
+	if *addBase != "" && (sub != "add" || *cwd != "" || *noNewWorktree) {
+		return errors.New("--base applies only to tt team queue add when it creates a new worktree")
 	}
 	e.task, e.hub = *task, *hub
 	c, err := e.client(20 * time.Second)
@@ -421,17 +478,25 @@ func cmdTeamQueue(e env, args []string) error {
 			// A parallel project gives each entry its own worktree by default.
 			*newWorktree = parallel
 		}
+		if *addBase != "" && !*newWorktree {
+			return errors.New("--base applies only to tt team queue add when it creates a new worktree")
+		}
 		if *newWorktree {
 			checkout, wdErr := os.Getwd()
 			if wdErr != nil {
 				return wdErr
 			}
 			// Refuse bad ownership before any worktree exists; the new
-			// worktree is the same repository at the checkout's HEAD.
+			// worktree is the same repository at the tasks-hub tip, not
+			// the checkout's HEAD (wi_6a36a19047db7f81).
 			if _, scopeErr := queueRepositoryScope(checkout, ownership); scopeErr != nil {
 				return scopeErr
 			}
-			*cwd, err = addQueueWorktree(checkout, *item, "HEAD")
+			commit, baseErr := queueAddBase(checkout, *addBase)
+			if baseErr != nil {
+				return baseErr
+			}
+			*cwd, err = addQueueWorktree(checkout, *item, commit)
 			if err != nil {
 				return err
 			}
@@ -444,6 +509,9 @@ func cmdTeamQueue(e env, args []string) error {
 				}
 			}()
 			fmt.Fprintf(notes, "worktree %s\n", *cwd)
+			if commit != "HEAD" {
+				fmt.Fprintf(notes, "base %s\n", commit)
+			}
 		}
 		if *cwd == "" {
 			*cwd, err = os.Getwd()
@@ -961,7 +1029,7 @@ func ownerIntegratedChanges(ctx context.Context, repository, base, commit string
 	return queueChangedFiles(ctx, repository, base, commit)
 }
 
-const queueAddUsage = "usage: tt team queue add --item wi_ID --order SEQ [--template planned|small] [--planned-reason paths|schema|risk:TEXT] [--owns PATH... | --serial] [--cwd DIR | --new-worktree | --no-new-worktree]"
+const queueAddUsage = "usage: tt team queue add --item wi_ID --order SEQ [--template planned|small] [--planned-reason paths|schema|risk:TEXT] [--owns PATH... | --serial] [--cwd DIR | --new-worktree [--base REV] | --no-new-worktree]"
 
 // queueSmallMaxOwned mirrors the hub's small-change admission cap; the hub
 // still decides admission.

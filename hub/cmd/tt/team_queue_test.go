@@ -301,6 +301,155 @@ func TestTeamQueueCLINewWorktreeDefault(t *testing.T) {
 	}
 }
 
+// queueTasksHubRepo makes a temporary repository whose main checkout stays on
+// its default branch at c1, with tracked.txt, while tasks-hub has moved on to
+// c2. It returns the real root, c1 and c2.
+func queueTasksHubRepo(t *testing.T) (string, string, string) {
+	t.Helper()
+	root, _ := queueGitRepo(t)
+	if err := os.WriteFile(filepath.Join(root, "tracked.txt"), []byte("c1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	queueGit(t, root, "add", "tracked.txt")
+	queueGit(t, root, "-c", "user.email=fixture@example.invalid", "-c", "user.name=fixture", "commit", "-q", "-m", "c1")
+	c1 := queueGit(t, root, "rev-parse", "HEAD")
+	c2 := queueChildCommit(t, root, c1, "c2")
+	queueGit(t, root, "update-ref", "refs/heads/tasks-hub", c2)
+	return root, c1, c2
+}
+
+// queueChildCommit makes a commit with parent's tree on no branch.
+func queueChildCommit(t *testing.T, root, parent, message string) string {
+	t.Helper()
+	return queueGit(t, root, "-c", "user.email=fixture@example.invalid", "-c", "user.name=fixture", "commit-tree", parent+"^{tree}", "-p", parent, "-m", message)
+}
+
+func queueGit(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	output, err := exec.Command("git", append([]string{"-C", dir}, args...)...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v %s", args, err, output)
+	}
+	return strings.TrimSpace(string(output))
+}
+
+// w0, w4 (wi_6a36a19047db7f81): a new queue worktree starts at the tasks-hub
+// tip, not the caller's HEAD, whether that HEAD is behind tasks-hub or a
+// detached commit ahead of it; an explicit --base off tasks-hub is refused
+// before any worktree or entry exists.
+func TestTeamQueueCLINewWorktreeBasesOnTasksHub(t *testing.T) {
+	f := newTeamFixture(t, true)
+	ctx := context.Background()
+	repo, c1, c2 := queueTasksHubRepo(t)
+	parallelCLIProject(t, f, "none")
+	entryFor := func(item string) (api.TeamQueueEntry, bool) {
+		t.Helper()
+		list, err := f.c.ListTeamQueue(ctx, f.task.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, q := range list.Entries {
+			if q.ItemID == item {
+				return q, true
+			}
+		}
+		return api.TeamQueueEntry{}, false
+	}
+	requireBase := func(name, item, want string) {
+		t.Helper()
+		q, ok := entryFor(item)
+		path := queueWorktreeFor(repo, item)
+		if !ok || q.BaseCommit != want {
+			t.Fatalf("%s: entry %+v base %s, want %s", name, q, q.BaseCommit, want)
+		}
+		if got, _ := filepath.EvalSymlinks(q.Cwd); got != path {
+			t.Fatalf("%s: entry cwd %s, want %s", name, q.Cwd, path)
+		}
+		if head := queueGit(t, path, "rev-parse", "HEAD"); head != want {
+			t.Fatalf("%s: worktree HEAD %s, want %s", name, head, want)
+		}
+		if branch := queueGit(t, path, "rev-parse", "--abbrev-ref", "HEAD"); branch != "HEAD" {
+			t.Fatalf("%s: worktree is on %s, not detached", name, branch)
+		}
+	}
+
+	// a. The main checkout is at c1, behind tasks-hub c2.
+	t.Chdir(repo)
+	out, err := captureCLIOutput(t, func() error {
+		return cmdTeamQueue(f.e, []string{"add", "--item", f.item.ID, "--order", fmt.Sprint(f.order), "--owns", "client"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "base "+c2) {
+		t.Fatalf("add output %q does not name the base %s", out, c2)
+	}
+	requireBase("behind", f.item.ID, c2)
+	if c1 == c2 {
+		t.Fatal("fixture: c1 equals c2")
+	}
+
+	// b. A detached checkout one commit ahead of tasks-hub.
+	c3 := queueChildCommit(t, repo, c2, "c3")
+	ahead := filepath.Join(filepath.Dir(repo), filepath.Base(repo)+"-ahead")
+	queueGit(t, repo, "worktree", "add", "--detach", ahead, c3)
+	t.Cleanup(func() { _ = os.RemoveAll(ahead) })
+	t.Chdir(ahead)
+	second, secondOrder := queueFixtureItem(t, f, "detached-ahead")
+	if _, err := captureCLIOutput(t, func() error {
+		return cmdTeamQueue(f.e, []string{"add", "--item", second.ID, "--order", fmt.Sprint(secondOrder), "--owns", "docs"})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	requireBase("detached ahead", second.ID, c2)
+
+	// c. An explicit base off tasks-hub is refused, naming the commit and
+	// the branch, with no worktree, git worktree record or entry.
+	third, thirdOrder := queueFixtureItem(t, f, "explicit-off-branch")
+	_, err = captureCLIOutput(t, func() error {
+		return cmdTeamQueue(f.e, []string{"add", "--item", third.ID, "--order", fmt.Sprint(thirdOrder), "--owns", "tests", "--base", c3})
+	})
+	if err == nil || !strings.Contains(err.Error(), c3) || !strings.Contains(err.Error(), "tasks-hub") || !strings.Contains(err.Error(), "not an ancestor") {
+		t.Fatalf("--base off tasks-hub: %v", err)
+	}
+	requireNoQueueWorktree(t, repo, queueWorktreeFor(repo, third.ID), "--base off tasks-hub")
+	if q, ok := entryFor(third.ID); ok {
+		t.Fatalf("--base off tasks-hub created entry %+v", q)
+	}
+	if _, err := captureCLIOutput(t, func() error {
+		return cmdTeamQueue(f.e, []string{"add", "--item", third.ID, "--order", fmt.Sprint(thirdOrder), "--owns", "tests", "--base", "no-such-rev"})
+	}); err == nil || !strings.Contains(err.Error(), "no-such-rev") {
+		t.Fatalf("--base unknown: %v", err)
+	}
+	requireNoQueueWorktree(t, repo, queueWorktreeFor(repo, third.ID), "--base unknown")
+	if _, err := captureCLIOutput(t, func() error {
+		return cmdTeamQueue(f.e, []string{"add", "--item", third.ID, "--order", fmt.Sprint(thirdOrder), "--owns", "tests", "--base=--orphan"})
+	}); err == nil || !strings.Contains(err.Error(), "is not a commit") {
+		t.Fatalf("--base option-like: %v", err)
+	}
+	requireNoQueueWorktree(t, repo, queueWorktreeFor(repo, third.ID), "--base option-like")
+
+	// d. --base needs a new worktree.
+	for _, extra := range [][]string{{"--cwd", repo}, {"--no-new-worktree"}} {
+		args := append([]string{"add", "--item", third.ID, "--order", fmt.Sprint(thirdOrder), "--owns", "tests", "--base", c1}, extra...)
+		if _, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, args) }); err == nil || !strings.Contains(err.Error(), "--base applies only") {
+			t.Fatalf("--base with %v: %v", extra, err)
+		}
+		requireNoQueueWorktree(t, repo, queueWorktreeFor(repo, third.ID), fmt.Sprintf("--base with %v", extra))
+	}
+	if q, ok := entryFor(third.ID); ok {
+		t.Fatalf("refused --base created entry %+v", q)
+	}
+
+	// An explicit base on tasks-hub is taken as given.
+	if _, err := captureCLIOutput(t, func() error {
+		return cmdTeamQueue(f.e, []string{"add", "--item", third.ID, "--order", fmt.Sprint(thirdOrder), "--owns", "tests", "--base", c1})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	requireBase("explicit ancestor", third.ID, c1)
+}
+
 // a6 (CLI) and a9: the owner and an available handler scope entries; a plain
 // agent may not; only the owner fails an entry.
 func TestTeamQueueCLIScopeAndOwnerFail(t *testing.T) {

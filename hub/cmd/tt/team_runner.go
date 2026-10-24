@@ -1812,6 +1812,9 @@ func (r teamRunner) launch(ctx context.Context, e env, c *api.Client, q api.Team
 		if handler == nil {
 			return nil
 		}
+		// The worktree moves before the plan reads it and before any member
+		// exists; a frozen launch never moves it (wi_6a36a19047db7f81).
+		base := advanceQueueWorktree(q)
 		var resolved teamLaunchResolved
 		input := map[string]any{"hub": e.hub, "token": e.token, "task": q.TaskID, "item": q.ItemID, "revision": q.ItemRevision, "order": q.OrderMessageSeq, "template": q.Template, "cwd": q.Cwd, "host": host, "handler": handler}
 		if err := r.plan(ctx, input, &resolved); err != nil {
@@ -1824,9 +1827,17 @@ func (r teamRunner) launch(ctx context.Context, e env, c *api.Client, q api.Team
 		for _, member := range resolved.Plan {
 			f := member.Fields
 			f.AgentID = api.NewID("agt")
+			if base != nil {
+				f.Prompt += "\n\nLAUNCH BASE\n" + launchBaseText(q.Cwd, base)
+			}
 			journal.Members = append(journal.Members, teamLaunchMember{Fields: f, State: "unstarted", RunID: api.NewID("run")})
 		}
-		frozen, _ := json.Marshal(journal)
+		// The base record rides in the frozen launch JSON beside the
+		// journal; the hub keeps fields it does not read.
+		frozen, _ := json.Marshal(struct {
+			teamLaunchJournal
+			Base *queueLaunchBase `json:"base,omitempty"`
+		}{journal, base})
 		revision := q.Revision
 		q, err = c.TeamQueueAction(ctx, q.TaskID, api.TeamQueueRequest{RequestID: "queue-freeze-" + q.ID, Operation: "freeze", EntryID: q.ID, ExpectedRevision: q.Revision, LaunchJSON: frozen})
 		if err != nil {
@@ -1987,6 +1998,102 @@ func (r teamRunner) launch(ctx context.Context, e env, c *api.Client, q api.Team
 		return &launchStepError{op: "running", revision: q.Revision, err: err}
 	}
 	return nil
+}
+
+// queueLaunchBase records where launch found an entry's worktree and where it
+// left it: Entry is the admission base, Before and After the worktree HEAD,
+// Tip the tasks-hub tip. Outcome is advanced, current or left; a left
+// worktree names its Reason and, when behind the tip, by how many commits.
+type queueLaunchBase struct {
+	Entry   string `json:"entry"`
+	Before  string `json:"before"`
+	After   string `json:"after"`
+	Tip     string `json:"tip"`
+	Branch  string `json:"branch"`
+	Outcome string `json:"outcome"`
+	Reason  string `json:"reason,omitempty"`
+	Behind  int    `json:"behind,omitempty"`
+}
+
+// advanceQueueWorktree moves a clean, detached queue worktree at launch to
+// the tasks-hub tip, fast-forward only. A worktree that is not the entry's
+// own, is on a branch, has changes or has commits not on tasks-hub is left
+// with a named reason. A checkout that is not Git returns nil.
+func advanceQueueWorktree(q api.TeamQueueEntry) *queueLaunchBase {
+	if q.Repository == "" {
+		return nil
+	}
+	head, err := queueGitCommit(q.Cwd)
+	if err != nil {
+		return nil
+	}
+	base := &queueLaunchBase{Entry: q.BaseCommit, Before: head, After: head, Branch: "tasks-hub", Tip: queueIntegrationTip(q.Cwd)}
+	left := func(reason string) *queueLaunchBase {
+		base.Outcome, base.Reason = "left", reason
+		if base.Tip != "" && base.Tip != head && exec.Command("git", "-C", q.Cwd, "merge-base", "--is-ancestor", head, base.Tip).Run() == nil {
+			if output, err := exec.Command("git", "-C", q.Cwd, "rev-list", "--count", head+".."+base.Tip).Output(); err == nil {
+				base.Behind, _ = strconv.Atoi(strings.TrimSpace(string(output)))
+			}
+		}
+		return base
+	}
+	if base.Tip == "" {
+		return left("the repository has no tasks-hub branch")
+	}
+	if !sameQueueDir(q.Cwd, queueWorktreeTarget(q)) {
+		return left("it is not the entry's own queue worktree " + queueWorktreeTarget(q))
+	}
+	if output, err := exec.Command("git", "-C", q.Cwd, "symbolic-ref", "-q", "--short", "HEAD").Output(); err == nil {
+		return left("it is on branch " + strings.TrimSpace(string(output)) + ", not detached")
+	}
+	status, err := exec.Command("git", "-C", q.Cwd, "status", "--porcelain", "--untracked-files=normal").Output()
+	if err != nil {
+		return left(fmt.Sprintf("git status failed: %v", err))
+	}
+	if changes := strings.TrimRight(string(status), "\n"); changes != "" {
+		return left("it has uncommitted changes in " + queuePathCount(strings.Count(changes, "\n")+1))
+	}
+	if head == base.Tip {
+		base.Outcome = "current"
+		return base
+	}
+	if err := exec.Command("git", "-C", q.Cwd, "merge-base", "--is-ancestor", head, base.Tip).Run(); err != nil {
+		if gitExitCode(err) == 1 {
+			return left("its HEAD has commits not on tasks-hub")
+		}
+		return left(fmt.Sprintf("checking its HEAD against tasks-hub failed: %v", err))
+	}
+	if output, err := exec.Command("git", "-C", q.Cwd, "checkout", "--quiet", "--detach", base.Tip).CombinedOutput(); err != nil {
+		return left(fmt.Sprintf("git checkout of the tip failed: %v: %s", err, strings.TrimSpace(string(output))))
+	}
+	after, err := queueGitCommit(q.Cwd)
+	if err != nil || after != base.Tip {
+		return left(fmt.Sprintf("its HEAD after checkout is %q, not the tip", after))
+	}
+	base.After, base.Outcome = after, "advanced"
+	return base
+}
+
+// launchBaseText is the LAUNCH BASE paragraph every member's briefing gets,
+// so branching from tasks-hub needs no manual base check.
+func launchBaseText(cwd string, b *queueLaunchBase) string {
+	switch b.Outcome {
+	case "advanced":
+		return fmt.Sprintf("Queue worktree %s was moved at launch from %s to the tasks-hub tip %s (entry base %s). Plan and branch from %s; no manual base check is needed.", cwd, b.Before, b.After, b.Entry, b.After)
+	case "current":
+		return fmt.Sprintf("Queue worktree %s is at the tasks-hub tip %s at launch (entry base %s). Plan and branch from %s.", cwd, b.After, b.Entry, b.After)
+	}
+	text := fmt.Sprintf("Queue worktree %s was left at %s (entry base %s) because %s", cwd, b.Before, b.Entry, b.Reason)
+	if b.Tip == "" {
+		return text + ". Decide the base before planning."
+	}
+	text += "; the tasks-hub tip at launch is " + b.Tip
+	if b.Behind == 1 {
+		text += ", 1 commit ahead"
+	} else if b.Behind > 1 {
+		text += fmt.Sprintf(", %d commits ahead", b.Behind)
+	}
+	return text + ". Decide the base before planning."
 }
 
 func (r teamRunner) finish(ctx context.Context, e env, c *api.Client, q api.TeamQueueEntry, host string) error {
