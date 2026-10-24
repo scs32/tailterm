@@ -474,15 +474,16 @@ if (status.unlocked) {
   mount();
 }
 // A failed status read names the failure and offers to read it again. The
-// unlock button stays disabled until a read succeeds.
+// unlock button stays disabled until a read succeeds. The hint becomes an
+// alert before the error is written, so assistive tech announces the change.
 async function readVaultStatus() {
   for (;;) {
     try {
       return await api("/status");
     } catch (e) {
       const hint = $("#vault-hint");
-      hint.textContent = `Could not read the encrypted vault: ${e?.message || e}`;
       hint.setAttribute("role", "alert");
+      hint.textContent = `Could not read the encrypted vault: ${e?.message || e}`;
       const retry = document.createElement("button");
       retry.id = "vault-retry";
       retry.type = "button";

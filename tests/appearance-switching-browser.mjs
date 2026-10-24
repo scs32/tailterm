@@ -113,6 +113,49 @@ const checkStatusFailure = async (browser, name) => {
           );
         return open.apply(this, args);
       };
+      // Assistive tech announces a live region's content when it changes, so
+      // the hint must already be live when the error text is written. Each
+      // text write into #vault-hint is logged with the role and aria-live the
+      // hint had at that moment. A batch of records is replayed backwards
+      // from the current attributes, since a later role change in the same
+      // batch is already applied by the time the observer runs.
+      window.hintWrites = [];
+      new MutationObserver((records) => {
+        const live = (el) => ({
+          role: el.getAttribute("role"),
+          ariaLive: el.getAttribute("aria-live"),
+        });
+        const states = new Map();
+        const writes = [];
+        for (const record of records.reverse()) {
+          const el =
+            record.type === "characterData"
+              ? record.target.parentNode
+              : record.target;
+          if (el?.id !== "vault-hint") continue;
+          if (!states.has(el)) states.set(el, live(el));
+          const state = states.get(el);
+          if (record.type === "attributes")
+            state[record.attributeName === "role" ? "role" : "ariaLive"] =
+              record.oldValue;
+          else if (record.type === "characterData" || record.addedNodes.length)
+            writes.unshift({
+              text:
+                record.type === "characterData"
+                  ? record.target.data
+                  : [...record.addedNodes].map((n) => n.textContent).join(""),
+              ...state,
+            });
+        }
+        window.hintWrites.push(...writes);
+      }).observe(document, {
+        subtree: true,
+        childList: true,
+        characterData: true,
+        attributes: true,
+        attributeOldValue: true,
+        attributeFilter: ["role", "aria-live"],
+      });
     });
     const page = await context.newPage();
     page.setDefaultTimeout(10000);
@@ -167,6 +210,27 @@ const checkStatusFailure = async (browser, name) => {
       .waitFor();
     assert.equal(await retry.count(), 0, `${name}: the retry is removed`);
     assert.equal(await hint.getAttribute("role"), null);
+    // Both failures wrote their error into a hint that was already live, so
+    // each was announced; the recovered hint is no longer an alert.
+    const writes = await page.evaluate(() => window.hintWrites);
+    const errorWrites = writes.filter((w) =>
+      w.text.startsWith("Could not read the encrypted vault"),
+    );
+    assert.equal(
+      errorWrites.length,
+      2,
+      `${name}: both failures wrote the error; writes ${JSON.stringify(writes)}`,
+    );
+    for (const w of errorWrites)
+      assert.ok(
+        w.role === "alert" || (w.ariaLive && w.ariaLive !== "off"),
+        `${name}: the hint is a live region before the error is written; writes ${JSON.stringify(writes)}`,
+      );
+    assert.equal(
+      writes.at(-1).role,
+      null,
+      `${name}: the recovered hint is written without an alert role`,
+    );
     assert.equal(
       await page.locator("#password").inputValue(),
       passphrase,
