@@ -29,7 +29,7 @@ const handlerCheckRule =
 // (wi_8a98bbcb8cd81a96). hub/cmd/tt/coordination.go
 // (handlerAmendedScopeRule) carries the same sentences.
 const handlerAmendedScopeRule =
-  "When an owner edit amends a queued item's scope, confirm the amended revision with its owned paths and amended criteria: tt work-items scope confirm ITEM --complete --request-id KEY --revision N --scope-revision S --order SEQ --owns PATH --criteria-file FILE, where FILE is a JSON object of each criterion ID that stays, the frozen ASSIGN's a1..aN, to its exact text as the owner amended it, without the moved ones. Read it back with tt work-items scope get. Without the criteria and owned paths the hub refuses any receipt carry-over to that revision, and the item needs a new plan and a full matrix run.";
+  "When an owner edit amends a queued item's scope, confirm the amended revision with its owned paths and amended criteria: tt work-items scope confirm --complete --request-id KEY --revision N --scope-revision S --order SEQ --owns PATH (once per owned path) --criteria-file FILE ITEM, where FILE is a JSON object of each criterion ID that stays, the frozen ASSIGN's a1..aN, to its exact text as the owner amended it, without the moved ones. Read it back with tt work-items scope get. Without the criteria and owned paths the hub refuses any receipt carry-over to that revision, and the item needs a new plan and a full matrix run.";
 const handlerPrompt =
   "You are this project's database handler, the sole agent owner of all work-item " +
   "database reads/writes (list/get/create/update/dispatch). All agent work must " +
