@@ -15,6 +15,9 @@ const LONGEST=["verification-2.test.js","release-runner-2.test.js","release-runn
 const dir=dirname(fileURLToPath(import.meta.url)),names=readdirSync(dir).filter(n=>n.endsWith(".test.js")).sort();
 const files=[...LONGEST.filter(n=>names.includes(n)),...names.filter(n=>!LONGEST.includes(n))].map(n=>join(dir,n));
 const flag=process.argv.indexOf("--concurrency"),concurrency=flag<0?Math.max(1,availableParallelism()-1):Number(process.argv[flag+1]);
-const stream=run({files,concurrency});
+// A stop (the matrix's SIGTERM on timeout) cancels the running files, so the
+// spec reporter still names them and prints the summary, as node --test does.
+const stop=new AbortController();for(const s of ["SIGTERM","SIGINT"])process.on(s,()=>{process.exitCode=1;stop.abort();});
+const stream=run({files,concurrency,signal:stop.signal});
 stream.on("test:fail",()=>{process.exitCode=1;});
 stream.compose(spec).pipe(process.stdout);
