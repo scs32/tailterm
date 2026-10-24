@@ -139,8 +139,8 @@ export function schemaRelease(id){
  return {c,a,e,said:recorded(a),journal:()=>JSON.parse(readFileSync(c.journalPath,"utf8"))};
 }
 // A fake journal: files maps a name to its size in bytes.
-export function journalFixture(files){
- const dir=mkdtempSync(join(tmpdir(),"release-retention-"));for(const [name,bytes] of Object.entries(files))writeFileSync(join(dir,name),"x".repeat(bytes));
+export function journalFixture(files,parent=tmpdir()){
+ const dir=mkdtempSync(join(parent,"release-retention-"));for(const [name,bytes] of Object.entries(files))writeFileSync(join(dir,name),"x".repeat(bytes));
  return {dir,names:()=>readdirSync(dir).filter(n=>n!=="retention.jsonl").sort(),lines:()=>existsSync(join(dir,"retention.jsonl"))?readFileSync(join(dir,"retention.jsonl"),"utf8").split("\n").filter(Boolean).map(l=>JSON.parse(l)):[]};
 }
 export const copyOf=id=>id+"-truenas-backup.sqlite",sweep=(j,jobs,retention)=>pruneJournal({journalDirectory:j.dir,retention},jobs,{now:()=>Date.parse("2026-10-01T09:30:00Z")});

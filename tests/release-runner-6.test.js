@@ -1,15 +1,16 @@
 // Held-claim restarts, transport retries and waits, progress reports and
-// stale list snapshots, split from tests/release-runner-3.test.js
-// (wi_f60103c0670388c8, order #44897) so node --test runs them beside the
-// rest of that file.
+// stale list snapshots, split from tests/release-runner-3.test.js, and
+// release batching recovery, split from tests/release-runner.test.js
+// (wi_f60103c0670388c8, order #44897), so node --test runs them beside the
+// rest of those files.
 import test from "node:test";
 import assert from "node:assert/strict";
-import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,chmodSync,existsSync,statSync,rmSync} from "node:fs";
+import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,chmodSync,existsSync,statSync,rmSync,readdirSync} from "node:fs";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
-import {runRelease,HostAdapter,serveDeployment,failureReason,cliFailureNotice,cliRetry,transportWait,transportWaitNotice} from "../scripts/release-runner.mjs";
+import {runRelease,HostAdapter,serveDeployment,failureReason,cliFailureNotice,cliRetry,transportWait,transportWaitNotice,batchId,materializeBatch,readBatchSolo,reconcileReceipts} from "../scripts/release-runner.mjs";
 import {RELEASE_READ_ATTEMPTS} from "../scripts/release-inputs.mjs";
-import {git,fixture,change,job,fake,config,recorded,remoteHead,until,ended,idle,reasonIs,CODE_AGENT,CODE_RUN,SAFE_TEXT,codeRepo,codeHost,verifiedJob,codeGate,codeSends,HELD_SECRET,HELD_HANDLER,HELD_HELPER,heldRoster,sendOf,heldOwn,heldJournal,HELD_SUBJECT,stale,claimed} from "./release-runner-fixtures.mjs";
+import {git,fixture,change,job,fake,config,recorded,remoteHead,until,ended,idle,reasonIs,CODE_AGENT,CODE_RUN,SAFE_TEXT,codeRepo,codeHost,verifiedJob,codeGate,codeSends,HELD_SECRET,HELD_HANDLER,HELD_HELPER,heldRoster,sendOf,heldOwn,heldJournal,HELD_SUBJECT,stale,claimed,SINGLE_JOB_TRACE,batchConfig,batchFake,batchFiles,batchJobs,batchJournal,daemonHub,three,traceOf} from "./release-runner-fixtures.mjs";
 test("held s2 a stale runner whose only owned job is held restarts once, at the published commit, before any claim or release run",async t=>{
  for(const journal of [{},{refuseFailure:undefined},{phase:"prepared",refusalReason:undefined,refuseFailure:undefined},{phase:"integrated",refusalReason:undefined,refuseFailure:undefined,integrated:"d".repeat(40),expected:"e".repeat(40)},{published:false}]){
   const name=JSON.stringify(journal),r=codeRepo(t),h=codeHost(t,r.cwd),own=heldOwn(),released=[],seen=[];r.at(r.a,r.b);h.setJobs([own,verifiedJob("rel_next")]);heldJournal(h,own,journal);
@@ -550,4 +551,111 @@ test("stale s1 a later job's bookend refused stale in the job loop ends the poll
  assert.equal(s.pages("first"),1);assert.deepEqual(s.h.claims().map(c=>c.argv[c.argv.indexOf("--job")+1]),["rel_first"]);assert.deepEqual(s.released,[]);assert.deepEqual(s.told(),[]);
  // The next poll reads afresh and runs the later job.
  assert.equal(await s.h.poll(null,s.release),"Release claim held; handler reconciliation required.\n");assert.deepEqual(s.released,["rel_next"]);assert.deepEqual(s.told(),[]);
+});
+test("batch13 a crash after hub settlement materializes the receipts without redeploying",async()=>{
+ // The hub saved the finish; the runner stopped before it learned so.
+ const stopped=async(check)=>{
+  const b=three(),a=batchFake(b.lead),c=batchConfig(b,3);let sent;if(check)a.check=check;
+  a.finish=async r=>{sent=structuredClone(r);a.calls.push("finish");throw new Error("connection lost");};
+  let result;try{result=await runRelease(c,a);}catch(error){result=error;}
+  return {b,a,c,sent,result};
+ };
+ const settled=(x,journal)=>({...x.b.lead,state:x.sent.outcome,generation:journal.finishGeneration+1,integratedCommit:x.sent.commit,published:true,receipt:x.sent});
+ let x=await stopped();
+ assert.deepEqual(x.result,{jobId:"rel_b1",outcome:"receipt_pending"});
+ let journal=batchJournal(x.c);const id=journal.batch.id,path=join(x.c.home,id+"-receipt.json");
+ assert.equal(journal.phase,"receipt_pending");assert.equal(journal.batchReceipt.batchId,id);assert.deepEqual(batchFiles(x.c.home),[],"nothing is written before the hub's settlement is known");assert.ok(!existsSync(join(x.c.home,"rel_b2.json")));
+ // A half-written batch receipt and a stale temporary file are replaced.
+ writeFileSync(path,'{"batchId":"');writeFileSync(path+".tmp","partial");writeFileSync(join(x.c.home,"rel_b2.json"),'{"jobId":"rel_b2","phase":"refused"}');
+ const calls=x.a.calls.length;
+ reconcileReceipts({journalDirectory:x.c.home},[settled(x,journal)]);
+ assert.equal(batchJournal(x.c).phase,"complete");assert.equal(x.a.calls.length,calls,"no prepare, deploy or second finish");
+ const receipt=JSON.parse(readFileSync(path,"utf8"));
+ assert.equal(receipt.outcome,"released");assert.deepEqual(receipt.jobs.map(j=>j.jobId),["rel_b1","rel_b2","rel_b3"]);assert.deepEqual(receipt.push,x.sent.push);
+ for(const member of ["rel_b2","rel_b3"]){const m=JSON.parse(readFileSync(join(x.c.home,member+".json"),"utf8"));assert.equal(m.batch.id,id);assert.equal(m.phase,"complete");assert.equal(m.receipt.jobId,member);}
+ assert.equal(JSON.parse(readFileSync(join(x.c.home,`rel_b2.json.before-${id}`),"utf8")).phase,"refused","an earlier journal of the member is kept");
+ // The same bytes on every repeat, from any path.
+ const bytes=()=>[id+"-receipt.json","rel_b2.json","rel_b3.json"].map(n=>readFileSync(join(x.c.home,n),"utf8"));const first=bytes();
+ materializeBatch(x.c.home,batchJournal(x.c));assert.deepEqual(bytes(),first);
+ assert.deepEqual(await runRelease(x.c,x.a),x.sent);assert.deepEqual(bytes(),first);assert.equal(x.a.calls.length,calls);
+ // The runner's own retry of a pending finish writes them too.
+ x=await stopped();journal=batchJournal(x.c);x.a.finish=async()=>{x.a.calls.push("finish-retry");};
+ assert.deepEqual(await runRelease(x.c,x.a),x.sent);
+ assert.deepEqual(x.a.calls.slice(-2),["finish","finish-retry"]);assert.equal(x.a.calls.filter(n=>n.startsWith("deploy:")).length,1);
+ assert.deepEqual(batchFiles(x.c.home),[journal.batch.id+"-receipt.json"]);assert.ok(existsSync(join(x.c.home,"rel_b3.json")));
+ // Rolled back: the batch receipt only, never a member journal.
+ x=await stopped(async()=>"identity");
+ assert.match(x.result.message,/final receipt pending retry/);journal=batchJournal(x.c);assert.equal(journal.phase,"receipt_pending");assert.equal(x.sent.outcome,"rolled_back");
+ const rollbacks=x.a.calls.filter(n=>n==="rollback:tailos").length;
+ reconcileReceipts({journalDirectory:x.c.home},[settled(x,journal)]);
+ const rolled=JSON.parse(readFileSync(join(x.c.home,journal.batch.id+"-receipt.json"),"utf8"));
+ assert.equal(rolled.outcome,"rolled_back");assert.deepEqual(rolled.revert,x.sent.revert);assert.ok(!existsSync(join(x.c.home,"rel_b2.json")));assert.ok(!existsSync(join(x.c.home,"rel_b3.json")));
+ assert.equal(x.a.calls.filter(n=>n==="rollback:tailos").length,rollbacks);
+ // Nothing is written from a journal without a batch, or without a final outcome.
+ assert.equal(materializeBatch(x.c.home,{receipt:x.sent}),null);assert.equal(materializeBatch(x.c.home,{batchReceipt:journal.batchReceipt,receipt:{...x.sent,outcome:"pending"}}),null);
+});
+test("batch13b a failed or interrupted batch receipt write stays pending and every later poll retries it",async()=>{
+ // A directory where the receipt's temporary file goes makes the write fail.
+ const blocked=(b,home)=>{const p=join(home,batchId("rel_b1",2,b.tip)+"-receipt.json.tmp");mkdirSync(p);return p;};
+ const settled=(b,sent,journal)=>({...b.lead,state:sent.outcome,generation:journal.finishGeneration+1,integratedCommit:sent.commit,published:true,receipt:sent});
+ for(const check of [undefined,async()=>"identity"]){
+  // The hub saved the finish, then the write failed: the lead journal is not marked finished.
+  const b=three(),a=batchFake(b.lead),c=batchConfig(b,3);if(check)a.check=check;const obstacle=blocked(b,c.home);
+  let result;try{result=await runRelease(c,a);}catch(error){result=error;}
+  const sent=a.receipts[0];let journal=batchJournal(c);const id=journal.batch.id,path=join(c.home,id+"-receipt.json");
+  assert.equal(a.receipts.length,1);assert.equal(sent.outcome,check?"rolled_back":"released");
+  if(check)assert.match(result.message,/batch receipt pending retry/);else assert.deepEqual(result,{jobId:"rel_b1",outcome:"receipt_pending"});
+  assert.equal(journal.phase,"receipt_pending");assert.ok(!existsSync(path));assert.ok(!existsSync(join(c.home,"rel_b2.json")));
+  // The next poll's reconciliation fails the same way and leaves it pending: nothing is lost.
+  assert.throws(()=>reconcileReceipts({journalDirectory:c.home},[settled(b,sent,journal)]));
+  assert.equal(batchJournal(c).phase,"receipt_pending");assert.ok(!existsSync(path));
+  // Once the write can succeed, the same poll step writes everything and only then finishes the journal.
+  rmSync(obstacle,{recursive:true});const calls=a.calls.length;
+  reconcileReceipts({journalDirectory:c.home},[settled(b,sent,journal)]);
+  assert.equal(batchJournal(c).phase,"complete");assert.equal(JSON.parse(readFileSync(path,"utf8")).outcome,sent.outcome);
+  assert.equal(existsSync(join(c.home,"rel_b2.json")),!check);assert.equal(existsSync(join(c.home,"rel_b3.json")),!check);assert.equal(a.calls.length,calls,"no deploy, rollback or finish is repeated");
+ }
+ // The runner's own retry of the pending finish: a failed write keeps it pending, the next retry completes.
+ const b=three(),a=batchFake(b.lead),c=batchConfig(b,3),obstacle=blocked(b,c.home);
+ assert.deepEqual(await runRelease(c,a),{jobId:"rel_b1",outcome:"receipt_pending"});
+ assert.deepEqual(await runRelease(c,a),{jobId:"rel_b1",outcome:"receipt_pending"});assert.equal(batchJournal(c).phase,"receipt_pending");
+ rmSync(obstacle,{recursive:true});const r=await runRelease(c,a);
+ assert.equal(r.outcome,"released");assert.equal(batchJournal(c).phase,"complete");assert.ok(existsSync(join(c.home,batchJournal(c).batch.id+"-receipt.json")));assert.ok(existsSync(join(c.home,"rel_b2.json")));
+ assert.equal(a.calls.filter(n=>n.startsWith("deploy:")).length,1);assert.equal(a.calls.filter(n=>n==="finish").length,3,"the finish is replayed with the same receipt and generation");
+ assert.deepEqual(a.receipts[1],a.receipts[0]);assert.deepEqual(a.receipts[2],a.receipts[0]);
+});
+test("batch14 daemon traces with batching absent and at 1 against an older hub",async()=>{
+ const traces=[];
+ for(const releaseBatch of [undefined,{maxJobs:1},{}]){
+  const b=batchJobs([["client/a.js","a"],["client/b.js","b"],["client/c.js","c"],["client/d.js","d"]]),h=daemonHub(b,{batchSupported:false,releaseBatch});
+  await h.poll();
+  const state=h.read();
+  assert.equal(state.jobs[0].state,"released");assert.deepEqual(state.jobs.slice(1).map(j=>[j.state,j.generation]),[["verified",1],["verified",1],["verified",1]]);
+  assert.deepEqual(traceOf(state.log),SINGLE_JOB_TRACE);assert.ok(!state.log.some(l=>l.startsWith("deployment batch-")));assert.equal(state.log.filter(l=>l.startsWith("deployment get")).length,1,"no extra detail read");
+  assert.equal(h.seen.length,1);assert.ok(!("batch" in h.seen[0]),"no batch key reaches runRelease");
+  assert.deepEqual(readdirSync(h.home).filter(n=>n.startsWith("bat_")||n.startsWith("batch-")||/^rel_b[234]/.test(n)),[]);assert.ok(!("batch" in JSON.parse(readFileSync(join(h.home,"rel_b1.json"),"utf8"))));
+  traces.push(state.log.map(l=>l.replace(/[a-f0-9]{40}/g,"SHA").replace(h.home,"HOME")));
+ }
+ assert.deepEqual(traces[1],traces[0],"a size of 1 sends exactly what an absent setting sends");assert.deepEqual(traces[2],traces[0]);
+ // Enabled against the same older hub: one refused open, then the lead alone.
+ const b=batchJobs([["client/a.js","a"],["client/b.js","b"],["client/c.js","c"],["client/d.js","d"]]),h=daemonHub(b,{batchSupported:false,releaseBatch:{maxJobs:3}});
+ await h.poll();
+ assert.equal(h.read().jobs[0].state,"released");assert.deepEqual(h.read().jobs.slice(1).map(j=>j.state),["verified","verified","verified"]);
+ assert.equal(h.read().log.filter(l=>l.startsWith("deployment batch-open")).length,2);assert.equal(h.read().log.filter(l=>l.startsWith("deployment batch-")).length,2);
+});
+test("batch15 a size of 3 with five eligible jobs batches three and leaves two waiting",async()=>{
+ const b=batchJobs([["client/a.js","a"],["client/b.js","b"],["client/c.js","c"],["client/d.js","d"],["client/e.js","e"],["client/f.js","f"]]),h=daemonHub(b,{releaseBatch:{maxJobs:3}});
+ await h.poll();
+ const state=h.read(),journal=JSON.parse(readFileSync(join(h.home,"rel_b1.json"),"utf8"));
+ assert.deepEqual(state.batch,["batch-open","batch-add:tqe_b1","batch-add:tqe_b2","batch-add:tqe_b3"]);
+ assert.deepEqual(journal.batch.jobs.map(j=>j.jobId),["rel_b1","rel_b2","rel_b3"]);assert.equal(state.jobs[0].state,"released");assert.equal(state.jobs[0].receipt.jobId,"rel_b1");
+ assert.equal(h.seen[0].batch.max,3);assert.deepEqual(h.seen[0].batch.candidates.map(j=>j.id),["rel_b2","rel_b3","rel_b4","rel_b5"],"twice the open places are read, in queue order");
+ assert.deepEqual(state.log.filter(l=>l.startsWith("deployment get")).map(l=>l.split(" ")[3]),["rel_b1","rel_b2","rel_b3","rel_b4","rel_b5"]);
+ // The two that did not fit were never declared and wait as they were.
+ assert.deepEqual(state.jobs.slice(3).map(j=>[j.id,j.state,j.generation]),[["rel_b4","verified",1],["rel_b5","verified",1],["rel_b6","verified",1]]);
+ for(const id of ["rel_b4","rel_b5","rel_b6"])assert.ok(!existsSync(join(h.home,id+".json")));
+ const receipt=JSON.parse(readFileSync(join(h.home,journal.batch.id+"-receipt.json"),"utf8"));
+ assert.deepEqual(receipt.jobs.map(j=>j.jobId),["rel_b1","rel_b2","rel_b3"]);assert.equal(receipt.outcome,"released");
+ assert.deepEqual(git(b.f.cwd,"diff","--name-only",b.tip,"refs/heads/tasks-hub").split("\n"),["client/a.js","client/b.js","client/c.js"]);
+ assert.ok(existsSync(join(h.home,"rel_b2.json"))&&existsSync(join(h.home,"rel_b3.json")));assert.deepEqual([...readBatchSolo(h.home)],[]);
 });

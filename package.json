@@ -7,7 +7,7 @@
     "dev": "node server/index.js",
     "build": "vite build",
     "start": "NODE_ENV=production node server/index.js",
-    "test": "node scripts/build-team-plan.mjs --check && node --test tests/*.test.js",
+    "test": "node scripts/build-team-plan.mjs --check && node tests/run-unit-tests.mjs --concurrency 12",
     "test:browser": "node tests/browser.mjs",
     "build:wasm": "./scripts/build-wasm.sh",
     "build:team-plan": "node scripts/build-team-plan.mjs",

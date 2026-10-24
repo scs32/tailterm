@@ -344,10 +344,11 @@ test("a6 a job that is not terminal keeps its backup and rehearsal copies under 
  assert.deepEqual(removed.map(r=>[r.file,r.kind,r.reason]),[[leftover,"rehearsal","terminal"],[leftover+"-shm","rehearsal","terminal"],[copyOf("rel_done"),"backup","count"]]);
  assert.deepEqual(j.names(),[...live.map(x=>copyOf(x.id)),blocked,blocked+"-wal",blocked+".json",leftover+".json"].sort());
 });
-test("a7 every removal is recorded once and nothing but listed backup, rehearsal and migration files is touched",()=>{
+test("a7 every removal is recorded once and nothing but listed backup, rehearsal and migration files is touched",t=>{
  const jobs=[{id:"rel_old",state:"released",settledAt:"2026-09-29T12:00:00Z"},{id:"rel_new",state:"released",settledAt:"2026-09-30T12:00:00Z"},{id:"rel_refused",state:"refused"},{id:"../rel_escape",state:"refused"}];
  const others=["rel_old.json","rel_old-inputs.json","rel_old-receipt.json","rel_old-truenas-plan.json","rel_old-migration.tmp","rel_old-mini-before","rel_old-truenas-backup.sqlite.rehearsal-rel_old.json","rel_old-truenas-backup.sqlite.tmp","rel_unlisted-truenas-backup.sqlite","rel_unlisted-truenas-backup.sqlite.rehearsal-rel_unlisted","mini-relay-offset.json"];
- const j=journalFixture({[copyOf("rel_old")]:30,"rel_old-hub-backup.sqlite":20,[copyOf("rel_old")+".rehearsal-rel_old"]:7,"rel_old-migration":13,[copyOf("rel_new")]:30,"rel_refused-bridge-backup.sqlite":11,...Object.fromEntries(others.map(n=>[n,3]))});
+ const parent=mkdtempSync(join(tmpdir(),"release-escape-"));t.after(()=>rmSync(parent,{recursive:true,force:true}));
+ const j=journalFixture({[copyOf("rel_old")]:30,"rel_old-hub-backup.sqlite":20,[copyOf("rel_old")+".rehearsal-rel_old"]:7,"rel_old-migration":13,[copyOf("rel_new")]:30,"rel_refused-bridge-backup.sqlite":11,...Object.fromEntries(others.map(n=>[n,3]))},parent);
  // Only a regular file directly in the journal directory is a copy: a directory or link of that name stays.
  mkdirSync(join(j.dir,"tailos-dist-fixture"));mkdirSync(join(j.dir,"rel_refused-hub-backup.sqlite"));symlinkSync(join(j.dir,"rel_old.json"),join(j.dir,copyOf("rel_refused")));
  const escape=join(dirname(j.dir),"rel_escape-truenas-backup.sqlite");writeFileSync(escape,"outside");
@@ -1035,11 +1036,14 @@ test("b1 an edited config baseline changes the next poll's target selection with
  assert.deepEqual(selections,[["mini","tailos"],[]]);
  write({...all(f.base),mini:"bad"});await serveDeployment(config,{once:true,configPath,release});assert.equal(selections.length,2,"an invalid edit holds the poll before any claim");
 });
-test("a Go artifact built for a worktree deployer checkout carries the integrated revision",async()=>{
+test("a Go artifact built for a worktree deployer checkout carries the integrated revision",async t=>{
+ // A per-test TMPDIR: another process's build clone in flight is not this one's.
+ const parent=mkdtempSync(join(tmpdir(),"release-go-build-")),previousTmpdir=process.env.TMPDIR;process.env.TMPDIR=parent;
+ t.after(()=>{if(previousTmpdir===undefined)delete process.env.TMPDIR;else process.env.TMPDIR=previousTmpdir;rmSync(parent,{recursive:true,force:true});});
  const {commit,deployer,adapter}=goWorktreeFixture();assert.ok(statSync(join(deployer,".git")).isFile(),"the deployer checkout is a worktree");
  const artifact=await adapter.prepare("mini",commit);const info=execFileSync("go",["version","-m",artifact.artifactPath],{encoding:"utf8"});
  assert.match(info,new RegExp(`\\tbuild\\tvcs\\.revision=${commit}\\n`));assert.match(info,/\tbuild\tvcs\.modified=false\n/);
- assert.equal(readdirSync(tmpdir()).filter(d=>d.startsWith("tailterm-release-build-")).filter(d=>existsSync(join(tmpdir(),d,"src"))).length,0,"the build clone is removed");
+ assert.equal(readdirSync(parent).filter(d=>d.startsWith("tailterm-release-build-")).filter(d=>existsSync(join(parent,d,"src"))).length,0,"the build clone is removed");
 });
 test("an unstamped or mismatched Go artifact is refused before any deploy",async()=>{
  for(const reply of [c=>"x: go1.26\n",c=>stamped("f".repeat(40)),c=>stamped(c,"true")]){
