@@ -647,7 +647,7 @@ function fakeGit(push,lsRemote){
  writeFileSync(join(dir,"stderr.txt"),"fatal: unable to access 'https://x-access-token:ghs_0123456789abcdefABCDEF0123456789@github.com/o/r.git/': The requested URL returned error: 403\npassword=hunter2hunter2\n");
  writeFileSync(path,`#!/bin/sh\nREAL='${REAL_GIT}'\nERR='${join(dir,"stderr.txt")}'\nD='${dir}'\ncase "$1" in\n push) ${push} ;;\n ls-remote) ${lsRemote||":"} ;;\nesac\nexec "$REAL" "$@"\n`);chmodSync(path,0o755);return path;
 }
-const PUSH_MODES={slow:"sleep 5; exit 0",fail:'cat "$ERR" >&2; exit 128',landed:'"$REAL" "$@" || exit $?; echo "error: RPC failed; curl 92 HTTP/2 stream 0 was not closed cleanly" >&2; exit 1'};
+const PUSH_MODES={slow:"sleep 30; exit 0",fail:'cat "$ERR" >&2; exit 128',landed:'"$REAL" "$@" || exit $?; echo "error: RPC failed; curl 92 HTTP/2 stream 0 was not closed cleanly" >&2; exit 1'};
 // A release through the fake git; finish writes the receipt file as the host
 // adapter does, so the file and the journal can be read separately.
 async function pushCase(push,lsRemote,{timeoutMs=60000,graceMs,stopMs,setup}={}){
@@ -660,11 +660,13 @@ async function pushCase(push,lsRemote,{timeoutMs=60000,graceMs,stopMs,setup}={})
 }
 const STDERR_TEXT=["unable to access","RPC failed","[redacted]","hunter2","ghs_","fatal","error:"];
 const noStderr=(text,what)=>{for(const s of STDERR_TEXT)assert.ok(!text.includes(s),`${what} holds ${s}`);};
+// The slow push would run 30 s, so a run well inside that did not wait for
+// it, however slowly a loaded host runs the rest of the release.
 test("push p5 a slow push past its limit is recorded as timed out with its elapsed time, without hanging the runner",async()=>{
  const t=await pushCase(PUSH_MODES.slow,undefined,{timeoutMs:500});
- assert.equal(t.r.outcome,"released");assert.ok(t.took<4000,String(t.took));assert.equal(remoteHead(t.f),t.f.base);
+ assert.equal(t.r.outcome,"released");assert.ok(t.took<20000,String(t.took));assert.equal(remoteHead(t.f),t.f.base);
  const {elapsedMs,...push}=t.r.push;assert.deepEqual(push,{remote:"origin",commit:t.j.commit,outcome:"failed",timedOut:true,signal:"sigterm",reason:"push-timed-out",remoteCheck:"absent"});
- assert.ok(elapsedMs>=500&&elapsedMs<4000,String(elapsedMs));assert.equal(t.escalations.length,1);assert.deepEqual(t.a.calls,["merged","deploy:tailos","escalate","finish"]);
+ assert.ok(elapsedMs>=500&&elapsedMs<20000,String(elapsedMs));assert.equal(t.escalations.length,1);assert.deepEqual(t.a.calls,["merged","deploy:tailos","escalate","finish"]);
  const attempt=t.journal.pushAttempts.at(-1);assert.equal(attempt.timedOut,true);assert.equal(attempt.elapsedMs,elapsedMs);assert.equal(attempt.remoteCheck,"absent");
  assert.deepEqual(JSON.parse(t.file).push,t.r.push);
  const cwd=mkdtempSync(join(tmpdir(),"escalate-push-")),calls=[],adapter=new HostAdapter({cwd,journalDirectory:cwd},{id:"rel_fixture"});adapter.command=argv=>{calls.push(argv);return "";};
@@ -697,31 +699,38 @@ test("push p5 a failed push whose remote cannot be read is unknown and escalated
  assert.equal(t.r.push.remoteCheck,"unknown");assert.equal(t.r.push.outcome,"failed");assert.equal(t.escalations.length,1);assert.equal(t.escalations[0].pushCause.remoteCheck,"unknown");
 });
 // wi_01b550d20e610c85: the push runs as its own process-group leader. A
-// timed-out push whose child would land two seconds later is stopped with
-// its whole group, and the re-check (which fails as unknown if that child
-// still runs) reads the remote only after the group is gone. Limits leave
-// the fake shell time to start, so its traps are set before the stop.
-const LATE='( sleep 2.5; "$REAL" "$@" ) & echo $! > "$D/child.pid"; sleep 30',ALIVE='kill -0 "$(cat "$D/child.pid")" 2>/dev/null && exit 3';
+// timed-out push whose child would land later (once the test writes $D/land,
+// after the run) is stopped with its whole group, and the re-check (which
+// fails as unknown if that child still runs) reads the remote only after the
+// group is gone. Limits leave the fake shell time to start, so its child and
+// traps are in place before the stop.
+const LATE='( while [ ! -f "$D/land" ]; do sleep 0.05; done; "$REAL" "$@" ) & echo $! > "$D/child.pid"; sleep 30',ALIVE='kill -0 "$(cat "$D/child.pid")" 2>/dev/null && exit 3';
+const lateLanding=async t=>{writeFileSync(join(t.dir,"land"),"");await new Promise(r=>setTimeout(r,500));};
+// A timed-out push that lands as it is stopped: its SIGTERM trap runs the real
+// push, then the shell dies of that signal. It lands after the timeout and
+// before the re-check on any host; the grace leaves the push time to finish.
+const LANDS_ON_STOP='trap \'"$REAL" "$@"; trap - TERM; kill -TERM $$\' TERM; touch "$D/armed"; sleep 30 & wait';
 // A failed push that leaves a child ignoring SIGTERM: the child sets its trap
 // before the push exits, so the stop never races the shell's start-up.
 const STUBBORN='( trap "" TERM; touch "$D/ready"; sleep 30 ) & echo $! > "$D/child.pid"; while [ ! -f "$D/ready" ]; do sleep 0.05; done; exit 1';
 const stubbornGone=dir=>{const pid=Number(readFileSync(join(dir,"child.pid"),"utf8"));assert.ok(pid>0);try{process.kill(pid,0);return false;}catch(error){return error.code==="ESRCH";}};
 test("push t1 a timed-out push whose child would land later is stopped with its group, never lands, and is escalated as absent",async()=>{
- const t=await pushCase(LATE,ALIVE,{timeoutMs:1500});
+ const t=await pushCase(LATE,ALIVE,{timeoutMs:2000});
  const {elapsedMs,...push}=t.r.push;assert.deepEqual(push,{remote:"origin",commit:t.j.commit,outcome:"failed",timedOut:true,signal:"sigterm",reason:"push-timed-out",remoteCheck:"absent"});
  assert.equal(t.escalations.length,1);assert.equal(t.escalations[0].pushCause.remoteCheck,"absent");assert.equal(t.journal.pushAttempts.at(-1).stopped,true);
  const child=Number(readFileSync(join(t.dir,"child.pid"),"utf8"));assert.throws(()=>process.kill(child,0),{code:"ESRCH"});
- await new Promise(r=>setTimeout(r,Math.max(0,4000-t.took)));assert.equal(remoteHead(t.f),t.f.base,"no late landing after the child's landing time");
+ await lateLanding(t);assert.equal(remoteHead(t.f),t.f.base,"no late landing once the child may land");
 });
 test("push t2 a timed-out push that landed before the re-check is recorded landed and not escalated",async()=>{
- const t=await pushCase('"$REAL" "$@" || exit $?; sleep 30',ALIVE,{timeoutMs:1500});
+ const t=await pushCase(LANDS_ON_STOP,ALIVE,{timeoutMs:2000,graceMs:30000,stopMs:60000});
+ assert.ok(existsSync(join(t.dir,"armed")),"the push set its trap before the stop");
  const {elapsedMs,...push}=t.r.push;assert.deepEqual(push,{remote:"origin",commit:t.j.commit,outcome:"failed",timedOut:true,signal:"sigterm",reason:"push-timed-out",remoteCheck:"landed"});
  assert.deepEqual(t.escalations,[]);assert.equal(t.journal.pushEscalated,undefined);assert.equal(remoteHead(t.f),t.j.commit);
 });
 test("push t2 a timed-out push whose remote cannot be read after the stop is unknown and escalated once",async()=>{
- const t=await pushCase(LATE,"exit 2",{timeoutMs:1500});
+ const t=await pushCase(LATE,"exit 2",{timeoutMs:2000});
  assert.equal(t.r.push.remoteCheck,"unknown");assert.equal(t.r.push.timedOut,true);assert.equal(t.escalations.length,1);assert.equal(t.escalations[0].pushCause.remoteCheck,"unknown");
- await new Promise(r=>setTimeout(r,Math.max(0,4000-t.took)));assert.equal(remoteHead(t.f),t.f.base);
+ await lateLanding(t);assert.equal(remoteHead(t.f),t.f.base);
 });
 test("push t2 a push group that outlives the stop bound is unknown without a read and escalated once",async()=>{
  const t=await pushCase(STUBBORN,'touch "$D/read"',{graceMs:4000,stopMs:300});
