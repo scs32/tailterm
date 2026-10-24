@@ -223,9 +223,10 @@ manual base check; a left worktree's paragraph gives the reason and the tip,
 and the lead decides the base before planning. A launch that is already frozen
 never moves the worktree again. The entry's `baseCommit` keeps its admission
 value until acceptance takes the verification plan base. After a launch move a
-plain `requeue` is refused because the worktree HEAD is no longer the entry's
-base; `requeue --cwd` with the same worktree path takes its tasks-hub HEAD as
-the base.
+plain `requeue` accepts a worktree whose HEAD is still the recorded `after`
+commit and gives the retry that commit as its base (it prints `base SHA`); a
+HEAD past it may hold the failed attempt's unreviewed commits and is refused as
+before, so requeue from a fresh worktree with `--cwd DIR`.
 
 The exact assigned database handler records the accepted builder worktree,
 branch and full SHA in the same save that marks the item done:

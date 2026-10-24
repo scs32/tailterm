@@ -795,6 +795,83 @@ func TestTeamRunnerLaunchMovesStaleQueueWorktreeToTasksHub(t *testing.T) {
 	}
 }
 
+// f1 (wi_6a36a19047db7f81 review #45460): after the launch moved the
+// worktree to the tasks-hub tip, a plain requeue takes that tip as the
+// retry's base; a HEAD past it may hold unreviewed commits and is refused.
+func TestTeamRunnerRequeueAfterLaunchMovedWorktree(t *testing.T) {
+	f := newTeamFixture(t, true)
+	ctx := context.Background()
+	repo, c1, c2 := queueTasksHubRepo(t)
+	cwd := queueWorktreeFor(repo, f.item.ID)
+	queueGit(t, repo, "worktree", "add", "--detach", cwd, c1)
+	host := spawn.Host()
+	parallelCLIProject(t, f, "none")
+	q, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "add", Operation: "add", ItemID: f.item.ID, OrderMessageSeq: f.order, Host: host, Cwd: cwd, Repository: filepath.Join(repo, ".git"), BaseCommit: c1, Serial: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The launch moves the worktree and freezes, then the spawn fails the entry.
+	r := queueCorrectionRunner(t, f, 1)
+	r.spawn = func(env, []string) error { return errors.New("fixture spawn failure") }
+	_ = r.tick(ctx, f.e, f.c, host)
+	q, err = f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+	if err != nil || q.State != "failed" || q.BaseCommit != c1 || queueLaunchAdvancedTo(q) != c2 {
+		t.Fatalf("failed launch %+v %v", q, err)
+	}
+	if head := queueGit(t, cwd, "rev-parse", "HEAD"); head != c2 {
+		t.Fatalf("launch left HEAD at %s, want %s", head, c2)
+	}
+	if _, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"release", "--entry", q.ID}) }); err != nil {
+		t.Fatal(err)
+	}
+	if q, err = f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID); err != nil {
+		t.Fatal(err)
+	}
+	attempts := func() []api.TeamQueueEntry {
+		t.Helper()
+		list, err := f.c.ListTeamQueue(ctx, f.task.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var found []api.TeamQueueEntry
+		for _, e := range list.Entries {
+			if e.ItemID == f.item.ID {
+				found = append(found, e)
+			}
+		}
+		return found
+	}
+	requeue := func() (string, error) {
+		return captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"requeue", "--entry", q.ID}) })
+	}
+
+	// A commit past the launch base is refused.
+	queueGit(t, cwd, "-c", "user.email=fixture@example.invalid", "-c", "user.name=fixture", "commit", "-q", "--allow-empty", "-m", "unreviewed")
+	past := queueGit(t, cwd, "rev-parse", "HEAD")
+	if _, err := requeue(); err == nil || !strings.Contains(err.Error(), "HEAD "+past) || !strings.Contains(err.Error(), "may hold the failed attempt's unreviewed commits") {
+		t.Fatalf("requeue with HEAD past the launch base: %v", err)
+	}
+	if got := attempts(); len(got) != 1 {
+		t.Fatalf("refused requeue queued an attempt: %+v", got)
+	}
+
+	// Back at the launch base, the plain requeue is taken with that base.
+	queueGit(t, cwd, "checkout", "--quiet", "--detach", c2)
+	out, err := requeue()
+	if err != nil || !strings.Contains(out, "base "+c2) || !strings.Contains(out, "requeue ") {
+		t.Fatalf("requeue at the launch base: %q %v", out, err)
+	}
+	got := attempts()
+	if len(got) != 2 {
+		t.Fatalf("attempts after the requeue: %+v", got)
+	}
+	for _, e := range got {
+		if e.ID != q.ID && (e.BaseCommit != c2 || e.Cwd != q.Cwd || e.RetryOf != q.ID) {
+			t.Fatalf("retry %+v, want base %s cwd %s", e, c2, q.Cwd)
+		}
+	}
+}
+
 func TestTeamRunnerWaitsForCloseObligationAndRefreshesSnapshot(t *testing.T) {
 	for _, changedSnapshot := range []bool{false, true} {
 		name := "open-obligation"

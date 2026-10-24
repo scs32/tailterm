@@ -156,6 +156,21 @@ func requeueHeadOnTasksHub(dir, head string) error {
 	return fmt.Errorf("HEAD %s of %s has commits not on tasks-hub, which may be a failed attempt's unreviewed work; create a fresh worktree at the current tasks-hub tip (git worktree add --detach DIR tasks-hub) and pass --cwd DIR, or pass --unmerged-head to take that HEAD as the base", head, dir)
 }
 
+// queueLaunchAdvancedTo is the commit the entry's frozen launch moved its
+// worktree to, or "" when the launch did not advance it.
+func queueLaunchAdvancedTo(q api.TeamQueueEntry) string {
+	var record struct {
+		Base *queueLaunchBase `json:"base"`
+	}
+	if len(q.LaunchJSON) == 0 || json.Unmarshal(q.LaunchJSON, &record) != nil || record.Base == nil {
+		return ""
+	}
+	if b := record.Base; b.Outcome == "advanced" && b.Entry == q.BaseCommit && b.After != "" {
+		return b.After
+	}
+	return ""
+}
+
 // queueWorktreeTarget is the entry's own queue worktree path under its
 // repository root.
 func queueWorktreeTarget(q api.TeamQueueEntry) string {
@@ -830,7 +845,17 @@ func cmdTeamQueue(e env, args []string) error {
 					if headErr != nil {
 						return fmt.Errorf("entry %s's checkout %s has no readable HEAD (%v); create a fresh worktree and pass --cwd DIR, which also takes its HEAD as the base", q.ID, q.Cwd, headErr)
 					}
-					if head != q.BaseCommit {
+					if after := queueLaunchAdvancedTo(q); head != q.BaseCommit && after != "" && head == after {
+						// The launch moved the clean worktree to the tasks-hub
+						// tip and nothing moved it since; the retry takes that
+						// tip as its base.
+						req.BaseCommit = head
+						notes := os.Stdout
+						if *jsonOut {
+							notes = os.Stderr
+						}
+						fmt.Fprintf(notes, "base %s (the launch moved the worktree from %s)\n", head, q.BaseCommit)
+					} else if head != q.BaseCommit {
 						// That HEAD may hold the failed attempt's own commits,
 						// so it is not offered as the new base.
 						return fmt.Errorf("entry %s's base %s is not the HEAD %s of its checkout %s, which may hold the failed attempt's unreviewed commits; create a fresh worktree at the current tasks-hub tip (git worktree add --detach DIR tasks-hub) and pass --cwd DIR", q.ID, q.BaseCommit, head, q.Cwd)
