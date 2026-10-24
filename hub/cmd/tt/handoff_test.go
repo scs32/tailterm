@@ -4007,6 +4007,50 @@ func TestHandoffOneShotProcess(t *testing.T) {
 	}
 }
 
+// wi_336700ffd3d84592: the process-table read waits seconds, not 20 ms, for
+// its output once ps exits, and still ends at the context deadline. The real
+// read runs, with its start hook putting a shell in place of ps.
+func TestHandoffProcessTableOutputWait(t *testing.T) {
+	var group atomic.Int64
+	as := func(script string) func(*exec.Cmd) error {
+		return func(cmd *exec.Cmd) error {
+			cmd.Path, cmd.Args = "/bin/sh", []string{"sh", "-c", script}
+			if err := cmd.Start(); err != nil {
+				return err
+			}
+			group.Store(int64(cmd.Process.Pid))
+			return nil
+		}
+	}
+	// ps exits at once, but a process it left behind holds its stdout and
+	// prints 300 ms later: what a loaded host does to the output copy.
+	started := time.Now()
+	raw, err := handoffHostProcessTable(context.Background(), as("(sleep 0.3; echo late) & echo early"))
+	if err != nil || string(raw) != "early\nlate\n" {
+		t.Fatalf("the late output = %q, %v", raw, err)
+	}
+	if took := time.Since(started); took < 300*time.Millisecond || took > handoffOutputWait {
+		t.Fatalf("the late output took %v", took)
+	}
+
+	// A ps that never ends is killed with its group at the deadline.
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	started = time.Now()
+	if raw, err := handoffHostProcessTable(ctx, as("sleep 30 & echo early; sleep 30")); err == nil {
+		t.Fatalf("a ps that never ends was read: %q", raw)
+	}
+	if took := time.Since(started); took > 200*time.Millisecond+handoffOutputWait {
+		t.Fatalf("a ps that never ends took %v", took)
+	}
+	// Its group may linger a moment as zombies, until they are reaped.
+	for deadline := time.Now().Add(2 * time.Second); syscall.Kill(-int(group.Load()), 0) == nil; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("process group %d is still alive", group.Load())
+		}
+	}
+}
+
 // r1: the start note is not printed into a process that is not a pane's
 // interactive Claude Code session, whether the hook matched it as the
 // registered thread or as a candidate, and what the hook writes is as before.

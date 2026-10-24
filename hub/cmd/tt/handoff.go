@@ -976,10 +976,10 @@ func handoffMatchTmux(ctx context.Context, files []ownerHelperFile, start func(*
 	}
 	cmd := exec.CommandContext(ctx, "tmux", args...)
 	// Its own process group, so that one signal ends it and anything it
-	// started; and a pipe-free stdout, so that Wait never waits on a reader.
+	// started, and its output pipe closes with it.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error { return handoffKillGroup(cmd.Process) }
-	cmd.WaitDelay = 20 * time.Millisecond
+	cmd.WaitDelay = handoffOutputWait
 	var raw bytes.Buffer
 	cmd.Stdout = &raw
 	if start == nil {
@@ -1030,6 +1030,10 @@ type handoffProcess struct {
 const (
 	handoffProcessMax    = 16 << 20 // bytes of ps output read
 	handoffProcessLayout = "Mon Jan 2 15:04:05 2006"
+	// How long a ps or tmux read waits, once the child has exited or been
+	// killed with its group, for the last of its output to be copied. On a
+	// loaded host the copy can trail the exit by far more than 20 ms.
+	handoffOutputWait = 3 * time.Second
 )
 
 // handoffProcessChain is this process and its ancestors, nearest first, from
@@ -1074,7 +1078,7 @@ var handoffProcessTable = func(ctx context.Context, start func(*exec.Cmd) error)
 	cmd.Env = append(os.Environ(), "LC_ALL=C", "TZ=UTC")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error { return handoffKillGroup(cmd.Process) }
-	cmd.WaitDelay = 20 * time.Millisecond
+	cmd.WaitDelay = handoffOutputWait
 	var raw bytes.Buffer
 	cmd.Stdout = &handoffCapWriter{to: &raw, left: handoffProcessMax}
 	if start == nil {
