@@ -1307,11 +1307,12 @@ func rateLimited(err error) bool {
 	return errors.As(err, &response) && response.Status == http.StatusTooManyRequests
 }
 
-// Test seams: the two rotation ticks, and the wait between passes, which
-// ends the loop when it returns false.
+// Test seams: the two rotation ticks, the loop's session cleanup, and the
+// wait between passes, which ends the loop when it returns false.
 var (
 	relayHandlerRotation = relayHandlerRotationTick
 	relayStewardRotation = relayStewardRotationTick
+	relayLoopCleanup     = relayCleanup
 	relayLoopPause       = func() bool { time.Sleep(3 * time.Second); return true }
 	// relayHubReachStart starts the hub reachability watch and returns its stop.
 	relayHubReachStart = startHubReachWatch
@@ -1355,6 +1356,8 @@ func (r *relayRotationPass) start() {
 		done <- result
 	}()
 }
+
+func (r *relayRotationPass) inFlight() bool { return r.done != nil }
 
 // collect observes a finished pass; with wait it blocks for one in flight.
 func (r *relayRotationPass) collect(backoff *teamQueuePollBackoff, wait bool) {
@@ -1423,9 +1426,14 @@ func cmdRelay(args []string) error {
 	var claudeRetryCursor int
 	for {
 		if !*status {
-			relayCleanup()
-			inspectStartupPrompts()
 			rotation.collect(&queueBackoff, false)
+			// A rotation pass stops the rotated handler's old session itself;
+			// the loop cleanup waits until that pass is collected, so the two
+			// never stop one session at once.
+			if !rotation.inFlight() {
+				relayLoopCleanup()
+			}
+			inspectStartupPrompts()
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 			if queueBackoff.ready(time.Now()) {
 				queueErr := relayTeamQueueTick(ctx)

@@ -1317,6 +1317,127 @@ func TestRelayLoopHoldsQueueAndRotationAfterRotationRateLimit(t *testing.T) {
 	}
 }
 
+// The loop's session cleanup and a rotation pass's cleanup of the rotated
+// handler's old session must not stop one session at once (wi_63fa6bb934e0af46).
+func TestRelayLoopCleanupWaitsForInFlightRotationPass(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(unblock)
+	// rotating is set while a rotation pass runs its ticks.
+	var rotating atomic.Bool
+	var handlerCalls, cleanups, overlaps atomic.Int32
+	handler := func(ctx context.Context) error {
+		rotating.Store(true)
+		if handlerCalls.Add(1) == 1 {
+			close(entered)
+			select {
+			case <-release:
+			case <-ctx.Done():
+			}
+		}
+		return nil
+	}
+	steward := func(context.Context) error { rotating.Store(false); return nil }
+	var passes int
+	var cleanupsWhileBlocked int32
+	var deadline time.Time
+	pause := func() bool {
+		passes++
+		switch {
+		case passes == 1:
+			select {
+			case <-entered:
+			case <-time.After(15 * time.Second):
+				t.Error("rotation tick never started")
+				return false
+			}
+			return true
+		case passes < 5:
+			// Three more loop passes run while the rotation pass is held.
+			return true
+		case passes == 5:
+			cleanupsWhileBlocked = cleanups.Load()
+			unblock()
+			deadline = time.Now().Add(15 * time.Second)
+			return true
+		}
+		if cleanups.Load() > cleanupsWhileBlocked {
+			return false
+		}
+		if time.Now().After(deadline) {
+			t.Error("loop cleanup never ran after the rotation pass was collected")
+			return false
+		}
+		time.Sleep(10 * time.Millisecond)
+		return true
+	}
+	newRotationLoopFixture(t, handler, steward, pause)
+	oldCleanup := relayLoopCleanup
+	t.Cleanup(func() { relayLoopCleanup = oldCleanup })
+	relayLoopCleanup = func() {
+		cleanups.Add(1)
+		if rotating.Load() {
+			overlaps.Add(1)
+		}
+	}
+	if err := cmdRelay(nil); err != nil {
+		t.Fatal(err)
+	}
+	// Only the first pass, before the rotation pass started, cleans up.
+	if cleanupsWhileBlocked != 1 {
+		t.Fatalf("loop cleanups by the end of four passes with a rotation pass in flight = %d, want 1", cleanupsWhileBlocked)
+	}
+	if got := overlaps.Load(); got != 0 {
+		t.Fatalf("loop cleanup ran %d time(s) while a rotation pass was in flight", got)
+	}
+	if cleanups.Load() <= cleanupsWhileBlocked {
+		t.Fatalf("loop cleanups = %d, want one more after the rotation pass was collected", cleanups.Load())
+	}
+}
+
+func TestRelayOnceWaitsForRotationPassBeforeWaking(t *testing.T) {
+	var f *rotationLoopFixture
+	var readsAtReturn atomic.Int32
+	readsAtReturn.Store(-1)
+	returned := make(chan struct{})
+	// The handler tick holds for half a second, or ends early once a wake
+	// pass reads the bound agent, as it would if once mode did not wait.
+	handler := func(ctx context.Context) error {
+		defer close(returned)
+		hold := time.After(500 * time.Millisecond)
+		for f.agentReads.Load() == 0 {
+			select {
+			case <-hold:
+				readsAtReturn.Store(f.agentReads.Load())
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(5 * time.Millisecond):
+			}
+		}
+		readsAtReturn.Store(f.agentReads.Load())
+		return nil
+	}
+	steward := func(context.Context) error { return nil }
+	pause := func() bool { t.Error("once mode paused between passes"); return false }
+	f = newRotationLoopFixture(t, handler, steward, pause)
+	if err := cmdRelay([]string{"--once"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-returned:
+	case <-time.After(15 * time.Second):
+		t.Fatal("rotation tick never returned")
+	}
+	if got := readsAtReturn.Load(); got != 0 {
+		t.Fatalf("agent reads before the rotation pass returned = %d, want 0", got)
+	}
+	if f.agentReads.Load() == 0 {
+		t.Fatal("once mode never ran the wake pass for the bound agent")
+	}
+}
+
 func TestRelayRotationPassObservesBackoffLikeInlineTicks(t *testing.T) {
 	rateLimited := &api.HTTPError{Status: http.StatusTooManyRequests, Msg: "synthetic 429"}
 	var handlerErr, stewardErr error
