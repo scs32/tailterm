@@ -94,6 +94,92 @@ const checkEarlyUnlock = async (browser, name) => {
     await context.close();
   }
 };
+// A vault status read that fails must say so and offer to read it again,
+// rather than leaving the unlock button disabled. The status read fails by
+// refusing IndexedDB's open until the test allows it.
+const checkStatusFailure = async (browser, name) => {
+  const context = await browser.newContext();
+  try {
+    await context.addInitScript(() => {
+      window.failVaultOpen = true;
+      window.vaultOpens = 0;
+      const open = IDBFactory.prototype.open;
+      IDBFactory.prototype.open = function (...args) {
+        window.vaultOpens++;
+        if (window.failVaultOpen)
+          throw new DOMException(
+            "The test refused to open the vault.",
+            "InvalidStateError",
+          );
+        return open.apply(this, args);
+      };
+    });
+    const page = await context.newPage();
+    page.setDefaultTimeout(10000);
+    const errors = collectErrors(page);
+    await page.goto(`${origin}/`);
+    let navigations = 0;
+    page.on("framenavigated", (frame) => {
+      if (frame === page.mainFrame()) navigations++;
+    });
+    const hint = page.locator("#vault-hint");
+    const retry = page.locator("#vault-retry");
+    const shown = async () =>
+      retry.waitFor({ timeout: 5000 }).then(
+        () => true,
+        () => false,
+      );
+    assert.ok(
+      await shown(),
+      `${name}: a failed vault status read offers a retry; the hint reads ${JSON.stringify(await hint.textContent())}`,
+    );
+    assert.equal(
+      await hint.textContent(),
+      "Could not read the encrypted vault: The test refused to open the vault.",
+      `${name}: the error names the failure`,
+    );
+    assert.equal(await hint.getAttribute("role"), "alert");
+    assert.equal(await page.locator("#unlock-button").isDisabled(), true);
+    // The early-submit guard still holds while the status is unread.
+    await page.locator("#password").fill(passphrase);
+    await page.locator("#password").press("Enter");
+    await page.locator("#unlock").evaluate((form) => form.requestSubmit());
+    await page.waitForTimeout(300);
+    assert.equal(
+      navigations,
+      0,
+      `${name}: a submit after the error does not reload`,
+    );
+    // A retry that fails again shows the error again.
+    const opens = await page.evaluate(() => window.vaultOpens);
+    await retry.click();
+    await page.waitForFunction((n) => window.vaultOpens > n, opens);
+    assert.ok(await shown(), `${name}: a second failure offers a retry again`);
+    assert.match(
+      await hint.textContent(),
+      /^Could not read the encrypted vault/,
+    );
+    // Once the open is allowed, the retry reads the status and unlocks.
+    await page.evaluate(() => (window.failVaultOpen = false));
+    await retry.click();
+    await page
+      .locator("#vault-hint", { hasText: "Create a passphrase" })
+      .waitFor();
+    assert.equal(await retry.count(), 0, `${name}: the retry is removed`);
+    assert.equal(await hint.getAttribute("role"), null);
+    assert.equal(
+      await page.locator("#password").inputValue(),
+      passphrase,
+      `${name}: the retry keeps the typed passphrase`,
+    );
+    await page.locator("#unlock-button").click();
+    await page.locator("#workspace").waitFor();
+    assert.equal(navigations, 0, `${name}: recovering did not reload the page`);
+    assert.deepEqual(errors, []);
+  } finally {
+    await context.close();
+  }
+};
 let browser;
 for (const [signal, code] of [
   ["SIGINT", 130],
@@ -112,6 +198,10 @@ try {
       await checkEarlyUnlock(browser, engine.name());
       console.log(
         `${engine.name()}: an unlock submitted before the vault status is read keeps the page and passphrase.`,
+      );
+      await checkStatusFailure(browser, engine.name());
+      console.log(
+        `${engine.name()}: a failed vault status read shows the error and a retry that recovers.`,
       );
       const page = await browser.newPage({
         viewport: { width: 1100, height: 800 },
@@ -235,238 +325,253 @@ try {
       const waits = [];
       for (const font of ["cascadia", "fira"])
         for (const arrival of ["held", "delayed", "stale", "modal"]) {
-          const label = `${engine.name()} ${font} ${arrival}`;
-          const context = await browser.newContext({
-            viewport: { width: 1100, height: 800 },
-          });
-          try {
-            await context.addInitScript(
-              ([font, waitMs]) => {
-                if (!localStorage.getItem("tailserve.appearance"))
-                  localStorage.setItem(
-                    "tailserve.appearance",
-                    JSON.stringify({ font }),
-                  );
-                // Records when each dialog opens, and whether the click that
-                // asked for it had already opened it when its handlers ran.
-                window.showModals = [];
-                const showModal = HTMLDialogElement.prototype.showModal;
-                HTMLDialogElement.prototype.showModal = function () {
-                  window.showModals.push(performance.now());
-                  // The faces still downloading when the dialog shows, and
-                  // each face's status then.
-                  window.loadingAtOpen ??= [...document.fonts]
-                    .filter((f) => f.status === "loading")
-                    .map((f) => f.family.replace(/"/g, ""));
-                  window.facesAtOpen ??= [...document.fonts].map((f) => [
-                    f.family.replace(/"/g, ""),
-                    f.status,
-                  ]);
-                  // When the bound's timer fired, or null if not yet.
-                  if (!("boundAtOpen" in window))
-                    window.boundAtOpen = window.boundAt;
-                  return showModal.call(this);
-                };
-                document.addEventListener(
-                  "click",
-                  (e) => {
-                    if (!e.target.closest?.("#appearance")) return;
-                    window.clickedAt ??= performance.now();
-                    // A timer for the bound, started before the app's own in
-                    // the same click, so a busy page delays both alike.
-                    if (window.boundAt === undefined) {
-                      window.boundAt = null;
-                      setTimeout(
-                        () => (window.boundAt = performance.now()),
-                        waitMs,
-                      );
-                    }
-                  },
-                  true,
-                );
-                document.addEventListener("click", (e) => {
-                  if (e.target.closest?.("#appearance"))
-                    window.openInClick = document.querySelector("#dialog").open;
-                });
-              },
-              [font, FONT_WAIT_MS],
-            );
-            const page = await context.newPage();
-            page.setDefaultTimeout(10000);
-            const caseErrors = collectErrors(page);
-            let releaseFaces;
-            const facesHeld = new Promise((r) => (releaseFaces = r));
-            await page.route(/-nerd-[^/]*\.woff2$/, async (route) => {
-              await facesHeld;
-              await route.continue();
+          // On a busy host a delayed face can miss the bound, so that case
+          // is tried again, up to 3 times, until one opens inside it.
+          let usedInBound = false;
+          for (let attempt = 1; ; attempt++) {
+            const label = `${engine.name()} ${font} ${arrival}${attempt > 1 ? ` try ${attempt}` : ""}`;
+            const context = await browser.newContext({
+              viewport: { width: 1100, height: 800 },
             });
-            await page.goto(`${origin}/`);
-            await unlock(page);
-            await page.locator("#appearance").waitFor();
-            const metrics = () =>
-              page.locator("#dialog").evaluate(async (d) => {
-                for (let frame = 0; frame < 2; frame++)
-                  await new Promise(requestAnimationFrame);
-                const strong = d.querySelector(".font-choice strong");
-                return {
-                  height: d.scrollHeight,
-                  card: d.querySelector(".font-grid").getBoundingClientRect()
-                    .height,
-                  uiFont: d.style.getPropertyValue("--appearance-ui-font"),
-                  textFont: getComputedStyle(strong).fontFamily,
-                  textWidth: strong.getBoundingClientRect().width,
-                };
+            try {
+              await context.addInitScript(
+                ([font, waitMs]) => {
+                  if (!localStorage.getItem("tailserve.appearance"))
+                    localStorage.setItem(
+                      "tailserve.appearance",
+                      JSON.stringify({ font }),
+                    );
+                  // Records when each dialog opens, and whether the click that
+                  // asked for it had already opened it when its handlers ran.
+                  window.showModals = [];
+                  const showModal = HTMLDialogElement.prototype.showModal;
+                  HTMLDialogElement.prototype.showModal = function () {
+                    window.showModals.push(performance.now());
+                    // The faces still downloading when the dialog shows, and
+                    // each face's status then.
+                    window.loadingAtOpen ??= [...document.fonts]
+                      .filter((f) => f.status === "loading")
+                      .map((f) => f.family.replace(/"/g, ""));
+                    window.facesAtOpen ??= [...document.fonts].map((f) => [
+                      f.family.replace(/"/g, ""),
+                      f.status,
+                    ]);
+                    // When the bound's timer fired, or null if not yet.
+                    if (!("boundAtOpen" in window))
+                      window.boundAtOpen = window.boundAt;
+                    return showModal.call(this);
+                  };
+                  document.addEventListener(
+                    "click",
+                    (e) => {
+                      if (!e.target.closest?.("#appearance")) return;
+                      window.clickedAt ??= performance.now();
+                      // A timer for the bound, started before the app's own in
+                      // the same click, so a busy page delays both alike.
+                      if (window.boundAt === undefined) {
+                        window.boundAt = null;
+                        setTimeout(
+                          () => (window.boundAt = performance.now()),
+                          waitMs,
+                        );
+                      }
+                    },
+                    true,
+                  );
+                  document.addEventListener("click", (e) => {
+                    if (e.target.closest?.("#appearance"))
+                      window.openInClick =
+                        document.querySelector("#dialog").open;
+                  });
+                },
+                [font, FONT_WAIT_MS],
+              );
+              const page = await context.newPage();
+              page.setDefaultTimeout(10000);
+              const caseErrors = collectErrors(page);
+              let releaseFaces;
+              const facesHeld = new Promise((r) => (releaseFaces = r));
+              await page.route(/-nerd-[^/]*\.woff2$/, async (route) => {
+                await facesHeld;
+                await route.continue();
               });
-            const family = await page.evaluate(
-              (font) =>
-                [...document.fonts].find((f) =>
-                  f.family.toLowerCase().includes(font),
-                ).family,
-              font === "cascadia" ? "caskaydia" : "firacode",
-            );
-            await page.locator("#appearance").click();
-            // Released only once the click has been handled, so on a busy host
-            // the face cannot arrive before the click that has to wait for it.
-            if (arrival === "delayed") setTimeout(releaseFaces, delayMs);
-            // A repeated click during the wait must not open a second time.
-            if (arrival === "held")
-              await page.evaluate(() =>
-                document.querySelector("#appearance").click(),
+              await page.goto(`${origin}/`);
+              await unlock(page);
+              await page.locator("#appearance").waitFor();
+              const metrics = () =>
+                page.locator("#dialog").evaluate(async (d) => {
+                  for (let frame = 0; frame < 2; frame++)
+                    await new Promise(requestAnimationFrame);
+                  const strong = d.querySelector(".font-choice strong");
+                  return {
+                    height: d.scrollHeight,
+                    card: d.querySelector(".font-grid").getBoundingClientRect()
+                      .height,
+                    uiFont: d.style.getPropertyValue("--appearance-ui-font"),
+                    textFont: getComputedStyle(strong).fontFamily,
+                    textWidth: strong.getBoundingClientRect().width,
+                  };
+                });
+              const family = await page.evaluate(
+                (font) =>
+                  [...document.fonts].find((f) =>
+                    f.family.toLowerCase().includes(font),
+                  ).family,
+                font === "cascadia" ? "caskaydia" : "firacode",
               );
-            if (arrival === "stale" || arrival === "modal") {
-              // Another dialog opened during the wait keeps the screen: one
-              // from the app's dialog(), or a module's own modal.
-              if (arrival === "stale") await page.locator("#keys").click();
-              else
+              await page.locator("#appearance").click();
+              // Released only once the click has been handled, so on a busy host
+              // the face cannot arrive before the click that has to wait for it.
+              if (arrival === "delayed") setTimeout(releaseFaces, delayMs);
+              // A repeated click during the wait must not open a second time.
+              if (arrival === "held")
                 await page.evaluate(() =>
-                  document.body
-                    .appendChild(document.createElement("dialog"))
-                    .showModal(),
+                  document.querySelector("#appearance").click(),
                 );
-              await page.waitForTimeout(500);
-              assert.equal(
-                await page.locator("#dialog .theme-grid").count(),
-                0,
-                `${label}: a stale wait does not open over another dialog`,
+              if (arrival === "stale" || arrival === "modal") {
+                // Another dialog opened during the wait keeps the screen: one
+                // from the app's dialog(), or a module's own modal.
+                if (arrival === "stale") await page.locator("#keys").click();
+                else
+                  await page.evaluate(() =>
+                    document.body
+                      .appendChild(document.createElement("dialog"))
+                      .showModal(),
+                  );
+                await page.waitForTimeout(500);
+                assert.equal(
+                  await page.locator("#dialog .theme-grid").count(),
+                  0,
+                  `${label}: a stale wait does not open over another dialog`,
+                );
+                assert.equal(
+                  await page.evaluate(() => window.showModals.length),
+                  1,
+                  `${label}: only the other dialog opened`,
+                );
+                releaseFaces();
+                assert.deepEqual(caseErrors, []);
+                break;
+              }
+              await page.locator("#dialog .theme-grid").waitFor();
+              const opened = await page.evaluate(() => ({
+                wait: Math.round(window.showModals[0] - window.clickedAt),
+                count: window.showModals.length,
+                inClick: window.openInClick,
+                fonts: document.fonts.status,
+                loading: window.loadingAtOpen,
+                faces: window.facesAtOpen,
+                pastBound:
+                  window.boundAtOpen === null
+                    ? null
+                    : Math.round(window.showModals[0] - window.boundAtOpen),
+              }));
+              // Every face of the chosen family had loaded when the dialog
+              // showed, which is what the app checks before using it.
+              const chosen = opened.faces.filter(
+                ([name]) => name === family.replace(/"/g, ""),
               );
-              assert.equal(
-                await page.evaluate(() => window.showModals.length),
-                1,
-                `${label}: only the other dialog opened`,
-              );
+              const arrived =
+                chosen.length > 0 &&
+                chosen.every(([, status]) => status === "loaded");
+              const early = await metrics();
               releaseFaces();
-              assert.deepEqual(caseErrors, []);
-              continue;
-            }
-            await page.locator("#dialog .theme-grid").waitFor();
-            const opened = await page.evaluate(() => ({
-              wait: Math.round(window.showModals[0] - window.clickedAt),
-              count: window.showModals.length,
-              inClick: window.openInClick,
-              fonts: document.fonts.status,
-              loading: window.loadingAtOpen,
-              faces: window.facesAtOpen,
-              pastBound:
-                window.boundAtOpen === null
-                  ? null
-                  : Math.round(window.showModals[0] - window.boundAtOpen),
-            }));
-            // Every face of the chosen family had loaded when the dialog
-            // showed, which is what the app checks before using it.
-            const chosen = opened.faces.filter(
-              ([name]) => name === family.replace(/"/g, ""),
-            );
-            const arrived =
-              chosen.length > 0 &&
-              chosen.every(([, status]) => status === "loaded");
-            const early = await metrics();
-            releaseFaces();
-            await settleFonts(
-              `${font} ${arrival} after the face arrives`,
-              page,
-            );
-            assert.deepEqual(
-              await metrics(),
-              early,
-              `${label}: the dialog keeps its size and wrapping when the chosen face arrives`,
-            );
-            // Text is visible: it renders in a face that had loaded when the
-            // dialog showed, or in the generic fallback, which needs none.
-            assert.ok(early.textWidth > 0, `${label}: dialog text is visible`);
-            assert.ok(
-              early.textFont === "monospace" ||
-                !opened.loading.includes(family.replace(/"/g, "")),
-              `${label}: the dialog text face was not downloading when it showed`,
-            );
-            assert.equal(opened.inClick, false, `${label}: the open waited`);
-            // Measured from a timer started in the same click rather than from
-            // the click, so a busy host that runs the app's timer late does
-            // not fail it.
-            assert.ok(
-              opened.pastBound === null || opened.pastBound < 150,
-              `${label}: the open waited at most the ${FONT_WAIT_MS} ms bound, opened ${opened.pastBound} ms after it (${opened.wait} ms after the click)`,
-            );
-            assert.equal(opened.count, 1, `${label}: the dialog opened once`);
-            if (arrival === "held") {
-              assert.equal(
-                opened.fonts,
-                "loading",
-                `${label}: the chosen face was held while the dialog opened`,
+              await settleFonts(
+                `${font} ${arrival} after the face arrives`,
+                page,
+              );
+              assert.deepEqual(
+                await metrics(),
+                early,
+                `${label}: the dialog keeps its size and wrapping when the chosen face arrives`,
+              );
+              // Text is visible: it renders in a face that had loaded when the
+              // dialog showed, or in the generic fallback, which needs none.
+              assert.ok(
+                early.textWidth > 0,
+                `${label}: dialog text is visible`,
               );
               assert.ok(
-                opened.wait >= 290,
-                `${label}: the open waited for the bound, took ${opened.wait} ms`,
+                early.textFont === "monospace" ||
+                  !opened.loading.includes(family.replace(/"/g, "")),
+                `${label}: the dialog text face was not downloading when it showed`,
+              );
+              assert.equal(opened.inClick, false, `${label}: the open waited`);
+              // Measured from a timer started in the same click rather than from
+              // the click, so a busy host that runs the app's timer late does
+              // not fail it.
+              assert.ok(
+                opened.pastBound === null || opened.pastBound < 150,
+                `${label}: the open waited at most the ${FONT_WAIT_MS} ms bound, opened ${opened.pastBound} ms after it (${opened.wait} ms after the click)`,
+              );
+              assert.equal(opened.count, 1, `${label}: the dialog opened once`);
+              if (arrival === "held") {
+                assert.equal(
+                  opened.fonts,
+                  "loading",
+                  `${label}: the chosen face was held while the dialog opened`,
+                );
+                assert.ok(
+                  opened.wait >= 290,
+                  `${label}: the open waited for the bound, took ${opened.wait} ms`,
+                );
+                assert.equal(
+                  early.uiFont,
+                  "monospace",
+                  `${label}: the dialog opened in the fallback, which needs no download`,
+                );
+                assert.equal(
+                  early.textFont,
+                  "monospace",
+                  `${label}: the dialog text renders in the fallback`,
+                );
+              } else if (arrived) {
+                assert.equal(
+                  early.uiFont.split(",")[0].replace(/"/g, ""),
+                  family.replace(/"/g, ""),
+                  `${label}: a face arriving within the bound is used`,
+                );
+                usedInBound = true;
+              } else {
+                // On a busy host the delayed face can miss the bound. The app
+                // then opens in the fallback, but only once the bound has passed.
+                assert.notEqual(
+                  opened.pastBound,
+                  null,
+                  `${label}: the open fell back before the bound, ${opened.wait} ms after the click; faces ${JSON.stringify(chosen)}`,
+                );
+                assert.equal(
+                  early.uiFont,
+                  "monospace",
+                  `${label}: a face missing the bound leaves the dialog in the fallback`,
+                );
+              }
+              waits.push(
+                `${font} ${arrival}${attempt > 1 ? ` try ${attempt}` : ""} ${opened.wait} ms${arrival === "held" || arrived ? "" : " (face missed the bound)"}`,
+              );
+              // The face is loaded now, so the next open is not delayed.
+              await page.locator("#dialog-close").click();
+              await page.locator("#appearance").click();
+              const reopened = await page.evaluate(() => window.openInClick);
+              assert.equal(
+                reopened,
+                true,
+                `${label}: with the face loaded, the dialog opens within the click`,
               );
               assert.equal(
-                early.uiFont,
-                "monospace",
-                `${label}: the dialog opened in the fallback, which needs no download`,
-              );
-              assert.equal(
-                early.textFont,
-                "monospace",
-                `${label}: the dialog text renders in the fallback`,
-              );
-            } else if (arrived)
-              assert.equal(
-                early.uiFont.split(",")[0].replace(/"/g, ""),
+                (await metrics()).uiFont.split(",")[0].replace(/"/g, ""),
                 family.replace(/"/g, ""),
-                `${label}: a face arriving within the bound is used`,
+                `${label}: the reopened dialog uses the chosen face`,
               );
-            else {
-              // On a busy host the delayed face can miss the bound. The app
-              // then opens in the fallback, but only once the bound has passed.
-              assert.notEqual(
-                opened.pastBound,
-                null,
-                `${label}: the open fell back before the bound, ${opened.wait} ms after the click; faces ${JSON.stringify(chosen)}`,
-              );
-              assert.equal(
-                early.uiFont,
-                "monospace",
-                `${label}: a face missing the bound leaves the dialog in the fallback`,
-              );
+              assert.deepEqual(caseErrors, []);
+            } finally {
+              await context.close();
             }
-            waits.push(
-              `${font} ${arrival} ${opened.wait} ms${arrival === "held" || arrived ? "" : " (face missed the bound)"}`,
+            if (arrival !== "delayed" || usedInBound) break;
+            assert.ok(
+              attempt < 3,
+              `${engine.name()} ${font} delayed: the face missed the ${FONT_WAIT_MS} ms bound in all 3 tries, so its use was never checked`,
             );
-            // The face is loaded now, so the next open is not delayed.
-            await page.locator("#dialog-close").click();
-            await page.locator("#appearance").click();
-            const reopened = await page.evaluate(() => window.openInClick);
-            assert.equal(
-              reopened,
-              true,
-              `${label}: with the face loaded, the dialog opens within the click`,
-            );
-            assert.equal(
-              (await metrics()).uiFont.split(",")[0].replace(/"/g, ""),
-              family.replace(/"/g, ""),
-              `${label}: the reopened dialog uses the chosen face`,
-            );
-            assert.deepEqual(caseErrors, []);
-          } finally {
-            await context.close();
           }
         }
       console.log(

@@ -440,7 +440,7 @@ const inactivity = createInactivityLock({
 // any other submit is refused: a native submit would reload the page and drop
 // the typed passphrase.
 $("#unlock").onsubmit = (e) => e.preventDefault();
-const status = await api("/status");
+const status = await readVaultStatus();
 if ($("#username")) $("#username").value = status.username || "";
 $("#vault-hint").textContent = status.initialized
   ? staticMode
@@ -472,6 +472,29 @@ $("#unlock-button").disabled = false;
 if (status.unlocked) {
   data = await api("/data");
   mount();
+}
+// A failed status read names the failure and offers to read it again. The
+// unlock button stays disabled until a read succeeds.
+async function readVaultStatus() {
+  for (;;) {
+    try {
+      return await api("/status");
+    } catch (e) {
+      const hint = $("#vault-hint");
+      hint.textContent = `Could not read the encrypted vault: ${e?.message || e}`;
+      hint.setAttribute("role", "alert");
+      const retry = document.createElement("button");
+      retry.id = "vault-retry";
+      retry.type = "button";
+      retry.className = "vault-reset-link";
+      retry.textContent = "Try again";
+      hint.after(retry);
+      await new Promise((r) => (retry.onclick = r));
+      retry.remove();
+      hint.removeAttribute("role");
+      hint.textContent = "Checking encrypted vault…";
+    }
+  }
 }
 function mount() {
   inactivity.reset();
