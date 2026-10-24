@@ -532,6 +532,21 @@ test("lead and verifier run the validated hub operations without a handler turn"
   assert.ok(bundle.includes("Import the receipt yourself: tt verification receipt"), "generated plan.mjs lacks the verifier's import");
 });
 
+// wi_8a98bbcb8cd81a96: a receipt carry-over needs the handler's confirmation
+// of the amended revision to record the amended criteria and owned paths, so
+// the handler template and the launch doc both show --criteria-file.
+test("the handler confirms an amended scope with its criteria and owned paths", () => {
+  const read = (file) => readFileSync(new URL(file, import.meta.url), "utf8");
+  const handler = exampleTeam("planned").members.find((member) => member.name === "database").prompt;
+  assert.match(handler, /--owns PATH --criteria-file FILE/);
+  assert.match(handler, /refuses any receipt carry-over to that revision/);
+  assert.match(handler, /Never send a success RESULT, or a complete or verified claim, until every audit or check command it cites has exited 0/);
+  const launch = read("../docs/team-launch.md");
+  assert.ok(launch.includes("--criteria-file criteria.json"), "team-launch.md lacks the amended scope confirm");
+  assert.ok(launch.includes("objective-verification.md#a-receipt-carried-over-an-owner-scope-edit"), "team-launch.md lacks the carry-over link");
+  assert.ok(read("../hub/internal/teamplan/plan.mjs").includes("--owns PATH --criteria-file FILE"), "generated plan.mjs lacks the handler's criteria rule");
+});
+
 // wi_8c5f65b4d6038b43 / order #20747: runs start at once and wait in the
 // host lock's ordered waitlist; nobody waits for an idle host by hand.
 test("verifier and small lead start the matrix at once and wait in the host waitlist", () => {

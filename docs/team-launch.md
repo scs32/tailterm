@@ -28,6 +28,20 @@ complete filing. Queue add, manual launch, TailOS planning and final agent
 registration refuse missing or stale confirmation before admitting a team.
 An actual scope edit advances the item revision and needs a new confirmation.
 
+When an owner edit amends a queued item's scope, the confirmation of the
+amended revision also records the amended criteria, so a passing receipt can
+carry over to it
+([objective-verification.md](objective-verification.md#a-receipt-carried-over-an-owner-scope-edit)):
+
+```sh
+tt work-items scope confirm --project tsk_... --revision 4 --scope-revision 4 --order 123 --request-id amend-123 --complete --owns hub/internal/store --owns docs/team-launch.md --criteria-file criteria.json wi_...
+```
+
+`criteria.json` maps each criterion ID that stays to its exact text as the
+owner amended it, without the moved ones, such as `{"a1": "<a1's exact text>"}`.
+Criteria need `--owns`. Without them the confirmation still saves, but the hub
+refuses any receipt carry-over to that revision.
+
 For an order, sequencing note or decision that changes no item field, the
 handler saves a separate receipt. This leaves item and queue revisions, the
 selected order, prepared contexts and Start evidence intact:
