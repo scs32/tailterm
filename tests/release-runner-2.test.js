@@ -647,7 +647,7 @@ function fakeGit(push,lsRemote){
  writeFileSync(join(dir,"stderr.txt"),"fatal: unable to access 'https://x-access-token:ghs_0123456789abcdefABCDEF0123456789@github.com/o/r.git/': The requested URL returned error: 403\npassword=hunter2hunter2\n");
  writeFileSync(path,`#!/bin/sh\nREAL='${REAL_GIT}'\nERR='${join(dir,"stderr.txt")}'\nD='${dir}'\ncase "$1" in\n push) ${push} ;;\n ls-remote) ${lsRemote||":"} ;;\nesac\nexec "$REAL" "$@"\n`);chmodSync(path,0o755);return path;
 }
-const PUSH_MODES={slow:"sleep 30; exit 0",fail:'cat "$ERR" >&2; exit 128',landed:'"$REAL" "$@" || exit $?; echo "error: RPC failed; curl 92 HTTP/2 stream 0 was not closed cleanly" >&2; exit 1'};
+const PUSH_MODES={slow:"sleep 60; exit 0",fail:'cat "$ERR" >&2; exit 128',landed:'"$REAL" "$@" || exit $?; echo "error: RPC failed; curl 92 HTTP/2 stream 0 was not closed cleanly" >&2; exit 1'};
 // A release through the fake git; finish writes the receipt file as the host
 // adapter does, so the file and the journal can be read separately.
 async function pushCase(push,lsRemote,{timeoutMs=60000,graceMs,stopMs,setup}={}){
@@ -660,13 +660,13 @@ async function pushCase(push,lsRemote,{timeoutMs=60000,graceMs,stopMs,setup}={})
 }
 const STDERR_TEXT=["unable to access","RPC failed","[redacted]","hunter2","ghs_","fatal","error:"];
 const noStderr=(text,what)=>{for(const s of STDERR_TEXT)assert.ok(!text.includes(s),`${what} holds ${s}`);};
-// The slow push would run 30 s, so a run well inside that did not wait for
+// The slow push would run 60 s, so a run well inside that did not wait for
 // it, however slowly a loaded host runs the rest of the release.
 test("push p5 a slow push past its limit is recorded as timed out with its elapsed time, without hanging the runner",async()=>{
  const t=await pushCase(PUSH_MODES.slow,undefined,{timeoutMs:500});
- assert.equal(t.r.outcome,"released");assert.ok(t.took<20000,String(t.took));assert.equal(remoteHead(t.f),t.f.base);
+ assert.equal(t.r.outcome,"released");assert.ok(t.took<45000,String(t.took));assert.equal(remoteHead(t.f),t.f.base);
  const {elapsedMs,...push}=t.r.push;assert.deepEqual(push,{remote:"origin",commit:t.j.commit,outcome:"failed",timedOut:true,signal:"sigterm",reason:"push-timed-out",remoteCheck:"absent"});
- assert.ok(elapsedMs>=500&&elapsedMs<20000,String(elapsedMs));assert.equal(t.escalations.length,1);assert.deepEqual(t.a.calls,["merged","deploy:tailos","escalate","finish"]);
+ assert.ok(elapsedMs>=500&&elapsedMs<45000,String(elapsedMs));assert.equal(t.escalations.length,1);assert.deepEqual(t.a.calls,["merged","deploy:tailos","escalate","finish"]);
  const attempt=t.journal.pushAttempts.at(-1);assert.equal(attempt.timedOut,true);assert.equal(attempt.elapsedMs,elapsedMs);assert.equal(attempt.remoteCheck,"absent");
  assert.deepEqual(JSON.parse(t.file).push,t.r.push);
  const cwd=mkdtempSync(join(tmpdir(),"escalate-push-")),calls=[],adapter=new HostAdapter({cwd,journalDirectory:cwd},{id:"rel_fixture"});adapter.command=argv=>{calls.push(argv);return "";};
@@ -703,8 +703,9 @@ test("push p5 a failed push whose remote cannot be read is unknown and escalated
 // after the run) is stopped with its whole group, and the re-check (which
 // fails as unknown if that child still runs) reads the remote only after the
 // group is gone. Limits leave the fake shell time to start, so its child and
-// traps are in place before the stop.
-const LATE='( while [ ! -f "$D/land" ]; do sleep 0.05; done; "$REAL" "$@" ) & echo $! > "$D/child.pid"; sleep 30',ALIVE='kill -0 "$(cat "$D/child.pid")" 2>/dev/null && exit 3';
+// traps are in place before the stop. A child that survives a regression
+// gives up after about 60 s rather than polling on the host.
+const LATE='( i=0; while [ ! -f "$D/land" ]; do [ $i -lt 1200 ] || exit 0; sleep 0.05; i=$((i+1)); done; "$REAL" "$@" ) & echo $! > "$D/child.pid"; sleep 30',ALIVE='kill -0 "$(cat "$D/child.pid")" 2>/dev/null && exit 3';
 const lateLanding=async t=>{writeFileSync(join(t.dir,"land"),"");await new Promise(r=>setTimeout(r,500));};
 // A timed-out push that lands as it is stopped: its SIGTERM trap runs the real
 // push, then the shell dies of that signal. It lands after the timeout and
