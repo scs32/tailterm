@@ -1878,12 +1878,14 @@ type releaseWindowLedger struct {
 // no-change finish, which has no push and never selects; or (S2) the commit of
 // a hand release naming every covered target. The causes, first match wins:
 // (U1) a published job whose own or integrated diff is covered, with no
-// committed revert in its receipt, and no job of its entry released or
-// superseded; (U2) a hand release that omits a covered
+// committed revert in its receipt, no job of its entry released or
+// superseded, and, when it is refused or rolled back, no S1 job claimed after
+// it left the project fence; (U2) a hand release that omits a covered
 // target, recorded after the newest sync record.
 func releaseWindowLedgerLoad(ctx context.Context, q queryRower, task string, w releaseWindow) (releaseWindowLedger, error) {
 	out := releaseWindowLedger{sync: map[string]bool{}}
-	var newest time.Time
+	var newest, newestPush time.Time
+	var pushed []string
 	settled := map[string]bool{}
 	var unreleased []api.ReleaseJob
 	rows, err := q.QueryContext(ctx, `SELECT record_json FROM release_jobs WHERE task_id=? ORDER BY rowid`, task)
@@ -1905,8 +1907,15 @@ func releaseWindowLedgerLoad(ctx context.Context, q queryRower, task string, w r
 		}
 		if r := j.Receipt; r != nil && r.Outcome == "released" && r.Push != nil {
 			out.sync[r.Commit] = true
-			if at := parseTS(j.SettledAt); at.After(newest) {
+			at := parseTS(j.SettledAt)
+			if at.After(newest) {
 				newest = at
+			}
+			if len(pushed) == 0 || at.After(newestPush) {
+				pushed, newestPush = nil, at
+			}
+			if at.Equal(newestPush) {
+				pushed = append(pushed, j.ID)
 			}
 		}
 		// A batch publishes its members' changes with its lead, which only
@@ -1950,11 +1959,40 @@ func releaseWindowLedgerLoad(ctx context.Context, q queryRower, task string, w r
 	if err != nil {
 		return out, err
 	}
+	// A job refused or rolled back has left the fence for good. An S1 job
+	// claimed after that was merged onto a tasks-hub that already carried its
+	// publication and any revert, and its push selected every target past
+	// them. The action receipts are the proof: one row is appended with each
+	// change and none is ever rewritten, unlike job rowids, which set-aside
+	// moves. Jobs pass the fence one at a time, so the newest S1 jobs by
+	// settledAt (a batch lead and its members, which never claim) hold the
+	// latest claim. A job no claim proves stays a cause.
+	claim, loaded := int64(0), false
 	for _, j := range unreleased {
-		if !settled[j.EntryID] {
-			out.cause = "job " + j.ID + " was published and is not released"
-			return out, nil
+		if settled[j.EntryID] {
+			continue
 		}
+		if (j.State == "refused" || j.State == "rolled_back") && len(pushed) > 0 {
+			if !loaded {
+				for _, id := range pushed {
+					row, err := releaseReceiptRow(ctx, q, task, id, "max", "claimed")
+					if err != nil {
+						return out, err
+					}
+					claim = max(claim, row)
+				}
+				loaded = true
+			}
+			left, err := releaseReceiptRow(ctx, q, task, j.ID, "min", "refused", "rolled_back")
+			if err != nil {
+				return out, err
+			}
+			if left != 0 && claim > left {
+				continue
+			}
+		}
+		out.cause = "job " + j.ID + " was published and is not released"
+		return out, nil
 	}
 	for _, h := range partial {
 		if parseTS(h.CreatedAt).After(newest) {
@@ -1963,6 +2001,19 @@ func releaseWindowLedgerLoad(ctx context.Context, q queryRower, task string, w r
 		}
 	}
 	return out, nil
+}
+
+// releaseReceiptRow returns the min or max rowid of the job's action receipts
+// that left it in one of states, or 0 when it has none. The instr test only
+// narrows the scan before the JSON is parsed.
+func releaseReceiptRow(ctx context.Context, q queryRower, task, job, agg string, states ...string) (int64, error) {
+	args := []any{task, `"id":"` + job + `"`, job}
+	for _, state := range states {
+		args = append(args, state)
+	}
+	var row sql.NullInt64
+	err := q.QueryRowContext(ctx, `SELECT `+agg+`(rowid) FROM release_action_receipts WHERE task_id=? AND instr(record_json,?)>0 AND json_extract(record_json,'$.id')=? AND json_extract(record_json,'$.state') IN (?`+strings.Repeat(",?", len(states)-1)+`)`, args...).Scan(&row)
+	return row.Int64, err
 }
 
 // releaseWindowCheck decides coverage inside an open window. It reads the

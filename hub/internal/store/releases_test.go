@@ -7062,6 +7062,102 @@ func TestReleaseWindowHoldsDocsJobBehindBlockedBatch(t *testing.T) {
 	}
 }
 
+// wi_fc763af18f58129f a2 (u3): the 10-09 shape. A published job refused after
+// its rollback has no receipt, and its change re-lands under another entry, so
+// its own entry never settles. It holds docs jobs only until an S1 job is
+// claimed after it left the fence; an S1 job released before it does not
+// clear it. A rolled-back job whose revert did not commit is cleared the same
+// way, and a published job no later release passes stays a cause.
+func TestReleaseWindowPassesDocsJobPastRefusalAndLaterRelease(t *testing.T) {
+	ctx := context.Background()
+	for _, shape := range []string{"refused", "rolled_back"} {
+		t.Run(shape, func(t *testing.T) {
+			s, task, h, d, _ := releaseFixture(t)
+			setNightWindow(t, s, task)
+			setWindowClock(t, s, d, windowAt("2026-10-18T21:00:00-07:00"))
+			act := func(key, op string, j api.ReleaseJob, receipt *api.ReleaseReceipt) api.ReleaseJob {
+				t.Helper()
+				out, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: key, Operation: op, AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, IntegratedCommit: j.Commit, Receipt: receipt})
+				if err != nil {
+					t.Fatal(key, err)
+				}
+				return out
+			}
+			receipt := func(j api.ReleaseJob, outcome string) *api.ReleaseReceipt {
+				target := api.ReleaseTargetReceipt{Target: "tailos", Release: "fixture", ArtifactSHA256: strings.Repeat("a", 64), Outcome: outcome}
+				r := &api.ReleaseReceipt{Version: 1, JobID: j.ID, Commit: j.IntegratedCommit, VerificationDigest: j.VerificationDigest, Outcome: outcome, Targets: []api.ReleaseTargetReceipt{target}}
+				switch outcome {
+				case "released":
+					r.Push = &api.ReleasePush{Remote: "origin", Commit: j.IntegratedCommit, Outcome: "pushed"}
+				case "rolled_back":
+					r.Targets[0].Rollback = "restored"
+					r.Revert = &api.ReleaseRevert{Outcome: "failed"}
+				}
+				return r
+			}
+			release := func(key string) api.ReleaseJob {
+				t.Helper()
+				j := windowEnqueue(t, s, task, h, "enqueue-"+key, releaseEntryChanged(t, s, task, key, key, "hub/internal/store/x.go"))
+				j = act("claim-"+key, "claim", j, nil)
+				j = act("merged-"+key, "merged", j, nil)
+				if j = act("finish-"+key, "finish", j, receipt(j, "released")); j.State != "released" {
+					t.Fatalf("release %s %+v", key, j)
+				}
+				return j
+			}
+			// An S1 release before the job: its claim proves nothing about it.
+			release("earlier")
+			p := windowEnqueue(t, s, task, h, "enqueue-store", releaseEntryChanged(t, s, task, "store change", "store-change", "hub/internal/store/x.go"))
+			p = act("claim", "claim", p, nil)
+			p = act("merged", "merged", p, nil)
+			if shape == "rolled_back" {
+				p = act("finish", "finish", p, receipt(p, "rolled_back"))
+			} else {
+				p = act("block", "block", p, nil)
+				evidence := recoveryEvidence(t, s, task, h, p)
+				evidence.Disposition, evidence.NoPublication, evidence.JournalState = "refuse", false, "restored"
+				if _, err := s.db.Exec(`UPDATE agents SET status='exited' WHERE id=?`, d.ID); err != nil {
+					t.Fatal(err)
+				}
+				var err error
+				if p, err = s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "reconcile", Operation: "reconcile", AgentID: h.ID, RunID: h.RunID, JobID: p.ID, ExpectedGeneration: p.Generation, Reconciliation: &evidence}); err != nil {
+					t.Fatal("published refusal", err)
+				}
+				if _, err = s.db.Exec(`UPDATE agents SET status='running' WHERE id=?`, d.ID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if p.State != shape || !p.Published || (shape == "refused" && p.Receipt != nil) || (p.Receipt != nil && p.Receipt.Revert.Outcome == "committed") {
+				t.Fatalf("published %s job %+v", shape, p)
+			}
+			cause := "job " + p.ID + " was published and is not released"
+			setWindowClock(t, s, d, windowAt("2026-10-18T23:30:00-07:00"))
+			if held := windowEnqueue(t, s, task, h, "enqueue-before", releaseEntryOn(t, s, task, "docs before", "docs-before", candidateB, "docs/a.md")); held.State != "held" || held.Hold == nil || !strings.HasSuffix(held.Hold.Reason, "; "+cause) {
+				t.Fatalf("docs job behind the %s job %+v", shape, held.Hold)
+			}
+
+			// The change re-lands under another entry, outside the window.
+			setWindowClock(t, s, d, windowAt("2026-10-19T08:00:00-07:00"))
+			relanded := release("relanded")
+			if p, err := releaseLoad(ctx, s.db, task.ID, p.ID); err != nil || p.State != shape || p.EntryID == relanded.EntryID {
+				t.Fatal("the old job is untouched", p.State, err)
+			}
+			setWindowClock(t, s, d, windowAt("2026-10-19T23:30:00-07:00"))
+			ledger, err := releaseWindowLedgerLoad(ctx, s.db, task.ID, releaseWindow{ReleaseWindow: api.ReleaseWindow{Targets: []string{"hub", "bridge", "mini"}}})
+			if err != nil || ledger.cause != "" || !ledger.sync[candidateB] {
+				t.Fatal("ledger after the later release", ledger, err)
+			}
+			docs := windowEnqueue(t, s, task, h, "enqueue-after", releaseEntryOn(t, s, task, "docs after", "docs-after", candidateB, "docs/b.md"))
+			if docs.State != "verified" || docs.Hold != nil {
+				t.Fatalf("docs job after the later release %+v", docs)
+			}
+			if claimed, err := s.ReleaseAction(ctx, task.ID, claimRequest("claim-after", d, docs)); err != nil || claimed.State != "claimed" {
+				t.Fatal("claim inside the window", err)
+			}
+		})
+	}
+}
+
 // wi_d87f594a6ae13ec9 a2 (q1, example b): a docs-only job whose base is an
 // owner commit with no hand-release record is held and its claim refused; the
 // owner's record of that commit lets the next one release. The window hold is

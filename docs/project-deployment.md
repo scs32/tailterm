@@ -1648,9 +1648,17 @@ The first of these that applies covers the job:
   its integrated plan's paths are covered, and no job of its queue entry is
   `released` or `superseded`. The integrated plan counts because a batch
   publishes its members' changes with its lead, while the members stay
-  unpublished until they release. Example: a job refused or blocked after
-  publishing that waits for a hand release, or a docs-only lead blocked with a
-  hub member in its batch.
+  unpublished until they release. Example: a job blocked after publishing
+  that waits for a hand release, or a docs-only lead blocked with a hub member
+  in its batch. A job that is `refused` or `rolled_back` stops counting once
+  an S1 job is claimed after it left the project fence
+  (wi_fc763af18f58129f): that job merged onto a tasks-hub that already carried
+  the publication and any revert, and its push selected every target past
+  them. The hub proves "after" from its release action receipts, which gain one
+  row per change and are never rewritten (job rowids are not used: set-aside
+  moves them). An S1 job released before the refusal does not count, and a
+  `blocked`, `merged` or `claimed` job still holds the fence, so no later claim
+  exists.
 - U2: a hand release that omits a covered target was recorded after the newest
   sync record (the receipt's `settledAt` or the hand release's `createdAt`,
   compared as times).
@@ -1669,8 +1677,9 @@ window is open and only for a job whose own paths are uncovered. Its limits:
   runner check (below) catches it: the job's selection then includes that
   commit's targets, and it waits.
 - A published job whose entry never settles holds every such job each night
-  until the handler settles it: a supersession citing the hand release, or a
-  released retry of the same entry.
+  until the handler settles it (a supersession citing the hand release, or a
+  released retry of the same entry) or, once it is refused or rolled back,
+  until a later S1 release.
 - Equality with recorded commits holds too many jobs, never too few: a job on a
   revert commit, a no-change finish, or a legacy receipt without `push` is held
   and waits for the morning unhold.
