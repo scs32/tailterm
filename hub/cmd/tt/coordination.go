@@ -217,7 +217,14 @@ const handlerReadBackRule = "Read back the committed record and verify its ID, r
 
 const handlerEvidenceReadRule = "For a complete native evidence read, use tt work-items evidence with an explicit private --manifest and --sources selection. Always include current as the item/scope snapshot anchor; request revisions for revision history, messages for full linked messages, and receipt plus the exact mutation request key for a keyed update receipt. The reader follows native terminal cursors, retains exact page bytes and hashes, and resumes only a matching manifest. Treat not_fetched, partial and error as incomplete; absent_after_complete_lookup is terminal absence, not verified evidence. Never substitute current GET for history, audit metadata for source content, or a first page/count for terminal coverage. Source availability and provenance do not establish semantic acceptance, and an evidence manifest never mutates or completes an item or Queue entry."
 
-const handlerAuditRule = "Retain assignment/result message links and verification evidence in the record; preserve owner text when appending the audit trail. Record scope changes before authorizing additional work. Track completion only after the lead accepts implementation and verification and required dependencies are resolved; report saved status/revision after read-back."
+// handlerAmendedScopeRule: a receipt carry-over needs the confirmation of
+// the amended revision to record the amended criteria and owned paths
+// (wi_8a98bbcb8cd81a96). The Planned database template in
+// client/team-examples.js and the browser handler prompt in
+// client/project-handler.js carry the same sentences.
+const handlerAmendedScopeRule = "When an owner edit amends a queued item's scope, confirm the amended revision with its owned paths and amended criteria: tt work-items scope confirm ITEM --complete --request-id KEY --revision N --scope-revision S --order SEQ --owns PATH --criteria-file FILE, where FILE is a JSON object of each criterion ID that stays, the frozen ASSIGN's a1..aN, to its exact text as the owner amended it, without the moved ones. Read it back with tt work-items scope get. Without the criteria and owned paths the hub refuses any receipt carry-over to that revision, and the item needs a new plan and a full matrix run."
+
+const handlerAuditRule = "Retain assignment/result message links and verification evidence in the record; preserve owner text when appending the audit trail. Record scope changes before authorizing additional work. " + handlerAmendedScopeRule + " Track completion only after the lead accepts implementation and verification and required dependencies are resolved; report saved status/revision after read-back."
 
 const handlerStartEvidenceRule = "Preserve deliberate selection, bounded order, admission and separate exact Start evidence with item/revision/agent/run/context digest; Send or notification is review only, never automatic claim, launch, reassignment or closure. " + queueTeamStartRule + " " + queueTeamStartHandlerRule + " " + queueTeamStartAmendmentRule
 

@@ -5,6 +5,7 @@ import { PROJECT_ROLE_TEMPLATES, QUEUE_TEAM_TEMPLATES, TEAM_EXAMPLES, exampleTea
 import { normalizeTeam, teamLaunches } from "../client/teams.js";
 import { MODEL_OPTIONS } from "../client/model-picker.js";
 import { MAX_AGENT_PROMPT_BYTES } from "../shared/tmux-command.js";
+import { withDatabaseHandler } from "../client/project-handler.js";
 test("ten complete examples are portable, launchable, bounded and independently editable", () => {
   assert.equal(TEAM_EXAMPLES.length, 10);
   for (const e of TEAM_EXAMPLES) {
@@ -534,10 +535,21 @@ test("lead and verifier run the validated hub operations without a handler turn"
 
 // wi_8a98bbcb8cd81a96: a receipt carry-over needs the handler's confirmation
 // of the amended revision to record the amended criteria and owned paths, so
-// the handler template and the launch doc both show --criteria-file.
+// the handler template, the shared and browser handler guidance and the launch
+// doc all show --criteria-file.
 test("the handler confirms an amended scope with its criteria and owned paths", () => {
   const read = (file) => readFileSync(new URL(file, import.meta.url), "utf8");
+  const count = (text, clause) => text.split(clause).length - 1;
+  const rule =
+    "When an owner edit amends a queued item's scope, confirm the amended revision with its owned paths and amended criteria: tt work-items scope confirm ITEM --complete --request-id KEY --revision N --scope-revision S --order SEQ --owns PATH --criteria-file FILE, where FILE is a JSON object of each criterion ID that stays, the frozen ASSIGN's a1..aN, to its exact text as the owner amended it, without the moved ones. Read it back with tt work-items scope get. Without the criteria and owned paths the hub refuses any receipt carry-over to that revision, and the item needs a new plan and a full matrix run.";
   const handler = exampleTeam("planned").members.find((member) => member.name === "database").prompt;
+  const browser = withDatabaseHandler([
+    { server: { id: "host" }, fields: { name: "lead", runtime: "codex", run: "codex", cwd: "/repo", prompt: "Lead." } },
+  ])[1].fields.prompt;
+  for (const [name, text] of [["database template", handler], ["coordination.go", read("../hub/cmd/tt/coordination.go")], ["browser handler", browser]])
+    assert.equal(count(text, rule), 1, name);
+  assert.ok(browser.length <= 8192, `browser handler prompt is ${browser.length} characters`);
+  assert.ok(browser.includes("Never send a success RESULT, or a complete or verified claim"), "browser handler lost the success-claim rule");
   assert.match(handler, /--owns PATH --criteria-file FILE/);
   assert.match(handler, /refuses any receipt carry-over to that revision/);
   assert.match(handler, /Never send a success RESULT, or a complete or verified claim, until every audit or check command it cites has exited 0/);

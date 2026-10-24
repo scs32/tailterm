@@ -849,10 +849,10 @@ func TestQueueHandlerBriefingIntakeOwnershipAndPlainDone(t *testing.T) {
 	if strings.Contains(briefing, "an unscoped queued entry waits until nothing else runs") {
 		t.Fatal("queue handler briefing still asks for hand scoping")
 	}
-	// The rule against a success claim before every cited check has passed
-	// (wi_5edba07856e84f45) changes the template again.
-	const before = "6bd82b85806d1f40ea1bdaf7be8ca64202f09eb8cd418b58c4b38d9f6d4d4142" // 65b11152
-	const current = "53953b866f8cf205afd81d5f18c8b98349f204d22c91b9dde9a6618795b25b64"
+	// The amended scope confirmation rule (wi_8a98bbcb8cd81a96) changes the
+	// template again.
+	const before = "53953b866f8cf205afd81d5f18c8b98349f204d22c91b9dde9a6618795b25b64" // 0b863746
+	const current = "638fc72887bccb606cc80daf579cfa725a0ffbff92f1120050fc998c2730c03b"
 	if got := handlerTemplateDigest("handler assignment"); got != current || got == before {
 		t.Fatalf("handler template digest %s, want %s", got, current)
 	}
