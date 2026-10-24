@@ -25,15 +25,74 @@ const collectErrors = (page) => {
   });
   return errors;
 };
-// The unlock form gets its handler only once the vault status has been read.
-// A click before then submits the form natively and reloads the page.
+const passphrase = "temporary appearance test password";
 const unlock = async (page) => {
-  await page
-    .locator("#vault-hint")
-    .filter({ hasNotText: "Checking encrypted vault" })
-    .waitFor();
-  await page.locator("#password").fill("temporary appearance test password");
+  await page.locator("#password").fill(passphrase);
   await page.locator("#unlock-button").click();
+};
+// An unlock submitted before the vault status has been read must neither
+// reload the page nor drop the typed passphrase. The status read is held by
+// deferring IndexedDB's open until the test releases it.
+const checkEarlyUnlock = async (browser, name) => {
+  const context = await browser.newContext();
+  try {
+    await context.addInitScript(() => {
+      let release;
+      const released = new Promise((r) => (release = r));
+      window.releaseVaultStatus = release;
+      const open = IDBFactory.prototype.open;
+      IDBFactory.prototype.open = function (...args) {
+        const request = open.apply(this, args);
+        let handler;
+        Object.defineProperty(request, "onsuccess", {
+          set: (f) => (handler = f),
+          get: () => handler,
+        });
+        request.addEventListener("success", (e) =>
+          released.then(() => handler?.call(request, e)),
+        );
+        return request;
+      };
+    });
+    const page = await context.newPage();
+    page.setDefaultTimeout(10000);
+    const errors = collectErrors(page);
+    await page.goto(`${origin}/`);
+    let navigations = 0;
+    page.on("framenavigated", (frame) => {
+      if (frame === page.mainFrame()) navigations++;
+    });
+    await page.locator("#password").fill(passphrase);
+    // Enter, a click and a scripted submit, all before the status is read.
+    await page.locator("#password").press("Enter");
+    await page.locator("#unlock-button").click({ force: true });
+    await page.locator("#unlock").evaluate((form) => form.requestSubmit());
+    await page.waitForTimeout(300);
+    assert.equal(
+      await page.locator("#vault-hint").textContent(),
+      "Checking encrypted vault…",
+      `${name}: the early unlock was submitted before the vault status was read`,
+    );
+    assert.equal(
+      navigations,
+      0,
+      `${name}: an early unlock does not reload the page`,
+    );
+    assert.equal(page.url(), `${origin}/`, `${name}: the page did not submit`);
+    assert.equal(
+      await page.locator("#password").inputValue(),
+      passphrase,
+      `${name}: an early unlock keeps the typed passphrase`,
+    );
+    assert.equal(await page.locator("#workspace").count(), 0);
+    await page.evaluate(() => window.releaseVaultStatus());
+    await page.locator("#unlock-button").click();
+    await page.locator("#workspace").waitFor();
+    assert.equal(navigations, 0, `${name}: unlocking did not reload the page`);
+    assert.deepEqual(errors, []);
+  } finally {
+    await context.close();
+  }
 };
 let browser;
 for (const [signal, code] of [
@@ -50,6 +109,10 @@ try {
   for (const engine of [chromium, webkit]) {
     browser = await engine.launch();
     try {
+      await checkEarlyUnlock(browser, engine.name());
+      console.log(
+        `${engine.name()}: an unlock submitted before the vault status is read keeps the page and passphrase.`,
+      );
       const page = await browser.newPage({
         viewport: { width: 1100, height: 800 },
       });

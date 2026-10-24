@@ -430,12 +430,16 @@ function guard(fn) {
 }
 const icon = `<span class="brand-icon" aria-hidden="true">${logo}</span>`;
 $("#app").innerHTML =
-  `<div id="notice" role="status" hidden></div><div id="lockscreen"><div class="login-brand">${icon} tailterm <span class="version">PREVIEW 01</span></div><section class="unlock-card"><span class="eyebrow">YOUR PRIVATE TERMINAL WORKSPACE</span><h1>Closer to<br>your servers.</h1><p>A real terminal. Your tailnet. Persistent sessions.<br>Everything you need, right here.</p><form id="unlock">${staticMode ? '<label for="username">Username</label><input id="username" autocomplete="username" maxlength="64" placeholder="Optional for a local-only profile">' : ""}<label for="password">Vault passphrase</label><input id="password" type="password" minlength="14" required autocomplete="current-password" placeholder="At least 14 characters"><button class="primary" id="unlock-button">Unlock workspace <span>↗</span></button></form><p class="fine" id="vault-hint">Checking encrypted vault…</p></section><div class="login-footer"><span>◈ Encrypted at rest</span><span>Powered by Tailscale + WebAssembly</span></div></div>`;
+  `<div id="notice" role="status" hidden></div><div id="lockscreen"><div class="login-brand">${icon} tailterm <span class="version">PREVIEW 01</span></div><section class="unlock-card"><span class="eyebrow">YOUR PRIVATE TERMINAL WORKSPACE</span><h1>Closer to<br>your servers.</h1><p>A real terminal. Your tailnet. Persistent sessions.<br>Everything you need, right here.</p><form id="unlock">${staticMode ? '<label for="username">Username</label><input id="username" autocomplete="username" maxlength="64" placeholder="Optional for a local-only profile">' : ""}<label for="password">Vault passphrase</label><input id="password" type="password" minlength="14" required autocomplete="current-password" placeholder="At least 14 characters"><button class="primary" id="unlock-button" disabled>Unlock workspace <span>↗</span></button></form><p class="fine" id="vault-hint">Checking encrypted vault…</p></section><div class="login-footer"><span>◈ Encrypted at rest</span><span>Powered by Tailscale + WebAssembly</span></div></div>`;
 const inactivity = createInactivityLock({
   enabled: () => staticMode && !!$("#workspace"),
   minutes: () => appearance.idleMinutes,
   lock: guard(lock),
 });
+// Until the vault status has been read the unlock button stays disabled, and
+// any other submit is refused: a native submit would reload the page and drop
+// the typed passphrase.
+$("#unlock").onsubmit = (e) => e.preventDefault();
 const status = await api("/status");
 if ($("#username")) $("#username").value = status.username || "";
 $("#vault-hint").textContent = status.initialized
@@ -464,6 +468,7 @@ $("#unlock").onsubmit = async (e) => {
     btn.disabled = false;
   }
 };
+$("#unlock-button").disabled = false;
 if (status.unlocked) {
   data = await api("/data");
   mount();
