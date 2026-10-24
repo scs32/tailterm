@@ -1483,35 +1483,13 @@ func claudeWakeRetry(ctx context.Context, b runtimeBinding, prompt string, ops c
 		fmt.Fprintf(os.Stderr, "[tt relay] %s %s Claude wake did not confirm after %d retries; exhausted, next cycle after %s\n", now.Format(time.RFC3339), b.Agent, previous.Attempts, claudeWakeCooldown)
 		return true, fmt.Errorf("Claude wake did not confirm after %d retries; needs attention", claudeWakeMaxRetries)
 	}
-	retryAt := previous.RetryAt
-	if retryAt.IsZero() {
-		retryAt = previous.At.Add(claudeWakeBackoff[0])
-	}
-	if now.Before(retryAt) {
+	if retryAt := claudeWakeRetryAt(*previous); now.Before(retryAt) {
 		return true, fmt.Errorf("prior Claude wake unconfirmed; retry %d/%d after %s; did not confirm", previous.Attempts+1, claudeWakeMaxRetries, retryAt.Format(time.RFC3339))
 	}
 	// Enter alone when Claude is idle and its own text is still in the prompt.
-	own, ownErr := ops.inspect(ctx, b, previous.Prompt)
-	if ownErr == nil && own.Pane == previous.Pane && own.Path == previous.Path && own.FileID == previous.FileID && exactClaudeInput(own.Screen, previous.Prompt) && claudeWakeIdle(own, ops.now()) {
-		if found, other, err := claudeWakeScan(*previous); found || other || err != nil {
-			return true, errors.New("Claude transcript changed before retry; did not confirm")
-		}
-		previous.Attempts++
-		previous.Cleared = "" // this attempt cleared nothing
-		claudeWakeSaveReason(previous, fmt.Sprintf("retry %d/%d: Enter on own unsubmitted text", previous.Attempts, claudeWakeMaxRetries))
-		previous.RetryAt = now.Add(claudeWakeBackoffAfter(previous.Attempts))
-		if err := writePrivateJSON(path, previous); err != nil {
-			return true, err
-		}
-		fmt.Fprintf(os.Stderr, "[tt relay] %s %s Claude wake %s\n", now.Format(time.RFC3339), b.Agent, previous.LastRetry)
-		if err := ops.send(ctx, own.Pane, "", false); err != nil {
-			return true, fmt.Errorf("Claude retry Enter failed; did not confirm: %w", err)
-		}
-		previous.EnterAt = ops.now().UTC()
-		if err := writePrivateJSON(path, previous); err != nil {
-			return true, fmt.Errorf("Claude Enter receipt save failed; did not confirm: %w", err)
-		}
-		return true, claudeWakeAwait(ctx, ops, path, previous)
+	own, ownErr, entered, err := claudeWakeEnterOwn(ctx, b, ops, path, previous, now, "")
+	if entered {
+		return true, err
 	}
 	// One retype of the current prompt when the input is empty, Claude is idle
 	// and the transcript still lacks the earlier prompt. Stray terminal replies,
@@ -1549,6 +1527,47 @@ func claudeWakeRetry(ctx context.Context, b runtimeBinding, prompt string, ops c
 	return true, fmt.Errorf("%w: prior wake unconfirmed; %s", errClaudeWakeUnsafe, reason)
 }
 
+// claudeWakeRetryAt is when an unconfirmed intent's next retry is due. An
+// intent saved before RetryAt existed waits the first backoff step from At.
+func claudeWakeRetryAt(intent claudeWakeIntent) time.Time {
+	if intent.RetryAt.IsZero() {
+		return intent.At.Add(claudeWakeBackoff[0])
+	}
+	return intent.RetryAt
+}
+
+// claudeWakeEnterOwn is the Enter-only retry: it presses Enter when the
+// intent's pane and transcript are unchanged, the input holds exactly the
+// saved prompt and Claude is idle. entered=false means the pane did not
+// qualify and nothing was written or sent; own and ownErr are that read.
+// Attempts and RetryAt are saved before the Enter, so a second caller for the
+// same intent finds the retry not due. note is appended to the log line.
+func claudeWakeEnterOwn(ctx context.Context, b runtimeBinding, ops claudeWakeOps, path string, previous *claudeWakeIntent, now time.Time, note string) (own claudeWakeSnapshot, ownErr error, entered bool, err error) {
+	own, ownErr = ops.inspect(ctx, b, previous.Prompt)
+	if ownErr != nil || own.Pane != previous.Pane || own.Path != previous.Path || own.FileID != previous.FileID || !exactClaudeInput(own.Screen, previous.Prompt) || !claudeWakeIdle(own, ops.now()) {
+		return own, ownErr, false, nil
+	}
+	if found, other, err := claudeWakeScan(*previous); found || other || err != nil {
+		return own, nil, true, errors.New("Claude transcript changed before retry; did not confirm")
+	}
+	previous.Attempts++
+	previous.Cleared = "" // this attempt cleared nothing
+	claudeWakeSaveReason(previous, fmt.Sprintf("retry %d/%d: Enter on own unsubmitted text", previous.Attempts, claudeWakeMaxRetries))
+	previous.RetryAt = now.Add(claudeWakeBackoffAfter(previous.Attempts))
+	if err := writePrivateJSON(path, previous); err != nil {
+		return own, nil, true, err
+	}
+	fmt.Fprintf(os.Stderr, "[tt relay] %s %s Claude wake %s%s\n", now.Format(time.RFC3339), b.Agent, previous.LastRetry, note)
+	if err := ops.send(ctx, own.Pane, "", false); err != nil {
+		return own, nil, true, fmt.Errorf("Claude retry Enter failed; did not confirm: %w", err)
+	}
+	previous.EnterAt = ops.now().UTC()
+	if err := writePrivateJSON(path, previous); err != nil {
+		return own, nil, true, fmt.Errorf("Claude Enter receipt save failed; did not confirm: %w", err)
+	}
+	return own, nil, true, claudeWakeAwait(ctx, ops, path, previous)
+}
+
 // claudeWakeBackoffAfter is the wait after the nth attempt (0 = the first
 // wake).
 func claudeWakeBackoffAfter(attempts int) time.Duration {
@@ -1564,7 +1583,13 @@ const (
 	// claudeWakeCheckBound is how long after typing the last such read may
 	// start. Until 2026-10-13 there was one read, at 100 ms; when it failed
 	// the wake stayed typed and unsent for minutes (docs/claude-wake.md).
-	claudeWakeCheckBound = time.Second
+	// Until 2026-10-24 the bound was 1 s; on the loaded host each read took
+	// about 0.3-0.5 s and 119 checks that day ended "input empty" after
+	// 0.9-1.5 s, so 3 s allows about three times those reads.
+	claudeWakeCheckBound = 3 * time.Second
+	// claudeWakeCheckSlow is how long a passing check may take before the
+	// relay logs its time, so draw times past the old bound can be measured.
+	claudeWakeCheckSlow = time.Second
 )
 
 // claudeWakeCheckSaw classifies the last failed read of the typed wake text
@@ -1629,15 +1654,24 @@ func claudeWakeType(ctx context.Context, b runtimeBinding, prompt string, ops cl
 	}
 	// The pane may not have drawn the text yet, so the read for the exact
 	// prompt is repeated inside claudeWakeCheckBound. Only that read passing
-	// leads to Enter; a read that fails leaves the input as it is.
+	// leads to Enter; a read that fails leaves the input as it is, and the
+	// Enter-only retry is due the backoff step after the check ends.
 	var third claudeWakeSnapshot
 	for typed := ops.now(); ; {
 		ops.sleep(claudeWakeCheckStep)
 		if third, err = ops.inspect(ctx, b, prompt); err == nil {
+			if elapsed := ops.now().Sub(typed); elapsed > claudeWakeCheckSlow {
+				fmt.Fprintf(os.Stderr, "[tt relay] %s %s Claude wake text read after %s\n", ops.now().UTC().Format(time.RFC3339), b.Agent, elapsed.Round(time.Millisecond))
+			}
 			break
 		}
 		if elapsed := ops.now().Sub(typed); elapsed+claudeWakeCheckStep > claudeWakeCheckBound || ctx.Err() != nil {
-			return fmt.Errorf("Claude input verification before Enter failed; did not confirm: %s after %s: %w", claudeWakeCheckSaw(err, prompt), elapsed.Round(time.Millisecond), err)
+			checkErr := fmt.Errorf("Claude input verification before Enter failed; did not confirm: %s after %s: %w", claudeWakeCheckSaw(err, prompt), elapsed.Round(time.Millisecond), err)
+			intent.RetryAt = ops.now().UTC().Add(claudeWakeBackoffAfter(intent.Attempts))
+			if err := writePrivateJSON(path, intent); err != nil {
+				return fmt.Errorf("%w (retry schedule save failed: %v)", checkErr, err)
+			}
+			return checkErr
 		}
 	}
 	if !sameClaudeSnapshot(first, third) {
@@ -1679,6 +1713,195 @@ func claudeWakeAwait(ctx context.Context, ops claudeWakeOps, path string, intent
 	}
 }
 
+// claudeWakeDueIntent reads a binding's saved intent and reports whether its
+// Enter-only retry is due: the same run, thread and session, uncertain with
+// typed text, retries left, and now at or past claudeWakeRetryAt. It only
+// reads.
+func claudeWakeDueIntent(b runtimeBinding, now time.Time) (claudeWakeIntent, bool) {
+	var intent claudeWakeIntent
+	data, err := os.ReadFile(claudeWakePath(b))
+	if err != nil || json.Unmarshal(data, &intent) != nil {
+		return claudeWakeIntent{}, false
+	}
+	due := intent.Run == b.Run && intent.Thread == b.Thread && intent.Session == b.Session && intent.Phase == "uncertain" &&
+		intent.Prompt != "" && intent.Pane != "" && intent.Attempts < claudeWakeMaxRetries && !now.Before(claudeWakeRetryAt(intent))
+	return intent, due
+}
+
+// claudeWakeRetryDue runs a due Enter-only retry for one binding without
+// waiting for the relay's next pass over it (the retry watch). It rescans the
+// transcript first, as claudeWakeRetry does: a confirmed wake is saved with no
+// Enter, a wake the transcript moved past is abandoned. Otherwise only
+// claudeWakeEnterOwn may act. A pane that does not show exactly the saved
+// prompt with Claude idle is left alone: no write, no attempt counted, no
+// retype and no clear; those stay with the relay's pass, which knows the
+// current prompt. acted reports that the intent was saved or Enter was
+// pressed. The caller holds claudePaneInput.
+func claudeWakeRetryDue(ctx context.Context, b runtimeBinding, ops claudeWakeOps) (acted bool, err error) {
+	if b.Runtime != "claude" || !validBinding(b) {
+		return false, nil
+	}
+	intent, due := claudeWakeDueIntent(b, ops.now())
+	if !due {
+		return false, nil
+	}
+	path, now := claudeWakePath(b), ops.now().UTC()
+	switch found, other, scanErr := claudeWakeScan(intent); {
+	case found:
+		intent.Phase, intent.ConfirmedAt = "confirmed", now
+		return true, writePrivateJSON(path, intent)
+	case scanErr != nil || other:
+		reason := "a different user turn was submitted"
+		if scanErr != nil {
+			reason = scanErr.Error()
+		}
+		intent.Phase = "abandoned"
+		claudeWakeSaveReason(&intent, "abandoned: "+reason)
+		return true, writePrivateJSON(path, intent)
+	}
+	_, _, entered, err := claudeWakeEnterOwn(ctx, b, ops, path, &intent, now, " (retry watch)")
+	return entered, err
+}
+
+// claudePaneInput serializes the relay's input into Claude panes: the relay
+// pass's wakes (claudeQueue), its stall pass and the retry watch never type
+// into a pane at once. Each rereads the intent under it, so one due retry is
+// taken once.
+var claudePaneInput sync.Mutex
+
+// claudePaneInputHeld marks a context whose caller holds claudePaneInput, so
+// claudeQueue under it does not take the lock again: the stall pass holds it
+// and wakes through claudeQueue.
+type claudePaneInputHeld struct{}
+
 func claudeQueue(ctx context.Context, b runtimeBinding, prompt string) error {
-	return claudeWakeWith(ctx, b, prompt, claudeWakeOps{inspect: nativeClaudeInspect, send: nativeClaudeSend, clear: nativeClaudeClear, sleep: time.Sleep, now: time.Now, escalate: nativeClaudeEscalate})
+	if ctx.Value(claudePaneInputHeld{}) == nil {
+		claudePaneInput.Lock()
+		defer claudePaneInput.Unlock()
+	}
+	return claudeWakeWith(ctx, b, prompt, nativeClaudeWakeOps())
+}
+
+func nativeClaudeWakeOps() claudeWakeOps {
+	return claudeWakeOps{inspect: nativeClaudeInspect, send: nativeClaudeSend, clear: nativeClaudeClear, sleep: time.Sleep, now: time.Now, escalate: nativeClaudeEscalate}
+}
+
+// claudeWakeDueEvery is how often the retry watch looks for a due retry.
+// Until 2026-10-24 a due retry ran only when the relay's pass next called
+// that binding's wake, minutes later on a loaded host (docs/claude-wake.md).
+const claudeWakeDueEvery = 2 * time.Second
+
+// claudeRetryWatch finds due Enter-only retries on its own timer. gate makes
+// the hub reads the relay's pass makes before a wake (an active project, and
+// an agent on this run that is online and not closed, exited or retired) and
+// returns an error when the binding may not be woken or a read failed.
+type claudeRetryWatch struct {
+	dir  string
+	gate func(context.Context, runtimeBinding) error
+	ops  claudeWakeOps
+	lock sync.Locker
+	log  io.Writer
+}
+
+// step runs one pass over the relay's bindings. Only a binding whose intent
+// is due by a local read is considered, so the hub is read only then. A held
+// team (its progress record says so) and any gate refusal or read error skip
+// the binding until the next tick: the watch fails closed. It writes only the
+// intent and its log line, never progress or hub records.
+func (w claudeRetryWatch) step(ctx context.Context) {
+	paths, _ := filepath.Glob(filepath.Join(w.dir, "*.binding.json"))
+	for _, path := range paths {
+		if ctx.Err() != nil {
+			return
+		}
+		var b runtimeBinding
+		if data, err := os.ReadFile(path); err != nil || json.Unmarshal(data, &b) != nil || b.Runtime != "claude" || !validBinding(b) {
+			continue
+		}
+		if _, due := claudeWakeDueIntent(b, w.ops.now()); !due {
+			continue
+		}
+		var progress relayProgress
+		if data, err := os.ReadFile(strings.TrimSuffix(path, ".binding.json") + ".progress.json"); err == nil && json.Unmarshal(data, &progress) == nil && progress.TeamHeld {
+			continue
+		}
+		w.retry(ctx, b)
+	}
+}
+
+// retry gates one due binding and runs its retry under the pane input lock.
+func (w claudeRetryWatch) retry(ctx context.Context, b runtimeBinding) {
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	if w.gate(ctx, b) != nil {
+		return
+	}
+	w.lock.Lock()
+	defer w.lock.Unlock()
+	if _, err := claudeWakeRetryDue(ctx, b, w.ops); err != nil {
+		fmt.Fprintf(w.log, "[tt relay] %s %s Claude retry watch: %v\n", w.ops.now().UTC().Format(time.RFC3339), b.Agent, err)
+	}
+}
+
+// nativeClaudeRetryGate reads this binding's hub for the retry watch.
+func nativeClaudeRetryGate(ctx context.Context, b runtimeBinding) error {
+	e := env{hub: b.Hub}
+	e.loadConfig()
+	c, err := e.client(5 * time.Second)
+	if err != nil {
+		return err
+	}
+	attachRelayBudget(c, activeRelayBudget)
+	return claudeRetryAllowed(ctx, c, b)
+}
+
+// claudeRetryAllowed makes the hub reads the relay's pass makes before a
+// wake: nil only for an active project and an agent on this run that is
+// online and not closed, exited or retired.
+func claudeRetryAllowed(ctx context.Context, c *api.Client, b runtimeBinding) error {
+	if active, err := relayProjectActive(ctx, c, b); err != nil || !active {
+		return errors.Join(err, errors.New("project not active"))
+	}
+	a, err := c.GetAgent(ctx, b.Task, b.Agent)
+	if err != nil {
+		return err
+	}
+	if reason := relayAgentSkipReason(a, b); reason != "" {
+		return errors.New(reason)
+	}
+	return nil
+}
+
+// startClaudeRetryWatch runs the retry watch on its own timer until stop is
+// called, as startHubReachWatch does.
+func startClaudeRetryWatch(dir string) (stop func()) {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	w := claudeRetryWatch{dir: dir, gate: nativeClaudeRetryGate, ops: nativeClaudeWakeOps(), lock: &claudePaneInput, log: os.Stderr}
+	go func() {
+		defer close(done)
+		tick := func() {
+			// A fault in the watch must not take the relay down with it.
+			defer func() {
+				if fault := recover(); fault != nil {
+					fmt.Fprintf(os.Stderr, "[tt relay] Claude retry watch: %v\n", fault)
+				}
+			}()
+			w.step(ctx)
+		}
+		ticker := time.NewTicker(claudeWakeDueEvery)
+		defer ticker.Stop()
+		for {
+			tick()
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+	return func() {
+		cancel()
+		<-done
+	}
 }

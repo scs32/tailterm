@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -3536,6 +3538,10 @@ func (f *lagPane) ops() claudeWakeOps {
 	return ops
 }
 
+// claudeWakeCheckReads is how many reads a check that never passes makes on
+// a pane whose reads take no time.
+const claudeWakeCheckReads = int(claudeWakeCheckBound / claudeWakeCheckStep)
+
 // e3: a prompt the pane draws later than the first read at 100 ms, but inside
 // the bound, is submitted with one Enter. Until 2026-10-13 the single read at
 // 100 ms failed and the wake stayed typed and unsent.
@@ -3550,7 +3556,7 @@ func TestClaudeWakeCheckWaitsForSlowRedraw(t *testing.T) {
 		{"drawn at once", 0, nil, 1},
 		{"empty until 400 ms", 400 * time.Millisecond, func(string) string { return "" }, 4},
 		{"a prefix until 700 ms", 700 * time.Millisecond, func(v string) string { return v[:23] }, 7},
-		{"empty until the bound", claudeWakeCheckBound, func(string) string { return "" }, 10},
+		{"empty until the bound", claudeWakeCheckBound, func(string) string { return "" }, claudeWakeCheckReads},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := &lagPane{strayPane: newStrayPane(t, ""), lag: tc.lag, drawn: tc.drawn}
@@ -3580,17 +3586,18 @@ func TestClaudeWakeCheckGivesUpWithClass(t *testing.T) {
 	const prompt = "Tailterm messages #33359. Run tt inbox --unread --mark-read."
 	const refused = ": Claude input is occupied, prompting, or unknown"
 	const dialog = `Claude pane has a permission or selection prompt: "esc to cancel" in prompt area row 4`
+	bound := claudeWakeCheckBound.String()
 	for _, tc := range []struct {
 		name  string
 		drawn func(string) string
 		fail  error
 		want  string
 	}{
-		{"never drawn", func(string) string { return "" }, nil, "input empty after 1s" + refused},
-		{"part drawn", func(v string) string { return v[:23] }, nil, "input holds a prefix of the prompt (23 of 60 characters) after 1s" + refused},
-		{"one word drawn", func(v string) string { return v[:9] }, nil, "input holds a prefix of the prompt (8 of 60 characters) after 1s" + refused},
-		{"other text", func(v string) string { return "garbled ?1;2c words" }, nil, "input holds other text (19 characters) after 1s" + refused},
-		{"dialog", nil, errors.New(dialog), "input unreadable after 1s: " + dialog},
+		{"never drawn", func(string) string { return "" }, nil, "input empty after " + bound + refused},
+		{"part drawn", func(v string) string { return v[:23] }, nil, "input holds a prefix of the prompt (23 of 60 characters) after " + bound + refused},
+		{"one word drawn", func(v string) string { return v[:9] }, nil, "input holds a prefix of the prompt (8 of 60 characters) after " + bound + refused},
+		{"other text", func(v string) string { return "garbled ?1;2c words" }, nil, "input holds other text (19 characters) after " + bound + refused},
+		{"dialog", nil, errors.New(dialog), "input unreadable after " + bound + ": " + dialog},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := &lagPane{strayPane: newStrayPane(t, ""), lag: time.Hour, drawn: tc.drawn, fail: tc.fail}
@@ -3603,14 +3610,16 @@ func TestClaudeWakeCheckGivesUpWithClass(t *testing.T) {
 			if strings.Contains(err.Error(), "garbled") || strings.Contains(err.Error(), prompt[:8]) {
 				t.Fatalf("error carries pane text: %v", err)
 			}
-			if want := []string{"text:" + prompt}; !slices.Equal(f.sends, want) || len(f.clears) != 0 || f.reads != 10 {
-				t.Fatalf("sends %v, clears %v, reads %d; want only the text and ten reads", f.sends, f.clears, f.reads)
+			if want := []string{"text:" + prompt}; !slices.Equal(f.sends, want) || len(f.clears) != 0 || f.reads != claudeWakeCheckReads {
+				t.Fatalf("sends %v, clears %v, reads %d; want only the text and %d reads", f.sends, f.clears, f.reads, claudeWakeCheckReads)
 			}
 			if turns := f.userTurns(); len(turns) != 0 || f.input != prompt {
 				t.Fatalf("submitted turns %q, input %q", turns, f.input)
 			}
 			got := f.intent(b)
-			if got.Phase != "uncertain" || got.TextAt.IsZero() || !got.EnterAt.IsZero() || f.now.Sub(got.TextAt) != claudeWakeCheckBound {
+			// The Enter-only retry is due the first backoff step after the
+			// check ends, not after the text was typed.
+			if got.Phase != "uncertain" || got.TextAt.IsZero() || !got.EnterAt.IsZero() || f.now.Sub(got.TextAt) != claudeWakeCheckBound || !got.RetryAt.Equal(f.now.UTC().Add(claudeWakeBackoff[0])) {
 				t.Fatalf("intent %+v, check ran %v", got, f.now.Sub(got.TextAt))
 			}
 		})
@@ -3674,15 +3683,418 @@ func TestClaudeWakeCheckLeavesDraftUntouched(t *testing.T) {
 			}
 		}
 		err := claudeWakeWith(context.Background(), b, prompt, ops)
-		const want = "Claude input verification before Enter failed; did not confirm: input holds other text (89 characters) after 1s: Claude input is occupied, prompting, or unknown"
+		want := "Claude input verification before Enter failed; did not confirm: input holds other text (89 characters) after " + claudeWakeCheckBound.String() + ": Claude input is occupied, prompting, or unknown"
 		if err == nil || err.Error() != want {
 			t.Fatalf("error %v, want %s", err, want)
 		}
-		if strings.Contains(err.Error(), "secret") || f.reads != 10 {
+		if strings.Contains(err.Error(), "secret") || f.reads != claudeWakeCheckReads {
 			t.Fatalf("error %v, reads %d", err, f.reads)
 		}
 		if want := []string{"text:" + prompt}; !slices.Equal(f.sends, want) || len(f.clears) != 0 || f.input != prompt+" "+draft || len(f.userTurns()) != 0 {
 			t.Fatalf("sends %v, clears %v, input %q, turns %q", f.sends, f.clears, f.input, f.userTurns())
 		}
 	})
+}
+
+// No test of this package starts the real retry watch: it would read the
+// relay state of this host and type into its panes from its own goroutine.
+func init() { relayClaudeRetryStart = func(string) func() { return func() {} } }
+
+// failedCheckWake types a wake into a lagPane that draws the text only after
+// lag, longer than the check before Enter, so the wake fails that check.
+func failedCheckWake(t *testing.T, b runtimeBinding, prompt string, lag time.Duration) *lagPane {
+	t.Helper()
+	f := &lagPane{strayPane: newStrayPane(t, ""), lag: lag, drawn: func(string) string { return "" }}
+	f.submit = true
+	if err := claudeWakeWith(context.Background(), b, prompt, f.ops()); err == nil || !strings.Contains(err.Error(), "verification before Enter failed") {
+		t.Fatalf("wake: %v", err)
+	}
+	return f
+}
+
+// writeTestBinding saves b where the relay and its retry watch find it.
+func writeTestBinding(t *testing.T, b runtimeBinding) string {
+	t.Helper()
+	path := filepath.Join(relayDir(), bindingKey(b)+".binding.json")
+	if err := writePrivateJSON(path, b); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// retryWatchTicks runs retry watch ticks every claudeWakeDueEvery from start
+// until an Enter is sent, and returns that tick's time and the relay log.
+func retryWatchTicks(t *testing.T, f *lagPane, w claudeRetryWatch, start time.Time, limit time.Duration) (time.Time, string) {
+	t.Helper()
+	for at := start; at.Sub(start) <= limit; at = at.Add(claudeWakeDueEvery) {
+		f.now = at
+		out, _ := captureRelayOutput(t, true, func() error { w.step(context.Background()); return nil })
+		if slices.Contains(f.sends, "Enter") {
+			return at, out
+		}
+		if out != "" {
+			t.Fatalf("tick at %v logged %q with no Enter", at.Sub(start), out)
+		}
+	}
+	t.Fatalf("no Enter within %v of the failed check; sends %v", limit, f.sends)
+	return time.Time{}, ""
+}
+
+// t1 (w3): a pane that draws the wake text 1.5 s after it is typed, past the
+// old 1 s bound, gets one Enter inside the check: confirmed with no retry and
+// no wait for the relay's next pass. The time the read took is logged.
+func TestClaudeWakeCheckReadsTextDrawnAfterOnePointFiveSeconds(t *testing.T) {
+	const prompt = "Tailterm messages #45753. Run tt inbox --unread --mark-read."
+	f := &lagPane{strayPane: newStrayPane(t, ""), lag: 1500 * time.Millisecond, drawn: func(string) string { return "" }}
+	f.submit = true
+	b := testClaudeBinding()
+	out, err := captureRelayOutput(t, true, func() error { return claudeWakeWith(context.Background(), b, prompt, f.ops()) })
+	if err != nil {
+		t.Fatalf("wake: %v", err)
+	}
+	if want := []string{"text:" + prompt, "Enter"}; !slices.Equal(f.sends, want) || f.reads != 15 {
+		t.Fatalf("sends %v reads %d, want one Enter after 15 reads", f.sends, f.reads)
+	}
+	got := f.intent(b)
+	if got.Phase != "confirmed" || got.Attempts != 0 || got.EnterAt.Sub(got.TextAt) != 1500*time.Millisecond {
+		t.Fatalf("intent %+v", got)
+	}
+	if !strings.Contains(out, " "+b.Agent+" Claude wake text read after 1.5s\n") || strings.Contains(out, prompt) {
+		t.Fatalf("relay log %q", out)
+	}
+}
+
+// t2 (w3, w2): a pane that never draws the text gets no Enter; the intent
+// stays uncertain with its Enter-only retry due the first backoff step after
+// the check ends. claudeWakeRetryDue does nothing a millisecond early, presses
+// nothing while the input is still empty, and at RetryAt with the text drawn
+// presses Enter once and confirms.
+func TestClaudeWakeRetryDueAfterTextNeverDrawn(t *testing.T) {
+	const prompt = "Tailterm obligations #45729. Run tt inbox --unread --mark-read. Wake wake_5c71d4f289f748ab."
+	b := testClaudeBinding()
+	f := failedCheckWake(t, b, prompt, time.Hour)
+	checkEnd := f.now
+	got := f.intent(b)
+	if got.Phase != "uncertain" || !got.EnterAt.IsZero() || !got.RetryAt.Equal(checkEnd.UTC().Add(claudeWakeBackoff[0])) || f.input != prompt {
+		t.Fatalf("after the failed check: intent %+v input %q", got, f.input)
+	}
+	saved, _ := os.ReadFile(claudeWakePath(b))
+	unchanged := func(when string) {
+		t.Helper()
+		if now, _ := os.ReadFile(claudeWakePath(b)); string(now) != string(saved) {
+			t.Fatalf("%s: intent changed: %s", when, now)
+		}
+		if want := []string{"text:" + prompt}; !slices.Equal(f.sends, want) || len(f.clears) != 0 {
+			t.Fatalf("%s: sends %v clears %v", when, f.sends, f.clears)
+		}
+	}
+	f.now = got.RetryAt.Add(-time.Millisecond)
+	if acted, err := claudeWakeRetryDue(context.Background(), b, f.ops()); acted || err != nil {
+		t.Fatalf("early: acted %v err %v", acted, err)
+	}
+	unchanged("a millisecond early")
+	f.now = got.RetryAt
+	if acted, err := claudeWakeRetryDue(context.Background(), b, f.ops()); acted || err != nil {
+		t.Fatalf("still empty: acted %v err %v", acted, err)
+	}
+	unchanged("input still empty")
+	f.lag = 0 // the pane has drawn the text by now
+	out, err := captureRelayOutput(t, true, func() error {
+		acted, err := claudeWakeRetryDue(context.Background(), b, f.ops())
+		if !acted {
+			return errors.New("not acted")
+		}
+		return err
+	})
+	if err != nil {
+		t.Fatalf("due: %v", err)
+	}
+	if want := []string{"text:" + prompt, "Enter"}; !slices.Equal(f.sends, want) || !slices.Equal(f.userTurns(), []string{prompt}) {
+		t.Fatalf("sends %v turns %q", f.sends, f.userTurns())
+	}
+	if got := f.intent(b); got.Phase != "confirmed" || got.Attempts != 1 || !got.EnterAt.Equal(got.RetryAt.Add(-claudeWakeBackoff[1])) {
+		t.Fatalf("intent %+v", got)
+	}
+	if !strings.Contains(out, " Claude wake retry 1/4: Enter on own unsubmitted text (retry watch)\n") {
+		t.Fatalf("relay log %q", out)
+	}
+}
+
+// t3 (w1): claudeWakeRetryDue presses Enter only on exactly the relay's own
+// saved text in an unchanged, idle pane. Every other state sends nothing and
+// clears nothing; text the transcript already holds confirms with no Enter.
+func TestClaudeWakeRetryDueNeverEntersUnseenText(t *testing.T) {
+	const prompt = "Tailterm messages #45822. Run tt inbox --unread --mark-read."
+	for _, tc := range []struct {
+		name   string
+		change func(*lagPane, *claudeWakeIntent, *claudeWakeOps)
+		phase  string // the saved phase after the call; "" leaves it unchanged
+	}{
+		{"confirmed intent", func(_ *lagPane, i *claudeWakeIntent, _ *claudeWakeOps) { i.Phase = "confirmed" }, ""},
+		{"abandoned intent", func(_ *lagPane, i *claudeWakeIntent, _ *claudeWakeOps) { i.Phase = "abandoned" }, ""},
+		{"exhausted intent", func(_ *lagPane, i *claudeWakeIntent, _ *claudeWakeOps) { i.Phase = "exhausted" }, ""},
+		{"retries used up", func(_ *lagPane, i *claudeWakeIntent, _ *claudeWakeOps) { i.Attempts = claudeWakeMaxRetries }, ""},
+		{"another run's intent", func(_ *lagPane, i *claudeWakeIntent, _ *claudeWakeOps) { i.Run = "run_0000000000000009" }, ""},
+		{"another session's intent", func(_ *lagPane, i *claudeWakeIntent, _ *claudeWakeOps) { i.Session = "other-claude" }, ""},
+		{"transcript holds the text", func(f *lagPane, _ *claudeWakeIntent, _ *claudeWakeOps) { f.appendUser(prompt); f.input = "" }, "confirmed"},
+		{"another turn submitted", func(f *lagPane, _ *claudeWakeIntent, _ *claudeWakeOps) { f.appendUser("a person's turn") }, "abandoned"},
+		{"a draft after the saved text", func(f *lagPane, _ *claudeWakeIntent, _ *claudeWakeOps) { f.input = prompt + " and an owner draft" }, ""},
+		{"other text", func(f *lagPane, _ *claudeWakeIntent, _ *claudeWakeOps) { f.input = "an owner draft" }, ""},
+		{"a prefix of the text", func(f *lagPane, _ *claudeWakeIntent, _ *claudeWakeOps) { f.input = prompt[:20] }, ""},
+		{"a dialog", func(_ *lagPane, _ *claudeWakeIntent, ops *claudeWakeOps) {
+			ops.inspect = func(context.Context, runtimeBinding, string) (claudeWakeSnapshot, error) {
+				return claudeWakeSnapshot{}, errors.New(`Claude pane has a permission or selection prompt: "esc to cancel"`)
+			}
+		}, ""},
+		{"a passing read whose screen holds more", func(_ *lagPane, _ *claudeWakeIntent, ops *claudeWakeOps) {
+			// The exact-input check stands on its own, behind the read.
+			inspect := ops.inspect
+			ops.inspect = func(ctx context.Context, b runtimeBinding, expected string) (claudeWakeSnapshot, error) {
+				s, err := inspect(ctx, b, expected)
+				s.Screen = "❯ " + prompt + " and an owner draft\n"
+				return s, err
+			}
+		}, ""},
+		{"a busy turn", func(f *lagPane, _ *claudeWakeIntent, _ *claudeWakeOps) { f.busy = true }, ""},
+		{"a changed pane", func(_ *lagPane, _ *claudeWakeIntent, ops *claudeWakeOps) {
+			inspect := ops.inspect
+			ops.inspect = func(ctx context.Context, b runtimeBinding, expected string) (claudeWakeSnapshot, error) {
+				s, err := inspect(ctx, b, expected)
+				s.Pane = "%2"
+				return s, err
+			}
+		}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := testClaudeBinding()
+			f := failedCheckWake(t, b, prompt, time.Hour)
+			f.lag = 0 // drawn: only the change under test may refuse
+			intent := f.intent(b)
+			ops := f.ops()
+			tc.change(f, &intent, &ops)
+			if err := writePrivateJSON(claudeWakePath(b), intent); err != nil {
+				t.Fatal(err)
+			}
+			saved, _ := os.ReadFile(claudeWakePath(b))
+			f.now = intent.RetryAt.Add(time.Second)
+			if _, err := claudeWakeRetryDue(context.Background(), b, ops); err != nil {
+				t.Fatalf("retry due: %v", err)
+			}
+			if want := []string{"text:" + prompt}; !slices.Equal(f.sends, want) || len(f.clears) != 0 {
+				t.Fatalf("sends %v clears %v", f.sends, f.clears)
+			}
+			got, _ := os.ReadFile(claudeWakePath(b))
+			if tc.phase == "" && string(got) != string(saved) {
+				t.Fatalf("intent changed: %s", got)
+			}
+			if tc.phase != "" && f.intent(b).Phase != tc.phase {
+				t.Fatalf("intent %+v, want phase %s", f.intent(b), tc.phase)
+			}
+		})
+	}
+}
+
+// t4 (w2): on both relay paths, a wake that failed the check before Enter is
+// retried by the retry watch within the first backoff step plus one watch
+// tick of the failed check, with no further relay pass. The watch reads the
+// hub only for that due binding.
+func TestClaudeWakeRetryWatchTakesFirstRetryOnBothPaths(t *testing.T) {
+	const lag = 5 * time.Second // drawn after the check, before the retry
+	for _, path := range []string{"broker", "inbox"} {
+		t.Run(path, func(t *testing.T) {
+			b, hub, c, _ := needsInputFixture(t)
+			f := &lagPane{strayPane: newStrayPane(t, ""), lag: lag, drawn: func(string) string { return "" }}
+			f.submit = true
+			writeTestBinding(t, b)
+			queue := func(ctx context.Context, b runtimeBinding, prompt string) error {
+				return claudeWakeWith(ctx, b, prompt, f.ops())
+			}
+			now := time.Date(2026, 10, 24, 22, 37, 51, 0, time.UTC)
+			var p relayProgress
+			hub.update(func(h *needsInputHub) {
+				h.agent.ReadUpTo, h.agent.Unread = 45728, 1
+				if path == "broker" {
+					h.messages = []api.Message{{Seq: 45729, To: b.Agent, From: api.Sender{AgentID: needsInputHandler}, Envelope: &api.Envelope{Kind: api.EnvelopeKindReview, Subject: "Review the candidate"}}}
+					h.jobs = []api.WakeJob{{ID: "wake_5c71d4f289f748ab", LeaseToken: "lease", MessageSeq: 45729, AgentID: b.Agent, RunID: b.Run, Prompt: "Tailterm broker: #45729 review."}}
+				} else {
+					h.messages = []api.Message{{Seq: 45729, To: b.Agent, From: api.Sender{AgentID: needsInputHandler}, Text: "Start saved"}}
+				}
+			})
+			if path == "broker" {
+				if _, err := relayWakeJob(context.Background(), b, &p, c, now, queue); err == nil || len(hub.reports) != 1 || hub.reports[0].Status != "ambiguous" {
+					t.Fatalf("broker wake: %v reports %+v", err, hub.reports)
+				}
+			} else if err := relayOne(context.Background(), b, &p, c, now, queue); err == nil || !strings.Contains(err.Error(), "verification before Enter failed") {
+				t.Fatalf("inbox wake: %v", err)
+			}
+			if want := []string{"text:" + f.typed}; !slices.Equal(f.sends, want) {
+				t.Fatalf("sends %v", f.sends)
+			}
+			hub.takeCalls()
+			checkEnd := f.now
+			w := claudeRetryWatch{dir: relayDir(), gate: func(ctx context.Context, b runtimeBinding) error { return claudeRetryAllowed(ctx, c, b) }, ops: f.ops(), lock: &sync.Mutex{}, log: io.Discard}
+			at, out := retryWatchTicks(t, f, w, checkEnd, 2*claudeWakeBackoff[0])
+			if wait := at.Sub(checkEnd); wait < claudeWakeBackoff[0] || wait > claudeWakeBackoff[0]+claudeWakeDueEvery {
+				t.Fatalf("first retry %v after the failed check, want within %v plus one %v tick", wait, claudeWakeBackoff[0], claudeWakeDueEvery)
+			}
+			if want := []string{"text:" + f.typed, "Enter"}; !slices.Equal(f.sends, want) || !slices.Equal(f.userTurns(), []string{f.typed}) {
+				t.Fatalf("sends %v turns %q", f.sends, f.userTurns())
+			}
+			if got := f.intent(b); got.Phase != "confirmed" || got.Attempts != 1 || !strings.Contains(out, "Enter on own unsubmitted text (retry watch)") {
+				t.Fatalf("intent %+v log %q", got, out)
+			}
+			calls := hub.takeCalls()
+			if len(calls) != 2 || !strings.HasSuffix(calls[0], "/pause") || !strings.Contains(calls[1], "/agents/") {
+				t.Fatalf("watch hub reads %q, want the pause and agent reads once", calls)
+			}
+		})
+	}
+}
+
+// t5: the watch fails closed. A due retry gets no Enter for a retired,
+// offline or superseded agent, a paused project, a held team or a hub read
+// that fails; the next tick after the hub allows it presses Enter once.
+func TestClaudeWakeRetryWatchGates(t *testing.T) {
+	const prompt = "Tailterm messages #45806. Run tt inbox --unread --mark-read."
+	dead := httptest.NewServer(http.NotFoundHandler())
+	deadURL := dead.URL
+	dead.Close()
+	for _, tc := range []struct {
+		name  string
+		block func(*needsInputHub)
+		held  bool
+		dead  bool
+	}{
+		{"agent retired", func(h *needsInputHub) { h.agent.Status = api.AgentRetired }, false, false},
+		{"agent offline", func(h *needsInputHub) { h.agent.Online = false }, false, false},
+		{"run superseded", func(h *needsInputHub) { h.agent.RunID = "run_0000000000000009" }, false, false},
+		{"project paused", func(h *needsInputHub) { h.paused = true }, false, false},
+		{"team held", nil, true, false},
+		{"hub read fails", nil, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b, hub, live, _ := needsInputFixture(t)
+			f := failedCheckWake(t, b, prompt, time.Hour)
+			bindingPath := writeTestBinding(t, b)
+			progressPath := strings.TrimSuffix(bindingPath, ".binding.json") + ".progress.json"
+			c := live
+			if tc.dead {
+				var err error
+				if c, err = api.NewClient(deadURL, time.Second); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.block != nil {
+				hub.update(tc.block)
+			}
+			if tc.held {
+				if err := writePrivateJSON(progressPath, relayProgress{Run: b.Run, Thread: b.Thread, TeamHeld: true}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			f.lag = 0
+			w := claudeRetryWatch{dir: relayDir(), gate: func(ctx context.Context, b runtimeBinding) error { return claudeRetryAllowed(ctx, c, b) }, ops: f.ops(), lock: &sync.Mutex{}, log: io.Discard}
+			saved, _ := os.ReadFile(claudeWakePath(b))
+			due := f.intent(b).RetryAt
+			for tick := 0; tick < 3; tick++ {
+				f.now = due.Add(time.Duration(tick) * claudeWakeDueEvery)
+				w.step(context.Background())
+			}
+			if now, _ := os.ReadFile(claudeWakePath(b)); string(now) != string(saved) || !slices.Equal(f.sends, []string{"text:" + prompt}) {
+				t.Fatalf("refused binding: sends %v intent %s", f.sends, now)
+			}
+			// The hub allows it again: the next tick presses Enter once.
+			c = live
+			hub.update(func(h *needsInputHub) {
+				h.agent.Status, h.agent.Online, h.agent.RunID, h.paused = api.AgentNeedsInput, true, b.Run, false
+			})
+			if err := writePrivateJSON(progressPath, relayProgress{Run: b.Run, Thread: b.Thread}); err != nil {
+				t.Fatal(err)
+			}
+			f.now = f.now.Add(claudeWakeDueEvery)
+			if _, err := captureRelayOutput(t, true, func() error { w.step(context.Background()); w.step(context.Background()); return nil }); err != nil {
+				t.Fatal(err)
+			}
+			if want := []string{"text:" + prompt, "Enter"}; !slices.Equal(f.sends, want) || f.intent(b).Phase != "confirmed" {
+				t.Fatalf("after the gate opened: sends %v intent %+v", f.sends, f.intent(b))
+			}
+		})
+	}
+}
+
+// t6 (S3): the watch types only under claudePaneInput, the relay-wide lock the
+// relay pass's wakes and stall pass hold. A tick that finds a due retry while
+// the lock is held waits, and presses Enter once after it is released.
+func TestClaudeWakeRetryWatchWaitsForPaneInputLock(t *testing.T) {
+	const prompt = "Tailterm messages #45821. Run tt inbox --unread --mark-read."
+	b := testClaudeBinding()
+	f := failedCheckWake(t, b, prompt, time.Hour)
+	writeTestBinding(t, b)
+	f.lag = 0
+	f.now = f.intent(b).RetryAt
+	w := claudeRetryWatch{dir: relayDir(), gate: func(context.Context, runtimeBinding) error { return nil }, ops: f.ops(), lock: &claudePaneInput, log: io.Discard}
+	claudePaneInput.Lock()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		w.step(context.Background())
+	}()
+	select {
+	case <-done:
+		claudePaneInput.Unlock()
+		t.Fatal("the watch ran while the pane input lock was held")
+	case <-time.After(200 * time.Millisecond):
+	}
+	claudePaneInput.Unlock()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the watch did not run after the lock was released")
+	}
+	if want := []string{"text:" + prompt, "Enter"}; !slices.Equal(f.sends, want) || f.intent(b).Phase != "confirmed" {
+		t.Fatalf("sends %v intent %+v", f.sends, f.intent(b))
+	}
+	// The retry was taken once: a second tick finds nothing due.
+	w.step(context.Background())
+	if len(f.sends) != 2 {
+		t.Fatalf("second tick sent again: %v", f.sends)
+	}
+}
+
+// t6 (S3): claudeQueue takes claudePaneInput, so a relay wake waits while the
+// watch or the stall pass holds it. The stall pass holds it and wakes through
+// claudeQueue under a context that says so; that wake does not wait for
+// itself. An invalid binding returns before any pane is read.
+func TestClaudeWakeQueueTakesPaneInputLockOnce(t *testing.T) {
+	claudePaneInput.Lock()
+	held := make(chan error, 1)
+	go func() {
+		held <- claudeQueue(context.WithValue(context.Background(), claudePaneInputHeld{}, true), runtimeBinding{}, "x")
+	}()
+	select {
+	case err := <-held:
+		if err == nil || !strings.Contains(err.Error(), "invalid Claude wake binding") {
+			claudePaneInput.Unlock()
+			t.Fatalf("held wake: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the stall pass's wake waited for the lock its own pass holds")
+	}
+	plain := make(chan error, 1)
+	go func() { plain <- claudeQueue(context.Background(), runtimeBinding{}, "x") }()
+	select {
+	case <-plain:
+		claudePaneInput.Unlock()
+		t.Fatal("a relay wake ran while the pane input lock was held")
+	case <-time.After(200 * time.Millisecond):
+	}
+	claudePaneInput.Unlock()
+	select {
+	case err := <-plain:
+		if err == nil || !strings.Contains(err.Error(), "invalid Claude wake binding") {
+			t.Fatalf("relay wake after release: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the relay wake did not run after the lock was released")
+	}
 }

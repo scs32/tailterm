@@ -1316,6 +1316,8 @@ var (
 	relayLoopPause       = func() bool { time.Sleep(3 * time.Second); return true }
 	// relayHubReachStart starts the hub reachability watch and returns its stop.
 	relayHubReachStart = startHubReachWatch
+	// relayClaudeRetryStart starts the Claude due-retry watch and returns its stop.
+	relayClaudeRetryStart = startClaudeRetryWatch
 )
 
 type relayRotationResult struct {
@@ -1417,6 +1419,9 @@ func cmdRelay(args []string) error {
 		// The watch for a hub this host cannot reach keeps its own timer:
 		// this loop is slowest exactly when the hub does not answer.
 		defer relayHubReachStart(dir)()
+		// A due Claude Enter-only retry runs on its own timer too, not on the
+		// relay's next pass over that binding.
+		defer relayClaudeRetryStart(dir)()
 	}
 	var queueBackoff teamQueuePollBackoff
 	var rotation relayRotationPass
@@ -1567,7 +1572,13 @@ func cmdRelay(args []string) error {
 						// wake it held back is typed in this same pass. The
 						// wrapper notes that wake in the stall record.
 						if relayStallPassDue(b, progress) {
+							// The pass holds claudePaneInput, so the retry
+							// watch never types into a pane it interrupts;
+							// its own wake runs under that hold.
+							ctx := context.WithValue(ctx, claudePaneInputHeld{}, true)
+							claudePaneInput.Lock()
 							claudeStallPass(ctx, b, nativeClaudeStallOps(c))
+							claudePaneInput.Unlock()
 						}
 						queue = claudeStallWake(claudeQueue, time.Now)
 					}
