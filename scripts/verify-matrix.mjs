@@ -2443,9 +2443,17 @@ export const SERIAL_SUITES = new Map([]);
 // Go checks therefore start first, go-race holds two job slots, and non-Go
 // checks run at a lower CPU priority. go-vet took 3 s and only type-checks,
 // so it runs outside the Go lane.
+// npm-unit holds three slots (wi_2a368cb26f29ec41): it runs its test files 12
+// at once, and beside four browser lanes, all at the same nice, it took 330 and
+// 382 s of its 480 s (b0c3ad03 receipts). With three slots two lanes run
+// beside it at 5 jobs; with go-race's two it fills 5 jobs, so nothing else
+// runs beside it while go-race does. It stays at NON_GO_NICE.
 export const isGoCheck = (check) => check.cwd === "hub";
 export const GO_LANE_EXEMPT = new Set(["go-vet"]);
-export const CHECK_WEIGHTS = new Map([["go-race", 2]]);
+export const CHECK_WEIGHTS = new Map([
+  ["go-race", 2],
+  ["npm-unit", 3],
+]);
 export const NON_GO_NICE = 10;
 // A go-race that will shard runs a pool of race test processes: the job for
 // its other packages (go test -p=1, one process) and every shard, at most the
