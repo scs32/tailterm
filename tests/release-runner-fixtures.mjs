@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import {mkdtempSync,mkdirSync,copyFileSync,writeFileSync,readFileSync,chmodSync,existsSync,readdirSync,rmSync,realpathSync,utimesSync} from "node:fs";
+import {cpSync,mkdtempSync,mkdirSync,copyFileSync,writeFileSync,readFileSync,chmodSync,existsSync,readdirSync,rmSync,realpathSync,utimesSync} from "node:fs";
 import {tmpdir} from "node:os";
 import {join,dirname,resolve} from "node:path";
 import {execFileSync,spawn,spawnSync} from "node:child_process";
@@ -357,17 +357,25 @@ export function refusesUnchanged(cwd,j,tag){
 // and tests/ hold small stand-ins for the watched files: commit a, then
 // commit b changing one of them (the runner unless another is named).
 export const CODE_AGENT="agt_c0defixture",CODE_RUN="run_c0defixture",SAFE_TEXT=/^[A-Za-z0-9 ,.:;()_\/-]+$/;
+// Each (real, changed) repository is built once per test process
+// (wi_f60103c0670388c8) and copied per call; the template goes on exit.
+const codeTemplates=new Map();
+process.on("exit",()=>{for(const tpl of codeTemplates.values())rmSync(tpl.cwd,{recursive:true,force:true});});
 export function codeRepo(t,real=false,changed="release-runner.mjs"){
- // The real path: the daemon entry compares its argv with the module's own URL.
- const cwd=realpathSync(mkdtempSync(join(tmpdir(),"release-code-")));t.after(()=>rmSync(cwd,{recursive:true,force:true}));
+ const key=real+"\0"+changed;let tpl=codeTemplates.get(key);
+ if(!tpl){
+ const cwd=realpathSync(mkdtempSync(join(tmpdir(),"release-code-template-")));
  git(cwd,"init","-b","tasks-hub");git(cwd,"config","user.email","fixture@example.invalid");git(cwd,"config","user.name","Fixture");mkdirSync(join(cwd,"scripts"));mkdirSync(join(cwd,"tests"));
  for(const n of RUNNER_CODE_FILES){if(real)copyFileSync(new URL("../scripts/"+n,import.meta.url),join(cwd,"scripts",n));else writeFileSync(join(cwd,"scripts",n),`// ${n} a\n`);}
  git(cwd,"add",".");git(cwd,"commit","-m","a");const a=git(cwd,"rev-parse","HEAD"),codeA=publishedCode(cwd);
  writeFileSync(join(cwd,"scripts",changed),readFileSync(join(cwd,"scripts",changed),"utf8")+"// b\n");git(cwd,"add",".");git(cwd,"commit","-m","b");
- const b=git(cwd,"rev-parse","HEAD"),codeB=publishedCode(cwd);
+ const b=git(cwd,"rev-parse","HEAD"),codeB=publishedCode(cwd);tpl={cwd,a,b,codeA,codeB};codeTemplates.set(key,tpl);
+ }
+ // The real path: the daemon entry compares its argv with the module's own URL.
+ const cwd=realpathSync(mkdtempSync(join(tmpdir(),"release-code-")));t.after(()=>rmSync(cwd,{recursive:true,force:true}));cpSync(tpl.cwd,cwd,{recursive:true});
  // at(head,published): detached at head with tasks-hub at published.
  const at=(head,published)=>{git(cwd,"checkout","--quiet","--detach",head);git(cwd,"update-ref","refs/heads/tasks-hub",published);};
- return {cwd,a,b,codeA,codeB,at,head:()=>git(cwd,"rev-parse","HEAD")};
+ return {cwd,a:tpl.a,b:tpl.b,codeA:structuredClone(tpl.codeA),codeB:structuredClone(tpl.codeB),at,head:()=>git(cwd,"rev-parse","HEAD")};
 }
 // A fake tt that reads its job list from a file on every call, logs each argv
 // as a JSON line, accepts claim, check and send, and fails anything else.
