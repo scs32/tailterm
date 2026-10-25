@@ -10,7 +10,7 @@ import {planRunTimeout,readPrerequisites,provisionWorktreePrerequisites} from ".
 import {createHash} from "node:crypto";
 import {renderTeamDelivery} from "../client/team-delivery-view.js";
 import {targetsForPaths,selectReleaseTargets} from "../scripts/release-targets.mjs";
-import {releaseReply,releaseReplySource,readHostState,git,bufferTT,fixture,change,job,fake,config,miniFixture,hash,stamped,importInputs,hostFixture,manifestFile,reclaimed,otherGeneration,HUB_SERVICE,rehearsalFixture,REPO,composePlan,recorded,schemaRelease,journalFixture,copyOf,sweep,C,DIST,SWEEP_AT,tailosJob,fiveReleased,addDist,distFixture,sweepAt,distRecord,addAttempt,EVIDENCE,BULK,YOUNG,attemptRecord,bulkRecords,remoteHead,goWorktreeFixture,PAIRED,pairedRelease,pairedHost,RUNNER,ignorePrerequisites,placePrerequisites,workedPlan,exitedPid,attemptDir,matrixHost,provisionFixture,until,ended,idle,lockHost,holderEntry,otherHolder,reasonIs,releaseHost,tailosAdapter,MATRIX_A,MATRIX_B,uncoveredReason,changedMatrixHost,matrixChangeRelease,heldRun,three,race,covers,stale,claimed,hubJob,journalAt} from "./release-runner-fixtures.mjs";
+import {releaseReply,releaseReplySource,readHostState,git,bufferTT,fixture,change,job,fake,config,miniFixture,hash,stamped,importInputs,hostFixture,manifestFile,reclaimed,otherGeneration,digestMismatch,oldName,HUB_SERVICE,rehearsalFixture,REPO,composePlan,recorded,schemaRelease,journalFixture,copyOf,sweep,C,DIST,SWEEP_AT,tailosJob,fiveReleased,addDist,distFixture,sweepAt,distRecord,addAttempt,EVIDENCE,BULK,YOUNG,attemptRecord,bulkRecords,remoteHead,goWorktreeFixture,PAIRED,pairedRelease,pairedHost,RUNNER,ignorePrerequisites,placePrerequisites,workedPlan,exitedPid,attemptDir,matrixHost,provisionFixture,until,ended,idle,lockHost,holderEntry,otherHolder,reasonIs,releaseHost,tailosAdapter,MATRIX_A,MATRIX_B,uncoveredReason,changedMatrixHost,matrixChangeRelease,heldRun,three,race,covers,stale,claimed,hubJob,journalAt} from "./release-runner-fixtures.mjs";
 // The real entry point reports progress for --once too: one report before the
 // first read and one after the last call. This fake tt rejects the command
 // (exit 99), so the first report is followed by the one withdraw.
@@ -127,7 +127,7 @@ test("b1 two consecutive jobs share stable config and restore the exact prior-li
   if(id==="rel_second")await assert.rejects(adapter.deploy("mini",artifact),/Synthetic second/);else await adapter.deploy("mini",artifact);
   assert.equal(readFileSync(install,"utf8"),version);
   if(id==="rel_second"){assert.equal(readFileSync(artifact.rollbackPath,"utf8"),"v2");assert.equal(await adapter.rollback("mini"),true);assert.equal(readFileSync(install,"utf8"),"v2");assert.equal(restarts,1,"the journal restore restarts the relay");}
-  writeFileSync(manifest,"{}");assert.throws(()=>adapter.jobInputs(commit),/another generation/);
+  writeFileSync(manifest,"{}");assert.throws(()=>adapter.jobInputs(commit),digestMismatch);
  }
 });
 test("the runner reads the manifest the hub bound for this attempt among those of earlier generations",()=>{
@@ -135,8 +135,8 @@ test("the runner reads the manifest the hub bound for this attempt among those o
  manifestFile(adapter,commit,"rel_selx-g8-inputs.json",{generation:8,attempt:1});bind(second);
  const input=adapter.jobInputs(commit);assert.deepEqual([input.generation,input.attempt],[8,1]);assert.deepEqual(input,JSON.parse(second.raw));
  assert.equal(readFileSync(first.path,"utf8"),first.raw,"the earlier attempt's manifest is only read");assert.deepEqual(readdirSync(dir).sort(),["rel_sel-g3-inputs.json","rel_sel-g8-inputs.json","rel_selx-g8-inputs.json"]);
- // The inputs command's copy under the name without a generation holds the
- // same bytes; the generation-named file is still the one checked and read.
+ // A file under the name without a generation is never used as the manifest:
+ // the generation-named file is checked and read whatever that file holds.
  writeFileSync(join(dir,"rel_sel-inputs.json"),second.raw);assert.deepEqual(adapter.jobInputs(commit),JSON.parse(second.raw));
  writeFileSync(join(dir,"rel_sel-inputs.json"),first.raw);assert.deepEqual(adapter.jobInputs(commit),JSON.parse(second.raw),"an earlier attempt's copy under that name does not matter");
  assert.throws(()=>adapter.jobInputs("e".repeat(40)),e=>failureReason(e)==="Handler input digest binding required");
@@ -151,9 +151,12 @@ test("the runner's inputs request names the manifest and request id of the gener
  assert.ok(field(sends[0],"--ask").includes(`Prepare the private manifest ${join(cwd,"rel_fixture-g8-inputs.json")} for exact job rel_fixture `));assert.ok(field(sends[2],"--ask").includes(join(cwd,"rel_fixture-g11-inputs.json")));
 });
 test("a manifest of another generation or attempt is refused with a named reason",()=>{
- // Only an earlier attempt's manifest exists; the bound one is not there.
+ // Only an earlier attempt's manifest exists, and none hashes to the bound digest.
  let x=reclaimed();manifestFile(x.adapter,x.commit,"rel_sel-g3-inputs.json",{generation:3,attempt:0});x.adapter.job.inputsDigest="e".repeat(64);
- assert.throws(()=>x.adapter.jobInputs(x.commit),otherGeneration);
+ assert.throws(()=>x.adapter.jobInputs(x.commit),digestMismatch);
+ // The bound manifest's bytes changed after the import: the digest is what is refused.
+ x=reclaimed();const bound=manifestFile(x.adapter,x.commit,"rel_sel-g8-inputs.json",{generation:8,attempt:1});x.bind(bound);assert.deepEqual(x.adapter.jobInputs(x.commit),JSON.parse(bound.raw));
+ writeFileSync(bound.path,JSON.stringify({...JSON.parse(bound.raw),targets:{x:1}}));assert.throws(()=>x.adapter.jobInputs(x.commit),digestMismatch);
  // The file named for generation 8 records generation 3.
  x=reclaimed();x.bind(manifestFile(x.adapter,x.commit,"rel_sel-g8-inputs.json",{generation:3,attempt:1}));assert.throws(()=>x.adapter.jobInputs(x.commit),otherGeneration);
  // The recorded generation is not below the job's: the import always moves the job on.
@@ -163,15 +166,16 @@ test("a manifest of another generation or attempt is refused with a named reason
  // With no manifest of any generation the binding itself is what is missing.
  x=reclaimed();x.adapter.job.inputsDigest="e".repeat(64);assert.throws(()=>x.adapter.jobInputs(x.commit),e=>failureReason(e)==="Handler input digest binding required");
 });
-test("a manifest written before names carried a generation is read only when it is the bound one",()=>{
- let x=reclaimed();const old=manifestFile(x.adapter,x.commit,"rel_sel-inputs.json",{});x.bind(old);
- assert.deepEqual(x.adapter.jobInputs(x.commit),JSON.parse(old.raw));assert.equal(x.adapter.backupKey(JSON.parse(old.raw)),"rel_sel");
- // The old name with a generation field is not a manifest of that time.
- x=reclaimed();x.bind(manifestFile(x.adapter,x.commit,"rel_sel-inputs.json",{generation:8,attempt:1}));assert.throws(()=>x.adapter.jobInputs(x.commit),otherGeneration);
+test("a manifest under the name without a generation is refused with its own reason",()=>{
+ let x=reclaimed();x.bind(manifestFile(x.adapter,x.commit,"rel_sel-inputs.json",{}));assert.throws(()=>x.adapter.jobInputs(x.commit),oldName);
+ // The name is what is refused, whatever the file records.
+ x=reclaimed();x.bind(manifestFile(x.adapter,x.commit,"rel_sel-inputs.json",{generation:8,attempt:1}));assert.throws(()=>x.adapter.jobInputs(x.commit),oldName);
+ // A generation-named file beside it that does not hash to the digest changes nothing.
+ x=reclaimed();x.bind(manifestFile(x.adapter,x.commit,"rel_sel-inputs.json",{}));manifestFile(x.adapter,x.commit,"rel_sel-g8-inputs.json",{generation:8,attempt:1});assert.throws(()=>x.adapter.jobInputs(x.commit),oldName);
  // Another digest: not the bound manifest, with or without a later attempt's file beside it.
  x=reclaimed();manifestFile(x.adapter,x.commit,"rel_sel-inputs.json",{});x.adapter.job.inputsDigest="e".repeat(64);
  assert.throws(()=>x.adapter.jobInputs(x.commit),e=>failureReason(e)==="Handler input digest binding required");
- manifestFile(x.adapter,x.commit,"rel_sel-g8-inputs.json",{generation:8,attempt:1});assert.throws(()=>x.adapter.jobInputs(x.commit),otherGeneration);
+ manifestFile(x.adapter,x.commit,"rel_sel-g8-inputs.json",{generation:8,attempt:1});assert.throws(()=>x.adapter.jobInputs(x.commit),digestMismatch);
 });
 test("b1 schema rehearsal builds the exact candidate binary for the Linux container and rejects stale job backups",async()=>{
  const {f,home,config}=hostFixture();const commit=change(f,"hub/internal/store/migrate.go","candidate schema"),id="rel_schema";

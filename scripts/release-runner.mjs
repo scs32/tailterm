@@ -1828,8 +1828,9 @@ export class HostAdapter {
   // hash to the hub's digest. The hub does not keep the generation it was
   // imported at and this run's own is later, so the name is found, not built.
   // The file must record its name's generation, which is below the job's, and
-  // this attempt (the count of set-asides and requeues). A manifest written
-  // before names carried a generation is still read when it is the bound one.
+  // this attempt (the count of set-asides and requeues). ID-inputs.json, the
+  // name before names carried a generation, is never used as the manifest; it
+  // only gets its own refusal.
   jobInputs(commit){
     if(this.job.inputsCommit!==commit)throw releaseError("Handler input digest binding required");
     const dir=this.config.journalDirectory,keyed=[];
@@ -1839,10 +1840,15 @@ export class HostAdapter {
     }
     const bound=path=>{try{return lstatSync(path).isFile() && fileDigest(path)===this.job.inputsDigest;}catch{return false;}};
     const other=()=>releaseError("Input manifest bound to another generation");
-    const found=keyed.sort((a,b)=>b.generation-a.generation).find(f=>bound(f.path)),legacy=join(dir,this.job.id+"-inputs.json");
-    if(!found && !bound(legacy))throw keyed.length?other():releaseError("Handler input digest binding required");
-    const input=JSON.parse(readFileSync(found?found.path:legacy,"utf8"));
-    if(found?input.generation!==found.generation || !(input.generation<this.job.generation) || input.attempt!==(this.job.reconciliations?.length||0):input.generation!==undefined)throw other();
+    const found=keyed.sort((a,b)=>b.generation-a.generation).find(f=>bound(f.path));
+    if(!found){
+      // No file hashes to the digest: a bound manifest whose bytes changed and
+      // one never written look the same, as the hub keeps no generation.
+      if(bound(join(dir,this.job.id+"-inputs.json")))throw releaseError("Input manifest has no generation in its name");
+      throw keyed.length?releaseError("Input manifest digest mismatch"):releaseError("Handler input digest binding required");
+    }
+    const input=JSON.parse(readFileSync(found.path,"utf8"));
+    if(input.generation!==found.generation || !(input.generation<this.job.generation) || input.attempt!==(this.job.reconciliations?.length||0))throw other();
     if(input.version!==1 || input.jobId!==this.job.id || input.commit!==commit || input.acceptedCommit!==this.job.commit || input.verificationDigest!==this.job.verificationDigest)throw releaseError("Exact job input binding required");
     // Two TrueNAS plans made before either deploy would each pin the other's
     // pre-release mount, so hub and bridge together must share one plan.
@@ -1853,9 +1859,8 @@ export class HostAdapter {
     if(hub && bridge && (!same(hub.planTargets,PAIR) || !same(bridge.planTargets,PAIR) || ["release","planPath","preflightReceipt","preflightReceiptSHA256","backup","backupSHA256"].some(k=>hub[k]!==bridge[k])))throw releaseError("Hub and bridge need one paired plan");
     return input;
   }
-  // What a job's backup destination must contain: the job and, for a manifest
-  // that records one, its generation.
-  backupKey(input){return input.generation===undefined?this.job.id:`${this.job.id}-g${input.generation}-`;}
+  // What a job's backup destination must contain: the job and its generation.
+  backupKey(input){return `${this.job.id}-g${input.generation}-`;}
   captureMiniRollback(artifact){
     const path=join(this.config.journalDirectory,this.job.id+"-mini-before");
     copyFileSync(artifact.installPath,path,constants.COPYFILE_EXCL);

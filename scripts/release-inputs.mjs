@@ -12,9 +12,7 @@
 // recording that generation and the attempt, and prints the exact
 // `tt deployment inputs` command to import its digest. Run again at the same
 // generation it returns the written manifest, or finishes a set a failed run
-// left. It also leaves the same bytes at journalDirectory/ID-inputs.json when
-// no file has that name, for a deployer still running the scripts from before
-// names carried a generation. --dry-run reads the job and prints the planned bindings without host
+// left. --dry-run reads the job and prints the planned bindings without host
 // calls or writes. Nothing printed carries credentials or captured program
 // output.
 import { createHash } from "node:crypto";
@@ -180,11 +178,6 @@ export async function buildInputs(config, jobId, { dryRun = false, deps }) {
   // attempt. The attempt is the count of set-asides and requeues so far.
   const key = `${job.id}-g${job.generation}`;
   const dir = config.journalDirectory, manifestPath = join(dir, `${key}-inputs.json`);
-  // A deployer that loaded its scripts before names carried a generation reads
-  // only ID-inputs.json and checks its digest. It gets the manifest's bytes
-  // under that name when the name is free; a file already there belongs to an
-  // earlier attempt and is left as it is.
-  const unkeyedCopy = raw => { try { writePrivate(join(dir, `${job.id}-inputs.json`), raw); } catch (error) { if (error.code !== "EEXIST") throw error; } };
   const command = [config.tt || "tt", "deployment", "inputs", "--job", job.id, "--generation", String(job.generation), "--commit", commit, "--file", manifestPath, "--request-id", `${key}-inputs-${commit.slice(0, 12)}`];
   const binding = { version: 1, jobId: job.id, generation: job.generation, attempt: job.reconciliations?.length || 0, commit, acceptedCommit: job.commit, verificationDigest: job.verificationDigest };
   // Hub and bridge selected together share ONE plan, release and backup:
@@ -205,7 +198,6 @@ export async function buildInputs(config, jobId, { dryRun = false, deps }) {
     const raw = readFileSync(manifestPath, "utf8");
     let written; try { written = JSON.parse(raw); } catch {}
     if (!written || Object.keys(binding).some(k => written[k] !== binding[k]) || !written.targets || typeof written.targets !== "object") throw new Error("Job manifest already written for this generation with a different binding");
-    unkeyedCopy(raw);
     return { manifest: manifestPath, sha256: createHash("sha256").update(raw).digest("hex"), targets: Object.keys(written.targets), command };
   }
   const live = {};
@@ -261,7 +253,6 @@ export async function buildInputs(config, jobId, { dryRun = false, deps }) {
   }
   const raw = JSON.stringify({ ...binding, targets });
   writePrivate(manifestPath, raw);
-  unkeyedCopy(raw);
   return { manifest: manifestPath, sha256: createHash("sha256").update(raw).digest("hex"), targets: Object.keys(targets), command };
 }
 

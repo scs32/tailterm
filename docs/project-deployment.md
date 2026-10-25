@@ -43,7 +43,7 @@ bases, conflicts, verification mismatches and release-ref races. A changed SHA
 waits before publication for a separate handler-imported release verification
 receipt covering the approved matrix on that exact integrated commit. The
 waiting-matrix journal can resume only with the same clean detached commit;
-other unfinished journals require reconciliation. Exact-job host inputs also wait before publication for a handler-imported digest (`tt deployment inputs --job ID --generation N --commit SHA --file PRIVATE_MANIFEST`). The manifest at `journalDirectory/ID-gN-inputs.json` (N is the job generation the handler's inputs run read) binds version 1, jobId, that generation, the attempt, acceptedCommit, integrated commit, verificationDigest and per-target inputs; its raw-byte SHA is immutable for that job generation. The runner uses the generation-named manifest whose bytes hash to the imported digest and refuses one that records another generation or attempt (see "Handler inputs procedure"). A lost final-receipt response retains receipt_pending and retries the same write-once receipt without rolling back live-verified targets; saved hub receipts reconcile that local pending state. The daemon prioritizes its own waiting claim and refuses a later release while another claim or blocked fence remains; when a later job is waiting it posts a fence-wait notice, and a waiting claim with no effects can be set aside (see "Setting aside a job that holds the fence"). The release branch update
+other unfinished journals require reconciliation. Exact-job host inputs also wait before publication for a handler-imported digest (`tt deployment inputs --job ID --generation N --commit SHA --file PRIVATE_MANIFEST`). The manifest at `journalDirectory/ID-gN-inputs.json` (N is the job generation the handler's inputs run read) binds version 1, jobId, that generation, the attempt, acceptedCommit, integrated commit, verificationDigest and per-target inputs; its raw-byte SHA is immutable for that job generation. The runner uses the generation-named manifest whose bytes hash to the imported digest and refuses one that records another generation or attempt, and refuses with a digest-mismatch reason when no generation-named manifest hashes to that digest (see "Handler inputs procedure"). A lost final-receipt response retains receipt_pending and retries the same write-once receipt without rolling back live-verified targets; saved hub receipts reconcile that local pending state. The daemon prioritizes its own waiting claim and refuses a later release while another claim or blocked fence remains; when a later job is waiting it posts a fence-wait notice, and a waiting claim with no effects can be set aside (see "Setting aside a job that holds the fence"). The release branch update
 uses Git compare-and-swap, and after every selected target is live-verified the
 runner fast-forward pushes `tasks-hub` to `origin` (see "Effects on tasks-hub").
 
@@ -2036,7 +2036,6 @@ and the generation N the inputs run read from the hub, the same N it prints as
 | Manifest | `journalDirectory/ID-gN-inputs.json` |
 | Plan | `journalDirectory/ID-gN-NAME-plan.json` |
 | Preflight receipt | `journalDirectory/ID-gN-NAME-preflight.json` |
-| Manifest copy for a deployer on the earlier scripts | `journalDirectory/ID-inputs.json` (only when absent) |
 | Local backup copy (schema change only) | `journalDirectory/ID-gN-NAME-backup.sqlite` |
 | TrueNAS backup | `backups/before-ID-gN-NAME.sqlite` |
 | Preflight request id | `ID-gN-NAME-backup` |
@@ -2073,28 +2072,14 @@ aside or requeued, the length of its `reconciliations`).
   hash to the job's `inputsDigest`. It refuses with "Input manifest bound to
   another generation" when that file records a generation other than its
   name's, a generation that is not below the job's current one, or another
-  attempt, and when only manifests of other generations exist. With no
-  generation-named manifest at all the refusal is "Handler input digest
-  binding required". A manifest that records a generation must also name a
+  attempt. When generation-named manifests exist but none hashes to the
+  digest, for example a bound manifest whose bytes changed, the refusal is
+  "Input manifest digest mismatch"; with no generation-named manifest at all
+  it is "Handler input digest binding required". A file named
+  `ID-inputs.json` (from scripts before names carried a generation) is never
+  used as the manifest. When it is the only file with the bound digest, the refusal is "Input
+  manifest has no generation in its name". The manifest must also name a
   backup containing `ID-gN-`.
-- **Transition: a manifest from before this change.** `ID-inputs.json` with no
-  `generation` field is still used when it hashes to the imported digest and
-  no generation-named manifest does, so a job already bound when the deployer
-  restarts goes on unchanged. The same file with a `generation` field and no
-  generation-named manifest of that digest, or another digest, is refused.
-- **Transition: a deployer still on the earlier scripts.** The inputs command
-  runs from the deployer's checkout, which the runner moves to the candidate
-  before it asks for inputs, while the running deployer keeps the scripts it
-  loaded until it restarts. Those earlier scripts read only `ID-inputs.json`
-  and check its digest. So after writing (or finding) `ID-gN-inputs.json` the
-  inputs command also creates `ID-inputs.json` with the same bytes, mode 0600,
-  when no file has that name. The printed command still imports the
-  generation-named path, and a runner with this change still selects that file
-  by digest. A file already named `ID-inputs.json` belongs to an earlier
-  attempt: it is never rewritten, renamed or removed, and is not an error; an
-  earlier-scripts deployer would refuse that retried job, as before this
-  change. The copy is a transition aid and can be dropped once no deployer
-  runs the earlier scripts.
 
 ### Migration rehearsal container (wi_78521ba68a8ad197)
 

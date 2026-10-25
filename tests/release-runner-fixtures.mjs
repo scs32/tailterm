@@ -99,6 +99,8 @@ export function reclaimed(){
  return {commit,adapter,dir:adapter.config.journalDirectory,bind:file=>{adapter.job.inputsDigest=file.digest;}};
 }
 export const otherGeneration=e=>failureReason(e)==="Input manifest bound to another generation" && failureDetail(e).text==="Input manifest bound to another generation";
+export const digestMismatch=e=>failureReason(e)==="Input manifest digest mismatch" && failureDetail(e).text==="Input manifest digest mismatch";
+export const oldName=e=>failureReason(e)==="Input manifest has no generation in its name" && failureDetail(e).text==="Input manifest has no generation in its name";
 // The production hub service as hub_compose prints it for a plain plan.
 export const HUB_SERVICE={image:"gcr.io/distroless/static-debian12:nonroot",user:"950:950",restart:"unless-stopped",entrypoint:["/opt/tailterm-hub"],read_only:true,cap_drop:["ALL"],security_opt:["no-new-privileges:true"],ports:["100.116.238.37:18765:18765"],
  environment:{TAILTERM_TCP_LISTEN:"0.0.0.0:18765",TAILTERM_STATE:"/state",SQLITE_TMPDIR:"/state",TAILTERM_TOKEN_FILE:"/run/hub-token",TAILTERM_MAX_AGENTS:"32"},

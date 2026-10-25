@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync, existsSync, readdirSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync, existsSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { releaseBaselines } from "../scripts/release-targets.mjs";
@@ -83,7 +83,7 @@ test("a store change deploys hub and bridge from ONE plan and backup with each t
   assert.ok(!planText.includes("rel_prev-111111111111-hub") && !planText.includes("20260929-live"), "no live release is pinned");
   assert.deepEqual(m.targets.mini, { release: `rel_0123abcd-${sha12}-mini`, rollbackSafe: true, rollbackProbe: ["node", "scripts/release-probe.mjs", "rollback", "mini", "--expect-sha", "4".repeat(64), "--config", f.deps.configPath] });
   assert.ok(!raw.includes(SECRET) && !JSON.stringify(out).includes(SECRET));
-  assert.deepEqual(readdirSync(f.home).filter(n => n !== "plan-template.json").sort(), [...["inputs.json", "truenas-backup.sqlite", "truenas-plan.json", "truenas-preflight.json"].map(n => "rel_0123abcd-g4-" + n), UNKEYED], "every file but the transition copy carries the job and generation");
+  assert.deepEqual(readdirSync(f.home).filter(n => n !== "plan-template.json").sort(), [...["inputs.json", "truenas-backup.sqlite", "truenas-plan.json", "truenas-preflight.json"].map(n => "rel_0123abcd-g4-" + n)], "every file carries the job and generation");
 });
 
 test("a single changed TrueNAS target gets its own plan pinning the live partner", async () => {
@@ -158,18 +158,6 @@ test("dry run prints the planned bindings with no host call or write", async () 
 // Every file in a journal directory, as its bytes' hash and mode.
 const journalFiles = home => Object.fromEntries(readdirSync(home).sort().map(n => [n, { sha256: hash(readFileSync(join(home, n))), mode: statSync(join(home, n)).mode & 0o777 }]));
 const SET = ["inputs.json", "truenas-backup.sqlite", "truenas-plan.json", "truenas-preflight.json"], UNKEYED = "rel_0123abcd-inputs.json";
-// What the runner from before names carried a generation requires of
-// ID-inputs.json (its jobInputs and its backup identity check), restated here
-// because that runner is the deployer's loaded code until it restarts.
-function earlierRunnerReads(home, job, commit, inputsDigest) {
-  const path = join(home, job.id + "-inputs.json"), input = JSON.parse(readFileSync(path, "utf8"));
-  assert.equal(hash(readFileSync(path)), inputsDigest, "the file hashes to the imported digest");
-  assert.deepEqual([input.version, input.jobId, input.commit, input.acceptedCommit, input.verificationDigest], [1, job.id, commit, job.commit, job.verificationDigest]);
-  const { hub, bridge } = input.targets;
-  if (hub && bridge) for (const k of ["release", "planPath", "preflightReceipt", "preflightReceiptSHA256", "backup", "backupSHA256"]) assert.equal(hub[k], bridge[k], k);
-  for (const t of [hub, bridge].filter(Boolean)) { assert.equal(t.backupJobId, job.id); assert.ok(t.backup.includes(job.id)); }
-  return input;
-}
 const hostCalls = f => f.calls.filter(c => c[0] !== "tt");
 // The job as the hub shows it once it was set aside and claimed again with a
 // freshly verified commit: one reconciliation and a later generation.
@@ -178,10 +166,10 @@ function reclaim(f, generation) { f.job.commit = commitFile(f.r, "hub/internal/s
 test("a job set aside and claimed again writes a fresh set and leaves the earlier attempt's files as they were", async () => {
   const f = setup("hub/internal/store/x.go"); f.job.generation = 3;
   const first = await buildInputs(f.config, f.job.id, { deps: f.deps }), before = journalFiles(f.home);
-  assert.deepEqual(Object.keys(before), ["plan-template.json", ...SET.map(n => "rel_0123abcd-g3-" + n), UNKEYED]);
-  assert.equal(before[UNKEYED].sha256, first.sha256, "the first attempt's transition copy");
+  assert.deepEqual(Object.keys(before), ["plan-template.json", ...SET.map(n => "rel_0123abcd-g3-" + n)]);
+  assert.ok(!existsSync(join(f.home, UNKEYED)));
   const commit = reclaim(f, 8), second = await buildInputs(f.config, f.job.id, { deps: f.deps }), after = journalFiles(f.home);
-  assert.deepEqual(Object.keys(after).sort(), ["plan-template.json", ...SET.map(n => "rel_0123abcd-g3-" + n), ...SET.map(n => "rel_0123abcd-g8-" + n), UNKEYED].sort());
+  assert.deepEqual(Object.keys(after).sort(), ["plan-template.json", ...SET.map(n => "rel_0123abcd-g3-" + n), ...SET.map(n => "rel_0123abcd-g8-" + n)].sort());
   for (const [name, was] of Object.entries(before)) assert.deepEqual(after[name], was, name + " keeps its bytes and mode");
   for (const n of SET.filter(n => n !== "truenas-preflight.json")) assert.equal(after["rel_0123abcd-g8-" + n].mode, 0o600, n);
   assert.equal(second.manifest, join(f.home, "rel_0123abcd-g8-inputs.json")); assert.notEqual(second.sha256, first.sha256);
@@ -230,14 +218,12 @@ test("a run that failed in preflight is finished at the same generation with the
   assert.deepEqual(journalFiles(g.home)["rel_0123abcd-g4-truenas-plan.json"], kept["rel_0123abcd-g4-truenas-plan.json"]); assert.ok(!g.calls.some(c => c[0] === "preflight")); assert.ok(!existsSync(join(g.home, "rel_0123abcd-g4-inputs.json")));
 });
 
-test("the manifest's bytes are also left under the name without a generation when that name is free", async () => {
+test("no manifest copy is written under the name without a generation", async () => {
   const f = setup("hub/internal/store/x.go");
   const out = await buildInputs(f.config, f.job.id, { deps: f.deps }), copy = join(f.home, UNKEYED);
-  assert.ok(readFileSync(copy).equals(readFileSync(out.manifest))); assert.equal(statSync(copy).mode & 0o777, 0o600); assert.equal(out.command[out.command.indexOf("--file") + 1], out.manifest, "the keyed manifest is what is imported");
-  assert.equal(earlierRunnerReads(f.home, f.job, f.commit, out.sha256).generation, 4);
-  // Run again: neither file changes, and a missing copy is put back.
-  const files = journalFiles(f.home); assert.deepEqual(await buildInputs(f.config, f.job.id, { deps: f.deps }), out); assert.deepEqual(journalFiles(f.home), files);
-  rmSync(copy); assert.deepEqual(await buildInputs(f.config, f.job.id, { deps: f.deps }), out); assert.deepEqual(journalFiles(f.home), files);
+  assert.ok(!existsSync(copy)); assert.equal(out.command[out.command.indexOf("--file") + 1], out.manifest, "the keyed manifest is what is imported");
+  // Run again: no journal file changes and still no copy.
+  const files = journalFiles(f.home); assert.deepEqual(await buildInputs(f.config, f.job.id, { deps: f.deps }), out); assert.deepEqual(journalFiles(f.home), files); assert.ok(!existsSync(copy));
   // A file of that name from an earlier attempt stays as it is, whatever it holds, and the run succeeds.
   const g = setup("hub/internal/store/x.go"), earlier = join(g.home, UNKEYED); writeFileSync(earlier, "an earlier attempt's manifest", { mode: 0o640 }); const was = journalFiles(g.home)[UNKEYED];
   reclaim(g, 8); const second = await buildInputs(g.config, g.job.id, { deps: g.deps });
