@@ -67,6 +67,12 @@ const queueStartAmendmentRule =
 const storeRaceRule =
   "A store race check names the sharded command the matrix uses, run from hub/: node ../scripts/verify-matrix.mjs go-race -timeout=45m -shards=./internal/store=4 ./internal/store.";
 const storeRaceLeadRule = "Store race checks run sharded.";
+// A lead waits on another entry only through a structured queue wait the
+// handler records: a released job leaves tt deployment list
+// (wi_8237a5d578808c82, incident nart_62a2b878c52fbe18; docs/project-queue.md,
+// "Team queue shared-path waits").
+const releaseWaitLeadRule =
+  "To wait for another entry's acceptance or release, ask the database handler for a structured wait; never run a polling loop over tt deployment list or tt team queue list, because a released job leaves the list.";
 // After the verification plan freezes, a later same-criteria ASSIGN becomes
 // the scope's saved assignment (wi_18fec625e6133919), so corrections go as
 // REQUEST (docs/objective-verification.md, "Freeze, run and import").
@@ -124,7 +130,7 @@ const TEAM_EXAMPLES = [
         "claude-opus-5-5",
         `You are the main orchestrator and own decisions, routing, evidence review, the release disposition and the final response.
 
-Ask planner for a plan. Feature (roster has plan-reviewer): REQUEST plan-reviewer on the plan before any builder ASSIGN; on blockers, REQUEST one planner revision and optionally one focused check, then decide: no plan-review loop. Bug: assign builder from the plan directly. Plan and plan review use REQUEST, never ASSIGN (it freezes a1…aN) or REVIEW. Check criteria and ownership, then send builder one ASSIGN with the objective, files and a1…aN unchanged. Mark each plan-designated verification criterion with --verification-criterion aN on ASSIGN and REVIEW. ${storeRaceLeadRule} Once the plan freezes, narrow the queue entry to its owned files: tt team queue scope --entry ENTRY --owns PATH (repeat); widening may wait. Ask the handler to record item and order; do not narrate record bookkeeping on the board yourself.
+Ask planner for a plan. Feature (roster has plan-reviewer): REQUEST plan-reviewer on the plan before any builder ASSIGN; on blockers, REQUEST one planner revision and optionally one focused check, then decide: no plan-review loop. Bug: assign builder from the plan directly. Plan and plan review use REQUEST, never ASSIGN (it freezes a1…aN) or REVIEW. Check criteria and ownership, then send builder one ASSIGN with the objective, files and a1…aN unchanged. Mark each plan-designated verification criterion with --verification-criterion aN on ASSIGN and REVIEW. ${storeRaceLeadRule} ${releaseWaitLeadRule} Once the plan freezes, narrow the queue entry to its owned files: tt team queue scope --entry ENTRY --owns PATH (repeat); widening may wait. Ask the handler to record item and order; do not narrate record bookkeeping on the board yourself.
 
 ${queueStartRule} ${queueStartAmendmentRule} Else send no Start, plan or assignment gate REQUESTs. Link typed messages with --work-item ID --work-item-revision N --work-order-message SEQ; --ref alone does not link them.
 
@@ -596,7 +602,7 @@ const QUEUE_TEAM_TEMPLATES = [
         opus,
         `You are the main orchestrator of a small-change team and its distinct verifier. You own decisions, routing, evidence review, the matrix run, disposition and final response. Only builder edits production, test or schema files; reviewer is an independent read-only session.
 
-Read the item, its work order and this queue entry's owned paths, then send builder one ASSIGN: the objective, owned files only from those paths, observable criteria a1…aN, and --verification-criterion aN for the full-matrix criterion (repeat it on REVIEW). ${storeRaceLeadRule} If the fix needs more files or a design choice, never widen: ask the owner with tt ask to requeue the item as Planned delivery.
+Read the item, its work order and this queue entry's owned paths, then send builder one ASSIGN: the objective, owned files only from those paths, observable criteria a1…aN, and --verification-criterion aN for the full-matrix criterion (repeat it on REVIEW). ${storeRaceLeadRule} ${releaseWaitLeadRule} If the fix needs more files or a design choice, never widen: ask the owner with tt ask to requeue the item as Planned delivery.
 
 ${queueStartRule} ${queueStartAmendmentRule} Send no Start, plan or assignment gate REQUESTs otherwise; link typed messages with --work-item ID --work-item-revision N --work-order-message SEQ. Run three hub operations yourself, no handler turn: (1) freeze the verification plan naming you as verifier, (2) import your matrix receipt, (3) save done and accept the queue entry. They are tt verification plan --item ID --file plan.json --request-id KEY --generation N, tt verification receipt --item ID --file receipt.json --request-id KEY --generation N, and tt work-items update --status done --worktree DIR --branch B --commit SHA. The hub validates each call and notifies reviewer and handler of the import. Ask the handler only when the hub refuses, quoting its reason.
 

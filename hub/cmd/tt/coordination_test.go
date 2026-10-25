@@ -1205,11 +1205,12 @@ func TestBriefingNamesLeadAndVerifierOperationException(t *testing.T) {
 	}
 }
 
-// wi_44cabd7e6233bc1b: the primary handler records shared-path sequencing as
-// a structured queue wait, and the browser handler prompt in
-// client/project-handler.js carries the same sentences.
+// wi_44cabd7e6233bc1b, wi_8237a5d578808c82: the primary handler records
+// shared-path sequencing and pathless pauses as a structured queue wait, and
+// the browser handler prompt in client/project-handler.js carries the same
+// sentences.
 func TestPrimaryHandlerGuidanceRecordsSharedPathWaits(t *testing.T) {
-	const rule = "Shared-path sequencing: when one team must wait for a path another team owns, record a structured wait with tt team queue wait set --entry WAITING_ENTRY --on PREDECESSOR_ENTRY --owns PATH --until accepted|done|released, not only a sequencing note; the hub then tells the waiting lead once when the condition is met. When the hub reports a wait that needs a handler decision, clear it with tt team queue wait clear --entry WAITING_ENTRY --on PREDECESSOR_ENTRY and tell the waiting lead, or set a new wait."
+	const rule = "Shared-path sequencing: when one team must wait for a path another team owns, record a structured wait with tt team queue wait set --entry WAITING_ENTRY --on PREDECESSOR_ENTRY --owns PATH --until accepted|done|released, not only a sequencing note; the hub then tells the waiting lead once when the condition is met. For a pause that shares no path, such as a quiet host for a release, use --reason TEXT in place of --owns PATH. When the hub reports a wait that needs a handler decision, clear it with tt team queue wait clear --entry WAITING_ENTRY --on PREDECESSOR_ENTRY and tell the waiting lead, or set a new wait."
 	if handlerWaitRule != rule {
 		t.Fatalf("wait rule changed: %q", handlerWaitRule)
 	}

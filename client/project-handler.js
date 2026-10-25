@@ -15,10 +15,11 @@ const handlerEvidenceRule =
   "Record a recurrence, log reference or other evidence on an existing item with tt work-items note --request-id KEY --title T --body-file F WI_ID: it changes neither the item revision nor the scope revision. Never append evidence to the description of an accepted or released item. The hub refuses a title or description change while an accepted candidate awaits release; pass --scope-change only for a recorded scope amendment, because it invalidates that release.";
 // Shared-path sequencing is recorded as a structured queue wait, which the
 // hub answers with one notice to the waiting lead (wi_44cabd7e6233bc1b,
-// docs/project-queue.md). hub/cmd/tt/coordination.go (handlerWaitRule)
+// docs/project-queue.md); a pause that shares no path is a pathless wait with
+// --reason (wi_8237a5d578808c82). hub/cmd/tt/coordination.go (handlerWaitRule)
 // carries the same sentences.
 const handlerWaitRule =
-  "Shared-path sequencing: when one team must wait for a path another team owns, record a structured wait with tt team queue wait set --entry WAITING_ENTRY --on PREDECESSOR_ENTRY --owns PATH --until accepted|done|released, not only a sequencing note; the hub then tells the waiting lead once when the condition is met. When the hub reports a wait that needs a handler decision, clear it with tt team queue wait clear --entry WAITING_ENTRY --on PREDECESSOR_ENTRY and tell the waiting lead, or set a new wait.";
+  "Shared-path sequencing: when one team must wait for a path another team owns, record a structured wait with tt team queue wait set --entry WAITING_ENTRY --on PREDECESSOR_ENTRY --owns PATH --until accepted|done|released, not only a sequencing note; the hub then tells the waiting lead once when the condition is met. For a pause that shares no path, such as a quiet host for a release, use --reason TEXT in place of --owns PATH. When the hub reports a wait that needs a handler decision, clear it with tt team queue wait clear --entry WAITING_ENTRY --on PREDECESSOR_ENTRY and tell the waiting lead, or set a new wait.";
 // A handler sends no success claim before every cited check has passed
 // (wi_5edba07856e84f45). hub/cmd/tt/coordination.go (handlerReadBackRule)
 // carries the same sentences.

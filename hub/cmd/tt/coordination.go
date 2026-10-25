@@ -196,9 +196,10 @@ const handlerEvidenceRule = "Record a recurrence, log reference or other evidenc
 // handlerWaitRule tells the primary handler to record shared-path sequencing
 // as a structured queue wait, which the hub answers with one notice to the
 // waiting lead, and what to do with a wait the hub hands back
-// (wi_44cabd7e6233bc1b, docs/project-queue.md). The browser handler prompt
-// in client/project-handler.js carries the same sentences.
-const handlerWaitRule = "Shared-path sequencing: when one team must wait for a path another team owns, record a structured wait with tt team queue wait set --entry WAITING_ENTRY --on PREDECESSOR_ENTRY --owns PATH --until accepted|done|released, not only a sequencing note; the hub then tells the waiting lead once when the condition is met. When the hub reports a wait that needs a handler decision, clear it with tt team queue wait clear --entry WAITING_ENTRY --on PREDECESSOR_ENTRY and tell the waiting lead, or set a new wait."
+// (wi_44cabd7e6233bc1b, docs/project-queue.md). A pause that shares no path
+// is a pathless wait with --reason (wi_8237a5d578808c82). The browser handler
+// prompt in client/project-handler.js carries the same sentences.
+const handlerWaitRule = "Shared-path sequencing: when one team must wait for a path another team owns, record a structured wait with tt team queue wait set --entry WAITING_ENTRY --on PREDECESSOR_ENTRY --owns PATH --until accepted|done|released, not only a sequencing note; the hub then tells the waiting lead once when the condition is met. For a pause that shares no path, such as a quiet host for a release, use --reason TEXT in place of --owns PATH. When the hub reports a wait that needs a handler decision, clear it with tt team queue wait clear --entry WAITING_ENTRY --on PREDECESSOR_ENTRY and tell the waiting lead, or set a new wait."
 
 // The rules below apply to every Database handler, including an
 // owner-provisioned auxiliary (leased arm) handler working on its one leased

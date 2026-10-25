@@ -224,7 +224,7 @@ test("handler prompt defaults qualifying bugs to the Small lane and names a reas
 // guidance in hub/cmd/tt/coordination.go carries the same text.
 test("handler prompt records shared-path sequencing as a structured wait", () => {
   const rule =
-    "Shared-path sequencing: when one team must wait for a path another team owns, record a structured wait with tt team queue wait set --entry WAITING_ENTRY --on PREDECESSOR_ENTRY --owns PATH --until accepted|done|released, not only a sequencing note; the hub then tells the waiting lead once when the condition is met. When the hub reports a wait that needs a handler decision, clear it with tt team queue wait clear --entry WAITING_ENTRY --on PREDECESSOR_ENTRY and tell the waiting lead, or set a new wait.";
+    "Shared-path sequencing: when one team must wait for a path another team owns, record a structured wait with tt team queue wait set --entry WAITING_ENTRY --on PREDECESSOR_ENTRY --owns PATH --until accepted|done|released, not only a sequencing note; the hub then tells the waiting lead once when the condition is met. For a pause that shares no path, such as a quiet host for a release, use --reason TEXT in place of --owns PATH. When the hub reports a wait that needs a handler decision, clear it with tt team queue wait clear --entry WAITING_ENTRY --on PREDECESSOR_ENTRY and tell the waiting lead, or set a new wait.";
   const count = (text, clause) => text.split(clause).length - 1;
   const prompt = withDatabaseHandler(plan())[1].fields.prompt;
   assert.equal(count(prompt, rule), 1);
