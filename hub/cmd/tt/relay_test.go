@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -1164,7 +1165,13 @@ func TestRelayCodexOwnerHelperWakeRoutes(t *testing.T) {
 // counts the team queue polls and the bound agent's wake-pass reads.
 type rotationLoopFixture struct {
 	queuePolls, agentReads atomic.Int32
+	// onAgentRead, when set, runs on each request for the bound agent.
+	onAgentRead atomic.Pointer[func(*http.Request)]
 }
+
+// rotationLoopSentinel is private text the fixture serves as the agent's
+// name; no relay log line may carry it.
+const rotationLoopSentinel = "relay-private-sentinel-text"
 
 func newRotationLoopFixture(t *testing.T, handler, steward func(context.Context) error, pause func() bool) *rotationLoopFixture {
 	t.Helper()
@@ -1189,7 +1196,10 @@ func newRotationLoopFixture(t *testing.T, handler, steward func(context.Context)
 			http.NotFound(w, r)
 		case strings.Contains(r.URL.Path, "/agents/"):
 			f.agentReads.Add(1)
-			_ = json.NewEncoder(w).Encode(api.Agent{ID: b.Agent, RunID: b.Run, Status: api.AgentDone, Online: true, Unread: 0})
+			if hook := f.onAgentRead.Load(); hook != nil {
+				(*hook)(r)
+			}
+			_ = json.NewEncoder(w).Encode(api.Agent{ID: b.Agent, RunID: b.Run, Name: rotationLoopSentinel, Status: api.AgentDone, Online: true, Unread: 0})
 		default:
 			http.NotFound(w, r)
 		}
@@ -3841,4 +3851,471 @@ func TestRelayHelperHeartbeatMarksOwnerClosedRun(t *testing.T) {
 			t.Fatalf("re-registered helper rows = %v; want one under %s", rows, newer.Run)
 		}
 	})
+}
+
+// relayTestClock stands in for relayPassClock, so a test can make a pass or
+// a team queue tick take minutes without waiting for them.
+type relayTestClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func newRelayTestClock(t *testing.T) *relayTestClock {
+	t.Helper()
+	c := &relayTestClock{now: time.Date(2026, 10, 25, 4, 0, 0, 0, time.UTC)}
+	old := relayPassClock
+	t.Cleanup(func() { relayPassClock = old })
+	relayPassClock = c.Now
+	return c
+}
+
+func (c *relayTestClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *relayTestClock) advance(d time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(d)
+	c.mu.Unlock()
+}
+
+func stubRelayTeamQueue(t *testing.T, tick func(context.Context) error) {
+	t.Helper()
+	old := relayTeamQueue
+	t.Cleanup(func() { relayTeamQueue = old })
+	relayTeamQueue = tick
+}
+
+// A git that does not answer is killed at activityWorktreeTimeout, its error
+// is cached for the pass, and the activity cursor keeps the last signature
+// (wi_44e5b080b7e7d846 r2).
+func TestActivityWorktreeGitTimeoutKeepsPreviousSignature(t *testing.T) {
+	old := activityWorktreeTimeout
+	t.Cleanup(func() { activityWorktreeTimeout = old })
+	// Long enough for a loaded host to start the stub shell.
+	activityWorktreeTimeout = time.Second
+	writeGit := func(t *testing.T, dir, calls, body string) {
+		t.Helper()
+		content := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '" + calls + "'\n" + body
+		if err := os.WriteFile(filepath.Join(dir, "git"), []byte(content), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, tc := range []struct {
+		name, body string
+		calls      int
+	}{
+		// The shell's sleep keeps stdout open after the shell is killed, so
+		// only WaitDelay ends the wait inside 3s.
+		{"status", "sleep 5\n", 1},
+		{"rev-parse", "if [ \"$4\" = 'rev-parse' ]; then exec sleep 30; fi\n", 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			calls := filepath.Join(home, "calls")
+			writeGit(t, home, calls, tc.body)
+			t.Setenv("PATH", home+":"+os.Getenv("PATH"))
+			ctx := context.WithValue(context.Background(), activityWorktreeContextKey{}, activityWorktreeCache{})
+			began := time.Now()
+			for i := 0; i < 2; i++ {
+				if signature, err := cachedActivityWorktree(ctx, home); err == nil || signature != "" {
+					t.Fatalf("probe %d of a git that does not answer = %q, %v; want an error", i, signature, err)
+				}
+			}
+			if elapsed := time.Since(began); elapsed > 3*time.Second {
+				t.Fatalf("two probes of a git that does not answer took %s, want under 3s", elapsed)
+			}
+			data, _ := os.ReadFile(calls)
+			if got := strings.Count(string(data), "\n"); got != tc.calls {
+				t.Fatalf("git calls in one pass = %d, want %d: %q", got, tc.calls, data)
+			}
+		})
+	}
+
+	t.Run("cursor", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		t.Setenv("CODEX_HOME", home)
+		t.Setenv("TAILTERM_RELAY_STATE", filepath.Join(home, "state"))
+		calls := filepath.Join(home, "calls")
+		writeGit(t, home, calls, "exec sleep 30\n")
+		t.Setenv("PATH", home+":"+os.Getenv("PATH"))
+		now := time.Date(2026, 10, 25, 4, 0, 0, 0, time.UTC)
+		changedAt := now.Add(-time.Hour)
+		hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == "GET" {
+				_ = json.NewEncoder(w).Encode(api.Agent{RunID: "run_0123456789abcdef", Status: api.AgentRunning, Online: true, Session: "fake"})
+				return
+			}
+			w.WriteHeader(http.StatusConflict)
+		}))
+		defer hub.Close()
+		client, _ := api.NewClient(hub.URL, time.Second)
+		b := runtimeBinding{Hub: hub.URL, Task: "tsk_0123456789abcdef", Agent: "agt_0123456789abcdef", Run: "run_0123456789abcdef", Thread: "12345678-1234-1234-1234-123456789abc", Runtime: "codex", Cwd: home, CreatedAt: now}
+		path := filepath.Join(relayDir(), bindingKey(b)+".activity.json")
+		if err := os.MkdirAll(relayDir(), 0700); err != nil {
+			t.Fatal(err)
+		}
+		seeded := relayActivityState{activityCursor: activityCursor{Run: b.Run, Thread: b.Thread, Worktree: "prev", WorktreeChangedAt: changedAt}, RequestNonce: "nonce"}
+		if err := writePrivateJSON(path, seeded); err != nil {
+			t.Fatal(err)
+		}
+		live := func(runtimeBinding, api.Agent) (bool, bool, error) { return true, true, nil }
+		tick := func(at time.Time) activityCursor {
+			t.Helper()
+			ctx := context.WithValue(context.Background(), activityWorktreeContextKey{}, activityWorktreeCache{})
+			if err := relayActivityTick(ctx, b, client, at, live); err != nil {
+				t.Fatal(err)
+			}
+			var saved relayActivityState
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal(data, &saved); err != nil {
+				t.Fatal(err)
+			}
+			return saved.activityCursor
+		}
+		if c := tick(now); c.Worktree != "prev" || !c.WorktreeChangedAt.Equal(changedAt) {
+			t.Fatalf("a timed-out git replaced the cursor's worktree: %q changed %s", c.Worktree, c.WorktreeChangedAt)
+		}
+		if data, _ := os.ReadFile(calls); !strings.Contains(string(data), " status ") {
+			t.Fatalf("the activity tick never probed the worktree: %q", data)
+		}
+		// The same tick with a git that answers records the change, so the
+		// timed-out tick above reached the worktree probe.
+		writeGit(t, home, calls, "if [ \"$4\" = 'rev-parse' ]; then echo head; fi\n")
+		later := now.Add(16 * time.Second)
+		if c := tick(later); c.Worktree == "prev" || c.Worktree == "" || !c.WorktreeChangedAt.Equal(later) {
+			t.Fatalf("a git that answers did not record the change: %q changed %s", c.Worktree, c.WorktreeChangedAt)
+		}
+	})
+}
+
+// A pass over 30s prints one line with its phase times, slowest step and
+// slowest hub call, at most once per two minutes, and no private text.
+func TestRelaySlowPassLogsPhaseTimes(t *testing.T) {
+	clock := newRelayTestClock(t)
+	stubRelayTeamQueue(t, func(context.Context) error { return nil })
+	steward := func(context.Context) error { return nil }
+	handler := func(context.Context) error { return nil }
+	// agentDelay is how long each read of the bound agent takes on the clock.
+	var agentDelay atomic.Int64
+	var passes int
+	pause := func() bool {
+		passes++
+		switch passes {
+		case 1:
+			// The second pass is slow too, inside the two-minute limit.
+		case 2:
+			// The third pass is slow after the limit.
+			clock.advance(2 * time.Minute)
+		case 3:
+			agentDelay.Store(0)
+		default:
+			return false
+		}
+		return true
+	}
+	f := newRotationLoopFixture(t, handler, steward, pause)
+	var agentPath string
+	agentDelay.Store(int64(35 * time.Second))
+	hook := func(r *http.Request) {
+		if r.Method == "GET" && r.URL.Path == agentPath {
+			clock.advance(time.Duration(agentDelay.Load()))
+		}
+	}
+	f.onAgentRead.Store(&hook)
+	data, err := os.ReadFile(func() string { paths, _ := filepath.Glob(filepath.Join(relayDir(), "*.binding.json")); return paths[0] }())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var b runtimeBinding
+	if err := json.Unmarshal(data, &b); err != nil {
+		t.Fatal(err)
+	}
+	agentPath = "/v1/tasks/" + b.Task + "/agents/" + b.Agent
+	oldCleanup := relayLoopCleanup
+	t.Cleanup(func() { relayLoopCleanup = oldCleanup })
+	var cleanups atomic.Int32
+	relayLoopCleanup = func() {
+		// Only the first pass's cleanup is slow: later ones may wait for a
+		// queue pass still in flight.
+		if cleanups.Add(1) == 1 {
+			clock.advance(20 * time.Second)
+		}
+	}
+	stderr, err := captureRelayOutput(t, true, func() error { return cmdRelay(nil) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lines []string
+	for _, line := range strings.Split(stderr, "\n") {
+		if strings.Contains(line, "] ") && strings.Contains(line, " slow pass ") {
+			lines = append(lines, line)
+		}
+	}
+	if len(lines) != 2 {
+		t.Fatalf("slow pass lines over three slow passes and one fast one = %d, want 2:\n%s", len(lines), stderr)
+	}
+	first := regexp.MustCompile(`^\[tt relay\] \S+ slow pass (\d+\.\d)s: start 20\.0s, bindings (\d+\.\d)s \(1 bindings\), end 0\.0s; slowest step (.+) (\d+\.\d)s; slowest hub call GET ` + regexp.QuoteMeta(agentPath) + ` 35\.0s$`)
+	if m := first.FindStringSubmatch(lines[0]); m == nil || m[1] == "20.0" {
+		t.Fatalf("first slow pass line = %q, want start, bindings and end times, the slowest step and hub call", lines[0])
+	}
+	if !strings.HasSuffix(lines[1], "; 1 slow pass not logged") || strings.Contains(lines[1], "start 20.0s") {
+		t.Fatalf("slow pass line after the limit = %q, want the held-back pass counted", lines[1])
+	}
+	for _, line := range lines {
+		if strings.Contains(line, rotationLoopSentinel) || strings.Contains(line, "?") {
+			t.Fatalf("slow pass line carries a query or private text: %q", line)
+		}
+	}
+}
+
+// The team queue tick runs in its own pass: while one blocks, the loop keeps
+// visiting the bound agent, starts no second tick, and runs no cleanup.
+func TestRelayLoopWakesWhileTeamQueueTickBlocks(t *testing.T) {
+	clock := newRelayTestClock(t)
+	entered, release, returned := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(unblock)
+	var ticks atomic.Int32
+	stubRelayTeamQueue(t, func(ctx context.Context) error {
+		if ticks.Add(1) != 1 {
+			return nil
+		}
+		close(entered)
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+		// The tick took two minutes on the relay's clock.
+		clock.advance(2 * time.Minute)
+		close(returned)
+		return nil
+	})
+	var cleanups atomic.Int32
+	oldCleanup := relayLoopCleanup
+	t.Cleanup(func() { relayLoopCleanup = oldCleanup })
+	relayLoopCleanup = func() { cleanups.Add(1) }
+	steward := func(context.Context) error { return nil }
+	handler := func(context.Context) error { return nil }
+	var f *rotationLoopFixture
+	var mu sync.Mutex
+	var visits []time.Time
+	var passes int
+	var readsWhenBlocked, readsBeforeRelease, ticksBeforeRelease, cleanupsBeforeRelease int32
+	var visitsBeforeRelease int
+	var deadline time.Time
+	pause := func() bool {
+		passes++
+		switch {
+		case passes == 1:
+			select {
+			case <-entered:
+			case <-time.After(15 * time.Second):
+				t.Error("team queue tick never started")
+				return false
+			}
+			readsWhenBlocked = f.agentReads.Load()
+			return true
+		case passes < 5:
+			// Each binding visit takes ten seconds on the relay's clock.
+			return true
+		case passes == 5:
+			readsBeforeRelease, ticksBeforeRelease, cleanupsBeforeRelease = f.agentReads.Load(), ticks.Load(), cleanups.Load()
+			mu.Lock()
+			visitsBeforeRelease = len(visits)
+			mu.Unlock()
+			unblock()
+			<-returned
+			deadline = time.Now().Add(15 * time.Second)
+			return true
+		}
+		// The next pass to collect the tick cleans up again.
+		if cleanups.Load() > cleanupsBeforeRelease {
+			return false
+		}
+		if time.Now().After(deadline) {
+			t.Error("the team queue pass was never collected after it returned")
+			return false
+		}
+		time.Sleep(10 * time.Millisecond)
+		return true
+	}
+	f = newRotationLoopFixture(t, handler, steward, pause)
+	hook := func(r *http.Request) {
+		if r.Method == "GET" && strings.Count(r.URL.Path, "/") == 5 {
+			clock.advance(10 * time.Second)
+			mu.Lock()
+			visits = append(visits, clock.Now())
+			mu.Unlock()
+		}
+	}
+	f.onAgentRead.Store(&hook)
+	stderr, err := captureRelayOutput(t, true, func() error { return cmdRelay(nil) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if readsBeforeRelease <= readsWhenBlocked {
+		t.Fatalf("no pass read the agent while the team queue tick blocked: %d then %d", readsWhenBlocked, readsBeforeRelease)
+	}
+	if ticksBeforeRelease != 1 {
+		t.Fatalf("team queue ticks while one blocked = %d, want 1", ticksBeforeRelease)
+	}
+	// Only the first pass, before the tick started, cleaned up.
+	if cleanupsBeforeRelease != 1 {
+		t.Fatalf("loop cleanups with a team queue pass in flight = %d, want only the first pass's", cleanupsBeforeRelease)
+	}
+	mu.Lock()
+	visits = visits[:visitsBeforeRelease]
+	for i := 1; i < len(visits); i++ {
+		if gap := visits[i].Sub(visits[i-1]); gap >= time.Minute {
+			t.Fatalf("binding visits %d and %d were %s apart on the relay's clock, want under 60s", i-1, i, gap)
+		}
+	}
+	if len(visits) < 4 {
+		t.Fatalf("binding visits = %d, want one per pass", len(visits))
+	}
+	mu.Unlock()
+	if strings.Contains(stderr, "slowest step team queue") {
+		t.Fatalf("a pass waited for the team queue tick:\n%s", stderr)
+	}
+	// The tick's own two minutes plus the visits that ran beside it.
+	m := regexp.MustCompile(`\] \S+ slow team queue pass (\d+)\.\ds\n`).FindStringSubmatch(stderr)
+	if took, _ := strconv.Atoi(func() string {
+		if m == nil {
+			return ""
+		}
+		return m[1]
+	}()); took < 120 {
+		t.Fatalf("no slow team queue pass line of at least 120s:\n%s", stderr)
+	}
+}
+
+func TestRelayOnceWaitsForTeamQueuePassBeforeWaking(t *testing.T) {
+	var f *rotationLoopFixture
+	var readsAtReturn atomic.Int32
+	readsAtReturn.Store(-1)
+	returned := make(chan struct{})
+	// The tick holds for half a second, or ends early once a wake pass reads
+	// the bound agent, as it would if once mode did not wait.
+	stubRelayTeamQueue(t, func(ctx context.Context) error {
+		defer close(returned)
+		hold := time.After(500 * time.Millisecond)
+		for f.agentReads.Load() == 0 {
+			select {
+			case <-hold:
+				readsAtReturn.Store(f.agentReads.Load())
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(5 * time.Millisecond):
+			}
+		}
+		readsAtReturn.Store(f.agentReads.Load())
+		return nil
+	})
+	noop := func(context.Context) error { return nil }
+	pause := func() bool { t.Error("once mode paused between passes"); return false }
+	f = newRotationLoopFixture(t, noop, noop, pause)
+	if err := cmdRelay([]string{"--once"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-returned:
+	case <-time.After(15 * time.Second):
+		t.Fatal("team queue tick never returned")
+	}
+	if got := readsAtReturn.Load(); got != 0 {
+		t.Fatalf("agent reads before the team queue pass returned = %d, want 0", got)
+	}
+	if f.agentReads.Load() == 0 {
+		t.Fatal("once mode never ran the wake pass for the bound agent")
+	}
+}
+
+func TestRelayTeamQueuePassObservesBackoff(t *testing.T) {
+	rateLimited := &api.HTTPError{Status: http.StatusTooManyRequests, Msg: "synthetic 429"}
+	var tickErr error
+	var ticks int
+	var hold chan struct{}
+	stubRelayTeamQueue(t, func(context.Context) error {
+		ticks++
+		if hold != nil {
+			<-hold
+		}
+		return tickErr
+	})
+	var backoff teamQueuePollBackoff
+	var queue relayQueuePass
+	// run mirrors the loop: a pass starts only when the backoff is ready.
+	run := func() (int, string) {
+		t.Helper()
+		ticks = 0
+		stderr, _ := captureRelayOutput(t, true, func() error {
+			if backoff.ready(time.Now()) {
+				queue.start()
+			}
+			queue.collect(&backoff, true)
+			return nil
+		})
+		return ticks, stderr
+	}
+	tickErr = rateLimited
+	if got, stderr := run(); got != 1 || backoff.delay != 6*time.Second || backoff.ready(time.Now()) || !strings.Contains(stderr, "[tt relay] team queue: ") {
+		t.Fatalf("queue 429: ticks=%d backoff=%+v stderr=%q", got, backoff, stderr)
+	}
+	if got, _ := run(); got != 0 {
+		t.Fatalf("team queue ran inside the backoff: %d", got)
+	}
+	backoff.next = time.Now().Add(-time.Second)
+	tickErr = errors.New("queue boom")
+	if got, stderr := run(); got != 1 || backoff.delay != 6*time.Second || !backoff.ready(time.Now()) || stderr != "[tt relay] team queue: queue boom\n" {
+		t.Fatalf("other error: ticks=%d backoff=%+v stderr=%q", got, backoff, stderr)
+	}
+	tickErr = nil
+	if got, stderr := run(); got != 1 || backoff.delay != 0 || stderr != "" {
+		t.Fatalf("success did not clear the backoff: ticks=%d backoff=%+v stderr=%q", got, backoff, stderr)
+	}
+	// A clean tick must not clear spacing that a rotation 429 set while it ran.
+	hold = make(chan struct{})
+	queue.start()
+	backoff.observe(time.Now(), rateLimited)
+	close(hold)
+	queue.collect(&backoff, true)
+	if backoff.delay != 6*time.Second || backoff.ready(time.Now()) {
+		t.Fatalf("a clean tick cleared spacing a later 429 set: %+v", backoff)
+	}
+
+	// In the loop, a 429 from the queue pass holds the next queue and
+	// rotation passes for the backoff spacing.
+	tickErr, hold = rateLimited, nil
+	var queueTicks, handlerCalls atomic.Int32
+	stubRelayTeamQueue(t, func(context.Context) error { queueTicks.Add(1); return rateLimited })
+	handler := func(context.Context) error { handlerCalls.Add(1); return nil }
+	steward := func(context.Context) error { return nil }
+	var passes int
+	pause := func() bool {
+		passes++
+		time.Sleep(50 * time.Millisecond)
+		return passes < 12
+	}
+	newRotationLoopFixture(t, handler, steward, pause)
+	stderr, err := captureRelayOutput(t, true, func() error { return cmdRelay(nil) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Twelve passes fit well inside the first six-second spacing; the first
+	// pass's rotation started before the 429 came back.
+	if queueTicks.Load() != 1 || handlerCalls.Load() != 1 {
+		t.Fatalf("queue ticks = %d, handler ticks = %d over %d passes, want 1 and 1", queueTicks.Load(), handlerCalls.Load(), passes)
+	}
+	if got := strings.Count(stderr, "[tt relay] team queue: "); got != 1 {
+		t.Fatalf("team queue log entries = %d: %s", got, stderr)
+	}
 }

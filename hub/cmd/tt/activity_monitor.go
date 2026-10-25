@@ -29,34 +29,54 @@ type activityWorktreeResult struct {
 }
 type activityWorktreeCache map[string]activityWorktreeResult
 
+// activityWorktreeTimeout bounds both git calls of one worktree probe, so a
+// slow git on a loaded host cannot hold the relay pass (wi_44e5b080b7e7d846).
+var activityWorktreeTimeout = 2 * time.Second
+
 func cachedActivityWorktree(ctx context.Context, cwd string) (string, error) {
 	if cache, ok := ctx.Value(activityWorktreeContextKey{}).(activityWorktreeCache); ok {
 		if result, found := cache[cwd]; found {
 			return result.signature, result.err
 		}
-		signature, err := activityWorktree(cwd)
+		// A timed-out probe is cached too: one wait per worktree per pass.
+		signature, err := activityWorktree(ctx, cwd)
 		cache[cwd] = activityWorktreeResult{signature, err}
 		return signature, err
 	}
-	return activityWorktree(cwd)
+	return activityWorktree(ctx, cwd)
 }
 
 func activityProbeNative(b runtimeBinding, a api.Agent) (bool, bool, error) {
 	return probeRuntimeWithDiscovery(b, a, spawn.ProbeSession, nativeRuntimeSessionProbe, nativeRuntimePIDProbe, nativeRuntimeDiscovery)
 }
 
-func activityWorktree(cwd string) (string, error) {
+func activityWorktree(ctx context.Context, cwd string) (string, error) {
 	if cwd == "" || !filepath.IsAbs(cwd) {
 		return "", nil
 	}
-	out, err := exec.Command("git", "--no-optional-locks", "-C", cwd, "status", "--porcelain=v1", "--untracked-files=normal").Output()
+	ctx, cancel := context.WithTimeout(ctx, activityWorktreeTimeout)
+	defer cancel()
+	git := func(args ...string) ([]byte, error) {
+		cmd := exec.CommandContext(ctx, "git", append([]string{"--no-optional-locks", "-C", cwd}, args...)...)
+		// A child that keeps stdout open cannot hold Output past the kill.
+		cmd.WaitDelay = 500 * time.Millisecond
+		return cmd.Output()
+	}
+	out, err := git("status", "--porcelain=v1", "--untracked-files=normal")
 	if err != nil {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
 		return "", err
 	}
 	h := sha256.New()
 	h.Write(out)
-	if head, headErr := exec.Command("git", "--no-optional-locks", "-C", cwd, "rev-parse", "HEAD").Output(); headErr == nil {
+	if head, headErr := git("rev-parse", "HEAD"); headErr == nil {
 		h.Write(head)
+	} else if ctx.Err() != nil {
+		// Hashed without its head the signature would differ from the last
+		// one and falsely mark the worktree changed; the caller keeps it.
+		return "", ctx.Err()
 	}
 	// File metadata catches edits to an already modified file without retaining
 	// source bytes or filenames in the durable checkpoint.

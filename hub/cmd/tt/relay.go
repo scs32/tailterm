@@ -1318,6 +1318,18 @@ var (
 	relayHubReachStart = startHubReachWatch
 	// relayClaudeRetryStart starts the Claude due-retry watch and returns its stop.
 	relayClaudeRetryStart = startClaudeRetryWatch
+	// relayTeamQueue is the team queue tick the loop runs in its own pass.
+	relayTeamQueue = relayTeamQueueTick
+	// relayPassClock times the loop's phases for its slow-pass lines only; no
+	// wake, retirement or activity decision reads it.
+	relayPassClock = time.Now
+)
+
+// A relay pass longer than relaySlowPass prints its phase times, at most one
+// line per relaySlowPassLogEvery (wi_44e5b080b7e7d846).
+const (
+	relaySlowPass         = 30 * time.Second
+	relaySlowPassLogEvery = 2 * time.Minute
 )
 
 type relayRotationResult struct {
@@ -1393,6 +1405,189 @@ func observeRotation(backoff *teamQueuePollBackoff, name string, at time.Time, e
 	}
 }
 
+// relayQueueResult is one finished team queue pass.
+type relayQueueResult struct {
+	err  error
+	at   time.Time
+	took time.Duration
+}
+
+// relayQueuePass runs the team queue tick off the wake path, as
+// relayRotationPass runs the rotation ticks. The tick keeps its two-minute
+// budget and one runs at a time, but a slow one no longer holds every
+// binding's visit. Only the relay loop calls these methods and touches the
+// shared backoff.
+type relayQueuePass struct {
+	done chan relayQueueResult // nil while no pass is in flight
+	slow relaySlowLimiter
+}
+
+func (q *relayQueuePass) start() {
+	if q.done != nil {
+		return
+	}
+	done := make(chan relayQueueResult, 1)
+	q.done = done
+	tick := relayTeamQueue
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		began := relayPassClock()
+		err := tick(ctx)
+		done <- relayQueueResult{err: err, at: time.Now(), took: relayPassClock().Sub(began)}
+	}()
+}
+
+func (q *relayQueuePass) inFlight() bool { return q.done != nil }
+
+// collect observes a finished pass; with wait it blocks for one in flight.
+func (q *relayQueuePass) collect(backoff *teamQueuePollBackoff, wait bool) {
+	if q.done == nil {
+		return
+	}
+	var result relayQueueResult
+	if wait {
+		result = <-q.done
+	} else {
+		select {
+		case result = <-q.done:
+		default:
+			return
+		}
+	}
+	q.done = nil
+	// A clean tick must not clear spacing that a later 429 set while it ran.
+	if result.err != nil || backoff.ready(result.at) {
+		backoff.observe(result.at, result.err)
+	}
+	if result.err != nil {
+		fmt.Fprintf(os.Stderr, "[tt relay] team queue: %v\n", result.err)
+	}
+	if result.took > relaySlowPass {
+		if skipped, ok := q.slow.allow(relayPassClock()); ok {
+			fmt.Fprintf(os.Stderr, "[tt relay] %s slow team queue pass %.1fs%s\n", relayPassClock().UTC().Format(time.RFC3339), result.took.Seconds(), relayNotLogged(skipped, "team queue pass", "team queue passes"))
+		}
+	}
+}
+
+// relaySlowLimiter lets one slow-pass line through per relaySlowPassLogEvery
+// and counts the ones it held back.
+type relaySlowLimiter struct {
+	last    time.Time
+	skipped int
+}
+
+// allow reports whether a line may print now and how many were held back
+// since the last one.
+func (l *relaySlowLimiter) allow(now time.Time) (int, bool) {
+	if !l.last.IsZero() && now.Sub(l.last) < relaySlowPassLogEvery {
+		l.skipped++
+		return 0, false
+	}
+	skipped := l.skipped
+	l.last, l.skipped = now, 0
+	return skipped, true
+}
+
+func relayNotLogged(skipped int, one, many string) string {
+	switch {
+	case skipped == 1:
+		return "; 1 slow " + one + " not logged"
+	case skipped > 1:
+		return fmt.Sprintf("; %d slow %s not logged", skipped, many)
+	}
+	return ""
+}
+
+// relayPassTiming times one relay loop pass for its slow-pass line. It keeps
+// step names, agent IDs, durations, and each hub call's method and path only:
+// never a query, header, body or message text.
+type relayPassTiming struct {
+	start, lapAt              time.Time
+	startPhase, bindings, end time.Duration
+	visited                   int
+	step                      string
+	stepTook                  time.Duration
+
+	mu       sync.Mutex // guards the slowest hub call
+	call     string
+	callTook time.Duration
+}
+
+func newRelayPassTiming() *relayPassTiming {
+	now := relayPassClock()
+	return &relayPassTiming{start: now, lapAt: now}
+}
+
+// lap ends the step that ran since the last lap and keeps the slowest. An
+// empty name starts the next step without naming the time before it.
+func (p *relayPassTiming) lap(name string) time.Time {
+	now := relayPassClock()
+	if took := now.Sub(p.lapAt); name != "" && took > p.stepTook {
+		p.step, p.stepTook = name, took
+	}
+	p.lapAt = now
+	return now
+}
+
+func (p *relayPassTiming) noteCall(method, path string, took time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.call == "" || took > p.callTook {
+		p.call, p.callTook = method+" "+path, took
+	}
+}
+
+// line is the slow-pass line, or "" for a pass at or under relaySlowPass.
+func (p *relayPassTiming) line(now time.Time, limit *relaySlowLimiter) string {
+	total := p.startPhase + p.bindings + p.end
+	if total <= relaySlowPass {
+		return ""
+	}
+	skipped, ok := limit.allow(now)
+	if !ok {
+		return ""
+	}
+	line := fmt.Sprintf("[tt relay] %s slow pass %.1fs: start %.1fs, bindings %.1fs (%d bindings), end %.1fs", now.UTC().Format(time.RFC3339), total.Seconds(), p.startPhase.Seconds(), p.bindings.Seconds(), p.visited, p.end.Seconds())
+	if p.step != "" {
+		line += fmt.Sprintf("; slowest step %s %.1fs", p.step, p.stepTook.Seconds())
+	}
+	p.mu.Lock()
+	if p.call != "" {
+		line += fmt.Sprintf("; slowest hub call %s %.1fs", p.call, p.callTook.Seconds())
+	}
+	p.mu.Unlock()
+	return line + relayNotLogged(skipped, "pass", "passes")
+}
+
+// relayTimedTransport times each hub round trip for the pass's slow-pass
+// line. It sits under the request budget, so its time leaves out the wait for
+// a budget token.
+type relayTimedTransport struct {
+	base http.RoundTripper
+	pass *relayPassTiming
+}
+
+func (t relayTimedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	began := relayPassClock()
+	resp, err := t.base.RoundTrip(req)
+	t.pass.noteCall(req.Method, req.URL.Path, relayPassClock().Sub(began))
+	return resp, err
+}
+
+// timeRelayClient times c's hub calls for pass. Call it before
+// attachRelayBudget, so the budget wraps the timer.
+func timeRelayClient(c *api.Client, pass *relayPassTiming) {
+	if c == nil || c.HTTP == nil || pass == nil {
+		return
+	}
+	base := c.HTTP.Transport
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	c.HTTP.Transport = relayTimedTransport{base: base, pass: pass}
+}
+
 func cmdRelay(args []string) error {
 	fs := flag.NewFlagSet("relay", flag.ContinueOnError)
 	once := fs.Bool("once", false, "check registered sessions once")
@@ -1424,30 +1619,37 @@ func cmdRelay(args []string) error {
 		defer relayClaudeRetryStart(dir)()
 	}
 	var queueBackoff teamQueuePollBackoff
+	var queue relayQueuePass
 	var rotation relayRotationPass
 	var sweep relaySweepPass
+	var slowPasses relaySlowLimiter
 	promptDeps := nativeRuntimePromptDeps()
 	var lastClaudeRetry, lastPendingBind, lastWindowSize time.Time
 	var claudeRetryCursor int
 	for {
+		pass := newRelayPassTiming()
 		if !*status {
 			rotation.collect(&queueBackoff, false)
-			// A rotation pass stops the rotated handler's old session itself;
-			// the loop cleanup waits until that pass is collected, so the two
-			// never stop one session at once.
-			if !rotation.inFlight() {
+			queue.collect(&queueBackoff, false)
+			// A rotation pass stops the rotated handler's old session itself,
+			// and a team queue pass stops sessions too; the loop cleanup waits
+			// until both are collected, so two never stop one session at once.
+			if !rotation.inFlight() && !queue.inFlight() {
 				relayLoopCleanup()
 			}
+			pass.lap("cleanup")
 			inspectStartupPrompts()
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			pass.lap("startup prompts")
+			// The team queue tick runs in its own pass under its two-minute
+			// budget, so a slow tick no longer delays every binding's visit.
+			// Under --once it still finishes before rotation and the wakes.
 			if queueBackoff.ready(time.Now()) {
-				queueErr := relayTeamQueueTick(ctx)
-				queueBackoff.observe(time.Now(), queueErr)
-				if queueErr != nil {
-					fmt.Fprintf(os.Stderr, "[tt relay] team queue: %v\n", queueErr)
-				}
+				queue.start()
 			}
-			cancel()
+			if *once {
+				queue.collect(&queueBackoff, true)
+			}
+			pass.lap("team queue")
 			// Handler and steward rotation share the queue's request budget and
 			// backoff, but run off the wake path; one pass is in flight at most.
 			if queueBackoff.ready(time.Now()) {
@@ -1456,12 +1658,14 @@ func cmdRelay(args []string) error {
 			if *once {
 				rotation.collect(&queueBackoff, true)
 			}
+			pass.lap("rotation")
 			// The scheduled worktree sweep runs off the wake path too, and
 			// never under --once: a sweep can outlast a single pass.
 			sweep.collect()
 			if !*once && queueBackoff.ready(time.Now()) {
 				sweep.start()
 			}
+			pass.lap("sweep")
 			if time.Since(lastClaudeRetry) >= 15*time.Second {
 				lastClaudeRetry = time.Now()
 				retryCtx, stopRetry := context.WithTimeout(context.Background(), 3*time.Second)
@@ -1488,6 +1692,7 @@ func cmdRelay(args []string) error {
 				}
 				stopRetry()
 			}
+			pass.lap("claude retry")
 			if time.Since(lastPendingBind) >= 15*time.Second {
 				lastPendingBind = time.Now()
 				retryPendingBindings(context.Background(), dir, time.Now(), func(hub string) (*api.Client, error) {
@@ -1495,11 +1700,13 @@ func cmdRelay(args []string) error {
 					e.loadConfig()
 					c, err := e.client(runtimeBindTimeout)
 					if err == nil {
+						timeRelayClient(c, pass)
 						attachRelayBudget(c, activeRelayBudget)
 					}
 					return c, err
 				})
 			}
+			pass.lap("pending bindings")
 		}
 		if !*status {
 			// Fix shrunken agent windows before any wake is typed into them.
@@ -1507,13 +1714,21 @@ func cmdRelay(args []string) error {
 				lastWindowSize = time.Now()
 				relayWindowSizeTick()
 			}
+			pass.lap("window size")
 			if err := recoverRelayRetirements(dir); err != nil {
 				fmt.Fprintln(os.Stderr, "[tt relay] recover retirement:", err)
 			}
+			pass.lap("retirement recovery")
 		}
+		bindingsAt := pass.lap("")
+		pass.startPhase = bindingsAt.Sub(pass.start)
 		paths, _ := filepath.Glob(filepath.Join(dir, "*.binding.json"))
 		worktreeCache := activityWorktreeCache{}
+		// visiting names the binding whose visit the next lap ends.
+		visiting := ""
 		for _, path := range paths {
+			pass.lap(visiting)
+			visiting = ""
 			data, err := os.ReadFile(path)
 			if err != nil {
 				continue
@@ -1541,10 +1756,13 @@ func cmdRelay(args []string) error {
 				fmt.Printf("%s %s thread=%s queued-through=%d broker-wakes=%v%s %s\n", b.Task, b.Agent, b.Thread, progress.Through, progress.BrokerWakes, wake, progress.Error)
 				continue
 			}
+			visiting = "binding " + b.Agent
+			pass.visited++
 			e := env{hub: b.Hub}
 			e.loadConfig()
 			c, err := e.client(15 * time.Second)
 			if err == nil {
+				timeRelayClient(c, pass)
 				attachRelayBudget(c, activeRelayBudget)
 				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 				retired, retirementErr := probeRelayRetirement(ctx, dir, path, b, &progress, c, time.Now().UTC())
@@ -1613,6 +1831,8 @@ func cmdRelay(args []string) error {
 				fmt.Fprintln(os.Stderr, "[tt relay] save progress:", err)
 			}
 		}
+		endAt := pass.lap(visiting)
+		pass.bindings = endAt.Sub(bindingsAt)
 		if !*status {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			err := flushFrozenUsage(ctx, dir, func(b runtimeBinding) (*api.Client, error) {
@@ -1620,6 +1840,7 @@ func cmdRelay(args []string) error {
 				e.loadConfig()
 				c, err := e.client(5 * time.Second)
 				if err == nil {
+					timeRelayClient(c, pass)
 					attachRelayBudget(c, activeRelayBudget)
 				}
 				return c, err
@@ -1628,6 +1849,7 @@ func cmdRelay(args []string) error {
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "[tt relay] frozen usage:", err)
 			}
+			pass.lap("frozen usage")
 			// The runtime's own usage capture, reported to each hub this host
 			// serves when it changed, for the token budget's admission check.
 			hubs := map[string]bool{}
@@ -1638,6 +1860,10 @@ func cmdRelay(args []string) error {
 				}
 			}
 			relayProviderUsage(hubs, time.Now().UTC())
+			pass.end = pass.lap("provider usage").Sub(endAt)
+			if line := pass.line(relayPassClock(), &slowPasses); line != "" {
+				fmt.Fprintln(os.Stderr, line)
+			}
 		}
 		if *status {
 			fmt.Printf("archived bindings=%d\n", relayArchiveCount(dir))
@@ -1650,6 +1876,7 @@ func cmdRelay(args []string) error {
 		}
 		if !relayLoopPause() {
 			rotation.collect(&queueBackoff, true)
+			queue.collect(&queueBackoff, true)
 			return nil
 		}
 	}
