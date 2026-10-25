@@ -592,3 +592,164 @@ func TestRelayRetirementProbeBudgetSurvivesProgressReloads(t *testing.T) {
 		})
 	}
 }
+
+// retiredFixture completes one retirement and returns its archive.
+func retiredFixture(t *testing.T) (string, runtimeBinding, string) {
+	t.Helper()
+	dir, path, b, _, _ := retirementFixture(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(api.Agent{ID: b.Agent, TaskID: b.Task, RunID: b.Run, Status: api.AgentClosed, CleanupDone: true})
+	}))
+	defer server.Close()
+	c, _ := api.NewClient(server.URL, time.Second)
+	if retired, err := retireRelayBinding(context.Background(), dir, path, b, c); err != nil || !retired {
+		t.Fatalf("retired=%v err=%v", retired, err)
+	}
+	archives, _ := filepath.Glob(filepath.Join(relayArchiveDir(dir), "*"))
+	if len(archives) != 1 {
+		t.Fatalf("archives=%v", archives)
+	}
+	return dir, b, archives[0]
+}
+
+func relayRetirementMarked(archive string) bool {
+	_, err := os.Stat(filepath.Join(archive, relayRetirementDoneFile))
+	return err == nil
+}
+
+func TestRelayRetirementFinishedIsNotReverified(t *testing.T) {
+	dir, b, archive := retiredFixture(t)
+	if !relayRetirementMarked(archive) || relayArchiveCount(dir) != 1 {
+		t.Fatal("finished retirement not marked")
+	}
+	// Recovery that read or hashed any of these files would now fail: the
+	// archived copies no longer match their digests and none can be opened.
+	for _, name := range []string{"binding.json", "progress.json"} {
+		if err := os.WriteFile(filepath.Join(archive, name), []byte("altered"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, name := range []string{"retirement.json", "binding.json", "progress.json"} {
+		if err := os.Chmod(filepath.Join(archive, name), 0); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { os.Chmod(filepath.Join(archive, name), 0600) })
+	}
+	if _, err := os.ReadFile(filepath.Join(archive, "retirement.json")); err == nil {
+		t.Skip("file permissions not enforced for this user")
+	}
+	for pass := 0; pass < 2; pass++ {
+		if err := recoverRelayRetirements(dir); err != nil {
+			t.Fatalf("pass %d re-verified a finished retirement: %v", pass, err)
+		}
+	}
+	// The per-binding writers run the same recovery under the binding lock.
+	successor := b
+	successor.Run = "run_0000000000000002"
+	successor.Thread = "00000000-0000-4000-8000-000000000002"
+	if err := writeRelayBinding(successor); err != nil {
+		t.Fatal(err)
+	}
+	pp := filepath.Join(dir, bindingKey(b)+".progress.json")
+	if err := saveRelayProgress(dir, pp, successor, relayProgress{Run: successor.Run, Thread: successor.Thread, Through: 7}); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"binding.json", "progress.json"} {
+		os.Chmod(filepath.Join(archive, name), 0600)
+		if got, _ := os.ReadFile(filepath.Join(archive, name)); string(got) != "altered" {
+			t.Fatalf("archived %s rewritten: %q", name, got)
+		}
+	}
+}
+
+func TestRelayRetirementInterruptedIsCompletedThenMarked(t *testing.T) {
+	dir, path, b, bd, pd := retirementFixture(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(api.Agent{ID: b.Agent, TaskID: b.Task, RunID: b.Run, Status: api.AgentClosed, CleanupDone: true})
+	}))
+	defer server.Close()
+	c, _ := api.NewClient(server.URL, time.Second)
+	original := relayArchiveRename
+	relayArchiveRename = func(src, dst string) error {
+		if strings.HasSuffix(src, ".binding.json") {
+			return errors.New("injected move failure")
+		}
+		return os.Rename(src, dst)
+	}
+	t.Cleanup(func() { relayArchiveRename = original })
+	if retired, err := retireRelayBinding(context.Background(), dir, path, b, c); !retired || err == nil {
+		t.Fatalf("retired=%v err=%v", retired, err)
+	}
+	archives, _ := filepath.Glob(filepath.Join(relayArchiveDir(dir), "*"))
+	if len(archives) != 1 {
+		t.Fatalf("archives=%v", archives)
+	}
+	archive := archives[0]
+	if relayRetirementMarked(archive) {
+		t.Fatal("failed finish marked done")
+	}
+	if err := recoverRelayRetirements(dir); err == nil || relayRetirementMarked(archive) {
+		t.Fatalf("failed recovery marked done: %v", err)
+	}
+	relayArchiveRename = original
+	logs, err := captureRelayOutput(t, true, func() error { return recoverRelayRetirements(dir) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(logs, "[tt relay] retired "+b.Agent) {
+		t.Fatalf("missing retirement log: %s", logs)
+	}
+	if !relayRetirementMarked(archive) {
+		t.Fatal("completed retirement not marked")
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatal("binding not moved")
+	}
+	got, _ := os.ReadFile(filepath.Join(archive, "binding.json"))
+	if !bytes.Equal(got, bd) {
+		t.Fatal("binding bytes changed")
+	}
+	got, _ = os.ReadFile(filepath.Join(archive, "progress.json"))
+	if !bytes.Equal(got, pd) {
+		t.Fatal("progress bytes changed")
+	}
+	if relayArchiveCount(dir) != 1 {
+		t.Fatal("census lost the archive")
+	}
+}
+
+func TestRelayRetirementLegacyArchiveVerifiedOnceThenMarked(t *testing.T) {
+	dir, _, archive := retiredFixture(t)
+	marker := filepath.Join(archive, relayRetirementDoneFile)
+	// An archive finished before the marker existed is verified, so a damaged
+	// one still reports its collision and is not marked.
+	os.Remove(marker)
+	bp := filepath.Join(archive, "binding.json")
+	bd, _ := os.ReadFile(bp)
+	os.WriteFile(bp, []byte("altered"), 0600)
+	if err := recoverRelayRetirements(dir); err == nil || relayRetirementMarked(archive) {
+		t.Fatalf("damaged legacy archive not verified: %v", err)
+	}
+	os.WriteFile(bp, bd, 0600)
+	if relayArchiveCount(dir) != 1 {
+		t.Fatal("legacy archive not counted")
+	}
+	logs, err := captureRelayOutput(t, true, func() error { return recoverRelayRetirements(dir) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(logs, "retired") {
+		t.Fatalf("legacy archive logged again: %s", logs)
+	}
+	if !relayRetirementMarked(archive) {
+		t.Fatal("verified legacy archive not marked")
+	}
+	if relayArchiveCount(dir) != 1 {
+		t.Fatal("marker changed the census")
+	}
+	// Once marked, later passes no longer read it.
+	os.WriteFile(bp, []byte("altered"), 0600)
+	if err := recoverRelayRetirements(dir); err != nil {
+		t.Fatalf("marked legacy archive re-verified: %v", err)
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -110,27 +111,59 @@ func finishRelayRetirement(dir, archive string, r relayRetirement) error {
 	if os.IsNotExist(before) {
 		fmt.Fprintf(os.Stderr, "[tt relay] retired %s run=%s: %s archive=%s\n", r.Binding.Agent, r.Binding.Run, r.Reason, archive)
 	}
+	// Marking is best effort: an unmarked archive is verified again next pass.
+	_ = markRelayRetirementDone(archive)
 	return nil
 }
 
+// Only an archive whose moves both verified holds this marker, so recovery skips
+// it with one stat instead of rereading and hashing its files on every pass
+// (bug wi_b3227351ffa5331e).
+const relayRetirementDoneFile = "retirement-done.json"
+
+func markRelayRetirementDone(archive string) error {
+	if err := writePrivateJSON(filepath.Join(archive, relayRetirementDoneFile), struct{}{}); err != nil {
+		return err
+	}
+	return syncRelayDirectory(archive)
+}
+
+// unfinishedRelayRetirement reads an archive's retirement record unless the
+// archive is marked done or holds no record.
+func unfinishedRelayRetirement(archive string) (relayRetirement, bool, error) {
+	var r relayRetirement
+	if _, err := os.Stat(filepath.Join(archive, relayRetirementDoneFile)); err == nil {
+		return r, false, nil
+	}
+	data, err := os.ReadFile(filepath.Join(archive, "retirement.json"))
+	if os.IsNotExist(err) || errors.Is(err, syscall.ENOTDIR) {
+		return r, false, nil
+	}
+	if err != nil {
+		return r, false, err
+	}
+	if err = json.Unmarshal(data, &r); err != nil {
+		return r, false, err
+	}
+	return r, true, nil
+}
+
 func recoverRelayRetirementsLocked(dir, key string) error {
-	paths, err := filepath.Glob(filepath.Join(relayArchiveDir(dir), key+"-*", "retirement.json"))
+	archives, err := filepath.Glob(filepath.Join(relayArchiveDir(dir), key+"-*"))
 	if err != nil {
 		return err
 	}
-	for _, path := range paths {
-		data, err := os.ReadFile(path)
+	for _, archive := range archives {
+		r, unfinished, err := unfinishedRelayRetirement(archive)
 		if err != nil {
 			return err
 		}
-		var r relayRetirement
-		if err = json.Unmarshal(data, &r); err != nil {
-			return err
+		if !unfinished {
+			continue
 		}
 		if !validBinding(r.Binding) || bindingKey(r.Binding) != key || r.BindingDigest == "" {
 			return fmt.Errorf("invalid relay retirement record")
 		}
-		archive := filepath.Dir(path)
 		if err := finishRelayRetirement(dir, archive, r); err != nil {
 			return err
 		}
@@ -139,18 +172,17 @@ func recoverRelayRetirementsLocked(dir, key string) error {
 }
 
 func recoverRelayRetirements(dir string) error {
-	paths, err := filepath.Glob(filepath.Join(relayArchiveDir(dir), "*", "retirement.json"))
+	archives, err := filepath.Glob(filepath.Join(relayArchiveDir(dir), "*"))
 	if err != nil {
 		return err
 	}
-	for _, path := range paths {
-		data, err := os.ReadFile(path)
+	for _, archive := range archives {
+		r, unfinished, err := unfinishedRelayRetirement(archive)
 		if err != nil {
 			return err
 		}
-		var r relayRetirement
-		if err = json.Unmarshal(data, &r); err != nil {
-			return err
+		if !unfinished {
+			continue
 		}
 		if !validBinding(r.Binding) {
 			return fmt.Errorf("invalid relay retirement binding")
