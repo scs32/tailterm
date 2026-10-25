@@ -2196,6 +2196,12 @@ func TestMatrixRunEndNotice(t *testing.T) {
 		}
 		return got
 	}
+	// A host-lock exec writes no receipt, and the hub cannot tell it from a
+	// matrix run, so every notice says where an exec's outcome is
+	// (wi_ac01454ba2e35fe6).
+	execOutcome := "It may have been a host-lock exec, which the hub cannot tell from a matrix run: " +
+		"a host-lock exec writes no receipt; its command's exit status and the host-lock.json you gave it (outcome, acquiredAt, releasedAt) are the outcome."
+	betweenReports := "It may also have held the host between two relay reports."
 	// checkText is what every run-end notice says and never says.
 	checkText := func(t *testing.T, m api.Message, parts ...string) {
 		t.Helper()
@@ -2204,7 +2210,8 @@ func TestMatrixRunEndNotice(t *testing.T) {
 			t.Fatalf("subject %q", m.Envelope.Subject)
 		}
 		for _, part := range append(parts, "receipt.json", "targeted-receipt.json", "runner.json", "host-lock.log", "never a path or a result",
-			"record why it stopped", "This notice does not authorise another run.", "you need no watcher and no message to yourself") {
+			"record why it stopped", "This notice does not authorise another run.", "you need no watcher and no message to yourself",
+			execOutcome, "For a matrix or targeted run, ") {
 			if !strings.Contains(text, part) {
 				t.Fatalf("text lacks %q: %s", part, text)
 			}
@@ -2228,7 +2235,11 @@ func TestMatrixRunEndNotice(t *testing.T) {
 		}
 		f.state(lead, "idle")
 		m := want(t, f, lead, 1)[0]
-		checkText(t, m, "Your verification run for "+item+", on the host since "+stamp(started)+", was no longer in the host's matrix lock at "+stamp(f.now()), "it finished, failed or was killed", "its checks are the outcome")
+		checkText(t, m, "Your verification run for "+item+", on the host since "+stamp(started)+", was no longer in the host's matrix lock at "+stamp(f.now()), "it finished, failed or was killed", "its checks are the outcome",
+			"If a matrix or targeted run left no receipt it did not finish")
+		if strings.Contains(m.Envelope.Body.Text, betweenReports) {
+			t.Fatalf("running notice says the waiting text: %s", m.Envelope.Body.Text)
+		}
 		for key, value := range map[string]string{"action": "matrix-run-ended", "agent": lead.ID, "run": lead.RunID, "item": item, "matrixRole": "running", "matrixSince": stamp(started), "endedAt": stamp(f.now())} {
 			if m.Envelope.Refs[key] != value {
 				t.Fatalf("ref %s = %q, want %q (%+v)", key, m.Envelope.Refs[key], value, m.Envelope.Refs)
@@ -2259,7 +2270,7 @@ func TestMatrixRunEndNotice(t *testing.T) {
 		f.report(lead, stallMatrixRun(api.MatrixWaitRunning, f.now(), item))
 		f.advance(time.Minute)
 		f.state(lead, "finished_silent")
-		checkText(t, want(t, f, lead, 1)[0], "it finished, failed or was killed", "If there is no receipt the run did not finish")
+		checkText(t, want(t, f, lead, 1)[0], "it finished, failed or was killed", "If a matrix or targeted run left no receipt it did not finish")
 	})
 	t.Run("waiting", func(t *testing.T) {
 		f, lead, item := team(t)
@@ -2269,9 +2280,17 @@ func TestMatrixRunEndNotice(t *testing.T) {
 		f.state(lead, "idle")
 		m := want(t, f, lead, 1)[0]
 		checkText(t, m, "Your verification run for "+item+", waiting for the host since "+stamp(requested)+", left the waitlist at "+stamp(f.now())+" without being seen running",
-			"it was withdrawn or killed, or it ran and ended inside one 15-second check")
-		if m.Envelope.Refs["matrixRole"] != "waiting" || strings.Contains(m.Envelope.Body.Text, "finished, failed") {
+			"it was withdrawn or killed, or it ran and ended inside one 15-second check. "+betweenReports, "With no receipt from a matrix or targeted run, read runner.json")
+		if strings.Contains(m.Envelope.Body.Text, "finished, failed") {
 			t.Fatalf("waitlist notice: %+v", m.Envelope)
+		}
+		for key, value := range map[string]string{"action": "matrix-run-ended", "agent": lead.ID, "run": lead.RunID, "item": item, "matrixRole": "waiting", "matrixSince": stamp(requested), "endedAt": stamp(f.now())} {
+			if m.Envelope.Refs[key] != value {
+				t.Fatalf("ref %s = %q, want %q (%+v)", key, m.Envelope.Refs[key], value, m.Envelope.Refs)
+			}
+		}
+		if len(m.Envelope.Refs) != 7 || m.Envelope.To != lead.Name {
+			t.Fatalf("to %q refs %+v", m.Envelope.To, m.Envelope.Refs)
 		}
 	})
 	t.Run("once", func(t *testing.T) {
@@ -2516,7 +2535,7 @@ func TestMatrixRunEndNoticeAgentless(t *testing.T) {
 		if want := "Your team's verification run for " + item + ", on the host since " + stamp(since) + ", was no longer in the host's matrix lock"; !strings.HasPrefix(text, want) {
 			t.Fatalf("text %q, want prefix %q", text, want)
 		}
-		if !strings.Contains(text, "This notice does not authorise another run.") || m.Envelope.Subject != matrixRunEndedSubject {
+		if !strings.Contains(text, "This notice does not authorise another run.") || !strings.Contains(text, "a host-lock exec writes no receipt; ") || m.Envelope.Subject != matrixRunEndedSubject {
 			t.Fatalf("notice %+v", m.Envelope)
 		}
 		for key, value := range map[string]string{"action": "matrix-run-ended", "agent": to.ID, "run": to.RunID, "item": item, "matrixRole": "running", "matrixSince": stamp(since), "matrixAgentless": "true"} {

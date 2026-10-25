@@ -174,14 +174,20 @@ const (
 	matrixRunEndedAction  = "matrix-run-ended"
 	matrixRunEndedRunning = "was no longer in the host's matrix lock at %s: it finished, failed or was killed. " +
 		"The hub is told only that it left, never a path or a result. " +
-		"Read receipt.json (targeted-receipt.json for a targeted run) in the log directory you gave the run; its checks are the outcome. " +
-		"If there is no receipt the run did not finish: read runner.json there for an exit code and host-lock.log for the reason, " +
+		matrixRunEndedExec +
+		"For a matrix or targeted run, read receipt.json (targeted-receipt.json for a targeted run) in the log directory you gave the run; its checks are the outcome. " +
+		"If a matrix or targeted run left no receipt it did not finish: read runner.json there for an exit code and host-lock.log for the reason, " +
 		"and record why it stopped (the recovery rule in AGENTS.md) before anything else. "
 	matrixRunEndedWaiting = "left the waitlist at %s without being seen running: it was withdrawn or killed, or it ran and ended inside one 15-second check. " +
+		"It may also have held the host between two relay reports. " +
 		"The hub is told only that it left, never a path or a result. " +
-		"Look for receipt.json (targeted-receipt.json for a targeted run) in the log directory you gave the run; its checks are the outcome. " +
-		"With no receipt, read runner.json there for an exit code and host-lock.log for the reason, " +
+		matrixRunEndedExec +
+		"For a matrix or targeted run, look for receipt.json (targeted-receipt.json for a targeted run) in the log directory you gave the run; its checks are the outcome. " +
+		"With no receipt from a matrix or targeted run, read runner.json there for an exit code and host-lock.log for the reason, " +
 		"and record why it stopped (the recovery rule in AGENTS.md) before anything else. "
+	// The hub cannot tell a host-lock exec from a matrix run (wi_ac01454ba2e35fe6).
+	matrixRunEndedExec = "It may have been a host-lock exec, which the hub cannot tell from a matrix run: " +
+		"a host-lock exec writes no receipt; its command's exit status and the host-lock.json you gave it (outcome, acquiredAt, releasedAt) are the outcome. "
 	matrixRunEndedClose = "This notice does not authorise another run. It is your wake; you need no watcher and no message to yourself."
 	// The report before the one being stored: the newest receipt of the run is
 	// the current report, which ReportActivity inserts before its hooks.
