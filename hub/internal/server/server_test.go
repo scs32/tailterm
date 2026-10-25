@@ -328,15 +328,26 @@ func TestLimitsAndValidation(t *testing.T) {
 
 func TestRateLimit(t *testing.T) {
 	c := newClient(t)
-	limited := false
-	for i := 0; i < 60; i++ {
-		if code := c.do("POST", "/v1/tasks", api.CreateTaskRequest{Name: fmt.Sprintf("t%d", i)}, nil); code == 429 {
-			limited = true
-			break
+	// Stop the server's own write bucket from refilling, so a slow host
+	// cannot earn back tokens between requests: exactly the burst is allowed.
+	c.s.limiter.mu.Lock()
+	c.s.limiter.rate = 0
+	burst := int(c.s.limiter.burst)
+	c.s.limiter.mu.Unlock()
+	for i := 0; i < burst; i++ {
+		if code := c.do("POST", "/v1/tasks", api.CreateTaskRequest{Name: fmt.Sprintf("t%d", i)}, nil); code != 201 {
+			t.Fatalf("write %d within the burst: got %d, want 201", i, code)
 		}
 	}
-	if !limited {
-		t.Fatal("expected the write rate limit to trigger")
+	if code := c.do("POST", "/v1/tasks", api.CreateTaskRequest{Name: "over"}, nil); code != 429 {
+		t.Fatalf("expected the write rate limit to trigger, got %d", code)
+	}
+	// Reads do not draw from the write bucket, so more than a burst of them
+	// still succeeds while writes are limited.
+	for i := 0; i <= burst; i++ {
+		if code := c.do("GET", "/v1/tasks", nil, nil); code != 200 {
+			t.Fatalf("read %d after the write limit: got %d, want 200", i, code)
+		}
 	}
 }
 
