@@ -1184,8 +1184,9 @@ test("p1 provisioning installs and copies each missing prerequisite, never overw
  assert.deepEqual(first.prerequisites.map(x=>[x.path,x.action]),[["node_modules/.package-lock.json","installed"],["wasm/tailserve.wasm","copied"],[".build/test.wasm","present"],[".build/speech-fixture.wav","copied"],[".build/go-modules.txt","copied"]]);
  assert.equal(readFileSync(join(p.cwd,".build/test.wasm"),"utf8"),"local build");assert.equal(readFileSync(join(p.cwd,"wasm/tailserve.wasm"),"utf8"),"fixture wasm/tailserve.wasm");
  for(const x of first.prerequisites)assert.equal(x.sha256,hash(readFileSync(join(p.cwd,x.path))));
+ for(const x of first.prerequisites)if(x.action==="copied")assert.deepEqual([Object.keys(x).sort(),x.sourceCommit],[["action","path","sha256","sourceCommit"],p.commit],x.path);else assert.deepEqual(Object.keys(x).sort(),["action","path","sha256"],x.path);
  assert.equal(git(p.cwd,"status","--porcelain"),"");
- const again=provisionPrerequisites(p.cwd,{from:p.from,run:p.run});assert.equal(p.installs.length,1);assert.ok(again.prerequisites.every(x=>x.action==="present"));
+ const again=provisionPrerequisites(p.cwd,{from:p.from,run:p.run});assert.equal(p.installs.length,1);assert.ok(again.prerequisites.every(x=>x.action==="present"&&!("sourceCommit" in x)));
  assert.deepEqual(again.prerequisites.map(x=>x.sha256),first.prerequisites.map(x=>x.sha256));
 });
 test("p1 provisioning names every prerequisite missing from both checkouts and refuses a bad source or a dirtied checkout",()=>{
@@ -1197,10 +1198,35 @@ test("p1 provisioning names every prerequisite missing from both checkouts and r
  const d=provisionFixture();writeFileSync(join(d.cwd,".gitignore"),"node_modules/\n.build/\n");git(d.cwd,"-c","user.email=f@example.invalid","-c","user.name=F","commit","-q","-am","track wasm");
  assert.throws(()=>provisionPrerequisites(d.cwd,{from:d.from,run:d.run}),e=>failureReason(e)==="Prerequisite provisioning changed the checkout");
 });
+// wi_adf23937db2c4d0c: a copy needs the source's commit; without one nothing is installed or copied.
+test("p1 provisioning refuses a source whose commit cannot be read before changing anything, and reads none when nothing is copied",()=>{
+ const reason="Prerequisite source commit unreadable: git rev-parse HEAD failed";
+ const plain=()=>{const from=mkdtempSync(join(tmpdir(),"provision-plain-"));placePrerequisites(from);return from;};
+ const unborn=()=>{const from=plain();git(from,"init","-q");return from;};
+ for(const from of [plain(),unborn()]){
+  const p=provisionFixture();
+  assert.throws(()=>provisionPrerequisites(p.cwd,{from,run:p.run}),e=>failureReason(e)===reason);
+  assert.deepEqual(p.installs,[],"npm ci never ran");
+  for(const x of MATRIX_PREREQUISITES)assert.ok(!existsSync(join(p.cwd,x)),x+" not copied");
+  assert.equal(git(p.cwd,"status","--porcelain"),"");
+ }
+ // Everything present, or only the install marker missing: no copy, so no commit is read.
+ const done=provisionFixture();placePrerequisites(done.cwd);
+ const present=provisionPrerequisites(done.cwd,{from:plain(),run:done.run});
+ assert.ok(present.prerequisites.every(x=>x.action==="present"&&!("sourceCommit" in x)));
+ const marker=provisionFixture();placePrerequisites(marker.cwd);rmSync(join(marker.cwd,"node_modules/.package-lock.json"));
+ const installed=provisionPrerequisites(marker.cwd,{from:unborn(),run:marker.run});
+ assert.deepEqual(installed.prerequisites.map(x=>x.action),MATRIX_PREREQUISITES.map((x,i)=>i?"present":"installed"));assert.ok(installed.prerequisites.every(x=>!("sourceCommit" in x)));
+ const c=provisionFixture();
+ const r=spawnSync(process.execPath,[RUNNER,"--provision-prerequisites","--from",plain()],{cwd:c.cwd,encoding:"utf8"});
+ assert.deepEqual({status:r.status,stdout:r.stdout,stderr:r.stderr},{status:1,stdout:"",stderr:reason+"\n"});
+ assert.deepEqual(c.installs,[]);assert.equal(git(c.cwd,"status","--porcelain"),"");
+});
 test("p1 the provisioning command prints the prerequisites, or only the named reason",()=>{
  const p=provisionFixture();mkdirSync(join(p.cwd,"node_modules"));writeFileSync(join(p.cwd,"node_modules/.package-lock.json"),"{}");
  const out=JSON.parse(execFileSync(process.execPath,[RUNNER,"--provision-prerequisites","--from",p.from],{cwd:p.cwd,encoding:"utf8"}));
  assert.equal(out.version,1);assert.deepEqual(out.prerequisites.map(x=>x.action),["present","copied","copied","copied","copied"]);assert.equal(git(p.cwd,"status","--porcelain"),"");
+ assert.deepEqual(out.prerequisites.map(x=>x.sourceCommit),[undefined,p.commit,p.commit,p.commit,p.commit]);
  const q=provisionFixture();mkdirSync(join(q.cwd,"node_modules"));writeFileSync(join(q.cwd,"node_modules/.package-lock.json"),"{}");rmSync(join(q.from,".build/go-modules.txt"));
  const r=execFileSync(process.execPath,["-e",`const r=require("child_process").spawnSync(process.execPath,${JSON.stringify([RUNNER,"--provision-prerequisites","--from",q.from])},{cwd:${JSON.stringify(q.cwd)},encoding:"utf8"});console.log(JSON.stringify({status:r.status,stdout:r.stdout,stderr:r.stderr}))`],{encoding:"utf8"});
  assert.deepEqual(JSON.parse(r),{status:1,stdout:"",stderr:"Missing matrix prerequisites: .build/go-modules.txt\n"});

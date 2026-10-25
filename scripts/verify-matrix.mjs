@@ -1191,12 +1191,20 @@ function copyGoLicenses(cwd, source, print) {
 // Provisioning (tt deployment setup): npm ci when the install marker is
 // missing, then every other missing file is copied from the source checkout,
 // with the licence texts that match a copied module list (print says whether
-// they came). An existing file is never overwritten.
+// they came). An existing file is never overwritten. Copied entries name the
+// source's commit; a source whose HEAD cannot be read is refused before
+// anything changes, when anything would be copied (wi_adf23937db2c4d0c).
 export function provisionPrerequisites(cwd, { from, run = (argv, dir) => execFileSync(argv[0], argv.slice(1), { cwd: dir, stdio: "ignore", timeout: 900000 }), print = (line) => process.stderr.write(line + "\n") } = {}) {
   let source;
   try { source = isAbsolute(from) && statSync(from).isDirectory() ? realpathSync(from) : null; } catch { source = null; }
   if (!source || source === realpathSync(cwd)) throw reasonError("Prerequisite source must be another absolute checkout");
   const [marker] = MATRIX_PREREQUISITES, actions = new Map(), missing = [];
+  let sourceCommit;
+  if (MATRIX_PREREQUISITES.some((p) => p !== marker && !existsSync(join(cwd, p)))) {
+    // stderr is dropped: the CLI's stderr carries only the reason.
+    try { sourceCommit = execFileSync("git", ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"], { cwd: source, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim(); } catch {}
+    if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(sourceCommit ?? "")) throw reasonError("Prerequisite source commit unreadable: git rev-parse HEAD failed");
+  }
   if (!existsSync(join(cwd, marker))) {
     try { run(["npm", "ci"], cwd); } catch { throw reasonError("Prerequisite install failed: npm ci"); }
     if (existsSync(join(cwd, marker))) actions.set(marker, "installed");
@@ -1213,7 +1221,7 @@ export function provisionPrerequisites(cwd, { from, run = (argv, dir) => execFil
   if (missing.length) throw prerequisiteError(missing);
   if (actions.get(".build/go-modules.txt") === "copied") copyGoLicenses(cwd, source, print);
   if (git(cwd, "status", "--porcelain")) throw reasonError("Prerequisite provisioning changed the checkout");
-  return { version: 1, prerequisites: MATRIX_PREREQUISITES.map((p) => ({ path: p, sha256: createHash("sha256").update(readFileSync(join(cwd, p))).digest("hex"), action: actions.get(p) })) };
+  return { version: 1, prerequisites: MATRIX_PREREQUISITES.map((p) => ({ path: p, sha256: createHash("sha256").update(readFileSync(join(cwd, p))).digest("hex"), action: actions.get(p), ...(actions.get(p) === "copied" ? { sourceCommit } : {}) })) };
 }
 
 // A run in a clean linked worktree first provisions any missing prerequisite
@@ -1243,7 +1251,7 @@ export function provisionWorktreePrerequisites(checks, cwd, options = {}) {
   }
   print("matrix run: provisioned prerequisites from " + from);
   for (const entry of provisioned.prerequisites)
-    print(`matrix run: prerequisite ${entry.path} ${entry.action} ${entry.sha256}`);
+    print(`matrix run: prerequisite ${entry.path} ${entry.action} ${entry.sha256}` + (entry.sourceCommit ? " from " + entry.sourceCommit : ""));
   for (const note of notes) print("matrix run: " + note);
 }
 

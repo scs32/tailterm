@@ -226,8 +226,10 @@ export function provisionFixture(){
  const cwd=mkdtempSync(join(tmpdir(),"provision-checkout-")),from=mkdtempSync(join(tmpdir(),"provision-source-"));
  git(cwd,"init","-q","-b","tasks-hub");writeFileSync(join(cwd,".gitignore"),"node_modules/\n.build/\nwasm/*.wasm\n");git(cwd,"add",".");git(cwd,"-c","user.email=f@example.invalid","-c","user.name=F","commit","-q","-m","base");
  placePrerequisites(from);const installs=[];
+ // wi_adf23937db2c4d0c: the source is a checkout with a commit, which copied entries name.
+ git(from,"init","-q");git(from,"-c","user.email=f@example.invalid","-c","user.name=F","commit","-q","--allow-empty","-m","source");
  const run=(argv,dir)=>{installs.push([argv,dir]);mkdirSync(join(dir,"node_modules"),{recursive:true});writeFileSync(join(dir,"node_modules/.package-lock.json"),"installed");};
- return {cwd,from,installs,run};
+ return {cwd,from,installs,run,commit:git(from,"rev-parse","HEAD")};
 }
 // The integrated matrix run as a member of the verification host's ordered
 // waitlist (wi_c5cb667695c3614c). Each test uses its own lock file; the child

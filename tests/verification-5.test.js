@@ -248,6 +248,9 @@ test("a linked worktree provisions missing prerequisites from the main worktree 
   const printed = lines.slice(1).map((line) => line.split(" ").slice(3));
   assert.deepEqual(printed.map(([path, action]) => [path, action]),
     prerequisitePaths.map((path, i) => [path, i === 0 ? "installed" : "copied"]));
+  // Copied lines end with main's commit; the installed line is as before.
+  const head = f.git("rev-parse", "HEAD");
+  assert.deepEqual(printed.map((tokens) => tokens.slice(3)), prerequisitePaths.map((path, i) => (i === 0 ? [] : ["from", head])));
   // The receipt keeps its {path, sha256} form; the copies carry main's bytes.
   assert.deepEqual(receipt.prerequisites.map((p) => Object.keys(p).sort()), prerequisitePaths.map(() => ["path", "sha256"]));
   assert.deepEqual(receipt.prerequisites.map((p) => p.path), prerequisitePaths);
@@ -723,7 +726,7 @@ test("WASM prerequisite: a provisioned build with no source record is rebuilt on
     const wt = linkedWorktree(t, f);
     const events = [], options = wasmOptions(events);
     const receipt = await preflightRun(mode, { ...f, cwd: wt }, tempDir(t, "verification-wasm-rebuild-"), options);
-    assert(events.includes(`matrix run: prerequisite .build/test.wasm copied ${digest("fixture")}`), "main's stale build was copied");
+    assert(events.includes(`matrix run: prerequisite .build/test.wasm copied ${digest("fixture")} from ${f.git("rev-parse", "HEAD")}`), "main's stale build was copied");
     assertRebuilt(receipt, events, wt, "no source record");
     assert.deepEqual(readLines(join(wt, ".build/rebuild-calls")), ["--test"], mode + ": one rebuild");
     assert.deepEqual(readLines(join(wt, ".build/order")), ["rebuild", "reader"], mode);

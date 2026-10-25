@@ -45,7 +45,8 @@ test("g1 g3 a copied module list brings the source's go-licenses copies when the
  assert.deepEqual(treeOf(join(p.cwd,".build/go-licenses")),treeOf(join(p.from,".build/go-licenses")));assert.equal(Object.keys(treeOf(join(p.cwd,".build/go-licenses"))).length,3);
  assert.deepEqual(readdirSync(join(p.cwd,".build")).sort(),["go-licenses","go-modules.txt","speech-fixture.wav","test.wasm"],"no temporary copy left");
  assert.deepEqual(receipt.prerequisites.map(x=>[x.path,x.action]),MATRIX_PREREQUISITES.map((x,i)=>[x,i?"copied":"installed"]));
- assert.deepEqual(Object.keys(receipt).sort(),["prerequisites","version"]);for(const x of receipt.prerequisites)assert.deepEqual(Object.keys(x).sort(),["action","path","sha256"]);
+ assert.deepEqual(Object.keys(receipt).sort(),["prerequisites","version"]);for(const x of receipt.prerequisites)assert.deepEqual(Object.keys(x).sort(),x.action==="copied"?["action","path","sha256","sourceCommit"]:["action","path","sha256"]);
+ assert.deepEqual(receipt.prerequisites.map(x=>x.sourceCommit),MATRIX_PREREQUISITES.map((x,i)=>i?p.commit:undefined),"copied entries name the source commit");
  assert.equal(git(p.cwd,"status","--porcelain"),"");
  const before=treeOf(join(p.cwd,".build"));writeFileSync(join(p.from,".build/go-licenses/modules/example.com/a/LICENSE"),"changed in the source");
  const again=provisioned(p);
@@ -67,6 +68,7 @@ test("g1 g3 a mismatched key or a missing tree copies none of it and names the r
  const r=spawnSync(process.execPath,[RUNNER,"--provision-prerequisites","--from",c.from],{cwd:c.cwd,encoding:"utf8"});
  assert.equal(r.status,0);assert.equal(r.stderr,".build/go-licenses not copied: its go-modules.txt differs from the copied module list; licence texts come from the module directories the list names\n");
  const out=JSON.parse(r.stdout);assert.deepEqual(Object.keys(out).sort(),["prerequisites","version"]);assert.deepEqual(out.prerequisites.map(x=>x.action),["present","copied","copied","copied","copied"]);
+ for(const x of out.prerequisites)assert.deepEqual([Object.keys(x).sort(),x.sourceCommit],x.action==="copied"?[["action","path","sha256","sourceCommit"],c.commit]:[["action","path","sha256"],undefined]);
 });
 test("g1 g3 an existing target go-licenses tree is left untouched",()=>{
  const p=provisionFixture();goLicenses(p.from);mkdirSync(join(p.cwd,".build/go-licenses"),{recursive:true});writeFileSync(join(p.cwd,".build/go-licenses/go-modules.txt"),"local list");
@@ -85,6 +87,8 @@ test("g1 a matrix run in a linked worktree prints whether the go-licenses copies
   const wt=join(mkdtempSync(join(tmpdir(),"provision-linked-")),"wt");git(p.cwd,"worktree","add","-q","--detach",wt);
   const printed=[];provisionWorktreePrerequisites(checks,wt,{installPrerequisites:p.run,hostLock:{print:l=>printed.push(l)}});
   assert.equal(printed.at(-1),line);assert.equal(printed.length,7);assert.equal(existsSync(join(wt,".build/go-licenses")),key===undefined);
+  const head=git(p.cwd,"rev-parse","HEAD");assert.match(printed[1],/^matrix run: prerequisite node_modules\/\.package-lock\.json installed [0-9a-f]{64}$/);
+  for(const l of printed.slice(2,6))assert.match(l,new RegExp("^matrix run: prerequisite \\S+ copied [0-9a-f]{64} from "+head+"$"));
   assert.equal(git(wt,"status","--porcelain"),"");
  }
 });
