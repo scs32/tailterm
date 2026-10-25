@@ -178,7 +178,9 @@ const generationChanged = error => GENERATION_CHANGED.test((typeof error?.stderr
 // were kept (wi_9b18784bb4bffb14): the hub refused the request's shape (400:
 // the unknown refusal field, or a refusal it holds invalid), tt does not know
 // the flag, or the hub saved a bare refuse under this request ID before.
-const REFUSAL_REFUSED = [/\bhub: 400 [^\n]*\s*$/, /\bhub: 409 [^\n]*\brelease: retry changed\s*$/, /\bflag provided but not defined: -(?:reason|step|target)\b/];
+// A block carrying a revert (wi_816228d539a80c48) is answered the same way by
+// a hub or tt from before reverts were kept on blocks.
+const REFUSAL_REFUSED = [/\bhub: 400 [^\n]*\s*$/, /\bhub: 409 [^\n]*\brelease: retry changed\s*$/, /\bflag provided but not defined: -(?:reason|step|target|revert-outcome|revert-commit|revert-bug-request)\b/];
 const refusalRefused = error => {const text = (typeof error?.stderr === "string" ? error.stderr : Buffer.isBuffer(error?.stderr) ? error.stderr.toString("utf8") : "").slice(-CLI_STDERR_BYTES);return REFUSAL_REFUSED.some(p => p.test(text));};
 function recordCliFailure(config, job, argv, cwd, error, reason, now) {
   const text = typeof error.stderr === "string" ? error.stderr : Buffer.isBuffer(error.stderr) ? error.stderr.toString("utf8") : "";
@@ -1371,7 +1373,12 @@ export async function runRelease(config, adapter) {
       try{await adapter.finish(state.receipt,state.finishGeneration);}catch{throw releaseError("Release failed; final receipt pending retry");}
       try{materialize();}catch{throw releaseError("Release failed; batch receipt pending retry");}
       state.phase="blocked";checkpoint();
-    }else{await adapter.block(job.id);}
+    }else{
+      // No receipt: the block carries the journaled revert, so the hub
+      // records what tasks-hub holds (wi_816228d539a80c48).
+      const v=state.revert;
+      await adapter.block({integrated:state.integrated,...(v?{revert:{outcome:v.outcome,...(v.commit?{commit:v.commit}:{}),...(v.bugRequestId?{bugRequestId:v.bugRequestId}:{})}}:{})});
+    }
     throw releaseError("Release failed; inspect saved journal");
   } finally {closeSync(fd);rmSync(lock);}
 }
@@ -1539,7 +1546,7 @@ export class HostAdapter {
         if(cause)failed.transport=true;
         if(argv[0]===cli)failed.refusal=refusalText(error.stderr);
         if(argv[0]===cli && argv[1]==="deployment" && generationChanged(error))failed.generationChanged=true;
-        if(argv[0]===cli && argv[1]==="deployment" && argv[2]==="refuse" && argv.includes("--reason") && refusalRefused(error))failed.refusalRefused=true;
+        if(argv[0]===cli && argv[1]==="deployment" && ((argv[2]==="refuse" && argv.includes("--reason")) || (argv[2]==="block" && argv.includes("--revert-outcome"))) && refusalRefused(error))failed.refusalRefused=true;
         if(kept)this.cliFailures.push(cause?{...kept,transport:true}:kept);
         throw failed;
       }
@@ -2082,7 +2089,35 @@ export class HostAdapter {
     rmSync(dir+".tmp",{recursive:true,force:true});cpSync(join(this.config.cwd,"dist-static"),dir+".tmp",{recursive:true});chmodSync(dir+".tmp",0o700);renameSync(dir+".tmp",dir);
   }
   async finish(receipt,expectedGeneration){const path=join(this.config.journalDirectory || dirname(this.config.journalPath),this.job.id+"-receipt.json");save(path,receipt);this.native("finish",["--file",path],expectedGeneration);}
-  async block(){this.native("block");}
+  // The block of a job that failed with no receipt (wi_816228d539a80c48).
+  // After publication it carries the journaled tasks-hub revert as flags, and
+  // the hub saves it on the job; with none it is the bare block, as before. A
+  // block whose revert an older hub or tt refused (refusalRefused) is sent once
+  // more bare: same job, generation and request ID, as refuse does. A block
+  // the hub refused only because the generation moved is re-read once, and
+  // sent again only when the hub saved merged under this exact claim at the
+  // runner's integrated commit (the merged reply was lost). A block only stops
+  // the job; nothing here resumes deploying. Any other failure is thrown.
+  async block(details={}){
+    const v=details.revert,flags=v?["--revert-outcome",v.outcome,...(v.commit?["--revert-commit",v.commit]:[]),...(v.bugRequestId?["--revert-bug-request",v.bugRequestId]:[])]:[];
+    const send=()=>{
+      if(!flags.length)return this.native("block");
+      try{return this.native("block",flags);}
+      catch(error){if(error?.refusalRefused!==true)throw error;return this.native("block");}
+    };
+    try{return send();}
+    catch(error){if(error?.generationChanged!==true || !this.adoptMerged(details.integrated))throw error;return send();}
+  }
+  // The one re-read of a block: detail() refuses a job that is no longer this
+  // exact claim or its pins; only a published merged job at the given
+  // integrated commit and a later generation is adopted. A failed read adopts
+  // nothing.
+  adoptMerged(integrated){
+    let current;
+    try{current=this.detail(this.job.id);}catch{return false;}
+    if(!this.job.agentId || !this.job.runId || !sha(integrated) || current.state!=="merged" || current.published!==true || current.integratedCommit!==integrated || current.generation<=this.job.generation)return false;
+    this.job=current;return true;
+  }
   // A refuse whose refusal an older hub or tt refused (refusalRefused) is
   // sent once more bare, the exact call of a runner before refusals were kept:
   // same job, generation and request ID. Both accept the bare form, and a hub

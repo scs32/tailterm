@@ -855,6 +855,104 @@ test("f2 a transport failure, a moved generation or any other refuse failure sen
  }
 });
 
+// The block of a job that failed with no receipt (wi_816228d539a80c48): a
+// CLI that answers block like this hub (the job's generation only; get prints
+// the job), or like an older hub or tt, a failing transport or another
+// refusal when the block carries a revert.
+function blockTT(mode,hub=hubJob(2)){
+ const home=mkdtempSync(join(tmpdir(),"release-block-")),tt=join(home,"tt"),log=join(home,"calls"),state=join(home,"job.json");
+ writeFileSync(state,JSON.stringify(hub));
+ writeFileSync(tt,"#!"+process.execPath+`
+const fs=require('fs'),a=process.argv.slice(2),job=JSON.parse(fs.readFileSync(${JSON.stringify(state)},'utf8')),mode=${JSON.stringify(mode)};
+fs.appendFileSync(${JSON.stringify(log)},JSON.stringify(a)+'\\n');
+const flag=n=>a.includes(n)?a[a.indexOf(n)+1]:undefined,revert=a[1]==='block'&&a.includes('--revert-outcome');
+if(a[1]==='get'){console.log(JSON.stringify(job));process.exit(0);}
+if(mode==='old-hub'&&revert){process.stderr.write('tt: hub: 400 invalid scope metadata request: unknown field "revert"\\n');process.exit(1);}
+if(mode==='invalid'&&revert){process.stderr.write('tt: hub: 400 invalid\\n');process.exit(1);}
+if(mode==='saved-bare'&&revert){process.stderr.write('tt: hub: 409 conflict: release: retry changed\\n');process.exit(1);}
+if(mode==='old-tt'&&revert){process.stderr.write('flag provided but not defined: -revert-outcome\\nUsage of deployment block:\\ntt: flag provided but not defined: -revert-outcome\\n');process.exit(1);}
+if(mode==='transport'&&revert){process.stderr.write('tt: hub: 503 service unavailable\\n');process.exit(1);}
+if(mode==='conflict'&&a[1]==='block'){process.stderr.write('tt: hub: 409 conflict: release: owned execution required\\n');process.exit(1);}
+if(mode==='other'&&a[1]==='block'){process.stderr.write('SYNTHETIC_PRIVATE_STDERR block failed\\n');process.exit(3);}
+if(a[1]==='block'){
+ if(Number(flag('--generation'))!==job.generation){process.stderr.write('tt: hub: 409 conflict: release: generation changed\\n');process.exit(1);}
+ job.state='blocked';job.generation++;
+ if(revert)job.revert={outcome:flag('--revert-outcome'),...(flag('--revert-commit')?{commit:flag('--revert-commit')}:{}),...(flag('--revert-bug-request')?{bugRequestId:flag('--revert-bug-request')}:{})};
+ fs.writeFileSync(${JSON.stringify(state)},JSON.stringify(job));
+}
+console.log(JSON.stringify(job));`);chmodSync(tt,0o755);
+ return {home,config:{cwd:home,journalDirectory:home,tt},calls:()=>readFileSync(log,"utf8").trim().split("\n").map(l=>JSON.parse(l)),hub:()=>JSON.parse(readFileSync(state,"utf8"))};
+}
+const BLOCK=g=>["deployment","block","--job","rel_fixture","--generation",String(g),"--request-id",`rel_fixture-block-${g}`];
+const REVERT_COMMIT="d".repeat(40),INTEGRATED="b".repeat(40);
+test("rv1 the host adapter's block sends the revert as flags, and the bare call without one",async()=>{
+ for(const [revert,extra] of [
+  [{outcome:"committed",commit:REVERT_COMMIT,bugRequestId:"rel_fixture-rollback-bug"},["--revert-outcome","committed","--revert-commit",REVERT_COMMIT,"--revert-bug-request","rel_fixture-rollback-bug"]],
+  [{outcome:"failed"},["--revert-outcome","failed"]],
+  [undefined,[]]]){
+  const t=blockTT("new"),adapter=new HostAdapter(t.config,hubJob(2));
+  await adapter.block({integrated:INTEGRATED,...(revert?{revert}:{})});
+  assert.deepEqual(t.calls(),[[...BLOCK(2),...extra]]);assert.equal(adapter.job.state,"blocked");assert.equal(adapter.job.generation,3);assert.deepEqual(t.hub().revert,revert);
+ }
+ // The call an older runner made, with no details at all, is the bare block.
+ const t=blockTT("new"),adapter=new HostAdapter(t.config,hubJob(2));
+ await adapter.block();assert.deepEqual(t.calls(),[BLOCK(2)]);assert.equal(adapter.job.state,"blocked");
+});
+test("rv2 an older hub or tt still blocks: one bare block follows with the same job, generation and request ID",async t=>{
+ const revert={outcome:"committed",commit:REVERT_COMMIT},sent=[...BLOCK(2),"--revert-outcome","committed","--revert-commit",REVERT_COMMIT];
+ // An older hub, a revert this hub holds invalid, an older tt, and a bare block saved under this request ID before.
+ for(const mode of ["old-hub","invalid","old-tt","saved-bare"]){
+  const b=blockTT(mode),adapter=new HostAdapter(b.config,hubJob(2));
+  await adapter.block({integrated:INTEGRATED,revert});
+  assert.deepEqual(b.calls(),[sent,BLOCK(2)],mode);assert.equal(adapter.job.state,"blocked",mode);assert.equal(b.hub().revert,undefined,mode);
+ }
+ const sleep=cliRetry.sleep;cliRetry.sleep=()=>{};t.after(()=>{cliRetry.sleep=sleep;});
+ const transport=blockTT("transport"),a=new HostAdapter(transport.config,hubJob(2));
+ await assert.rejects(a.block({integrated:INTEGRATED,revert}),e=>e.transport===true);
+ assert.deepEqual(transport.calls(),[sent,sent,sent],"the transport tries, never the bare form");assert.equal(a.job.state,"claimed");
+ // The hub's state refusal and a failure it does not name are thrown as they were.
+ for(const mode of ["conflict","other"]){
+  const other=blockTT(mode),c=new HostAdapter(other.config,hubJob(2));
+  await assert.rejects(c.block({integrated:INTEGRATED,revert}),e=>e.refusalRefused===undefined && e.transport===undefined,mode);
+  assert.deepEqual(other.calls(),[sent],mode);assert.equal(c.job.state,"claimed",mode);
+ }
+});
+test("rv3 a block whose merged reply was lost re-reads the job once and blocks at the hub's generation",async()=>{
+ const revert={outcome:"committed",commit:REVERT_COMMIT,bugRequestId:"rel_fixture-rollback-bug"},flags=["--revert-outcome","committed","--revert-commit",REVERT_COMMIT,"--revert-bug-request","rel_fixture-rollback-bug"];
+ const merged=hubJob(3,{state:"merged",published:true,integratedCommit:INTEGRATED});
+ const t=blockTT("new",merged),adapter=new HostAdapter(t.config,hubJob(2));
+ await adapter.block({integrated:INTEGRATED,revert});
+ assert.deepEqual(t.calls(),[[...BLOCK(2),...flags],["deployment","get","--job","rel_fixture"],[...BLOCK(3),...flags]]);
+ assert.equal(adapter.job.state,"blocked");assert.equal(adapter.job.generation,4);assert.deepEqual(t.hub().revert,revert);
+ // Another run, another integrated commit, a job still claimed, or no
+ // integrated commit to compare: nothing is adopted and the refusal is thrown.
+ for(const [label,hub,integrated] of [
+  ["another run",{...merged,runId:"run_other"},INTEGRATED],
+  ["another commit",{...merged,integratedCommit:"e".repeat(40)},INTEGRATED],
+  ["still claimed",hubJob(3),INTEGRATED],
+  ["unpublished",{...merged,published:undefined},INTEGRATED],
+  ["no integrated commit",merged,undefined]]){
+  const n=blockTT("new",hub),a=new HostAdapter(n.config,hubJob(2));
+  await assert.rejects(a.block({integrated,revert}),e=>e.generationChanged===true,label);
+  assert.deepEqual(n.calls(),[[...BLOCK(2),...flags],["deployment","get","--job","rel_fixture"]],label);assert.equal(a.job.generation,2,label);assert.equal(n.hub().state,hub.state,label);
+ }
+});
+test("rv4 a run that fails after publication with no receipt sends its journaled revert on block",async()=>{
+ // The hub never saw merged (claimed at 2), or saved it and the reply was lost (merged at 3).
+ for(const saved of [false,true]){
+  const f=fixture(),j=job(f,change(f,"client/a.js","a")),a=fake(),c=config(f,j);
+  a.merged=async()=>{throw new Error("merged response lost");};
+  const t=blockTT("new",saved?hubJob(3,{state:"merged",published:true,integratedCommit:j.commit}):hubJob(2)),host=new HostAdapter(t.config,hubJob(2));
+  a.block=async d=>{a.calls.push("block");return host.block(d);};
+  await assert.rejects(runRelease(c,a),/inspect saved journal/);
+  assert.deepEqual(a.calls,["escalate","bug","block"]);
+  const journal=journalAt(c);assert.equal(journal.revert.outcome,"committed");assert.match(journal.revert.commit,/^[a-f0-9]{40}$/);assert.equal(journal.integrated,j.commit);
+  const flags=["--revert-outcome","committed","--revert-commit",journal.revert.commit,"--revert-bug-request","rel_fixture-rollback-bug"];
+  assert.deepEqual(t.calls(),saved?[[...BLOCK(2),...flags],["deployment","get","--job","rel_fixture"],[...BLOCK(3),...flags]]:[[...BLOCK(2),...flags]],String(saved));
+  assert.equal(host.job.state,"blocked");assert.deepEqual(t.hub().revert,{outcome:"committed",commit:journal.revert.commit,bugRequestId:"rel_fixture-rollback-bug"});
+ }
+});
+
 // The runner check of the release quiet window (wi_3427bf81094d2225): on every
 // pass, after selection and the integrated matrix and before the inputs are
 // bound, a window that is open over a selected target, or unreadable while any

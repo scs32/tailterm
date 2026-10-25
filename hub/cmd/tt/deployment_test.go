@@ -1169,6 +1169,62 @@ setTimeout(() => process.exit(7), 10000);
 	}
 }
 
+// wi_816228d539a80c48 a1/a2: tt deployment block sends the runner's revert
+// flags as the request's revert, a block without them carries no revert key
+// (the bare block of an older runner), and a revert flag on any other
+// operation is refused before a request is sent.
+func TestDeploymentBlockSendsRevert(t *testing.T) {
+	var bodies [][]byte
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, b)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(api.ReleaseJob{ID: "rel_fixture", State: "blocked", Generation: 4})
+	}))
+	defer hub.Close()
+	e := env{hub: hub.URL, task: "tsk_0123456789abcdef", agent: "agt_0123456789abcdef", runID: "run_0123456789abcdef"}
+	commit := strings.Repeat("c", 40)
+	block := func(name string, flags ...string) map[string]any {
+		t.Helper()
+		before := len(bodies)
+		args := append([]string{"block", "--job", "rel_fixture", "--generation", "3", "--request-id", "block-" + name}, flags...)
+		if _, err := captureRelayOutput(t, false, func() error { return cmdDeployment(e, args) }); err != nil || len(bodies) != before+1 {
+			t.Fatalf("%s: %v %d", name, err, len(bodies))
+		}
+		var wire map[string]any
+		if err := json.Unmarshal(bodies[len(bodies)-1], &wire); err != nil {
+			t.Fatal(err)
+		}
+		if wire["operation"] != "block" || wire["jobId"] != "rel_fixture" || wire["expectedGeneration"] != float64(3) || wire["requestId"] != "block-"+name {
+			t.Fatalf("%s: %v", name, wire)
+		}
+		return wire
+	}
+	committed := block("committed", "--revert-outcome", "committed", "--revert-commit", commit, "--revert-bug-request", "rel_fixture-revert-bug")
+	if want := map[string]any{"outcome": "committed", "commit": commit, "bugRequestId": "rel_fixture-revert-bug"}; !reflect.DeepEqual(committed["revert"], want) {
+		t.Fatalf("committed revert %v", committed["revert"])
+	}
+	if failed := block("failed", "--revert-outcome", "failed"); !reflect.DeepEqual(failed["revert"], map[string]any{"outcome": "failed"}) {
+		t.Fatalf("failed revert %v", failed["revert"])
+	}
+	if bare := block("bare"); bare["revert"] != nil {
+		t.Fatalf("bare block carries a revert: %v", bare)
+	}
+	if _, ok := block("bare-key")["revert"]; ok {
+		t.Fatal("bare block sends a revert key")
+	}
+	before := len(bodies)
+	for _, op := range []string{"refuse", "finish", "merged", "claim"} {
+		err := cmdDeployment(e, []string{op, "--job", "rel_fixture", "--generation", "3", "--request-id", "other-" + op, "--revert-outcome", "committed", "--revert-commit", commit})
+		if err == nil || !strings.Contains(err.Error(), "block flags") {
+			t.Fatalf("%s with a revert: %v", op, err)
+		}
+	}
+	if len(bodies) != before {
+		t.Fatalf("a revert on another operation reached the hub: %d", len(bodies)-before)
+	}
+}
+
 // The usage line lists every operation the release runner calls.
 func TestDeploymentUsageListsRunnerOperations(t *testing.T) {
 	err := cmdDeployment(env{}, nil)

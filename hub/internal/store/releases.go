@@ -738,6 +738,10 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 	if req.Refusal != nil && req.Operation != "refuse" {
 		return zero, api.ErrInvalid
 	}
+	// So is a revert outside a block.
+	if req.Revert != nil && req.Operation != "block" {
+		return zero, api.ErrInvalid
+	}
 	// The owner's window setting has its own record and receipt; it is never
 	// rebuilt as a job.
 	if req.Operation == "window-set" || req.Operation == "window-clear" {
@@ -843,6 +847,11 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 				}
 				if err = reconcileRelease(ctx, tx, task, &j, req.Reconciliation, generation); err != nil {
 					return zero, err
+				}
+				// The hub time the job left the fence refused: the quiet
+				// window's order proof reads it, never a row number.
+				if j.State == "refused" {
+					j.SettledAt = ts(s.now())
 				}
 				// Every accepted reconcile resolved the release ref and
 				// inspected the journal as restored or without effects.
@@ -1161,6 +1170,15 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 				if j.State != "claimed" && j.State != "merged" {
 					return zero, releaseConflict("owned execution required")
 				}
+				// A bare block, from an older runner, keeps the job's old
+				// shape: its revert is unknown, never read as failed.
+				if req.Revert != nil {
+					if err = validateReleaseRevert(req.Revert); err != nil {
+						return zero, err
+					}
+					revert := *req.Revert
+					j.Revert = &revert
+				}
 				j.State = "blocked"
 				if batch != nil {
 					batchState = "held"
@@ -1249,8 +1267,11 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 // push may add only typed, bounded diagnostics (see validReleasePushDiagnostics).
 func validateReleaseRefEffects(r *api.ReleaseReceipt) error {
 	if v := r.Revert; v != nil {
-		if r.Outcome == "released" || (v.Outcome != "committed" && v.Outcome != "failed") || (v.Outcome == "committed" && !validGitCommit(v.Commit)) || (v.Commit != "" && !validGitCommit(v.Commit)) || len(v.BugRequestID) > 128 || strings.ContainsAny(v.BugRequestID, "\x00\n\r ") {
+		if r.Outcome == "released" {
 			return api.ErrInvalid
+		}
+		if err := validateReleaseRevert(v); err != nil {
+			return err
 		}
 	}
 	if p := r.Push; p != nil {
@@ -1436,6 +1457,16 @@ func goRaceArgv(argv []string) (flags, packages []string, ok bool) {
 		}
 	}
 	return argv[:i], argv[i:], true
+}
+
+// validateReleaseRevert checks a tasks-hub revert, on a receipt or a block:
+// committed with its commit, or failed with any commit it made, and the
+// bug request ID as the runner sent it.
+func validateReleaseRevert(v *api.ReleaseRevert) error {
+	if (v.Outcome != "committed" && v.Outcome != "failed") || (v.Outcome == "committed" && !validGitCommit(v.Commit)) || (v.Commit != "" && !validGitCommit(v.Commit)) || len(v.BugRequestID) > 128 || strings.ContainsAny(v.BugRequestID, "\x00\n\r ") {
+		return api.ErrInvalid
+	}
+	return nil
 }
 
 // Reconciliation refuses unknown/active execution. Exited-run rotation and a
@@ -1878,14 +1909,13 @@ type releaseWindowLedger struct {
 // no-change finish, which has no push and never selects; or (S2) the commit of
 // a hand release naming every covered target. The causes, first match wins:
 // (U1) a published job whose own or integrated diff is covered, with no
-// committed revert in its receipt, no job of its entry released or
-// superseded, and, when it is refused or rolled back, no S1 job claimed after
-// it left the project fence; (U2) a hand release that omits a covered
-// target, recorded after the newest sync record.
+// committed revert in its receipt or on the job (a block's), no job of its
+// entry released or superseded, and, when it is refused or rolled back, no S1
+// job settled after it left the project fence; (U2) a hand release that omits
+// a covered target, recorded after the newest sync record.
 func releaseWindowLedgerLoad(ctx context.Context, q queryRower, task string, w releaseWindow) (releaseWindowLedger, error) {
 	out := releaseWindowLedger{sync: map[string]bool{}}
 	var newest, newestPush time.Time
-	var pushed []string
 	settled := map[string]bool{}
 	var unreleased []api.ReleaseJob
 	rows, err := q.QueryContext(ctx, `SELECT record_json FROM release_jobs WHERE task_id=? ORDER BY rowid`, task)
@@ -1911,16 +1941,16 @@ func releaseWindowLedgerLoad(ctx context.Context, q queryRower, task string, w r
 			if at.After(newest) {
 				newest = at
 			}
-			if len(pushed) == 0 || at.After(newestPush) {
-				pushed, newestPush = nil, at
-			}
-			if at.Equal(newestPush) {
-				pushed = append(pushed, j.ID)
+			if at.After(newestPush) {
+				newestPush = at
 			}
 		}
+		// The recorded revert is read first, before any order proof: the
+		// receipt's, or the one the runner's block saved on a job that has no
+		// receipt. A job with neither has an unknown revert, never a committed one.
 		// A batch publishes its members' changes with its lead, which only
 		// the lead's integrated plan records.
-		reverted := j.Receipt != nil && j.Receipt.Revert != nil && j.Receipt.Revert.Outcome == "committed"
+		reverted := (j.Receipt != nil && j.Receipt.Revert != nil && j.Receipt.Revert.Outcome == "committed") || (j.Revert != nil && j.Revert.Outcome == "committed")
 		covered := releaseWindowCovers(w, j.Plan.Changed) || (j.IntegratedPlan != nil && releaseWindowCovers(w, j.IntegratedPlan.Changed))
 		if j.Published && j.State != "released" && j.State != "superseded" && !reverted && covered {
 			unreleased = append(unreleased, j)
@@ -1959,35 +1989,22 @@ func releaseWindowLedgerLoad(ctx context.Context, q queryRower, task string, w r
 	if err != nil {
 		return out, err
 	}
-	// A job refused or rolled back has left the fence for good. An S1 job
-	// claimed after that was merged onto a tasks-hub that already carried its
-	// publication and any revert, and its push selected every target past
-	// them. The action receipts are the proof: one row is appended with each
-	// change and none is ever rewritten, unlike job rowids, which set-aside
-	// moves. Jobs pass the fence one at a time, so the newest S1 jobs by
-	// settledAt (a batch lead and its members, which never claim) hold the
-	// latest claim. A job no claim proves stays a cause.
-	claim, loaded := int64(0), false
+	// A job refused or rolled back has left the fence for good. Jobs pass the
+	// fence one at a time and the job held it from its claim until it left,
+	// so an S1 job that settled after it left was claimed after it: merged
+	// onto a tasks-hub that already carried its publication and any revert,
+	// its push selected every target past them. The proof compares parsed
+	// times, never row numbers, which set-aside and VACUUM may reorder: the
+	// newest S1 settledAt against the job's own settledAt (its final receipt,
+	// or the hub time of the reconcile that refused it) or, for a refusal
+	// saved before refused jobs carried one, that reconcile's observedAt.
+	// An equal or unknown time keeps the job a cause.
 	for _, j := range unreleased {
 		if settled[j.EntryID] {
 			continue
 		}
-		if (j.State == "refused" || j.State == "rolled_back") && len(pushed) > 0 {
-			if !loaded {
-				for _, id := range pushed {
-					row, err := releaseReceiptRow(ctx, q, task, id, "max", "claimed")
-					if err != nil {
-						return out, err
-					}
-					claim = max(claim, row)
-				}
-				loaded = true
-			}
-			left, err := releaseReceiptRow(ctx, q, task, j.ID, "min", "refused", "rolled_back")
-			if err != nil {
-				return out, err
-			}
-			if left != 0 && claim > left {
+		if j.State == "refused" || j.State == "rolled_back" {
+			if left := releaseWindowLeft(j); !left.IsZero() && newestPush.After(left) {
 				continue
 			}
 		}
@@ -2003,17 +2020,19 @@ func releaseWindowLedgerLoad(ctx context.Context, q queryRower, task string, w r
 	return out, nil
 }
 
-// releaseReceiptRow returns the min or max rowid of the job's action receipts
-// that left it in one of states, or 0 when it has none. The instr test only
-// narrows the scan before the JSON is parsed.
-func releaseReceiptRow(ctx context.Context, q queryRower, task, job, agg string, states ...string) (int64, error) {
-	args := []any{task, `"id":"` + job + `"`, job}
-	for _, state := range states {
-		args = append(args, state)
+// releaseWindowLeft is the parsed time a refused or rolled-back job left the
+// fence: its settledAt, or for a refusal saved without one, the observedAt of
+// its last refuse reconcile. Zero when neither parses.
+func releaseWindowLeft(j api.ReleaseJob) time.Time {
+	if at := parseTS(j.SettledAt); !at.IsZero() || j.State != "refused" {
+		return at
 	}
-	var row sql.NullInt64
-	err := q.QueryRowContext(ctx, `SELECT `+agg+`(rowid) FROM release_action_receipts WHERE task_id=? AND instr(record_json,?)>0 AND json_extract(record_json,'$.id')=? AND json_extract(record_json,'$.state') IN (?`+strings.Repeat(",?", len(states)-1)+`)`, args...).Scan(&row)
-	return row.Int64, err
+	for i := len(j.Reconciliations) - 1; i >= 0; i-- {
+		if j.Reconciliations[i].Disposition == "refuse" {
+			return parseTS(j.Reconciliations[i].ObservedAt)
+		}
+	}
+	return time.Time{}
 }
 
 // releaseWindowCheck decides coverage inside an open window. It reads the

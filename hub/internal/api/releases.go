@@ -51,6 +51,11 @@ type ReleaseJob struct {
 	// Refusal is the failure tag of a job refused before publication, which
 	// has no receipt. Absent on a refusal saved earlier or sent without one.
 	Refusal *ReleaseRefusal `json:"refusal,omitempty"`
+	// Revert is the tasks-hub revert the runner reported when it blocked a
+	// published job that has no receipt; a later refuse keeps it. Absent when
+	// the block sent none (an older runner, or no revert was attempted): the
+	// revert is then unknown, not failed.
+	Revert *ReleaseRevert `json:"revert,omitempty"`
 	// Published survives a later block: tasks-hub already carries the release.
 	Published    bool                 `json:"published,omitempty"`
 	Supersession *ReleaseSupersession `json:"supersession,omitempty"`
@@ -59,6 +64,8 @@ type ReleaseJob struct {
 	RetryOf *ReleaseRetry `json:"retryOf,omitempty"`
 	// SettledAt orders released and superseded jobs for target baselines:
 	// the hub time of the final receipt, or the hand release's record time.
+	// A job the handler's reconcile refused carries that reconcile's hub
+	// time, which only the quiet-window ledger reads.
 	SettledAt string `json:"settledAt,omitempty"`
 	// Hold is set only while the job is in state held (an owner hold);
 	// HoldHistory keeps every hold and release of the job and is never rewritten.
@@ -544,6 +551,9 @@ type ReleaseRequest struct {
 	Progress           *ReleaseProgress       `json:"progress,omitempty"`
 	// Refusal is accepted on a refuse only; a bare refuse leaves it out.
 	Refusal *ReleaseRefusal `json:"refusal,omitempty"`
+	// Revert is accepted on a block only; a bare block, from an older
+	// runner, leaves it out.
+	Revert *ReleaseRevert `json:"revert,omitempty"`
 }
 
 // ReleaseProgressWait is the wait a release runner's poll ended in. It is

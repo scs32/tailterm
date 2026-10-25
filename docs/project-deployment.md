@@ -329,7 +329,10 @@ and the first release are separate operational steps.
   the project handler to file a bug linked to the item. The receipt records
   `revert: {commit, outcome: committed|failed, bugRequestId}`; the hub accepts a
   revert only on `rolled_back` or `blocked` receipts. The next release integrates
-  on top of the revert, so the rolled-back change does not ship again.
+  on top of the revert, so the rolled-back change does not ship again. A failed
+  release with no receipt (published on tasks-hub, but the hub's `merged` reply
+  never confirmed) records its revert on its block instead; see "Revert on the
+  block" below.
 - **Failure receipt retry (f3).** The failure receipt is written like the
   success receipt: its generation is saved and the journal waits in
   `receipt_pending`, so a lost response retries the identical receipt and
@@ -1392,7 +1395,9 @@ names another agent or run, a job that is no longer claimed, a changed pin, a
 failed re-read, any other check error, a second `generation changed` after the
 one re-read, and any generation change once the release is published or an
 effect is journaled. The runner never re-reads twice for one call, and it never
-continues or refuses for another agent or run.
+continues or refuses for another agent or run. The one re-read after
+publication is the final block of a job with no receipt, which only stops the
+job (see "Revert on the block").
 
 **A refusal left unfinished.** A refuse call that still fails leaves the journal
 in phase `refusing` with `refuseFailure` beside `refusalReason`, nothing
@@ -1643,22 +1648,30 @@ A *sync commit* is a commit at which every covered target is current:
 
 The first of these that applies covers the job:
 
-- U1: a job of the project is `published`, not `released` or `superseded`, its
-  receipt records no committed revert (whatever its outcome), its own paths or
+- U1: a job of the project is `published`, not `released` or `superseded`,
+  neither its receipt nor the job (a block's revert, wi_816228d539a80c48)
+  records a committed revert (whatever its outcome), its own paths or
   its integrated plan's paths are covered, and no job of its queue entry is
   `released` or `superseded`. The integrated plan counts because a batch
   publishes its members' changes with its lead, while the members stay
   unpublished until they release. Example: a job blocked after publishing
   that waits for a hand release, or a docs-only lead blocked with a hub member
-  in its batch. A job that is `refused` or `rolled_back` stops counting once
-  an S1 job is claimed after it left the project fence
-  (wi_fc763af18f58129f): that job merged onto a tasks-hub that already carried
-  the publication and any revert, and its push selected every target past
-  them. The hub proves "after" from its release action receipts, which gain one
-  row per change and are never rewritten (job rowids are not used: set-aside
-  moves them). An S1 job released before the refusal does not count, and a
-  `blocked`, `merged` or `claimed` job still holds the fence, so no later claim
-  exists.
+  in its batch. The recorded revert is read first, before any order proof. A
+  job that is `refused` or `rolled_back` with no committed revert stops
+  counting once an S1 job settled after it left the project fence
+  (wi_fc763af18f58129f): jobs pass the fence one at a time, so that S1 job was
+  claimed after it, merged onto a tasks-hub that already carried the
+  publication and any revert, and its push selected every target past them.
+  The hub proves "after" by parsed times, never row numbers (set-aside moves
+  job rows and VACUUM may renumber any): the newest S1 `settledAt` must be
+  later than the job's own `settledAt` (its final receipt's hub time, or the
+  hub time of the reconcile that refused it, wi_816228d539a80c48). A refusal
+  saved before refused jobs carried `settledAt` uses its last refuse
+  reconcile's `observedAt`, the handler's clock; an S1 job claimed after a
+  refusal settles minutes later, so a skew of seconds cannot change the
+  answer. An equal or unknown time keeps the job a cause. An S1 job released
+  before the refusal does not count, and a `blocked`, `merged` or `claimed`
+  job still holds the fence, so no later claim exists.
 - U2: a hand release that omits a covered target was recorded after the newest
   sync record (the receipt's `settledAt` or the hand release's `createdAt`,
   compared as times).
@@ -1679,7 +1692,8 @@ window is open and only for a job whose own paths are uncovered. Its limits:
 - A published job whose entry never settles holds every such job each night
   until the handler settles it (a supersession citing the hand release, or a
   released retry of the same entry) or, once it is refused or rolled back,
-  until a later S1 release.
+  until a later S1 release. That includes a published job whose block never
+  reached the hub, or reached it bare, so that it records no revert.
 - Equality with recorded commits holds too many jobs, never too few: a job on a
   revert commit, a no-change finish, or a legacy receipt without `push` is held
   and waits for the morning unhold.
@@ -1966,6 +1980,39 @@ with the same job, generation and request ID, and the job is refused without a
 reason. The first, failed call is recorded as a deployer CLI failure. So this
 runner may run beside an older hub or `tt`; deploy the hub before the runner
 as usual to keep the reason.
+
+**Revert on the block** (wi_816228d539a80c48). A release that fails after
+publication with no receipt (the runner published tasks-hub, but the hub's
+`merged` reply never reached it) ends with `tt deployment block`, not a
+finish. That block carries the journaled tasks-hub revert: `tt deployment
+block --revert-outcome committed|failed [--revert-commit SHA]
+[--revert-bug-request ID]`, from the journal's `revert` (its commit when one
+was made, and the bug request ID when the request was sent). The hub checks it
+by the receipt revert rules (`committed` needs its commit, any commit must be
+a full SHA, the bug request ID is at most 128 bytes with no space or line
+break), refuses a revert on any operation but block (400), and saves it on the
+job as `revert: {outcome, commit, bugRequestId}`, shown by `tt deployment get`.
+The handler's later refuse reconcile keeps it, and also records the job's
+`settledAt` (the hub time of that reconcile), which the quiet-window ledger
+reads.
+
+When the hub answers that block `generation changed`, the runner reads the job
+once (`tt deployment get`) and sends the same block at the hub's generation
+only when the job is `merged` and `published` under this exact agent and run,
+with unchanged pins, at the runner's own integrated commit and a later
+generation: the hub saved `merged` and its reply was lost. Anything else, or a
+failed read, fails as before. This re-read only blocks the job; it never
+resumes a release.
+
+The revert is optional. A bare block, from an older runner or with no revert
+journaled, is saved exactly as before, with no `revert`: that revert is
+unknown, never read as `failed` or `committed`. When the hub refuses the revert
+(400: an older hub's unknown field, or a revert it holds invalid), an older
+`tt` does not know `--revert-outcome`, or the hub already saved a bare block
+under the same request ID (409 `retry changed`), the runner sends that block
+once more bare, with the same job, generation and request ID. A transport
+failure or any other refusal sends no bare block. Deploy the hub before the
+runner as usual to keep the revert.
 
 ### Private host configuration (keys only)
 

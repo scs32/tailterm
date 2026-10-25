@@ -69,6 +69,9 @@ func cmdDeployment(e env, args []string) error {
 	phase := fs.String("phase", "", "runner phase to report (progress)")
 	step := fs.String("step", "", "runner step within the phase (progress), or the step that failed (refuse)")
 	target := fs.String("target", "", "the target of the step that failed (refuse)")
+	revertOutcome := fs.String("revert-outcome", "", "committed or failed: the tasks-hub revert of a job blocked after publication with no receipt (block)")
+	revertCommit := fs.String("revert-commit", "", "the revert commit the runner made, required when committed (block)")
+	revertBug := fs.String("revert-bug-request", "", "the request ID of the handler request filing the revert's bug (block)")
 	wait := fs.String("wait", "", "the wait the poll ended in: matrix, inputs, host_lock, fence, owner_hold or transport (progress)")
 	pid := fs.Int64("pid", 0, "process the wait names, such as the matrix run (progress)")
 	withdraw := fs.Bool("withdraw", false, "withdraw this run's progress report (progress)")
@@ -76,6 +79,11 @@ func cmdDeployment(e env, args []string) error {
 	fs.Var(&restored, "restored", "TARGET=RELEASE the refused job's target runs again; one per target in its receipt (retry, repeatable)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
+	}
+	// Checked before any hub call: a revert belongs to a block only.
+	hasRevert := *revertOutcome != "" || *revertCommit != "" || *revertBug != ""
+	if hasRevert && args[0] != "block" {
+		return errors.New("--revert-outcome, --revert-commit and --revert-bug-request are block flags")
 	}
 	var retry *api.ReleaseRetry
 	if args[0] == "retry" {
@@ -204,6 +212,11 @@ func cmdDeployment(e env, args []string) error {
 		// The hub checks the refusal; without these flags the refuse is the
 		// bare one an older runner sends.
 		req.Refusal = &api.ReleaseRefusal{Step: *step, Target: *target, Reason: *reason}
+	}
+	if hasRevert {
+		// The hub checks the revert; without these flags the block is the
+		// bare one an older runner sends, and its revert stays unknown.
+		req.Revert = &api.ReleaseRevert{Outcome: *revertOutcome, Commit: *revertCommit, BugRequestID: *revertBug}
 	}
 	if args[0] == "supersede" {
 		j, err := c.Release(ctx, e.task, *job)

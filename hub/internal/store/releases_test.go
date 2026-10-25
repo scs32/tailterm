@@ -7158,6 +7158,297 @@ func TestReleaseWindowPassesDocsJobPastRefusalAndLaterRelease(t *testing.T) {
 	}
 }
 
+// windowRefusalFixture drives published jobs to the shapes the window ledger
+// reads: released S1 jobs, a published block with or without a revert, and the
+// handler's refuse reconcile, each at the store clock the caller sets.
+type windowRefusalFixture struct {
+	t    *testing.T
+	s    *Store
+	task api.Task
+	h, d api.Agent
+}
+
+func newWindowRefusalFixture(t *testing.T) *windowRefusalFixture {
+	s, task, h, d, _ := releaseFixture(t)
+	setNightWindow(t, s, task)
+	return &windowRefusalFixture{t: t, s: s, task: task, h: h, d: d}
+}
+
+func (f *windowRefusalFixture) clock(at string) { setWindowClock(f.t, f.s, f.d, windowAt(at)) }
+
+func (f *windowRefusalFixture) do(key, op string, j api.ReleaseJob, set func(*api.ReleaseRequest)) (api.ReleaseJob, error) {
+	req := api.ReleaseRequest{RequestID: key, Operation: op, AgentID: f.d.ID, RunID: f.d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, IntegratedCommit: j.Commit}
+	if set != nil {
+		set(&req)
+	}
+	return f.s.ReleaseAction(context.Background(), f.task.ID, req)
+}
+
+func (f *windowRefusalFixture) act(key, op string, j api.ReleaseJob, set func(*api.ReleaseRequest)) api.ReleaseJob {
+	f.t.Helper()
+	out, err := f.do(key, op, j, set)
+	if err != nil {
+		f.t.Fatal(key, err)
+	}
+	return out
+}
+
+// published is a store change claimed and merged, so tasks-hub carries it.
+func (f *windowRefusalFixture) published(key string) api.ReleaseJob {
+	f.t.Helper()
+	j := windowEnqueue(f.t, f.s, f.task, f.h, "enqueue-"+key, releaseEntryChanged(f.t, f.s, f.task, key, key, "hub/internal/store/x.go"))
+	j = f.act("claim-"+key, "claim", j, nil)
+	return f.act("merged-"+key, "merged", j, nil)
+}
+
+// release is an S1 job: released with its push at the current clock.
+func (f *windowRefusalFixture) release(key string) api.ReleaseJob {
+	f.t.Helper()
+	j := f.published(key)
+	target := api.ReleaseTargetReceipt{Target: "tailos", Release: "fixture", ArtifactSHA256: strings.Repeat("a", 64), Outcome: "released"}
+	receipt := &api.ReleaseReceipt{Version: 1, JobID: j.ID, Commit: j.IntegratedCommit, VerificationDigest: j.VerificationDigest, Outcome: "released", Targets: []api.ReleaseTargetReceipt{target}, Push: &api.ReleasePush{Remote: "origin", Commit: j.IntegratedCommit, Outcome: "pushed"}}
+	if j = f.act("finish-"+key, "finish", j, func(r *api.ReleaseRequest) { r.Receipt = receipt }); j.State != "released" {
+		f.t.Fatalf("release %s %+v", key, j)
+	}
+	return j
+}
+
+// refuse is the handler's refuse reconcile of a blocked published job, with
+// the incident observed at observed (RFC3339) or now when empty.
+func (f *windowRefusalFixture) refuse(key string, j api.ReleaseJob, observed string) api.ReleaseJob {
+	f.t.Helper()
+	evidence := recoveryEvidence(f.t, f.s, f.task, f.h, j)
+	evidence.Disposition, evidence.NoPublication, evidence.JournalState = "refuse", false, "restored"
+	if observed != "" {
+		evidence.ObservedAt = ts(windowAt(observed))
+	}
+	if _, err := f.s.db.Exec(`UPDATE agents SET status='exited' WHERE id=?`, f.d.ID); err != nil {
+		f.t.Fatal(err)
+	}
+	out, err := f.s.ReleaseAction(context.Background(), f.task.ID, api.ReleaseRequest{RequestID: key, Operation: "reconcile", AgentID: f.h.ID, RunID: f.h.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, Reconciliation: &evidence})
+	if err != nil || out.State != "refused" || !out.Published {
+		f.t.Fatal("published refusal", out.State, err)
+	}
+	if _, err = f.s.db.Exec(`UPDATE agents SET status='running' WHERE id=?`, f.d.ID); err != nil {
+		f.t.Fatal(err)
+	}
+	return out
+}
+
+func (f *windowRefusalFixture) cause() string {
+	f.t.Helper()
+	ledger, err := releaseWindowLedgerLoad(context.Background(), f.s.db, f.task.ID, releaseWindow{ReleaseWindow: api.ReleaseWindow{Targets: []string{"hub", "bridge", "mini"}}})
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	return ledger.cause
+}
+
+func (f *windowRefusalFixture) raw(id string) string {
+	f.t.Helper()
+	var raw string
+	if err := f.s.db.QueryRow(`SELECT record_json FROM release_jobs WHERE task_id=? AND id=?`, f.task.ID, id).Scan(&raw); err != nil {
+		f.t.Fatal(err)
+	}
+	return raw
+}
+
+// wi_816228d539a80c48 a1/a2 (r1, r2): the runner's block of a published job
+// with no receipt carries its tasks-hub revert; the hub saves it on the job,
+// a later refuse reconcile keeps it and records the hub time, and the window
+// ledger reads it first: a committed revert is no cause, a failed one is a
+// cause until a later S1 release. A bare block, as an older runner sends it,
+// is saved as before with no revert, which stays unknown. A revert is
+// accepted on a block only, checked like a receipt's, and part of the
+// request's retry identity.
+func TestReleaseWindowReadsRevertRecordedOnBlock(t *testing.T) {
+	commit := strings.Repeat("e", 40)
+	for _, shape := range []string{"committed", "failed", "bare"} {
+		t.Run(shape, func(t *testing.T) {
+			f := newWindowRefusalFixture(t)
+			f.clock("2026-10-18T20:00:00-07:00")
+			f.release("earlier")
+			f.clock("2026-10-18T21:00:00-07:00")
+			p := f.published("store")
+			var revert *api.ReleaseRevert
+			switch shape {
+			case "committed":
+				revert = &api.ReleaseRevert{Outcome: "committed", Commit: commit, BugRequestID: p.ID + "-revert-bug"}
+			case "failed":
+				revert = &api.ReleaseRevert{Outcome: "failed"}
+			}
+			withRevert := func(v *api.ReleaseRevert) func(*api.ReleaseRequest) {
+				return func(r *api.ReleaseRequest) { r.Revert = v }
+			}
+			if shape == "committed" {
+				for name, bad := range map[string]api.ReleaseRevert{
+					"outcome":          {Outcome: "reverted", Commit: commit},
+					"committed bare":   {Outcome: "committed"},
+					"commit":           {Outcome: "committed", Commit: "abc"},
+					"failed commit":    {Outcome: "failed", Commit: "xyz"},
+					"bug request":      {Outcome: "failed", BugRequestID: "two words"},
+					"long bug request": {Outcome: "failed", BugRequestID: strings.Repeat("b", 129)},
+				} {
+					if _, err := f.do("block-bad-"+strings.ReplaceAll(name, " ", "-"), "block", p, withRevert(&bad)); !errors.Is(err, api.ErrInvalid) {
+						t.Fatalf("invalid revert %s: %v", name, err)
+					}
+				}
+				for _, op := range []string{"claim", "merged", "finish", "refuse", "unclaim"} {
+					if _, err := f.do("revert-on-"+op, op, p, withRevert(revert)); !errors.Is(err, api.ErrInvalid) {
+						t.Fatalf("revert on %s: %v", op, err)
+					}
+				}
+			}
+			p = f.act("block", "block", p, withRevert(revert))
+			if p.State != "blocked" || !p.Published || p.Receipt != nil || !reflect.DeepEqual(p.Revert, revert) {
+				t.Fatalf("blocked %s job %+v revert %+v", shape, p, p.Revert)
+			}
+			if shape == "bare" && strings.Contains(f.raw(p.ID), `"revert"`) {
+				t.Fatalf("a bare block saved a revert: %s", f.raw(p.ID))
+			}
+			if shape == "committed" {
+				if replay, err := f.do("block", "block", api.ReleaseJob{ID: p.ID, Commit: p.Commit, Generation: p.Generation - 1}, withRevert(revert)); err != nil || !reflect.DeepEqual(replay.Revert, revert) {
+					t.Fatal("exact block replay", replay.Revert, err)
+				}
+				changed := *revert
+				changed.Outcome, changed.Commit = "failed", ""
+				if _, err := f.do("block", "block", api.ReleaseJob{ID: p.ID, Commit: p.Commit, Generation: p.Generation - 1}, withRevert(&changed)); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "retry changed") {
+					t.Fatal("block retried with another revert", err)
+				}
+			}
+			cause := "job " + p.ID + " was published and is not released"
+			want := cause
+			if shape == "committed" {
+				want = ""
+			}
+			if got := f.cause(); got != want {
+				t.Fatalf("ledger cause of the blocked %s job %q, want %q", shape, got, want)
+			}
+
+			f.clock("2026-10-18T21:30:00-07:00")
+			p = f.refuse("reconcile", p, "")
+			if !reflect.DeepEqual(p.Revert, revert) || p.SettledAt != ts(windowAt("2026-10-18T21:30:00-07:00")) {
+				t.Fatalf("refused %s job revert %+v settledAt %q", shape, p.Revert, p.SettledAt)
+			}
+			if saved, err := releaseLoad(context.Background(), f.s.db, f.task.ID, p.ID); err != nil || !reflect.DeepEqual(saved.Revert, revert) || saved.SettledAt != p.SettledAt {
+				t.Fatal("saved refused job", saved.Revert, saved.SettledAt, err)
+			}
+			// The S1 release before the refusal clears nothing.
+			if got := f.cause(); got != want {
+				t.Fatalf("ledger cause of the refused %s job %q, want %q", shape, got, want)
+			}
+			f.clock("2026-10-19T08:00:00-07:00")
+			f.release("relanded")
+			if got := f.cause(); got != "" {
+				t.Fatalf("ledger cause after a later release %q", got)
+			}
+		})
+	}
+}
+
+// wi_816228d539a80c48 a5 (r5): the later-release proof compares parsed times,
+// never rows. A refusal and an S1 job's rows are reordered in the isolated
+// database, as set-aside moves job rows and VACUUM may renumber the receipts:
+// an S1 release settled after the refusal still clears the refused job, and
+// one settled before it still leaves it a cause. A refusal saved before
+// refused jobs carried settledAt is ordered by its refuse reconcile's
+// observedAt; with neither time it stays a cause.
+func TestReleaseWindowOrdersRefusalByTimeNotRowid(t *testing.T) {
+	ctx := context.Background()
+	// scramble moves the job's row before or after every other job and
+	// reverses the action receipts' rows.
+	scramble := func(f *windowRefusalFixture, id string, first bool) {
+		t.Helper()
+		move := `UPDATE release_jobs SET rowid=(SELECT MAX(rowid)+1 FROM release_jobs) WHERE task_id=? AND id=?`
+		if first {
+			move = `UPDATE release_jobs SET rowid=(SELECT MIN(rowid)-1 FROM release_jobs) WHERE task_id=? AND id=?`
+		}
+		for _, stmt := range []string{move, `DROP TRIGGER IF EXISTS release_receipt_no_update`} {
+			if _, err := f.s.db.ExecContext(ctx, stmt, f.task.ID, id); err != nil {
+				t.Fatal(stmt, err)
+			}
+		}
+		for _, stmt := range []string{`UPDATE release_action_receipts SET rowid=-rowid`, `UPDATE release_action_receipts SET rowid=1000000+rowid`} {
+			if _, err := f.s.db.ExecContext(ctx, stmt); err != nil {
+				t.Fatal(stmt, err)
+			}
+		}
+	}
+	rowBefore := func(f *windowRefusalFixture, a, b string) bool {
+		t.Helper()
+		var before bool
+		if err := f.s.db.QueryRowContext(ctx, `SELECT (SELECT rowid FROM release_jobs WHERE id=?)<(SELECT rowid FROM release_jobs WHERE id=?)`, a, b).Scan(&before); err != nil {
+			t.Fatal(err)
+		}
+		return before
+	}
+	refused := func(f *windowRefusalFixture, observed string) api.ReleaseJob {
+		t.Helper()
+		f.clock("2026-10-18T21:00:00-07:00")
+		p := f.published("store")
+		p = f.act("block", "block", p, nil)
+		f.clock("2026-10-18T21:30:00-07:00")
+		return f.refuse("reconcile", p, observed)
+	}
+
+	t.Run("later release whose rows come first", func(t *testing.T) {
+		f := newWindowRefusalFixture(t)
+		p := refused(f, "")
+		f.clock("2026-10-19T08:00:00-07:00")
+		later := f.release("relanded")
+		scramble(f, later.ID, true)
+		if !rowBefore(f, later.ID, p.ID) {
+			t.Fatal("the later release's row was not moved first")
+		}
+		if got := f.cause(); got != "" {
+			t.Fatalf("a release settled after the refusal leaves cause %q", got)
+		}
+	})
+	t.Run("earlier release whose rows come last", func(t *testing.T) {
+		f := newWindowRefusalFixture(t)
+		f.clock("2026-10-18T20:00:00-07:00")
+		earlier := f.release("earlier")
+		p := refused(f, "")
+		scramble(f, earlier.ID, false)
+		if !rowBefore(f, p.ID, earlier.ID) {
+			t.Fatal("the earlier release's row was not moved last")
+		}
+		if got, want := f.cause(), "job "+p.ID+" was published and is not released"; got != want {
+			t.Fatalf("a release settled before the refusal: cause %q, want %q", got, want)
+		}
+	})
+	t.Run("refusal saved without settledAt", func(t *testing.T) {
+		f := newWindowRefusalFixture(t)
+		f.clock("2026-10-18T20:00:00-07:00")
+		earlier := f.release("earlier")
+		p := refused(f, "2026-10-18T21:15:00-07:00")
+		if _, err := f.s.db.ExecContext(ctx, `UPDATE release_jobs SET record_json=json_remove(record_json,'$.settledAt') WHERE task_id=? AND id=?`, f.task.ID, p.ID); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(f.raw(p.ID), `"settledAt"`) {
+			t.Fatal("legacy refusal still has settledAt")
+		}
+		scramble(f, earlier.ID, false)
+		cause := "job " + p.ID + " was published and is not released"
+		if got := f.cause(); got != cause {
+			t.Fatalf("legacy refusal after an earlier release: cause %q", got)
+		}
+		f.clock("2026-10-19T08:00:00-07:00")
+		later := f.release("relanded")
+		scramble(f, later.ID, true)
+		if got := f.cause(); got != "" {
+			t.Fatalf("legacy refusal before a later release: cause %q", got)
+		}
+		// With no time at all the job stays a cause.
+		if _, err := f.s.db.ExecContext(ctx, `UPDATE release_jobs SET record_json=json_set(record_json,'$.reconciliations[#-1].observedAt','') WHERE task_id=? AND id=?`, f.task.ID, p.ID); err != nil {
+			t.Fatal(err)
+		}
+		if got := f.cause(); got != cause {
+			t.Fatalf("refusal with no parsed time: cause %q", got)
+		}
+	})
+}
+
 // wi_d87f594a6ae13ec9 a2 (q1, example b): a docs-only job whose base is an
 // owner commit with no hand-release record is held and its claim refused; the
 // owner's record of that commit lets the next one release. The window hold is
