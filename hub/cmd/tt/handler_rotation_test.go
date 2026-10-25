@@ -850,9 +850,10 @@ func TestQueueHandlerBriefingIntakeOwnershipAndPlainDone(t *testing.T) {
 		t.Fatal("queue handler briefing still asks for hand scoping")
 	}
 	// The amended scope confirmation rule (wi_8a98bbcb8cd81a96), with the item
-	// ID after the flags, changes the template again.
-	const before = "638fc72887bccb606cc80daf579cfa725a0ffbff92f1120050fc998c2730c03b" // 842baf01
-	const current = "d15c04366ae5ad19a58b7ebe59970d3f935d268c094a3983e3eedbef249e207a"
+	// ID after the flags, changes the template again, and so does the pathless
+	// wait sentence in the shared-path wait rule (wi_8237a5d578808c82).
+	const before = "d15c04366ae5ad19a58b7ebe59970d3f935d268c094a3983e3eedbef249e207a" // e0b58267
+	const current = "3d18b15618973afbab57dca450b149f6ebc6ddf98fb578c9a002799174e32aa9"
 	if got := handlerTemplateDigest("handler assignment"); got != current || got == before {
 		t.Fatalf("handler template digest %s, want %s", got, current)
 	}
