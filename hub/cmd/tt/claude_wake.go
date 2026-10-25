@@ -1794,21 +1794,40 @@ const claudeWakeDueEvery = 2 * time.Second
 // claudeRetryWatch finds due Enter-only retries on its own timer. gate makes
 // the hub reads the relay's pass makes before a wake (an active project, and
 // an agent on this run that is online and not closed, exited or retired) and
-// returns an error when the binding may not be woken or a read failed.
+// returns an error when the binding may not be woken or a read failed. held
+// is the watch's own memory of refused retries, by binding file; it is never
+// saved.
 type claudeRetryWatch struct {
 	dir  string
 	gate func(context.Context, runtimeBinding) error
 	ops  claudeWakeOps
 	lock sync.Locker
 	log  io.Writer
+	held map[string]claudeRetryHold
+}
+
+// claudeRetryHold spaces the watch's attempts at a due retry it did not take:
+// a gate refusal, a failed hub read, or a pane that did not qualify. The
+// binding is not gated again before until, unless its intent file changes
+// (intent is a hash of its bytes), which ends the hold. Each refusal waits
+// the next claudeWakeBackoff step, 15 s up to 120 s. Without it a refused
+// retry stays due and every 2-second tick repeats its two hub reads and its
+// pane read (review #45863 b1).
+type claudeRetryHold struct {
+	intent   [sha256.Size]byte
+	refusals int
+	until    time.Time
 }
 
 // step runs one pass over the relay's bindings. Only a binding whose intent
-// is due by a local read is considered, so the hub is read only then. A held
-// team (its progress record says so) and any gate refusal or read error skip
-// the binding until the next tick: the watch fails closed. It writes only the
-// intent and its log line, never progress or hub records.
-func (w claudeRetryWatch) step(ctx context.Context) {
+// is due by a local read, and not held after a refusal, is considered, so the
+// hub is read only then. A held team (its progress record says so) and any
+// gate refusal or read error skip the binding: the watch fails closed. It
+// writes only the intent and its log line, never progress or hub records.
+func (w *claudeRetryWatch) step(ctx context.Context) {
+	if w.held == nil {
+		w.held = map[string]claudeRetryHold{}
+	}
 	paths, _ := filepath.Glob(filepath.Join(w.dir, "*.binding.json"))
 	for _, path := range paths {
 		if ctx.Err() != nil {
@@ -1816,31 +1835,52 @@ func (w claudeRetryWatch) step(ctx context.Context) {
 		}
 		var b runtimeBinding
 		if data, err := os.ReadFile(path); err != nil || json.Unmarshal(data, &b) != nil || b.Runtime != "claude" || !validBinding(b) {
+			delete(w.held, path)
 			continue
 		}
-		if _, due := claudeWakeDueIntent(b, w.ops.now()); !due {
+		now := w.ops.now()
+		data, err := os.ReadFile(claudeWakePath(b))
+		if _, due := claudeWakeDueIntent(b, now); !due || err != nil {
+			delete(w.held, path)
 			continue
+		}
+		intent := sha256.Sum256(data)
+		hold, ok := w.held[path]
+		if ok && hold.intent == intent && now.Before(hold.until) {
+			continue
+		}
+		if !ok || hold.intent != intent {
+			hold = claudeRetryHold{intent: intent}
 		}
 		var progress relayProgress
 		if data, err := os.ReadFile(strings.TrimSuffix(path, ".binding.json") + ".progress.json"); err == nil && json.Unmarshal(data, &progress) == nil && progress.TeamHeld {
 			continue
 		}
-		w.retry(ctx, b)
+		if w.retry(ctx, b) {
+			delete(w.held, path)
+			continue
+		}
+		hold.until = now.Add(claudeWakeBackoffAfter(hold.refusals))
+		hold.refusals++
+		w.held[path] = hold
 	}
 }
 
 // retry gates one due binding and runs its retry under the pane input lock.
-func (w claudeRetryWatch) retry(ctx context.Context, b runtimeBinding) {
+// It reports whether the retry acted: saved the intent or pressed Enter.
+func (w *claudeRetryWatch) retry(ctx context.Context, b runtimeBinding) bool {
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	if w.gate(ctx, b) != nil {
-		return
+		return false
 	}
 	w.lock.Lock()
 	defer w.lock.Unlock()
-	if _, err := claudeWakeRetryDue(ctx, b, w.ops); err != nil {
+	acted, err := claudeWakeRetryDue(ctx, b, w.ops)
+	if err != nil {
 		fmt.Fprintf(w.log, "[tt relay] %s %s Claude retry watch: %v\n", w.ops.now().UTC().Format(time.RFC3339), b.Agent, err)
 	}
+	return acted
 }
 
 // nativeClaudeRetryGate reads this binding's hub for the retry watch.
@@ -1877,7 +1917,7 @@ func claudeRetryAllowed(ctx context.Context, c *api.Client, b runtimeBinding) er
 func startClaudeRetryWatch(dir string) (stop func()) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	w := claudeRetryWatch{dir: dir, gate: nativeClaudeRetryGate, ops: nativeClaudeWakeOps(), lock: &claudePaneInput, log: os.Stderr}
+	w := &claudeRetryWatch{dir: dir, gate: nativeClaudeRetryGate, ops: nativeClaudeWakeOps(), lock: &claudePaneInput, log: os.Stderr}
 	go func() {
 		defer close(done)
 		tick := func() {

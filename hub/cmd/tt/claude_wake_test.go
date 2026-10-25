@@ -3953,7 +3953,10 @@ func TestClaudeWakeRetryWatchTakesFirstRetryOnBothPaths(t *testing.T) {
 
 // t5: the watch fails closed. A due retry gets no Enter for a retired,
 // offline or superseded agent, a paused project, a held team or a hub read
-// that fails; the next tick after the hub allows it presses Enter once.
+// that fails. A refusal holds the binding for the first backoff step, so the
+// hub is read once in that time, not every tick; the first tick after the
+// hold once the hub allows it presses Enter once. A held team is skipped
+// before any hub read and holds nothing.
 func TestClaudeWakeRetryWatchGates(t *testing.T) {
 	const prompt = "Tailterm messages #45806. Run tt inbox --unread --mark-read."
 	dead := httptest.NewServer(http.NotFoundHandler())
@@ -3996,6 +3999,7 @@ func TestClaudeWakeRetryWatchGates(t *testing.T) {
 			w := claudeRetryWatch{dir: relayDir(), gate: func(ctx context.Context, b runtimeBinding) error { return claudeRetryAllowed(ctx, c, b) }, ops: f.ops(), lock: &sync.Mutex{}, log: io.Discard}
 			saved, _ := os.ReadFile(claudeWakePath(b))
 			due := f.intent(b).RetryAt
+			hub.takeCalls()
 			for tick := 0; tick < 3; tick++ {
 				f.now = due.Add(time.Duration(tick) * claudeWakeDueEvery)
 				w.step(context.Background())
@@ -4003,7 +4007,11 @@ func TestClaudeWakeRetryWatchGates(t *testing.T) {
 			if now, _ := os.ReadFile(claudeWakePath(b)); string(now) != string(saved) || !slices.Equal(f.sends, []string{"text:" + prompt}) {
 				t.Fatalf("refused binding: sends %v intent %s", f.sends, now)
 			}
-			// The hub allows it again: the next tick presses Enter once.
+			if calls := hub.takeCalls(); len(calls) > 2 || (tc.held || tc.dead) && len(calls) != 0 {
+				t.Fatalf("hub reads in three ticks: %q", calls)
+			}
+			// The hub allows it again: the first tick after the hold presses
+			// Enter once.
 			c = live
 			hub.update(func(h *needsInputHub) {
 				h.agent.Status, h.agent.Online, h.agent.RunID, h.paused = api.AgentNeedsInput, true, b.Run, false
@@ -4012,6 +4020,11 @@ func TestClaudeWakeRetryWatchGates(t *testing.T) {
 				t.Fatal(err)
 			}
 			f.now = f.now.Add(claudeWakeDueEvery)
+			w.step(context.Background())
+			if held := len(f.sends) == 1; held == tc.held {
+				t.Fatalf("tick inside the hold: sends %v (team held %v)", f.sends, tc.held)
+			}
+			f.now = due.Add(claudeWakeBackoff[0])
 			if _, err := captureRelayOutput(t, true, func() error { w.step(context.Background()); w.step(context.Background()); return nil }); err != nil {
 				t.Fatal(err)
 			}
@@ -4097,4 +4110,94 @@ func TestClaudeWakeQueueTakesPaneInputLockOnce(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("the relay wake did not run after the lock was released")
 	}
+}
+
+// b1 (review #45863): a due retry the watch refuses, here for a person's
+// draft after the wake text, is held for the next backoff step each time
+// (15, 30, 60, then 120 s), so a minute of 2-second ticks makes three gates:
+// six hub reads and three pane reads, not 60 and 30. A change to the intent
+// file ends the hold at once. When the pane qualifies, the first tick after
+// the hold presses Enter, once.
+func TestClaudeWakeRetryWatchHoldsARefusedRetry(t *testing.T) {
+	const prompt = "Tailterm messages #45865. Run tt inbox --unread --mark-read."
+	setup := func(t *testing.T) (*lagPane, runtimeBinding, *needsInputHub, *claudeRetryWatch, *int) {
+		b, hub, c, _ := needsInputFixture(t)
+		f := failedCheckWake(t, b, prompt, time.Hour)
+		writeTestBinding(t, b)
+		f.lag = 0
+		f.input = prompt + " and an owner draft"
+		hub.takeCalls()
+		inspects := new(int)
+		ops := f.ops()
+		inspect := ops.inspect
+		ops.inspect = func(ctx context.Context, b runtimeBinding, expected string) (claudeWakeSnapshot, error) {
+			*inspects++
+			return inspect(ctx, b, expected)
+		}
+		w := &claudeRetryWatch{dir: relayDir(), gate: func(ctx context.Context, b runtimeBinding) error { return claudeRetryAllowed(ctx, c, b) }, ops: ops, lock: &sync.Mutex{}, log: io.Discard}
+		return f, b, hub, w, inspects
+	}
+	t.Run("a minute of refusals, then one Enter", func(t *testing.T) {
+		f, b, hub, w, inspects := setup(t)
+		due := f.intent(b).RetryAt
+		for i := 0; i < 30; i++ { // one minute of ticks
+			f.now = due.Add(time.Duration(i) * claudeWakeDueEvery)
+			w.step(context.Background())
+		}
+		if calls := hub.takeCalls(); len(calls) != 6 || *inspects != 3 || !slices.Equal(f.sends, []string{"text:" + prompt}) {
+			t.Fatalf("one minute: hub reads %d %q, pane reads %d, sends %v; want 6, 3 and no Enter", len(calls), calls, *inspects, f.sends)
+		}
+		if got := f.intent(b); got.Attempts != 0 || got.Phase != "uncertain" {
+			t.Fatalf("refusals counted as attempts: %+v", got)
+		}
+		// The third refusal, at 45 s, holds until 105 s. Meanwhile the draft
+		// is deleted and the wake text alone remains, so the pane qualifies.
+		f.input = prompt
+		var enterAt time.Time
+		for at := due.Add(60 * time.Second); at.Before(due.Add(3 * time.Minute)); at = at.Add(claudeWakeDueEvery) {
+			f.now = at
+			if _, err := captureRelayOutput(t, true, func() error { w.step(context.Background()); return nil }); err != nil {
+				t.Fatal(err)
+			}
+			if enterAt.IsZero() && slices.Contains(f.sends, "Enter") {
+				enterAt = at
+			}
+		}
+		if want := []string{"text:" + prompt, "Enter"}; !slices.Equal(f.sends, want) || f.intent(b).Phase != "confirmed" || f.intent(b).Attempts != 1 {
+			t.Fatalf("sends %v intent %+v", f.sends, f.intent(b))
+		}
+		if hold := due.Add(105 * time.Second); enterAt.Before(hold) || enterAt.Sub(hold) >= claudeWakeDueEvery {
+			t.Fatalf("Enter at %v, want the first tick at or after the hold ends at 105s", enterAt.Sub(due))
+		}
+	})
+	t.Run("an intent change ends the hold", func(t *testing.T) {
+		f, b, hub, w, _ := setup(t)
+		f.now = f.intent(b).RetryAt
+		w.step(context.Background())
+		f.now = f.now.Add(claudeWakeDueEvery)
+		w.step(context.Background())
+		if calls := hub.takeCalls(); len(calls) != 2 {
+			t.Fatalf("first refusal and one held tick: hub reads %q", calls)
+		}
+		// The relay's pass saves its own skip reason in the intent.
+		intent := f.intent(b)
+		claudeWakeSaveReason(&intent, "pane not safe for retry: input holds other text")
+		if err := writePrivateJSON(claudeWakePath(b), intent); err != nil {
+			t.Fatal(err)
+		}
+		f.now = f.now.Add(claudeWakeDueEvery)
+		w.step(context.Background())
+		if calls := hub.takeCalls(); len(calls) != 2 || !slices.Equal(f.sends, []string{"text:" + prompt}) {
+			t.Fatalf("after the intent changed: hub reads %q sends %v", calls, f.sends)
+		}
+		// The changed intent starts its holds again at the first step.
+		refused := f.now
+		for at := refused.Add(claudeWakeDueEvery); at.Before(refused.Add(claudeWakeBackoff[0] + claudeWakeDueEvery)); at = at.Add(claudeWakeDueEvery) {
+			f.now = at
+			w.step(context.Background())
+		}
+		if calls := hub.takeCalls(); len(calls) != 2 {
+			t.Fatalf("hub reads in the %v after the changed intent's refusal: %q, want one gate at %v", claudeWakeBackoff[0]+claudeWakeDueEvery, calls, claudeWakeBackoff[0])
+		}
+	})
 }
