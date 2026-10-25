@@ -920,9 +920,13 @@ go-test already carries `-timeout=45m`, so go test's 600 s package default
 cannot trip under the 20-minute check limit. This matrix change also needed a
 new owner approval of the digest.
 
-**npm-unit file budget.** npm-unit is `node --test tests/*.test.js`: the test
-files run in parallel and the tests inside one file run one after another, so
-the check lasts about as long as its slowest file. The rule: no test file may
+**npm-unit file budget.** npm-unit is `npm test`: after
+`node scripts/build-team-plan.mjs --check` it runs
+`node tests/run-unit-tests.mjs --concurrency 12`. The runner starts the files
+in its `LONGEST` list first and the other `tests/*.test.js` files after them
+in name order. Up to 12 files run in parallel and the tests inside one file
+run one after another, so the check lasts about as long as its slowest file.
+The rule: no test file may
 take more than half of `checkTimeoutMs["npm-unit"]` in a passing npm-unit
 attempt (240 s under the present 480000 ms), and a full npm-unit run alone on
 the host finishes within that same half. When a file passes the half, split
@@ -930,7 +934,8 @@ it; do not raise the limit for it.
 
 The two slowest files were split under this rule on 2026-10-12
 (`wi_ae63ff4bc52842dc`), with no matrix change, because new `tests/*.test.js`
-files are already selected by the `tests/` rule and the `npm test` glob.
+files are already selected by the `tests/` rule and picked up by the runner's
+directory listing, which runs them after its `LONGEST` list.
 `tests/release-runner.test.js` (475 s in a passing attempt beside the rest of
 the suite, 315 s alone) is now that file plus `tests/release-runner-2.test.js`,
 `tests/release-runner-3.test.js` and `tests/release-runner-4.test.js`, with
