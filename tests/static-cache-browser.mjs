@@ -11,11 +11,14 @@ const assetCacheControl = assetRule[1].trim();
 assert.equal(assetCacheControl, "no-cache");
 
 for (const engine of [chromium, webkit]) {
-  let cssRequests = 0;
+  // The fallback is keyed on the test phase, not on a request count, so an
+  // extra or speculative first-load CSS request cannot use it up.
+  let reloaded = false;
+  const cssRequests = { firstLoad: 0, reload: 0 };
   const server = createServer((request, response) => {
     if (request.url === "/assets/index-upgrade.css") {
-      cssRequests++;
-      if (cssRequests === 1) {
+      cssRequests[reloaded ? "reload" : "firstLoad"]++;
+      if (!reloaded) {
         // Cloudflare Pages' SPA fallback when a deploy-time asset is not yet
         // available. nosniff makes browsers correctly reject it as CSS.
         const body = "<!doctype html><title>TailOS fallback</title>";
@@ -64,8 +67,16 @@ for (const engine of [chromium, webkit]) {
       "rgba(0, 0, 0, 0)",
       `${engine.name()} must reject the HTML fallback as CSS`,
     );
+    assert.ok(
+      cssRequests.firstLoad >= 1,
+      `${engine.name()} must request CSS on first load`,
+    );
+    reloaded = true;
     await page.reload();
-    assert.equal(cssRequests, 2, `${engine.name()} must revalidate failed CSS`);
+    assert.ok(
+      cssRequests.reload >= 1,
+      `${engine.name()} must revalidate failed CSS`,
+    );
     assert.equal(
       await page.evaluate(
         () => getComputedStyle(document.body).backgroundColor,
