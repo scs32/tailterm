@@ -1214,6 +1214,54 @@ test("occupied required port reports its PID and never starts or kills a listene
   }
 });
 
+// wi_de301820aa1e91f9: only a timed-out lsof is retried, a bounded number of
+// times, before the check is refused.
+test("a timed-out port owner probe is retried and any other probe error refuses at once", () => {
+  const check = {
+    id: "fixture-browser",
+    environment: { VERIFICATION_TIMEOUT_MS: "1000", VERIFICATION_REQUIRED_PORTS: "4173" },
+  };
+  const probes = (...answers) => {
+    const calls = [];
+    const run = (command, args, options) => {
+      calls.push({ command, args, options });
+      return answers[Math.min(calls.length, answers.length) - 1];
+    };
+    return { calls, run };
+  };
+  const timedOut = {
+    status: null,
+    stdout: "",
+    stderr: "",
+    error: Object.assign(new Error("spawnSync lsof ETIMEDOUT"), { code: "ETIMEDOUT" }),
+  };
+  assert.equal(matrixRunner.PORT_PROBE_ATTEMPTS, 3);
+  const retried = probes(timedOut, { status: 0, stdout: "p123\n", stderr: "" });
+  assert.deepEqual(occupiedPorts(check, retried.run), [{ port: 4173, pids: [123] }]);
+  assert.equal(retried.calls.length, 2);
+  for (const call of retried.calls) {
+    assert.equal(call.command, "lsof");
+    assert.deepEqual(call.args, ["-nP", "-iTCP:4173", "-sTCP:LISTEN", "-Fp"]);
+    assert.equal(call.options.timeout, 10000);
+  }
+  const free = probes(timedOut, { status: 1, stdout: "", stderr: "" });
+  assert.deepEqual(occupiedPorts(check, free.run), [], "a free port after a retry");
+  const stuck = probes(timedOut);
+  assert.throws(
+    () => occupiedPorts(check, stuck.run),
+    /Port owner inspection unavailable: spawnSync lsof ETIMEDOUT after 3 attempts/,
+  );
+  assert.equal(stuck.calls.length, 3, "the retry is bounded");
+  const missing = probes({
+    status: null,
+    stdout: "",
+    stderr: "",
+    error: Object.assign(new Error("spawnSync lsof ENOENT"), { code: "ENOENT" }),
+  });
+  assert.throws(() => occupiedPorts(check, missing.run), /^Error: Port owner inspection unavailable: spawnSync lsof ENOENT$/);
+  assert.equal(missing.calls.length, 1, "only a timeout is retried");
+});
+
 test("matrix timeout kills its own process group descendants and retains failed receipt evidence", async (t) => {
   const f = fixture(t),
     external = tempDir(t, "verification-timeout-logs-"),
@@ -1939,23 +1987,51 @@ test("plans and targeted runs refuse a base the candidate does not contain", asy
   assert.equal(makePlan({ ...context, baseCommit: f.commit }, f.cwd).changed.length, 0);
   assert.deepEqual(linear.changed, ["docs/old.md", "docs/new.md"]);
 });
+// wi_de301820aa1e91f9: read from start and end order, not wall-clock overlap,
+// which load inverted ("wasm-test-build is off the Go tail" with go-race on a
+// 120 ms timer). A counter ticks at each start and end, and the receipt times
+// are made from the ticks, so no two share a millisecond. go-race ends only
+// once every non-Go check has, or after a fallback that a scheduler holding
+// non-Go checks behind Go would reach, failing the overlap assertions below.
 test("Go checks start first and bypass exclusive barriers while one job keeps plan order", async () => {
   const checks = criticalPathPlan();
-  const duration = (c) => (c.id === "go-race" ? 120 : c.id === "go-test" ? 20 : 10);
-  const { results, starts } = await simulateLoad(checks, 5, duration);
+  const run = async (checks, jobs, untilNonGoEnds) => {
+    let tick = 0,
+      nonGoLeft = checks.filter((c) => !matrixRunner.isGoCheck(c)).length,
+      nonGoEnded;
+    const nonGoDone = new Promise((resolve) => (nonGoEnded = resolve));
+    const at = (t) => new Date(Date.UTC(2026, 0, 1) + t * 1000).toISOString();
+    const starts = [];
+    const results = await runScheduled(checks, { jobs }, async (check) => {
+      starts.push(check.id);
+      const start = tick++;
+      if (untilNonGoEnds && check.id === "go-race") {
+        let fallback;
+        await Promise.race([
+          nonGoDone,
+          new Promise((resolve) => (fallback = setTimeout(resolve, 20_000))),
+        ]);
+        clearTimeout(fallback);
+      } else await new Promise((resolve) => setTimeout(resolve, 1 + (start % 3)));
+      const end = tick++;
+      if (!matrixRunner.isGoCheck(check) && --nonGoLeft === 0) nonGoEnded();
+      return { ...check, start, end, startedAt: at(start), endedAt: at(end) };
+    });
+    return { results, starts };
+  };
+  const { results, starts } = await run(checks, 5, true);
   assert.equal(starts[0], "go-race", "the longest check starts at once");
   assert.deepEqual(overlapViolations(results), []);
   const span = (id) => results.find((r) => r.id === id);
-  const overlaps = (a, b) =>
-    span(a).startedAt < span(b).endedAt && span(b).startedAt < span(a).endedAt;
+  const overlaps = (a, b) => span(a).start < span(b).end && span(b).start < span(a).end;
   assert(overlaps("go-race", "00-static-build"), "Go does not wait for the static build");
   assert(overlaps("go-race", "go-vet"), "go-vet runs beside go-race");
   assert(!overlaps("go-race", "go-test"), "go-test stays in the Go lane");
   assert(overlaps("go-race", "wasm-test-build"), "wasm-test-build is off the Go tail");
-  assert(span("wasm-test-build").endedAt <= span("go-race").endedAt);
+  assert(span("wasm-test-build").end <= span("go-race").end);
   for (let i = 0; i < 8; i++)
-    assert(span(`tests/s${i}.mjs`).startedAt >= span("01-static-release-verify").endedAt);
-  const serial = await simulateLoad(checks, 1, () => 2);
+    assert(span(`tests/s${i}.mjs`).start >= span("01-static-release-verify").end);
+  const serial = await run(checks, 1, false);
   assert.deepEqual(serial.starts, checks.map((c) => c.id), "one job runs in plan order");
 });
 test("go-race holds two job slots so fewer checks run beside it", async () => {

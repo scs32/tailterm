@@ -892,23 +892,36 @@ export function checkClean(cwd, commit) {
   )
     throw new Error("Clean detached worktree required");
 }
+// wi_de301820aa1e91f9: lsof on a loaded host has run past 5 s (10-13 and
+// 10-24 matrix logs), so a timed-out probe is retried before the check is
+// refused. Any other probe error still refuses it at once.
+export const PORT_PROBE_TIMEOUT_MS = 10000;
+export const PORT_PROBE_ATTEMPTS = 3;
 // Port and timeout policy is included in the approved command environment,
 // and failure reasons are retained in the receipt and its hashed logs.
-export function occupiedPorts(check) {
+// run replaces spawnSync for tests.
+export function occupiedPorts(check, run = spawnSync) {
   const raw = check.environment.VERIFICATION_REQUIRED_PORTS;
   if (!raw) return [];
   const ports = raw.split(",").map(Number);
   if (ports.some((p) => !Number.isInteger(p) || p < 1 || p > 65535))
     throw new Error("Invalid required port list");
   return ports.flatMap((port) => {
-    const probe = spawnSync(
-      "lsof",
-      ["-nP", "-iTCP:" + port, "-sTCP:LISTEN", "-Fp"],
-      { encoding: "utf8", timeout: 5000 },
-    );
+    let probe;
+    for (let attempt = 1; attempt <= PORT_PROBE_ATTEMPTS; attempt++) {
+      probe = run("lsof", ["-nP", "-iTCP:" + port, "-sTCP:LISTEN", "-Fp"], {
+        encoding: "utf8",
+        timeout: PORT_PROBE_TIMEOUT_MS,
+      });
+      if (probe.error?.code !== "ETIMEDOUT") break;
+    }
     if (probe.error)
       throw new Error(
-        "Port owner inspection unavailable: " + probe.error.message,
+        "Port owner inspection unavailable: " +
+          probe.error.message +
+          (probe.error.code === "ETIMEDOUT"
+            ? " after " + PORT_PROBE_ATTEMPTS + " attempts"
+            : ""),
       );
     if (probe.status === 1 && !probe.stdout && !probe.stderr) return [];
     if (probe.status !== 0)
