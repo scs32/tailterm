@@ -1226,7 +1226,8 @@ func newLaunchFaultHub(t *testing.T, f teamFixture) *launchFaultHub {
 				return
 			}
 			if fault.landed {
-				inner.ServeHTTP(httptest.NewRecorder(), r)
+				// The write lands even when a slow serve outlasts its caller.
+				inner.ServeHTTP(httptest.NewRecorder(), r.WithContext(context.WithoutCancel(r.Context())))
 			}
 			// The server notices a caller that gave up only once the body
 			// is read, so a stalled write ends with its caller.
@@ -1359,6 +1360,19 @@ func (h *launchFaultHub) takeOnce(r *http.Request) *unansweredOnce {
 		}
 	}
 	return nil
+}
+
+// holds reports whether the hub will hold r for its caller: an armed stall,
+// not a refusal or a dropped connection.
+func (h *launchFaultHub) holds(r *http.Request) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, fault := range h.once {
+		if fault.hits == 0 && fault.refusal == nil && !fault.drop && fault.match(r) {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *launchFaultHub) fired(fault *unansweredOnce) bool {
@@ -5142,17 +5156,66 @@ func TestTeamRunnerCloseoutRealCleanupTimeoutRetries(t *testing.T) {
 }
 
 // Hub timeouts in the lead claim, the post-spawn registration read and the
-// team close write (wi_fa522a5f0f48c870, order #44435). The runner talks to
-// the fault hub through a 1 s client; only the exact matched request stalls.
+// team close write (wi_fa522a5f0f48c870, order #44435). Only the exact
+// matched request stalls, and only it gets a 1 s timeout.
 
-// faultClient is the runner's client for these tests.
+// faultClient is the runner's client for these tests. A request the hub will
+// hold for its caller times out after 1 s; every other request gets 10 s, so
+// a slow unrelated call on a loaded race run cannot time out first
+// (wi_c66434a2ac1dc9f6).
 func faultClient(t *testing.T, hub *launchFaultHub) *api.Client {
 	t.Helper()
-	c, err := api.NewClient(hub.e.hub, time.Second)
+	c, err := api.NewClient(hub.e.hub, 10*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
+	c.HTTP.Transport = stallTimeout{hub: hub, timeout: time.Second}
 	return c
+}
+
+// stallTimeout gives a request the hub will hold its own short deadline and
+// sends any other request straight to the default transport.
+type stallTimeout struct {
+	hub     *launchFaultHub
+	timeout time.Duration
+}
+
+func (s stallTimeout) RoundTrip(r *http.Request) (*http.Response, error) {
+	if !s.hub.holds(r) {
+		return http.DefaultTransport.RoundTrip(r)
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), s.timeout)
+	res, err := http.DefaultTransport.RoundTrip(r.WithContext(ctx))
+	if err != nil {
+		cancel()
+		// http.Client names its own timeout only when its timer wins the
+		// race with the request's deadline; this deadline always says so.
+		if ctx.Err() == context.DeadlineExceeded && r.Context().Err() == nil {
+			return nil, stallTimeoutError{}
+		}
+		return nil, err
+	}
+	res.Body = cancelOnClose{res.Body, cancel}
+	return res, nil
+}
+
+// stallTimeoutError reads as http.Client's own timeout error.
+type stallTimeoutError struct{}
+
+func (stallTimeoutError) Error() string {
+	return context.DeadlineExceeded.Error() + " (Client.Timeout exceeded while awaiting headers)"
+}
+func (stallTimeoutError) Timeout() bool        { return true }
+func (stallTimeoutError) Is(target error) bool { return target == context.DeadlineExceeded }
+
+type cancelOnClose struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b cancelOnClose) Close() error {
+	defer b.cancel()
+	return b.ReadCloser.Close()
 }
 
 func exactRequest(method, path string) func(*http.Request) bool {
