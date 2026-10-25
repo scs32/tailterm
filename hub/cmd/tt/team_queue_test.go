@@ -2349,6 +2349,102 @@ func TestTeamQueueCLIWaitSetListAndClear(t *testing.T) {
 	}
 }
 
+// wi_b787a95c1757f554 h1, h2: wait set records a pause that shares no path
+// when it gives --reason in place of --owns; list and --json show the reason
+// where a path wait shows its paths. Neither and both are refused before the
+// hub is asked, and clear round-trips.
+func TestTeamQueueWaitCLIPathless(t *testing.T) {
+	f := newTeamFixture(t, true)
+	ctx := context.Background()
+	repo, head := queueGitRepo(t)
+	parallelCLIProject(t, f, "none")
+	second, secondOrder := queueFixtureItem(t, f, "paused-behind")
+	add := func(key, item string, order int64) api.TeamQueueEntry {
+		t.Helper()
+		q, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: key, Operation: "add", ItemID: item, OrderMessageSeq: order, Host: spawn.Host(), Cwd: repo, Repository: filepath.Join(repo, ".git"), BaseCommit: head, Serial: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return q
+	}
+	pred, waiting := add("pause-pred", f.item.ID, f.order), add("pause-waiting", second.ID, secondOrder)
+	run := func(e env, args ...string) (string, error) {
+		t.Helper()
+		return captureCLIOutput(t, func() error { return cmdTeamQueue(e, append([]string{"wait"}, args...)) })
+	}
+	for name, args := range map[string][]string{
+		"neither a path nor a reason": {"set", "--entry", waiting.ID, "--on", pred.ID, "--until", "released"},
+		"a reason of only spaces":     {"set", "--entry", waiting.ID, "--on", pred.ID, "--reason", "  ", "--until", "released"},
+		"both a path and a reason":    {"set", "--entry", waiting.ID, "--on", pred.ID, "--owns", "hub/a.go", "--reason", "quiet host", "--until", "released"},
+	} {
+		if _, err := run(f.e, args...); err == nil || !strings.Contains(err.Error(), "wait set needs --owns PATH for a shared path, or --reason TEXT for a pause that shares no path, not both") ||
+			!strings.Contains(err.Error(), "tt team queue wait set --entry tqe_WAITING --on tqe_PREDECESSOR --reason TEXT --until accepted|done|released") {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	if !strings.Contains(teamQueueWaitUsage, "usage: tt team queue wait set --entry tqe_WAITING --on tqe_PREDECESSOR --owns PATH") {
+		t.Fatalf("the path form left the usage: %s", teamQueueWaitUsage)
+	}
+	if got, _ := f.c.GetTeamQueueEntry(ctx, f.task.ID, waiting.ID); len(got.Waits) != 0 {
+		t.Fatalf("a refused set stored a wait: %+v", got.Waits)
+	}
+
+	const pause = "a quiet host for its release"
+	sentence := fmt.Sprintf("waits on %s for %s until released", f.item.ID, pause)
+	out, err := run(f.e, "set", "--entry", waiting.ID, "--on", pred.ID, "--reason", pause, "--until", "released")
+	if err != nil || out != fmt.Sprintf("wait set %s %s: %s\n", waiting.ID, second.ID, sentence) {
+		t.Fatalf("owner pathless wait set: %q %v", out, err)
+	}
+	list, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"list"}) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entryLine string
+	lines := strings.Split(list, "\n")
+	for i, line := range lines {
+		if strings.Contains(line, " "+waiting.ID+" ") {
+			entryLine = line
+			if i+1 >= len(lines) || lines[i+1] != "  "+sentence {
+				t.Fatalf("list does not print the pause under its entry:\n%s", list)
+			}
+		}
+	}
+	if !strings.Contains(entryLine, "reason=") || !strings.Contains(entryLine, sentence) || strings.Count(list, sentence) != 2 {
+		t.Fatalf("list reason lacks the pause, or another entry shows it:\n%s", list)
+	}
+	jsonList, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"list", "--json"}) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded api.TeamQueueList
+	if err := json.Unmarshal([]byte(jsonList), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, q := range decoded.Entries {
+		if q.ID == waiting.ID {
+			found = len(q.Waits) == 1 && q.Waits[0].Reason == pause && q.Waits[0].Paths != nil && len(q.Waits[0].Paths) == 0 && q.Waits[0].Until == "released" && q.Waits[0].State == "waiting"
+		}
+	}
+	if !found || !strings.Contains(jsonList, `"paths": []`) || !strings.Contains(jsonList, `"reason": "`+pause+`"`) {
+		t.Fatalf("json does not carry the pause:\n%s", jsonList)
+	}
+
+	handlerEnv := f.e
+	handlerEnv.agent, handlerEnv.runID = f.handler.ID, f.handler.RunID
+	out, err = run(handlerEnv, "clear", "--entry", waiting.ID, "--on", pred.ID, "--reason", "release ended")
+	if err != nil || out != fmt.Sprintf("wait clear %s %s: no longer waits on entry %s\n", waiting.ID, second.ID, pred.ID) {
+		t.Fatalf("handler wait clear: %q %v", out, err)
+	}
+	if list, err = captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"list"}) }); err != nil || strings.Contains(list, "waits on") {
+		t.Fatalf("cleared pause still listed: %v\n%s", err, list)
+	}
+	out, err = run(handlerEnv, "set", "--entry", waiting.ID, "--on", pred.ID, "--reason", "another pause", "--until", "accepted")
+	if err != nil || out != fmt.Sprintf("wait set %s %s: waits on %s for another pause until accepted\n", waiting.ID, second.ID, f.item.ID) {
+		t.Fatalf("handler pathless wait set: %q %v", out, err)
+	}
+}
+
 // q1, q2 (wi_09e8be006c508126): a requeue without --cwd copies the failed
 // entry's checkout and base, so the CLI refuses a checkout that was cleaned, a
 // checkout it cannot check from another host, and a base that is not the

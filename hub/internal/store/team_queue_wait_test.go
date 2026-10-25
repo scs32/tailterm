@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/scs32/tailterm/hub/internal/api"
 )
@@ -104,6 +105,11 @@ func (f *waitFixture) setRequest(until string, paths ...string) api.TeamQueueReq
 		paths = []string{waitPath}
 	}
 	return api.TeamQueueRequest{RequestID: api.NewID("req"), Operation: "wait_set", EntryID: f.waiting.ID, WaitOnEntryID: f.pred.ID, WaitPaths: paths, WaitUntil: until}
+}
+
+// setPause is a pathless wait: a reason in place of paths.
+func (f *waitFixture) setPause(until, reason string) api.TeamQueueRequest {
+	return api.TeamQueueRequest{RequestID: api.NewID("req"), Operation: "wait_set", EntryID: f.waiting.ID, WaitOnEntryID: f.pred.ID, WaitUntil: until, WaitReason: reason}
 }
 
 func (f *waitFixture) set(t *testing.T, until string) api.TeamQueueEntry {
@@ -1219,5 +1225,242 @@ func TestQueueStallFutureMatrixWaitSinceBounded(t *testing.T) {
 			advance(2 * time.Minute)
 			assertStall(t, f, b.ID, api.StallIdleEntry, a.ID)
 		})
+	}
+}
+
+// waitPause is a pathless wait's reason: a requested pause that shares no path.
+const waitPause = "a quiet host while the predecessor's release runs go-test"
+
+// wi_b787a95c1757f554 h1: the owner or a live handler records a wait that
+// names a reason instead of paths. Neither, both, a long or multi-line
+// reason, and a lead are refused and store nothing; an identical repeat
+// changes nothing and another reason on the same pair is a conflict.
+func TestTeamQueueWaitPathlessSetAndRefusals(t *testing.T) {
+	f := newWaitFixture(t)
+	f.team(t)
+	for name, c := range map[string]struct {
+		edit func(*api.TeamQueueRequest)
+		kind error
+		text string
+	}{
+		"neither a path nor a reason": {func(r *api.TeamQueueRequest) { r.WaitReason = "" }, api.ErrInvalid, "a wait needs at least one path, or a reason for a pause that shares no path"},
+		"a reason of only spaces":     {func(r *api.TeamQueueRequest) { r.WaitReason = "   " }, api.ErrInvalid, "at least one path, or a reason"},
+		"both paths and a reason":     {func(r *api.TeamQueueRequest) { r.WaitPaths = []string{waitPath} }, api.ErrInvalid, "a wait names shared paths or a reason, not both"},
+		"a reason over 500 bytes":     {func(r *api.TeamQueueRequest) { r.WaitReason = strings.Repeat("x", 501) }, api.ErrInvalid, "a wait reason is one line of at most 500 bytes"},
+		"a reason of two lines":       {func(r *api.TeamQueueRequest) { r.WaitReason = "quiet host\nfor a release" }, api.ErrInvalid, "one line"},
+		"an item lead":                {func(r *api.TeamQueueRequest) { r.LeadAgentID, r.LeadRunID = f.lead.ID, f.lead.RunID }, api.ErrConflict, "only the owner or a database handler"},
+	} {
+		req := f.setPause(api.TeamQueueWaitReleased, waitPause)
+		c.edit(&req)
+		if _, err := f.s.TeamQueueAction(f.ctx, f.task.ID, req); !errors.Is(err, c.kind) || !strings.Contains(err.Error(), c.text) {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	var rows int
+	if err := f.s.db.QueryRow(`SELECT count(*) FROM team_queue_waits`).Scan(&rows); err != nil || rows != 0 {
+		t.Fatalf("refused waits stored %d rows %v", rows, err)
+	}
+
+	req := f.setPause(api.TeamQueueWaitReleased, "  "+waitPause+" ")
+	req.HandlerAgentID, req.HandlerRunID = f.handler.ID, f.handler.RunID
+	q, err := f.s.TeamQueueAction(f.ctx, f.task.ID, req)
+	if err != nil || len(q.Waits) != 1 {
+		t.Fatalf("handler pathless set %+v %v", q, err)
+	}
+	w := q.Waits[0]
+	if w.Paths == nil || len(w.Paths) != 0 || w.Reason != waitPause || w.Until != api.TeamQueueWaitReleased || w.State != api.TeamQueueWaitWaiting || w.OnItemID != f.items[0].ID {
+		t.Fatalf("wait %+v", w)
+	}
+	var pathsJSON, reason, by, setAt string
+	if err := f.s.db.QueryRow(`SELECT paths_json,reason,set_by,set_at FROM team_queue_waits`).Scan(&pathsJSON, &reason, &by, &setAt); err != nil || pathsJSON != "[]" || reason != waitPause || by != f.handler.ID {
+		t.Fatalf("row %q %q %q %v", pathsJSON, reason, by, err)
+	}
+	sentence := fmt.Sprintf("waits on %s for %s until released", f.items[0].ID, waitPause)
+	if listed := f.waitingEntry(t); len(listed.Waits) != 1 || listed.Waits[0].Text() != sentence || !strings.HasSuffix(listed.BlockReason, sentence) || listed.Revision != f.waiting.Revision {
+		t.Fatalf("listed %+v reason %q", listed.Waits, listed.BlockReason)
+	}
+	f.clock = f.clock.Add(time.Minute)
+	if again, err := f.s.TeamQueueAction(f.ctx, f.task.ID, f.setPause(api.TeamQueueWaitReleased, waitPause)); err != nil || len(again.Waits) != 1 || again.Waits[0].SetAt != setAt {
+		t.Fatalf("identical repeat changed the wait: %+v %v", again.Waits, err)
+	}
+	clearCommand := fmt.Sprintf("tt team queue wait clear --task %s --entry %s --on %s", f.task.ID, f.waiting.ID, f.pred.ID)
+	for name, other := range map[string]api.TeamQueueRequest{
+		"another reason":    f.setPause(api.TeamQueueWaitReleased, "another pause"),
+		"another condition": f.setPause(api.TeamQueueWaitAccepted, waitPause),
+		"paths instead":     f.setRequest(api.TeamQueueWaitReleased),
+	} {
+		if _, err := f.s.TeamQueueAction(f.ctx, f.task.ID, other); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), clearCommand) {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+}
+
+// wi_b787a95c1757f554 h2, h3: a pathless wait on a predecessor's release
+// tells the waiting lead exactly once when the release job is released,
+// naming the reason where a path wait names its paths.
+func TestTeamQueueWaitPathlessReleasedNotifiesOnce(t *testing.T) {
+	f := newWaitFixture(t)
+	f.team(t)
+	if _, err := f.s.TeamQueueAction(f.ctx, f.task.ID, f.setPause(api.TeamQueueWaitReleased, waitPause)); err != nil {
+		t.Fatal(err)
+	}
+	f.exec(t, `INSERT INTO release_jobs(task_id,id,entry_id,state,generation,record_json) VALUES(?,?,?,'verified',1,'{}')`, f.task.ID, api.NewID("rel"), f.pred.ID)
+	before := f.messageCount(t)
+	if steps := f.sweep(t); len(steps) != 0 || f.messageCount(t) != before {
+		t.Fatalf("steps while the release runs: %v", steps)
+	}
+	f.clock = f.clock.Add(time.Minute)
+	f.meet(t, api.TeamQueueWaitReleased)
+	if steps := f.sweep(t); len(steps) != 1 || steps[0] != "wait-met" {
+		t.Fatalf("steps at the release: %v", steps)
+	}
+	got := f.notices(t, f.lead, queueWaitMetSubject)
+	if len(got) != 1 {
+		t.Fatalf("%d notices to the lead", len(got))
+	}
+	text, refs := got[0].Envelope.Body.Text, got[0].Envelope.Refs
+	for _, want := range []string{f.items[0].ID, f.pred.ID, "until it was released", "released commit " + waitReleased, "Paused for: " + waitPause + ".", "Resume the paused work."} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("notice lacks %q: %s", want, text)
+		}
+	}
+	if strings.Contains(text, "Paths now free") || strings.Contains(text, "these paths") {
+		t.Fatalf("a pathless notice names paths: %s", text)
+	}
+	if refs["activity"] != "queue_wait" || refs["condition"] != api.TeamQueueWaitReleased || refs["commit"] != waitReleased || refs["predecessorEntry"] != f.pred.ID {
+		t.Fatalf("refs %v", refs)
+	}
+	sentence := fmt.Sprintf("wait on %s met (released, commit %s): resume the work paused for %s", f.items[0].ID, waitReleased, waitPause)
+	if listed := f.waitingEntry(t); len(listed.Waits) != 1 || listed.Waits[0].State != api.TeamQueueWaitMet || listed.Waits[0].Text() != sentence || !strings.HasSuffix(listed.BlockReason, sentence) {
+		t.Fatalf("listed %+v %q", listed.Waits, listed.BlockReason)
+	}
+	for i := 0; i < 3; i++ {
+		f.clock = f.clock.Add(30 * time.Second)
+		if steps := f.sweep(t); len(steps) != 0 {
+			t.Fatalf("sweep %d repeated: %v", i, steps)
+		}
+	}
+	f.reopen(t)
+	f.clock = f.clock.Add(30 * time.Second)
+	if steps := f.sweep(t); len(steps) != 0 {
+		t.Fatalf("sweep after reopen repeated: %v", steps)
+	}
+	if got := f.notices(t, f.lead, queueWaitMetSubject); len(got) != 1 {
+		t.Fatalf("%d notices to the lead after more sweeps and a reopen", len(got))
+	}
+}
+
+// wi_b787a95c1757f554 h2: a met pathless wait whose team stays idle is
+// reported once to the owner helper and the handler, and a pathless wait
+// whose predecessor can no longer meet it is reported once to the handler,
+// each naming the reason.
+func TestTeamQueueWaitPathlessOverdueAndOrphaned(t *testing.T) {
+	t.Run("overdue", func(t *testing.T) {
+		f := newWaitFixture(t)
+		f.team(t)
+		helper := f.helper(t)
+		if _, err := f.s.TeamQueueAction(f.ctx, f.task.ID, f.setPause(api.TeamQueueWaitReleased, waitPause)); err != nil {
+			t.Fatal(err)
+		}
+		f.meet(t, api.TeamQueueWaitReleased)
+		f.sweep(t)
+		f.clock = f.clock.Add(queueWaitIdleBound())
+		if steps := f.sweep(t); len(steps) != 1 || steps[0] != "wait-overdue" {
+			t.Fatalf("at the bound: %v", steps)
+		}
+		for _, to := range []api.Agent{helper, f.handler} {
+			got := f.notices(t, to, queueWaitOverdueSubject)
+			if len(got) != 1 {
+				t.Fatalf("%d overdue notices to %s", len(got), to.Name)
+			}
+			text := got[0].Envelope.Body.Text
+			if !strings.Contains(text, "Paused for: "+waitPause+".") || strings.Contains(text, "Paths free") || !strings.Contains(text, f.waiting.ID) {
+				t.Fatalf("overdue notice %s", text)
+			}
+		}
+		for i := 0; i < 3; i++ {
+			f.clock = f.clock.Add(time.Minute)
+			if steps := f.sweep(t); len(steps) != 0 {
+				t.Fatalf("sweep %d reported again: %v", i, steps)
+			}
+		}
+	})
+	t.Run("orphaned", func(t *testing.T) {
+		f := newWaitFixture(t)
+		f.team(t)
+		if _, err := f.s.TeamQueueAction(f.ctx, f.task.ID, f.setPause(api.TeamQueueWaitReleased, waitPause)); err != nil {
+			t.Fatal(err)
+		}
+		f.exec(t, `UPDATE team_queue_entries SET state='finished' WHERE id=?`, f.pred.ID)
+		if steps := f.sweep(t); len(steps) != 1 || steps[0] != "wait-orphaned" {
+			t.Fatalf("steps %v", steps)
+		}
+		got := f.notices(t, f.handler, queueWaitOrphanedSubject)
+		if len(got) != 1 {
+			t.Fatalf("%d notices to the handler", len(got))
+		}
+		text := got[0].Envelope.Body.Text
+		for _, want := range []string{"for " + waitPause + " until it is released", "the predecessor entry finished without a release job", "--owns PATH|--reason TEXT --until"} {
+			if !strings.Contains(text, want) {
+				t.Fatalf("handler notice lacks %q: %s", want, text)
+			}
+		}
+		if got := f.notices(t, f.lead, queueWaitMetSubject); len(got) != 0 {
+			t.Fatalf("the lead was told of an orphaned wait")
+		}
+		sentence := fmt.Sprintf("wait on %s needs a handler decision: the predecessor entry finished without a release job", f.items[0].ID)
+		if listed := f.waitingEntry(t); len(listed.Waits) != 1 || listed.Waits[0].Text() != sentence {
+			t.Fatalf("listed %+v", listed.Waits)
+		}
+		f.clock = f.clock.Add(time.Minute)
+		if steps := f.sweep(t); len(steps) != 0 {
+			t.Fatalf("reported again: %v", steps)
+		}
+	})
+}
+
+// wi_b787a95c1757f554 h3: a pathless wait clears like a path wait, and the
+// pair can then be set again with another reason or with paths.
+func TestTeamQueueWaitPathlessSetClearRoundTrip(t *testing.T) {
+	f := newWaitFixture(t)
+	if q, err := f.s.TeamQueueAction(f.ctx, f.task.ID, f.setPause(api.TeamQueueWaitDone, waitPause)); err != nil || len(q.Waits) != 1 {
+		t.Fatalf("set %+v %v", q, err)
+	}
+	if q := f.clear(t); len(q.Waits) != 0 {
+		t.Fatalf("clear result still waits: %+v", q.Waits)
+	}
+	if listed := f.waitingEntry(t); len(listed.Waits) != 0 || strings.Contains(listed.BlockReason, "waits on") {
+		t.Fatalf("cleared wait still listed: %+v %q", listed.Waits, listed.BlockReason)
+	}
+	var state, reason string
+	if err := f.s.db.QueryRow(`SELECT state,reason FROM team_queue_waits`).Scan(&state, &reason); err != nil || state != api.TeamQueueWaitCleared || reason != "sequencing changed" {
+		t.Fatalf("cleared row %s %q %v", state, reason, err)
+	}
+	q, err := f.s.TeamQueueAction(f.ctx, f.task.ID, f.setPause(api.TeamQueueWaitAccepted, "another pause"))
+	if err != nil || len(q.Waits) != 1 || q.Waits[0].Reason != "another pause" || q.Waits[0].Until != api.TeamQueueWaitAccepted {
+		t.Fatalf("set after clear %+v %v", q.Waits, err)
+	}
+	f.clear(t)
+	if q := f.set(t, api.TeamQueueWaitAccepted); len(q.Waits) != 1 || len(q.Waits[0].Paths) != 1 || q.Waits[0].Reason != "" {
+		t.Fatalf("path wait after a pathless one: %+v", q.Waits)
+	}
+}
+
+// wi_b787a95c1757f554 h2: a 500-byte reason is cut in the listing sentence
+// to the path list's bound on a rune boundary, so BlockReason stays small;
+// the wait's Reason keeps the whole text.
+func TestTeamQueueWaitPathlessSentenceIsBounded(t *testing.T) {
+	f := newWaitFixture(t)
+	long := "a" + strings.Repeat("é", 249) + "a"
+	if _, err := f.s.TeamQueueAction(f.ctx, f.task.ID, f.setPause(api.TeamQueueWaitAccepted, long)); err != nil {
+		t.Fatal(err)
+	}
+	listed := f.waitingEntry(t)
+	if len(listed.Waits) != 1 || listed.Waits[0].Reason != long {
+		t.Fatalf("listed %+v", listed.Waits)
+	}
+	text := listed.Waits[0].Text()
+	if len(text) > 600 || !utf8.ValidString(text) || !strings.HasSuffix(text, "... until accepted") || !strings.HasSuffix(listed.BlockReason, text) {
+		t.Fatalf("sentence %d bytes: %q", len(text), text)
 	}
 }

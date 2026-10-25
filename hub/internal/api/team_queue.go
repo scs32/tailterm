@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // TeamCloseWaitError is a definite close refusal. A queue runner may refresh
@@ -175,21 +176,43 @@ func TeamQueueWaitPaths(paths []string, max int) string {
 	return b.String()
 }
 
+// teamQueueWaitReasonText cuts a pathless wait's reason to the path list's
+// bound on a rune boundary.
+func teamQueueWaitReasonText(reason string) string {
+	if len(reason) <= TeamQueueWaitTextPathBytes {
+		return reason
+	}
+	cut := TeamQueueWaitTextPathBytes
+	for cut > 0 && !utf8.RuneStart(reason[cut]) {
+		cut--
+	}
+	return reason[:cut] + "..."
+}
+
 // Text is the wait's one sentence in a listing and in BlockReason, with a
-// long path list cut short.
+// long path list cut short. A pathless wait names its reason where a path
+// wait names its paths; an orphaned wait's Reason is why it was orphaned.
 func (w TeamQueueWait) Text() string {
-	paths := TeamQueueWaitPaths(w.Paths, TeamQueueWaitTextPathBytes)
+	// held is what the wait holds: its paths, or a pathless wait's reason.
+	held := TeamQueueWaitPaths(w.Paths, TeamQueueWaitTextPathBytes)
+	pathless := len(w.Paths) == 0
+	if pathless {
+		held = teamQueueWaitReasonText(w.Reason)
+	}
 	switch w.State {
 	case TeamQueueWaitMet:
 		commit := w.MetCommit
 		if commit == "" {
 			commit = "none recorded"
 		}
-		return fmt.Sprintf("wait on %s met (%s, commit %s): rebase before editing %s", w.OnItemID, w.Until, commit, paths)
+		if pathless {
+			return fmt.Sprintf("wait on %s met (%s, commit %s): resume the work paused for %s", w.OnItemID, w.Until, commit, held)
+		}
+		return fmt.Sprintf("wait on %s met (%s, commit %s): rebase before editing %s", w.OnItemID, w.Until, commit, held)
 	case TeamQueueWaitOrphaned:
 		return fmt.Sprintf("wait on %s needs a handler decision: %s", w.OnItemID, w.Reason)
 	}
-	return fmt.Sprintf("waits on %s for %s until %s", w.OnItemID, paths, w.Until)
+	return fmt.Sprintf("waits on %s for %s until %s", w.OnItemID, held, w.Until)
 }
 
 // TeamQueueEstimateDefault is a lane default estimate: the tokens, the lane
@@ -483,7 +506,8 @@ type TeamQueueRequest struct {
 	HandlerSpecArgs []string `json:"handlerSpecArgs,omitempty"`
 	// wait_set and wait_clear: EntryID is the waiting entry, WaitOnEntryID
 	// the predecessor entry. WaitPaths and WaitUntil (accepted, done or
-	// released) belong to wait_set; WaitReason is wait_clear's optional why.
+	// released) belong to wait_set; WaitReason is wait_set's reason for a
+	// wait that names no path, and wait_clear's optional why.
 	WaitOnEntryID string   `json:"waitOnEntryId,omitempty"`
 	WaitPaths     []string `json:"waitPaths,omitempty"`
 	WaitUntil     string   `json:"waitUntil,omitempty"`

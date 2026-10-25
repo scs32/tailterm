@@ -737,8 +737,19 @@ of, the note:
 ```sh
 tt team queue wait set --entry tqe_WAITING --on tqe_PREDECESSOR \
   --owns PATH [--owns PATH...] --until accepted|done|released
+tt team queue wait set --entry tqe_WAITING --on tqe_PREDECESSOR \
+  --reason TEXT --until accepted|done|released
 tt team queue wait clear --entry tqe_WAITING --on tqe_PREDECESSOR [--reason TEXT]
 ```
+
+A requested pause that shares no path, such as a quiet host while a
+predecessor's release runs, is recorded as a pathless wait through the
+handler: `--reason TEXT` in place of `--owns` (one line of at most 500 bytes,
+like the clear reason). Agents never poll release or queue state by hand: a
+released job leaves `tt deployment list`, so a loop over it reads a finished
+release as still claimed (incident `nart_62a2b878c52fbe18`, a lead idle about
+1.5 hours; `wi_b787a95c1757f554`). Ask the handler for a wait; the hub tells
+the waiting lead.
 
 Only the owner or a live database handler sets or clears a wait; an item lead
 is refused and asks the handler. `--until` names the resume condition:
@@ -750,25 +761,33 @@ is refused and asks the handler. `--until` names the resume condition:
 | `released` | the predecessor entry's latest release job is `released` | the integrated commit of that job, else its commit |
 
 The hub refuses a wait of an entry on itself, a predecessor that is not an
-entry of this project, a condition outside the three, no path, and a waiting
-entry that is finished or released. The predecessor's item is read from its
-entry. Setting the identical wait again changes nothing; a different wait on
-the same pair of entries is a conflict that names `wait clear`. Neither
-command reads or moves the waiting entry's revision.
+entry of this project, a condition outside the three, neither a path nor a
+reason (or both), a reason longer than 500 bytes or of more than one line, and
+a waiting entry that is finished or released. The predecessor's item is read
+from its entry. Setting the identical wait again (same condition, paths and
+reason) changes nothing; a different wait on the same pair of entries is a
+conflict that names `wait clear`. Neither command reads or moves the waiting
+entry's revision.
 
 A wait is a record and a notice trigger only. It does not hold a queued entry
 out of admission and changes no ownership check.
 
 `tt team queue list` prints each open wait under its waiting entry, the JSON
 listing carries it as `waits[]` (`onItemId`, `onEntryId`, `paths`, `until`,
-`state`), and the same sentence is appended to the entry's `blockReason`, which
-the queue view shows:
+`state`, `reason`), and the same sentence is appended to the entry's
+`blockReason`, which the queue view shows:
 
 - `waits on ITEM for PATHS until CONDITION` while it waits;
 - `wait on ITEM met (CONDITION, commit SHA): rebase before editing PATHS` once
   the lead was told;
 - `wait on ITEM needs a handler decision: REASON` when the predecessor can no
   longer meet the condition.
+
+A pathless wait names its reason where a path wait names its paths:
+`waits on ITEM for REASON until CONDITION`, then `wait on ITEM met (CONDITION,
+commit SHA): resume the work paused for REASON`. The sentence cuts a reason
+to about 300 bytes with `...`; `waits[].reason` keeps it whole and
+`waits[].paths` is `[]`.
 
 The sentence names the first path and then whole paths up to about 300 bytes,
 then `and N more`, so a wait with many paths keeps `blockReason` small (a stall
@@ -791,6 +810,8 @@ a repeated tick or a restarted hub posts nothing twice.
   rebase before editing them. Only the waiting item's own team lead is told,
   never the project orchestrator in its place: a waiting entry with no live
   lead yet (it is still queued) keeps waiting and is told once it has one.
+  For a pathless wait the notice says `Paused for: REASON` and to resume the
+  paused work, in place of the paths and the rebase.
 - **Idle after met.** If no member of the waiting team posts after that
   notice and every live member is done or idle for the bound, with none
   waiting for or holding the matrix host (the stall check's member rule), the
@@ -798,18 +819,22 @@ a repeated tick or a restarted hub posts nothing twice.
   after its shared path wait was met`. The bound is 15 minutes, or
   `TAILTERM_QUEUE_WAIT_IDLE_MINUTES` (1 to 1440) in the hub's environment. A
   team that shows activity once ends the wait as resumed and is never
-  reported for it.
+  reported for it. A pathless wait's report says `Paused for: REASON` where a
+  path wait's says `Paths free`.
 - **Needs a handler decision.** When the predecessor can no longer meet the
   condition, the primary handler gets one NOTICE, `A shared path wait needs a
-  handler decision`, with the reason and both commands. The waiting lead is
-  told nothing and the wait is not released. The cases: the predecessor entry
-  was removed; it failed and was released; the owner integrated it outside
-  the acceptance path; its item was dismissed; it finished without what the
-  condition needs (no acceptance, item not done, no release job); or, for
-  `released`, its latest release job is superseded, refused or rolled back. A
-  running predecessor, or a failed one not yet released, is still pending. The
-  handler clears the wait and tells the waiting lead, or clears it and sets a
-  new wait, for example on the entry that retries the predecessor's item.
+  handler decision`, with the reason and both commands. A pathless wait's
+  notice names its pause reason where a path wait names its paths; the
+  record's `reason` then becomes the orphan reason, so the listing shows
+  that. The waiting lead is told nothing and the wait is not released. The
+  cases: the predecessor entry was removed; it failed and was released; the
+  owner integrated it outside the acceptance path; its item was dismissed; it
+  finished without what the condition needs (no acceptance, item not done, no
+  release job); or, for `released`, its latest release job is superseded,
+  refused or rolled back. A running predecessor, or a failed one not yet
+  released, is still pending. The handler clears the wait and tells the
+  waiting lead, or clears it and sets a new wait, for example on the entry
+  that retries the predecessor's item.
 - **Waiting entry ended.** A wait whose own entry finished, was released as
   failed or was removed is cleared without a message.
 
@@ -827,7 +852,9 @@ adds one indexed read for the project, not one per entry. The relay makes no
 new request: the notices use the ordinary delivery obligation and wake.
 
 The table `team_queue_waits` is new and no existing table changes, so an older
-hub ignores it and a rollback needs no migration.
+hub ignores it and a rollback needs no migration. A pathless wait uses the
+same columns (`paths_json` `[]`, the set reason in `reason`); an older hub
+still notifies it once but lists it with an empty path list.
 
 ## Team queue listing
 
