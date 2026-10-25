@@ -864,6 +864,33 @@ func TestActivityWorktreeProbeIsReadOnlyAndSharedPerPass(t *testing.T) {
 	}
 }
 
+// A binding whose activity ctx is nearly spent probes the shared worktree
+// under the probe's own bound, so the next binding on that cwd reuses a
+// signature rather than the first caller's timeout (wi_69cf6b3eee54d00c).
+func TestActivityWorktreeProbeIgnoresFirstCallersDeadline(t *testing.T) {
+	home := t.TempDir()
+	calls := filepath.Join(home, "calls")
+	content := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '" + calls + "'\nsleep 0.3\nif [ \"$4\" = 'rev-parse' ]; then echo head; fi\n"
+	if err := os.WriteFile(filepath.Join(home, "git"), []byte(content), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", home+":"+os.Getenv("PATH"))
+	pass := context.WithValue(context.Background(), activityWorktreeContextKey{}, activityWorktreeCache{})
+	spent, cancel := context.WithTimeout(pass, 50*time.Millisecond)
+	defer cancel()
+	first, err := cachedActivityWorktree(spent, home)
+	if err != nil || first == "" {
+		t.Errorf("binding A's probe = %q, %v; want a signature under the probe's own bound", first, err)
+	}
+	if second, err := cachedActivityWorktree(pass, home); err != nil || second != first {
+		t.Fatalf("binding B on the same cwd = %q, %v; want A's signature %q", second, err, first)
+	}
+	data, _ := os.ReadFile(calls)
+	if got := strings.Count(string(data), "\n"); got != 2 {
+		t.Fatalf("git calls in one pass = %d, want one probe of 2: %q", got, data)
+	}
+}
+
 func TestActivityLargeTranscriptFirstReport(t *testing.T) {
 	for _, runtime := range []string{"codex", "claude"} {
 		t.Run(runtime, func(t *testing.T) {

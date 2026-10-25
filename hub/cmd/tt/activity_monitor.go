@@ -38,8 +38,10 @@ func cachedActivityWorktree(ctx context.Context, cwd string) (string, error) {
 		if result, found := cache[cwd]; found {
 			return result.signature, result.err
 		}
-		// A timed-out probe is cached too: one wait per worktree per pass.
-		signature, err := activityWorktree(ctx, cwd)
+		// A timed-out probe is cached too: one wait per worktree per pass. It
+		// runs under its own bound, not the first caller's remaining time, so
+		// a nearly spent binding cannot hand every sharer its timeout.
+		signature, err := activityWorktree(context.WithoutCancel(ctx), cwd)
 		cache[cwd] = activityWorktreeResult{signature, err}
 		return signature, err
 	}
