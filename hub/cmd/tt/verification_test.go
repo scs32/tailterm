@@ -5,6 +5,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -487,5 +490,50 @@ func TestVerificationCLICarryOver(t *testing.T) {
 				t.Fatalf("history %q %v", out, err)
 			}
 		})
+	}
+}
+
+// w1-w3 through tt verification plan|receipt --trigger against the real
+// route (bug wi_60fda3c3fefa60c4).
+func TestVerificationCLITriggerFlag(t *testing.T) {
+	f := newVerificationCLI(t)
+	target, err := url.Parse(f.e.hub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bodies []string
+	srv := recordTriggerWire(t, httputil.NewSingleHostReverseProxy(target), "/verification", &bodies)
+	handler := f.as(f.handler)
+	handler.hub = srv.URL
+	// w3: an uncited plan saves beside a withdrawn request.
+	withdrawn := triggerCLIRequest(t, f.st, f.task.ID, f.lead, f.handler)
+	withdrawCLITrigger(t, f.st, f.task.ID, f.lead, withdrawn)
+	plan, _, err := f.run(t, handler, "plan", "--file", f.planFile, "--request-id", "cli-plan")
+	if err != nil || plan.Generation != 1 || len(bodies) != 1 || strings.Contains(bodies[0], "triggerSeq") {
+		t.Fatalf("uncited plan %+v %v, wire %v", plan, err, bodies)
+	}
+	// w1: a receipt citing the withdrawn request is refused, naming it.
+	if _, _, err = f.run(t, handler, "receipt", "--file", f.receiptFile, "--request-id", "cli-receipt-withdrawn", "--generation", "1", "--trigger", fmt.Sprint(withdrawn)); err == nil || !strings.Contains(err.Error(), fmt.Sprintf("triggering request #%d was withdrawn", withdrawn)) {
+		t.Fatalf("receipt citing the withdrawn request: %v", err)
+	}
+	// w2: a receipt saved while its trigger was open replays after the
+	// withdrawal; a new request ID citing it is refused.
+	trigger := triggerCLIRequest(t, f.st, f.task.ID, f.lead, f.handler)
+	bodies = nil
+	cited := []string{"receipt", "--file", f.receiptFile, "--request-id", "cli-receipt", "--generation", "1", "--trigger", fmt.Sprint(trigger)}
+	receipt, out, err := f.run(t, handler, cited...)
+	if err != nil || receipt.Generation != 2 || len(bodies) != 1 || !strings.Contains(bodies[0], fmt.Sprintf(`"triggerSeq":%d`, trigger)) {
+		t.Fatalf("cited receipt %+v %v, wire %v", receipt, err, bodies)
+	}
+	withdrawCLITrigger(t, f.st, f.task.ID, f.lead, trigger)
+	if _, again, err := f.run(t, handler, cited...); err != nil || again != out {
+		t.Fatalf("retry after the withdrawal %q vs %q: %v", again, out, err)
+	}
+	if _, _, err = f.run(t, handler, "receipt", "--file", f.receiptFile, "--request-id", "cli-receipt-2", "--generation", "2", "--trigger", fmt.Sprint(trigger)); err == nil || !strings.Contains(err.Error(), fmt.Sprintf("triggering request #%d was withdrawn", trigger)) {
+		t.Fatalf("new receipt citing the withdrawn request: %v", err)
+	}
+	history, err := f.c.VerificationHistory(context.Background(), f.task.ID, f.item.ID, f.handler.ID, f.handler.RunID)
+	if err != nil || len(history) != 2 {
+		t.Fatalf("history: %d records %v", len(history), err)
 	}
 }

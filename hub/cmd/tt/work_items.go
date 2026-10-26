@@ -309,12 +309,13 @@ func cmdWorkItemUpdate(e env, args []string) error {
 	scopeChange := fs.Bool("scope-change", false, "mark a --title or --body-file change as a deliberate scope amendment (it invalidates an accepted candidate awaiting release)")
 	estimateTokens := fs.Int64("estimate-tokens", 0, "token estimate, saved without a new revision (database handler or owner; 0 clears it)")
 	estimateBasis := fs.String("estimate-basis", "", "one-line basis of the estimate, such as \"Small, 2 paths, median of 8 Small items\"")
+	trigger := fs.Int64("trigger", 0, "seq of the request that triggered this write; the hub refuses it once that request is withdrawn or answered")
 	asJSON := fs.Bool("json", false, "JSON output")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if fs.NArg() != 1 || !api.ValidID(fs.Arg(0), "wi") || *revision < 1 {
-		return errors.New("usage: tt work-items update --revision N --request-id KEY [fields] [--worktree DIR --branch B --commit SHA] WI_ID | tt work-items update --revision N --request-id KEY --estimate-tokens N --estimate-basis TEXT WI_ID")
+	if fs.NArg() != 1 || !api.ValidID(fs.Arg(0), "wi") || *revision < 1 || *trigger < 0 {
+		return errors.New("usage: tt work-items update --revision N --request-id KEY [--trigger SEQ] [fields] [--worktree DIR --branch B --commit SHA] WI_ID | tt work-items update --revision N --request-id KEY [--trigger SEQ] --estimate-tokens N --estimate-basis TEXT WI_ID")
 	}
 	project, err := workItemProject(e, *projectFlag)
 	if err != nil {
@@ -322,7 +323,7 @@ func cmdWorkItemUpdate(e env, args []string) error {
 	}
 	visited := map[string]bool{}
 	fs.Visit(func(f *flag.Flag) { visited[f.Name] = true })
-	req := api.CreateWorkItemUpdate{ExpectedRevision: *revision, AgentID: e.agent, RunID: e.runID, RequestID: *requestID}
+	req := api.CreateWorkItemUpdate{ExpectedRevision: *revision, AgentID: e.agent, RunID: e.runID, RequestID: *requestID, TriggerSeq: *trigger}
 	if *reportID != "" || *reportVersion != 0 || *reportDigest != "" || *reportScope != 0 {
 		req.CompletionReport = &api.NarrativeReportPin{ReportID: *reportID, Version: *reportVersion, Digest: *reportDigest, ScopeRevision: *reportScope}
 	}

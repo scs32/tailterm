@@ -2715,3 +2715,87 @@ func TestVerificationCarryOverCompletionStillNeedsReview(t *testing.T) {
 	}
 	refusedFor(t, "review gate on another candidate", "a carried scope needs its latest general review on the exact candidate", reviewReady(state, f.updated.ScopeRevision, candidateB))
 }
+
+func verificationGeneration(t *testing.T, f *convergenceFixture, h api.Agent) int {
+	t.Helper()
+	history, err := f.s.VerificationHistory(f.ctx, f.task.ID, f.item.ID, h.ID, h.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(history)
+}
+
+// w1 (bug wi_60fda3c3fefa60c4): a plan or receipt citing a withdrawn or
+// answered request is refused, naming the request, and saves nothing.
+func TestVerificationRefusesWithdrawnOrAnsweredTrigger(t *testing.T) {
+	f, h, p := verificationFixture(t)
+	withdrawn := triggerToHandler(t, f.s, f.ctx, f.by, f.task.ID, f.reviewer, h)
+	withdrawTrigger(t, f.s, f.ctx, f.task.ID, f.reviewer, withdrawn, "Do not import at generation 1")
+	_, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: "plan-withdrawn", AgentID: h.ID, RunID: h.RunID, Plan: &p, TriggerSeq: withdrawn})
+	refusedNaming(t, "plan", err, fmt.Sprintf("#%d", withdrawn), "withdrawn", "Do not import at generation 1")
+	if n := verificationGeneration(t, f, h); n != 0 {
+		t.Fatalf("refused plan saved generation %d", n)
+	}
+	saveFixturePlan(t, f, h, p, 0)
+	r := passingVerification(p)
+	_, err = f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: "receipt-withdrawn", AgentID: h.ID, RunID: h.RunID, ExpectedGeneration: 1, Receipt: &r, TriggerSeq: withdrawn})
+	refusedNaming(t, "receipt", err, fmt.Sprintf("#%d", withdrawn), "withdrawn")
+	answered := triggerToHandler(t, f.s, f.ctx, f.by, f.task.ID, f.reviewer, h)
+	result := answerTrigger(t, f.s, f.ctx, f.by, f.task.ID, f.reviewer, h, answered)
+	_, err = f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: "receipt-answered", AgentID: h.ID, RunID: h.RunID, ExpectedGeneration: 1, Receipt: &r, TriggerSeq: answered})
+	refusedNaming(t, "answered receipt", err, fmt.Sprintf("#%d", answered), "already answered", fmt.Sprintf("#%d", result))
+	if n := verificationGeneration(t, f, h); n != 1 {
+		t.Fatalf("refused receipts changed the generation to %d", n)
+	}
+	if _, err = f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: "receipt-negative", AgentID: h.ID, RunID: h.RunID, ExpectedGeneration: 1, Receipt: &r, TriggerSeq: -1}); !errors.Is(err, api.ErrInvalid) {
+		t.Fatalf("negative trigger = %v", err)
+	}
+}
+
+// w2: a receipt saved while its trigger was open replays after the
+// withdrawal; a new request ID citing it is refused.
+func TestVerificationTriggerRetryReplaysAfterWithdrawal(t *testing.T) {
+	f, h, p := verificationFixture(t)
+	saveFixturePlan(t, f, h, p, 0)
+	trigger := triggerToHandler(t, f.s, f.ctx, f.by, f.task.ID, f.reviewer, h)
+	r := passingVerification(p)
+	req := api.VerificationRequest{RequestID: "receipt-import", AgentID: h.ID, RunID: h.RunID, ExpectedGeneration: 1, Receipt: &r, TriggerSeq: trigger}
+	saved, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withdrawTrigger(t, f.s, f.ctx, f.task.ID, f.reviewer, trigger, "withdrawn after the import")
+	again, err := f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, req)
+	if err != nil || again.Generation != saved.Generation || again.Digest != saved.Digest {
+		t.Fatalf("replay: %+v %v", again, err)
+	}
+	if n := verificationGeneration(t, f, h); n != 2 {
+		t.Fatalf("replay saved generation %d", n)
+	}
+	fresh := req
+	fresh.RequestID, fresh.ExpectedGeneration = "receipt-import-2", 2
+	_, err = f.s.SaveVerification(f.ctx, f.task.ID, f.item.ID, fresh)
+	refusedNaming(t, "new request ID", err, fmt.Sprintf("#%d", trigger), "withdrawn")
+}
+
+// w3: an uncited plan and receipt save beside a withdrawn request, and the
+// uncited digest is the one the previous hub computed.
+func TestVerificationUntriggeredWriteUnchanged(t *testing.T) {
+	f, h, p := verificationFixture(t)
+	trigger := triggerToHandler(t, f.s, f.ctx, f.by, f.task.ID, f.reviewer, h)
+	withdrawTrigger(t, f.s, f.ctx, f.task.ID, f.reviewer, trigger, "not needed")
+	saveFixturePlan(t, f, h, p, 0)
+	saveFixtureReceipt(t, f, h, p, 1, false)
+	if n := verificationGeneration(t, f, h); n != 2 {
+		t.Fatalf("uncited writes saved %d generations", n)
+	}
+	// The golden digest is the one hub 39216151, which had no trigger field,
+	// computed for this request, so its saved records still replay.
+	golden := api.VerificationRequest{RequestID: "uncited", AgentID: "agt_0123456789abcdef", RunID: "run_0123456789abcdef", ExpectedGeneration: 2, CarryOver: &api.VerificationCarryOver{}}
+	if b, _ := json.Marshal(golden); strings.Contains(string(b), "triggerSeq") {
+		t.Fatalf("an uncited request marshals a trigger: %s", b)
+	}
+	if got := verificationDigest(golden); got != "3c6df82b2833fac03d36cd75a9cc67051923f5e482638195f79505c19fa0f9c3" {
+		t.Fatalf("the uncited digest changed: %s", got)
+	}
+}

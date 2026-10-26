@@ -824,3 +824,103 @@ func TestWorkItemNoteRecordsArtifact(t *testing.T) {
 		}
 	}
 }
+
+// triggerCLIRequest has from send to a request that to acknowledges, and
+// returns its seq (bug wi_60fda3c3fefa60c4).
+func triggerCLIRequest(t *testing.T, st *store.Store, task string, from, to api.Agent) int64 {
+	t.Helper()
+	ctx := context.Background()
+	m, err := st.PostMessage(ctx, task, api.PostMessageRequest{AgentID: from.ID, RunID: from.RunID, To: to.ID,
+		Envelope: &api.Envelope{Kind: api.EnvelopeKindRequest, To: to.Name, Subject: "Import the receipt", Body: api.EnvelopeBody{Ask: "Please import it"}}}, api.Caller{Node: "cli-test", User: "owner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.ObligationAction(ctx, task, m.Seq, "ack", api.ObligationActionRequest{AgentID: to.ID, RunID: to.RunID}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	return m.Seq
+}
+
+func withdrawCLITrigger(t *testing.T, st *store.Store, task string, from api.Agent, seq int64) {
+	t.Helper()
+	ctx := context.Background()
+	rows, err := st.ListObligations(ctx, task, store.ObligationFilter{FromSeq: seq, ToSeq: seq}, time.Now())
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("obligation for #%d: %+v %v", seq, rows, err)
+	}
+	if _, err = st.WithdrawObligation(ctx, task, rows[0].ID, api.ObligationWithdrawRequest{AgentID: from.ID, RunID: from.RunID, Reason: "Do not import at generation 1"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// recordTriggerWire forwards to hub and records each POST body whose path ends
+// in suffix.
+func recordTriggerWire(t *testing.T, hub http.Handler, suffix string, bodies *[]string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, suffix) {
+			raw, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Error(err)
+			}
+			*bodies = append(*bodies, string(raw))
+			r.Body = io.NopCloser(bytes.NewReader(raw))
+		}
+		hub.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// w1-w3 through tt work-items update --trigger against the real route.
+func TestWorkItemsCLITriggerFlag(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "hub.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	by := api.Caller{Node: "cli-test", User: "owner"}
+	ctx := context.Background()
+	task, err := st.CreateTask(ctx, api.CreateTaskRequest{Name: "CLI project"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lead, err := st.AddAgent(ctx, task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "lead", Host: "h", Session: "lead", Runtime: "codex"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := st.AddAgent(ctx, task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "db-handler", Host: "h", Session: "db-handler", Runtime: "codex", Role: api.AgentRoleDatabaseHandler}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, err := st.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Trigger flag", RequestID: "item"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bodies []string
+	srv := recordTriggerWire(t, server.New(st, func(*http.Request) (api.Caller, error) { return by, nil }), "/updates", &bodies)
+	e := env{hub: srv.URL, task: task.ID, agent: handler.ID, runID: handler.RunID}
+	update := func(args ...string) (string, error) {
+		return captureCLIOutput(t, func() error { return cmdWorkItems(e, append([]string{"update"}, append(args, item.ID)...)) })
+	}
+	trigger := triggerCLIRequest(t, st, task.ID, lead, handler)
+	cited := []string{"--revision", "1", "--request-id", "cited", "--priority", "urgent", "--trigger", fmt.Sprint(trigger)}
+	first, err := update(cited...)
+	if err != nil || len(bodies) != 1 || !strings.Contains(bodies[0], fmt.Sprintf(`"triggerSeq":%d`, trigger)) {
+		t.Fatalf("cited update %q %v, wire %v", first, err, bodies)
+	}
+	withdrawCLITrigger(t, st, task.ID, lead, trigger)
+	if again, err := update(cited...); err != nil || again != first {
+		t.Fatalf("retry after the withdrawal %q vs %q: %v", again, first, err)
+	}
+	if _, err = update("--revision", "2", "--request-id", "cited-2", "--priority", "low", "--trigger", fmt.Sprint(trigger)); err == nil || !strings.Contains(err.Error(), fmt.Sprintf("triggering request #%d was withdrawn", trigger)) {
+		t.Fatalf("new write citing the withdrawn request: %v", err)
+	}
+	if _, err = update("--revision", "2", "--request-id", "negative", "--priority", "low", "--trigger", "-1"); err == nil || !strings.Contains(err.Error(), "--trigger SEQ") {
+		t.Fatalf("negative trigger: %v", err)
+	}
+	bodies = nil
+	if out, err := update("--revision", "2", "--request-id", "uncited", "--priority", "low"); err != nil || !strings.Contains(out, "revision 3") || len(bodies) != 1 || strings.Contains(bodies[0], "triggerSeq") {
+		t.Fatalf("uncited update %q %v, wire %v", out, err, bodies)
+	}
+}

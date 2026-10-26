@@ -142,6 +142,10 @@ type CreateWorkItemUpdate struct {
 	// amendment, which the hub otherwise refuses while the item's accepted
 	// candidate awaits release.
 	ScopeChange bool `json:"scopeChange,omitempty"`
+	// TriggerSeq cites the request that triggered this write. The hub refuses
+	// the write, naming the request, once the writer's obligation on it is
+	// closed (withdrawn, answered or otherwise). 0 cites nothing.
+	TriggerSeq int64 `json:"triggerSeq,omitempty"`
 }
 
 // WorkItemQueueAcceptance is the Git tuple of the accepted builder result for

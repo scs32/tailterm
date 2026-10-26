@@ -1448,3 +1448,157 @@ func TestScopeEditGuardClearsWhenNoReleaseCanHappen(t *testing.T) {
 		})
 	}
 }
+
+// triggerToHandler has the lead send the handler a request, which the handler
+// acknowledges, and returns its seq (bug wi_60fda3c3fefa60c4).
+func triggerToHandler(t *testing.T, s *Store, ctx context.Context, by api.Caller, task string, lead, handler api.Agent) int64 {
+	t.Helper()
+	m, err := s.PostMessage(ctx, task, withdrawSource(api.EnvelopeKindRequest, lead, handler), by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.ObligationAction(ctx, task, m.Seq, "ack", api.ObligationActionRequest{AgentID: handler.ID, RunID: handler.RunID}, s.now()); err != nil {
+		t.Fatal(err)
+	}
+	return m.Seq
+}
+
+func withdrawTrigger(t *testing.T, s *Store, ctx context.Context, task string, lead api.Agent, seq int64, reason string) {
+	t.Helper()
+	var id string
+	if err := s.db.QueryRowContext(ctx, `SELECT id FROM obligations WHERE message_seq=?`, seq).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.WithdrawObligation(ctx, task, id, api.ObligationWithdrawRequest{AgentID: lead.ID, RunID: lead.RunID, Reason: reason}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func answerTrigger(t *testing.T, s *Store, ctx context.Context, by api.Caller, task string, lead, handler api.Agent, seq int64) int64 {
+	t.Helper()
+	m, err := s.PostMessage(ctx, task, api.PostMessageRequest{AgentID: handler.ID, RunID: handler.RunID, To: lead.ID, ReplyTo: seq,
+		Envelope: &api.Envelope{Kind: api.EnvelopeKindResult, To: lead.Name, Subject: "Saved the requested record", Body: api.EnvelopeBody{Outcome: "done", Status: map[string]string{"a1": "pass"}}, Evidence: map[string]api.Evidence{"e1": {Type: "record", Value: "saved"}}}}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m.Seq
+}
+
+func triggerItem(t *testing.T, f phase3Fixture) api.WorkItem {
+	t.Helper()
+	item, err := f.s.CreateWorkItem(f.ctx, f.task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Trigger fixture", Description: "fixture", AgentID: f.handler.ID, RequestID: "trigger-item"}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return item
+}
+
+func refusedNaming(t *testing.T, what string, err error, wants ...string) {
+	t.Helper()
+	if !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("%s: want a conflict, got %v", what, err)
+	}
+	for _, want := range wants {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("%s: %q does not name %q", what, err, want)
+		}
+	}
+}
+
+// w1: field, scope and done saves citing a withdrawn request, and an update
+// citing an answered or foreign request, are refused, naming the request.
+func TestWorkItemUpdateRefusesWithdrawnOrAnsweredTrigger(t *testing.T) {
+	f := newPhase3Fixture(t)
+	item := triggerItem(t, f)
+	withdrawn := triggerToHandler(t, f.s, f.ctx, f.by, f.task.ID, f.lead, f.handler)
+	withdrawTrigger(t, f.s, f.ctx, f.task.ID, f.lead, withdrawn, "Do not import at generation 1")
+	priority, description, done := "urgent", "rescoped", "done"
+	for name, req := range map[string]api.CreateWorkItemUpdate{
+		"field": {Priority: &priority},
+		"scope": {Description: &description, ScopeChange: true},
+		"done":  {Status: &done},
+	} {
+		req.ExpectedRevision, req.AgentID, req.RunID, req.RequestID, req.TriggerSeq = item.Revision, f.handler.ID, f.handler.RunID, "withdrawn-"+name, withdrawn
+		_, _, err := f.s.CreateWorkItemUpdate(f.ctx, f.task.ID, item.ID, req, f.by)
+		refusedNaming(t, name, err, fmt.Sprintf("#%d", withdrawn), "withdrawn", "Do not import at generation 1")
+	}
+	answered := triggerToHandler(t, f.s, f.ctx, f.by, f.task.ID, f.lead, f.handler)
+	result := answerTrigger(t, f.s, f.ctx, f.by, f.task.ID, f.lead, f.handler, answered)
+	_, _, err := f.s.CreateWorkItemUpdate(f.ctx, f.task.ID, item.ID, api.CreateWorkItemUpdate{ExpectedRevision: item.Revision, Priority: &priority, AgentID: f.handler.ID, RunID: f.handler.RunID, RequestID: "answered", TriggerSeq: answered}, f.by)
+	refusedNaming(t, "answered", err, fmt.Sprintf("#%d", answered), "already answered", fmt.Sprintf("#%d", result))
+	foreign, err := f.post(t, withdrawSource(api.EnvelopeKindRequest, f.lead, f.builder))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = f.s.CreateWorkItemUpdate(f.ctx, f.task.ID, item.ID, api.CreateWorkItemUpdate{ExpectedRevision: item.Revision, Priority: &priority, AgentID: f.handler.ID, RunID: f.handler.RunID, RequestID: "foreign", TriggerSeq: foreign.Seq}, f.by)
+	refusedNaming(t, "foreign", err, fmt.Sprintf("#%d", foreign.Seq), "not a request addressed to you")
+	if got, err := f.s.GetWorkItem(f.ctx, f.task.ID, item.ID); err != nil || got.Revision != item.Revision || got.Priority != item.Priority {
+		t.Fatalf("refused writes changed the item: %+v %v", got, err)
+	}
+	if _, _, err = f.s.CreateWorkItemUpdate(f.ctx, f.task.ID, item.ID, api.CreateWorkItemUpdate{ExpectedRevision: item.Revision, Priority: &priority, AgentID: f.handler.ID, RequestID: "negative", TriggerSeq: -1}, f.by); !errors.Is(err, api.ErrInvalid) {
+		t.Fatalf("negative trigger = %v", err)
+	}
+	if _, _, err = f.s.CreateWorkItemUpdate(f.ctx, f.task.ID, item.ID, api.CreateWorkItemUpdate{ExpectedRevision: item.Revision, Priority: &priority, RequestID: "no-agent", TriggerSeq: withdrawn}, f.by); !errors.Is(err, api.ErrInvalid) {
+		t.Fatalf("trigger without an agent = %v", err)
+	}
+}
+
+// w2: a write saved while its trigger was open replays after the withdrawal.
+func TestWorkItemTriggerRetryReplaysAfterWithdrawal(t *testing.T) {
+	f := newPhase3Fixture(t)
+	item := triggerItem(t, f)
+	trigger := triggerToHandler(t, f.s, f.ctx, f.by, f.task.ID, f.lead, f.handler)
+	priority := "urgent"
+	req := api.CreateWorkItemUpdate{ExpectedRevision: item.Revision, Priority: &priority, AgentID: f.handler.ID, RunID: f.handler.RunID, RequestID: "import-1", TriggerSeq: trigger}
+	saved, replay, err := f.s.CreateWorkItemUpdate(f.ctx, f.task.ID, item.ID, req, f.by)
+	if err != nil || replay {
+		t.Fatalf("first save: %+v %v %v", saved, replay, err)
+	}
+	withdrawTrigger(t, f.s, f.ctx, f.task.ID, f.lead, trigger, "withdrawn after the save")
+	again, replay, err := f.s.CreateWorkItemUpdate(f.ctx, f.task.ID, item.ID, req, f.by)
+	if err != nil || !replay || again.Receipt.ID != saved.Receipt.ID || again.Receipt.ResultRevision != saved.Receipt.ResultRevision {
+		t.Fatalf("replay: %+v %v %v", again, replay, err)
+	}
+	if got, _ := f.s.GetWorkItem(f.ctx, f.task.ID, item.ID); got.Revision != saved.Receipt.ResultRevision {
+		t.Fatalf("replay saved a new revision: %d", got.Revision)
+	}
+	changed := req
+	other := "low"
+	changed.Priority = &other
+	if _, _, err = f.s.CreateWorkItemUpdate(f.ctx, f.task.ID, item.ID, changed, f.by); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "different update data") {
+		t.Fatalf("changed retry = %v", err)
+	}
+	fresh := req
+	fresh.RequestID, fresh.ExpectedRevision = "import-2", saved.Receipt.ResultRevision
+	_, _, err = f.s.CreateWorkItemUpdate(f.ctx, f.task.ID, item.ID, fresh, f.by)
+	refusedNaming(t, "new request ID", err, fmt.Sprintf("#%d", trigger), "withdrawn")
+}
+
+// w3: an uncited write saves beside a withdrawn request, and its payload hash
+// is the one the previous hub computed.
+func TestWorkItemUntriggeredWriteUnchanged(t *testing.T) {
+	f := newPhase3Fixture(t)
+	item := triggerItem(t, f)
+	trigger := triggerToHandler(t, f.s, f.ctx, f.by, f.task.ID, f.lead, f.handler)
+	withdrawTrigger(t, f.s, f.ctx, f.task.ID, f.lead, trigger, "not needed")
+	priority := "urgent"
+	req := api.CreateWorkItemUpdate{ExpectedRevision: item.Revision, Priority: &priority, AgentID: f.handler.ID, RunID: f.handler.RunID, RequestID: "uncited"}
+	saved, _, err := f.s.CreateWorkItemUpdate(f.ctx, f.task.ID, item.ID, req, f.by)
+	if err != nil || saved.Receipt.ResultRevision != item.Revision+1 {
+		t.Fatalf("uncited save: %+v %v", saved, err)
+	}
+	b, _ := json.Marshal(req)
+	if strings.Contains(string(b), "triggerSeq") {
+		t.Fatalf("an uncited request marshals a trigger: %s", b)
+	}
+	// The golden hash is the one hub 39216151, which had no trigger field,
+	// computed for this request, so its saved receipts still replay.
+	golden := req
+	golden.ExpectedRevision, golden.AgentID, golden.RunID = 3, "agt_0123456789abcdef", "run_0123456789abcdef"
+	if got := requestHash(struct {
+		ItemID  string                   `json:"itemId"`
+		Request api.CreateWorkItemUpdate `json:"request"`
+	}{"wi_0123456789abcdef", golden}); got != "e237e668fc07600198739255df626477e9eb0436d8f8fe3bb3fa71f235e6310f" {
+		t.Fatalf("the uncited payload hash changed: %s", got)
+	}
+}

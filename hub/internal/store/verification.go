@@ -613,7 +613,8 @@ func (s *Store) SaveVerification(ctx context.Context, task, itemID string, req a
 			parts++
 		}
 	}
-	if !api.ValidID(task, "tsk") || !api.ValidID(itemID, "wi") || !validRequestID(req.RequestID) || parts != 1 {
+	if !api.ValidID(task, "tsk") || !api.ValidID(itemID, "wi") || !validRequestID(req.RequestID) || parts != 1 ||
+		req.TriggerSeq < 0 || (req.TriggerSeq > 0 && req.AgentID == "") {
 		return zero, api.ErrInvalid
 	}
 	if c := req.CarryOver; c != nil && (c.AmendedBy != nil || c.Plan != nil || c.Receipt != nil) {
@@ -649,6 +650,13 @@ func (s *Store) SaveVerification(ctx context.Context, task, itemID string, req a
 		return zero, err
 	}
 	if err = ackGate(ctx, tx, req.AgentID, req.RunID, 0, s.now()); err != nil {
+		return zero, err
+	}
+	// After the replay and before every other check, as in CreateWorkItemUpdate.
+	if reason, err := closedTriggerReason(ctx, tx, req.AgentID, req.TriggerSeq); err != nil || reason != "" {
+		if err == nil {
+			err = verificationConflict(reason)
+		}
 		return zero, err
 	}
 	item, err := getWorkItem(tx, ctx, task, itemID)

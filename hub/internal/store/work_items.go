@@ -65,6 +65,46 @@ func workItemConflict(message string) error {
 	return fmt.Errorf("%w: %s", api.ErrConflict, message)
 }
 
+// closedTriggerReason names why a write citing request seq may not proceed:
+// agentID's obligation on it is missing or closed. It returns "" when seq is
+// 0 (the write cites nothing) or the obligation is still open. Message seqs
+// are global, so a cross-project request resolves without a task filter.
+func closedTriggerReason(ctx context.Context, q queryRower, agentID string, seq int64) (string, error) {
+	if seq == 0 {
+		return "", nil
+	}
+	var state, outcome, reason string
+	var outcomeSeq int64
+	err := q.QueryRowContext(ctx, `SELECT state,outcome,outcome_seq,reason FROM obligations WHERE message_seq=? AND agent_id=? AND needs IN (?,?)`,
+		seq, agentID, api.ObligationNeedsOutcome, api.ObligationNeedsAnswer).Scan(&state, &outcome, &outcomeSeq, &reason)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Sprintf("triggering request #%d is not a request addressed to you", seq), nil
+	}
+	if err != nil || state != api.ObligationClosed {
+		return "", err
+	}
+	switch outcome {
+	case api.OutcomeWithdrawn:
+		return fmt.Sprintf("triggering request #%d was withdrawn by its sender: %s; reread your inbox before writing", seq, reason), nil
+	case api.OutcomeResult, api.OutcomeAnswered, api.OutcomeDeclined:
+		if outcomeSeq > 0 {
+			return fmt.Sprintf("triggering request #%d was already answered (outcome %s, #%d)", seq, outcome, outcomeSeq), nil
+		}
+		return fmt.Sprintf("triggering request #%d was already answered (outcome %s)", seq, outcome), nil
+	}
+	return fmt.Sprintf("triggering request #%d is closed (%s: %s)", seq, outcome, reason), nil
+}
+
+// refuseClosedTrigger refuses a work-item write whose cited triggering
+// request is closed for the writer (bug wi_60fda3c3fefa60c4).
+func refuseClosedTrigger(ctx context.Context, q queryRower, agentID string, seq int64) error {
+	reason, err := closedTriggerReason(ctx, q, agentID, seq)
+	if err != nil || reason == "" {
+		return err
+	}
+	return workItemConflict(reason)
+}
+
 // refuseScopeEditBeforeRelease refuses a title or description change while the
 // item's accepted candidate awaits release: the change advances the scope
 // revision, and the release claim then refuses the accepted candidate. The
@@ -512,7 +552,8 @@ func (s *Store) UpdateWorkItem(ctx context.Context, taskID, itemID string, req a
 
 func validateCreateWorkItemUpdate(taskID, itemID string, req api.CreateWorkItemUpdate) error {
 	if !api.ValidID(taskID, "tsk") || !api.ValidID(itemID, "wi") || req.ExpectedRevision < 1 || !validRequestID(req.RequestID) ||
-		(req.AgentID != "" && !api.ValidID(req.AgentID, "agt")) || (req.RunID != "" && (req.AgentID == "" || !validRunID(req.RunID))) {
+		(req.AgentID != "" && !api.ValidID(req.AgentID, "agt")) || (req.RunID != "" && (req.AgentID == "" || !validRunID(req.RunID))) ||
+		req.TriggerSeq < 0 || (req.TriggerSeq > 0 && req.AgentID == "") {
 		return api.ErrInvalid
 	}
 	if req.EstimateTokens != nil || req.EstimateBasis != nil {
@@ -705,6 +746,11 @@ func (s *Store) CreateWorkItemUpdate(ctx context.Context, taskID, itemID string,
 	}
 	// Broker phase 3.1: gated after the replay, like PostMessage.
 	if err := ackGate(ctx, tx, req.AgentID, req.RunID, 0, s.now()); err != nil {
+		return api.WorkItemUpdateResult{}, false, err
+	}
+	// After the replay, so a write saved before a withdrawal still replays,
+	// and before every other check, so the trigger reason wins.
+	if err := refuseClosedTrigger(ctx, tx, req.AgentID, req.TriggerSeq); err != nil {
 		return api.WorkItemUpdateResult{}, false, err
 	}
 	task, err := scanTask(tx.QueryRowContext(ctx, `SELECT `+taskCols+` FROM tasks WHERE id=?`, taskID))

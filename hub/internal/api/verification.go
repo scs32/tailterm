@@ -178,6 +178,9 @@ type VerificationRequest struct {
 	// lead or verifier must send it; a database handler has no binding and
 	// sends none.
 	ContextDigest string `json:"contextDigest,omitempty"`
+	// TriggerSeq cites the request that triggered this write, as on
+	// CreateWorkItemUpdate. 0 cites nothing.
+	TriggerSeq int64 `json:"triggerSeq,omitempty"`
 }
 
 // VerificationCarryOver rebinds the current passing receipt to the scope an

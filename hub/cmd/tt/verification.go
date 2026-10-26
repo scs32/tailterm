@@ -18,13 +18,14 @@ import (
 
 func cmdVerification(e env, args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: tt verification plan|receipt|carry-over|history|enrollment --item ID [--file PATH --request-id KEY --generation N]")
+		return errors.New("usage: tt verification plan|receipt|carry-over|history|enrollment --item ID [--file PATH --request-id KEY --generation N [--trigger SEQ]]")
 	}
 	fs := flag.NewFlagSet("verification "+args[0], flag.ContinueOnError)
 	item := fs.String("item", "", "exact work item")
 	file := fs.String("file", "", "plan, receipt or carry-over JSON file")
 	key := fs.String("request-id", "", "stable retry identity")
 	generation := fs.Int64("generation", 0, "expected record generation")
+	trigger := fs.Int64("trigger", 0, "seq of the request that triggered this write; the hub refuses it once that request is withdrawn or answered")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -56,6 +57,9 @@ func cmdVerification(e env, args []string) error {
 	if *key == "" || *file == "" {
 		return errors.New("file and request-id required")
 	}
+	if *trigger < 0 {
+		return errors.New("--trigger must be a message seq")
+	}
 	data, err := os.ReadFile(*file)
 	if err != nil {
 		return err
@@ -64,7 +68,7 @@ func cmdVerification(e env, args []string) error {
 	if err != nil {
 		return err
 	}
-	req := api.VerificationRequest{RequestID: *key, AgentID: e.agent, RunID: e.runID, ExpectedGeneration: *generation, ContextDigest: digest}
+	req := api.VerificationRequest{RequestID: *key, AgentID: e.agent, RunID: e.runID, ExpectedGeneration: *generation, ContextDigest: digest, TriggerSeq: *trigger}
 	switch args[0] {
 	case "plan":
 		req.Plan = &api.VerificationPlan{}
