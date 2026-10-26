@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1206,4 +1208,308 @@ func TestProviderBlockedQueueStallIdleEntry(t *testing.T) {
 	assertNoStall(t, f, b.ID, "blocked below the threshold")
 	advance(25 * time.Minute)
 	assertStall(t, f, b.ID, api.StallIdleEntry, a.ID, "tt team queue integrated", "tt team queue scope --task "+f.task.ID+" --entry "+a.ID)
+}
+
+// Retry wakes for rate_limited and server_error blocks (bug
+// wi_ce7310979bc45479, order #46760, criteria a2 and a3).
+
+// retryBlock reports a block of class that began now, with a 429 or 503.
+func (f *providerFixture) retryBlock(a api.Agent, class string) {
+	f.t.Helper()
+	f.n++
+	p := &api.ProviderBlock{Provider: "openai", Runtime: "codex", Model: "gpt-6-astra", Class: class, Code: "response_too_many_failed_attempts", Status: 429, Since: f.clock}
+	if class == api.ProviderBlockServerError {
+		p.Code, p.Status = "server_overloaded", 0
+	}
+	if err := f.report(a, fmt.Sprintf("block-%d", f.n), api.AgentActivity{State: "provider_blocked", Provider: p}); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+// request sends a typed REQUEST, which opens an ack_outcome obligation, or a
+// NOTICE, which needs delivery only, from the first lead to a.
+func (f *providerFixture) request(a api.Agent, kind string) api.Message {
+	f.t.Helper()
+	f.n++
+	from := f.leads[0]
+	env := &api.Envelope{Kind: kind, To: a.Name, Subject: "Synthetic retry fixture request", Body: api.EnvelopeBody{Ask: "Please record this synthetic fixture item.", Text: "synthetic fixture text"}}
+	req := api.PostMessageRequest{Envelope: env, AgentID: from.ID, RunID: from.RunID, To: a.ID, Text: api.RenderText(*env), RequestID: fmt.Sprintf("retry-req-%d", f.n)}
+	m, err := f.s.PostMessage(context.Background(), f.task.ID, req, api.Caller{Node: "fixture", User: "owner"})
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	return m
+}
+
+// retries is the number of retry rows of a's episodes; retryWakes the
+// pending wake jobs those rows queued.
+func (f *providerFixture) retries(a api.Agent) int {
+	f.t.Helper()
+	return countRows(f.t, f.s, `SELECT count(*) FROM provider_block_retries WHERE agent_id=?`, a.ID)
+}
+
+func (f *providerFixture) retryWakes(a api.Agent) int {
+	f.t.Helper()
+	return countRows(f.t, f.s, `SELECT count(*) FROM wake_jobs w JOIN provider_block_retries r ON r.wake_job_id=w.id WHERE w.agent_id=? AND w.state=?`, a.ID, wakePending)
+}
+
+func TestProviderBlockRetryWakeAfterBackoff(t *testing.T) {
+	f := newProviderFixture(t)
+	a := f.agent("db-handler", "codex", -1)
+	req := f.request(a, api.EnvelopeKindRequest)
+	var obligation string
+	var wakesBefore int
+	if err := f.s.db.QueryRow(`SELECT id,wakes FROM obligations WHERE message_seq=? AND agent_id=?`, req.Seq, a.ID).Scan(&obligation, &wakesBefore); err != nil {
+		t.Fatal(err)
+	}
+	jobsBefore := countRows(t, f.s, `SELECT count(*) FROM wake_jobs WHERE agent_id=?`, a.ID)
+	opened := f.clock
+	f.retryBlock(a, api.ProviderBlockRateLimited)
+	at := func(d time.Duration) {
+		f.clock = opened.Add(d)
+		f.seen(a, true)
+		f.sweep()
+	}
+	at(4*time.Minute + 59*time.Second)
+	if n := f.retries(a); n != 0 {
+		t.Fatalf("retry before the backoff: %d", n)
+	}
+	at(5 * time.Minute)
+	if n, w := f.retries(a), f.retryWakes(a); n != 1 || w != 1 {
+		t.Fatalf("at 5 min: retries=%d wakes=%d", n, w)
+	}
+	var due, attemptObligation, created string
+	var attempt, wakes int
+	if err := f.s.db.QueryRow(`SELECT r.attempt,r.obligation_id,r.created_at,w.due_at,o.wakes FROM provider_block_retries r JOIN wake_jobs w ON w.id=r.wake_job_id JOIN obligations o ON o.id=r.obligation_id WHERE r.agent_id=?`, a.ID).Scan(&attempt, &attemptObligation, &created, &due, &wakes); err != nil {
+		t.Fatal(err)
+	}
+	if attempt != 1 || attemptObligation != obligation || !parseTS(due).Equal(f.clock) || !parseTS(created).Equal(f.clock) || wakes != wakesBefore+1 {
+		t.Fatalf("attempt %d obligation %s due %s created %s wakes %d (before %d)", attempt, attemptObligation, due, created, wakes, wakesBefore)
+	}
+	if n := countRows(t, f.s, `SELECT count(*) FROM wake_jobs WHERE agent_id=?`, a.ID); n != jobsBefore+1 {
+		t.Fatalf("wake jobs %d, want %d", n, jobsBefore+1)
+	}
+	// The relay leases it like any obligation wake.
+	job, err := f.s.LeaseWakeJob(context.Background(), f.task.ID, a.ID, a.RunID, f.clock)
+	if err != nil || job == nil || job.ObligationID != obligation {
+		t.Fatalf("lease %+v %v", job, err)
+	}
+	// No board message and no new obligation.
+	if n := countRows(t, f.s, `SELECT count(*) FROM obligations WHERE agent_id=?`, a.ID); n != 1 {
+		t.Fatalf("obligations %d", n)
+	}
+	// The woken turn succeeds: recovery closes the episode as before, and no
+	// second attempt follows.
+	f.state(a, "working")
+	if n := countRows(t, f.s, `SELECT count(*) FROM provider_block_episodes WHERE agent_id=? AND cleared_at=''`, a.ID); n != 0 {
+		t.Fatalf("episode still open: %d", n)
+	}
+	for _, d := range []time.Duration{15 * time.Minute, 30 * time.Minute, 2 * time.Hour} {
+		at(d)
+	}
+	if n := f.retries(a); n != 1 {
+		t.Fatalf("attempts after recovery: %d", n)
+	}
+}
+
+func TestProviderBlockRetryBounds(t *testing.T) {
+	attemptTimes := func(f *providerFixture, a api.Agent) []time.Time {
+		t.Helper()
+		rows, err := f.s.db.Query(`SELECT created_at FROM provider_block_retries WHERE agent_id=? ORDER BY attempt`, a.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		var out []time.Time
+		for rows.Next() {
+			var at string
+			if err := rows.Scan(&at); err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, parseTS(at))
+		}
+		return out
+	}
+	t.Run("persisting block", func(t *testing.T) {
+		for _, class := range []string{api.ProviderBlockRateLimited, api.ProviderBlockServerError} {
+			f := newProviderFixture(t)
+			a := f.agent("db-handler", "codex", -1)
+			f.request(a, api.EnvelopeKindRequest)
+			opened := f.clock
+			f.retryBlock(a, class)
+			for d := time.Minute; d <= 75*time.Minute; d += time.Minute {
+				f.clock = opened.Add(d)
+				f.seen(a, true)
+				f.sweep()
+			}
+			// Hours later the block still holds: no fourth attempt.
+			f.clock = opened.Add(3 * time.Hour)
+			f.seen(a, true)
+			f.sweep()
+			got := attemptTimes(f, a)
+			want := []time.Time{opened.Add(5 * time.Minute), opened.Add(15 * time.Minute), opened.Add(30 * time.Minute)}
+			if !reflect.DeepEqual(got, want) || f.retryWakes(a) != 3 {
+				t.Fatalf("%s attempts %v, want %v (wakes %d)", class, got, want, f.retryWakes(a))
+			}
+		}
+	})
+	t.Run("after downtime", func(t *testing.T) {
+		f := newProviderFixture(t)
+		a := f.agent("db-handler", "codex", -1)
+		f.request(a, api.EnvelopeKindRequest)
+		opened := f.clock
+		f.retryBlock(a, api.ProviderBlockRateLimited)
+		// The hub was down until 40 minutes: every attempt is overdue, but
+		// they still go one per sweep and at least five minutes apart.
+		for d := 40 * time.Minute; d <= 2*time.Hour; d += time.Minute {
+			f.clock = opened.Add(d)
+			f.seen(a, true)
+			f.sweep()
+		}
+		got := attemptTimes(f, a)
+		want := []time.Time{opened.Add(40 * time.Minute), opened.Add(45 * time.Minute), opened.Add(50 * time.Minute)}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("attempts %v, want %v", got, want)
+		}
+	})
+	t.Run("ineligible", func(t *testing.T) {
+		f := newProviderFixture(t)
+		auth := f.agent("auth", "codex", -1)
+		usage := f.agent("usage", "codex", -1)
+		noticeOnly := f.agent("notice-only", "codex", -1)
+		answered := f.agent("answered", "codex", -1)
+		offline := f.agent("offline", "codex", -1)
+		deployer := f.agent("deployer", "codex", -1)
+		held := f.agent("held", "codex", 1)
+		if _, err := f.s.db.Exec(`INSERT INTO team_queue_entries(id,task_id,item_id,item_revision,order_seq,template,position,state,created_at,updated_at) VALUES('tqe_held',?,?,1,1,'planned',1,'running',?,?)`,
+			f.task.ID, f.items[1].ID, ts(f.clock.Add(-time.Hour)), ts(f.clock.Add(-time.Hour))); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.s.db.Exec(`INSERT INTO team_queue_budget_holds(task_id,entry_id,item_id,estimate_tokens,team_tokens,team_state,state,created_at) VALUES(?,'tqe_held',?,1,'2','running','held',?)`,
+			f.task.ID, f.items[1].ID, ts(f.clock)); err != nil {
+			t.Fatal(err)
+		}
+		for _, a := range []api.Agent{auth, usage, answered, offline, deployer, held} {
+			f.request(a, api.EnvelopeKindRequest)
+		}
+		f.request(noticeOnly, api.EnvelopeKindNotice)
+		// A message to a deployment agent opens no obligation, so the role is
+		// set after the request: the role alone must keep its wake away.
+		if _, err := f.s.db.Exec(`UPDATE agents SET role=? WHERE id=?`, api.AgentRoleDeployment, deployer.ID); err != nil {
+			t.Fatal(err)
+		}
+		if n := countRows(t, f.s, `SELECT count(*) FROM obligations WHERE agent_id=? AND state<>? AND needs<>?`, deployer.ID, api.ObligationClosed, api.ObligationNeedsDelivery); n != 1 {
+			t.Fatalf("deployer obligations %d", n)
+		}
+		if n := countRows(t, f.s, `SELECT count(*) FROM obligations WHERE agent_id=? AND needs=?`, noticeOnly.ID, api.ObligationNeedsDelivery); n != 1 {
+			t.Fatalf("notice obligations %d", n)
+		}
+		if _, err := f.s.db.Exec(`UPDATE obligations SET state=? WHERE agent_id=?`, api.ObligationClosed, answered.ID); err != nil {
+			t.Fatal(err)
+		}
+		opened := f.clock
+		f.block(auth, "codex", api.ProviderBlockAuth)
+		f.block(usage, "codex", api.ProviderBlockUsageLimit)
+		for _, a := range []api.Agent{noticeOnly, answered, offline, deployer, held} {
+			f.retryBlock(a, api.ProviderBlockRateLimited)
+		}
+		for d := time.Minute; d <= time.Hour; d += time.Minute {
+			f.clock = opened.Add(d)
+			for _, a := range []api.Agent{auth, usage, noticeOnly, answered, deployer, held} {
+				f.seen(a, true)
+			}
+			f.seen(offline, false)
+			f.sweep()
+		}
+		for _, a := range []api.Agent{auth, usage, noticeOnly, answered, offline, deployer, held} {
+			if n := f.retries(a); n != 0 {
+				t.Fatalf("%s got %d retries", a.Name, n)
+			}
+		}
+		// Ineligible attempts are not counted: the offline agent that comes
+		// back gets its first attempt then.
+		f.advance(time.Minute)
+		f.seen(offline, true)
+		f.sweep()
+		if got := attemptTimes(f, offline); len(got) != 1 || !got[0].Equal(f.clock) {
+			t.Fatalf("offline agent back online: %v", got)
+		}
+	})
+	t.Run("paused project", func(t *testing.T) {
+		f := newProviderFixture(t)
+		a := f.agent("db-handler", "codex", -1)
+		f.request(a, api.EnvelopeKindRequest)
+		if _, err := f.s.db.Exec(`UPDATE tasks SET pause_state=? WHERE id=?`, api.ProjectPausePaused, f.task.ID); err != nil {
+			t.Fatal(err)
+		}
+		opened := f.clock
+		f.retryBlock(a, api.ProviderBlockRateLimited)
+		for d := time.Minute; d <= time.Hour; d += time.Minute {
+			f.clock = opened.Add(d)
+			f.seen(a, true)
+			f.sweep()
+		}
+		if n := f.retries(a); n != 0 {
+			t.Fatalf("paused project got %d retries", n)
+		}
+	})
+}
+
+func TestProviderBlockRetryNoDuplicate(t *testing.T) {
+	f := newProviderFixture(t)
+	a := f.agent("db-handler", "codex", -1)
+	f.request(a, api.EnvelopeKindRequest)
+	var path string
+	if err := f.s.db.QueryRow(`SELECT file FROM pragma_database_list WHERE name='main'`).Scan(&path); err != nil {
+		t.Fatal(err)
+	}
+	other, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	opened := f.clock
+	f.retryBlock(a, api.ProviderBlockRateLimited)
+	for attempt, d := range []time.Duration{5 * time.Minute, 15 * time.Minute, 30 * time.Minute} {
+		now := opened.Add(d)
+		f.clock = now
+		f.seen(a, true)
+		// Concurrent retry sweeps on this store and on a second store of the
+		// same database, then repeated full sweeps on both. (Only the retry
+		// sweep is run concurrently across stores: the owner-notice sweep
+		// can meet a busy database from another process, which the hub, one
+		// process, never is.)
+		var wg sync.WaitGroup
+		errs := make(chan error, 16)
+		for i := 0; i < 8; i++ {
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				_, err := f.s.providerBlockRetrySweep(context.Background(), now)
+				errs <- err
+			}()
+			go func() {
+				defer wg.Done()
+				_, err := other.providerBlockRetrySweep(context.Background(), now)
+				errs <- err
+			}()
+		}
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			if err != nil {
+				t.Fatalf("attempt %d sweep: %v", attempt+1, err)
+			}
+		}
+		f.sweep()
+		if _, err := other.ProviderBlockSweep(context.Background(), now); err != nil {
+			t.Fatal(err)
+		}
+		if n, w := f.retries(a), f.retryWakes(a); n != attempt+1 || w != attempt+1 {
+			t.Fatalf("attempt %d: retries=%d wakes=%d", attempt+1, n, w)
+		}
+		if n := countRows(t, f.s, `SELECT count(*) FROM wake_jobs WHERE agent_id=? AND julianday(created_at)=julianday(?)`, a.ID, ts(now)); n != 1 {
+			t.Fatalf("attempt %d queued %d wake jobs", attempt+1, n)
+		}
+	}
 }

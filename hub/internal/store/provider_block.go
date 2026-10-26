@@ -21,7 +21,9 @@ import (
 // runtime that block together become a single outage notice. A notice that
 // still needs the owner carries escalation=owner, which the Discord bridge
 // turns into a ping. When an auth block clears, the agents of that runtime and
-// host that are still blocked are woken.
+// host that are still blocked are woken. A rate_limited or server_error block
+// of an agent with open obligations is retried: the hub queues a wake after a
+// bounded backoff (providerBlockRetrySweep).
 
 func migrateProviderBlock(db *sql.DB) error {
 	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS provider_block_episodes (
@@ -38,7 +40,10 @@ CREATE TABLE IF NOT EXISTS provider_outages (
  agent_count INTEGER NOT NULL DEFAULT 0);
 CREATE UNIQUE INDEX IF NOT EXISTS provider_outages_open ON provider_outages(task_id,runtime) WHERE closed_at='';
 CREATE TABLE IF NOT EXISTS provider_block_recoveries (
- episode_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, notice_seq INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);`)
+ episode_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, notice_seq INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS provider_block_retries (
+ episode_id TEXT NOT NULL, attempt INTEGER NOT NULL, task_id TEXT NOT NULL, agent_id TEXT NOT NULL, run_id TEXT NOT NULL,
+ obligation_id TEXT NOT NULL, wake_job_id TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(episode_id,attempt));`)
 	if err != nil {
 		return err
 	}
@@ -304,12 +309,157 @@ type providerEpisode struct {
 	cleared, live            bool
 }
 
-// ProviderBlockSweep sends the owner notices that waited for the grace
-// period: one per project and runtime when it is an outage (two or more live
+// Retry wakes for a rate_limited or server_error block (bug
+// wi_ce7310979bc45479, order #46760, q1). Attempt k is due providerRetryAfter[k-1]
+// after the episode opened, and at least providerRetryGap after attempt k-1;
+// there are at most len(providerRetryAfter) attempts per episode.
+var providerRetryAfter = [...]time.Duration{5 * time.Minute, 15 * time.Minute, 30 * time.Minute}
+
+const providerRetryGap = 5 * time.Minute
+
+// providerBlockRetrySweep queues the retry wakes that are due. It returns the
+// number of wakes queued.
+func (s *Store) providerBlockRetrySweep(ctx context.Context, now time.Time) (int, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT e.id FROM provider_block_episodes e JOIN agents a ON a.id=e.agent_id AND a.run_id=e.run_id
+ WHERE e.cleared_at='' AND e.class IN (?,?) AND `+liveAgentFilter+` AND (SELECT count(*) FROM provider_block_retries r WHERE r.episode_id=e.id)<?
+ ORDER BY e.opened_at,e.id`, api.ProviderBlockRateLimited, api.ProviderBlockServerError, len(providerRetryAfter))
+	if err != nil {
+		return 0, err
+	}
+	var episodes []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		episodes = append(episodes, id)
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+	woken := 0
+	var firstErr error
+	for _, id := range episodes {
+		ok, err := s.providerBlockRetry(ctx, id, now)
+		if ok {
+			woken++
+		}
+		if err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("provider block retry %s: %w", id, err)
+		}
+	}
+	return woken, firstErr
+}
+
+// providerBlockRetry queues the next retry wake of one episode when it is due
+// and the agent can take it: the episode is still open on the agent's current
+// run, the agent is live, online and not a deployment agent, the project is
+// open and active, its team is not held past its token estimate, and it holds
+// an obligation that needs more than delivery. Otherwise nothing is written,
+// and the next sweep checks again. The wake is an ordinary wake job on the
+// oldest such obligation, so the relay's prompt lists every open obligation;
+// no message or obligation is created. The retry row is the attempt's key, so
+// a repeated or concurrent sweep, or another hub process, queues one wake per
+// attempt.
+func (s *Store) providerBlockRetry(ctx context.Context, episode string, now time.Time) (bool, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	// Write first, so the transaction holds the database's write lock before
+	// it reads: another process's committed attempt is then always seen.
+	if _, err := tx.ExecContext(ctx, `UPDATE provider_block_episodes SET cleared_at=cleared_at WHERE id=?`, episode); err != nil {
+		return false, err
+	}
+	var task, agent, run, class, opened, cleared string
+	err = tx.QueryRowContext(ctx, `SELECT task_id,agent_id,run_id,class,opened_at,cleared_at FROM provider_block_episodes WHERE id=?`, episode).Scan(&task, &agent, &run, &class, &opened, &cleared)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if cleared != "" || (class != api.ProviderBlockRateLimited && class != api.ProviderBlockServerError) {
+		return false, nil
+	}
+	var attempts int
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM provider_block_retries WHERE episode_id=?`, episode).Scan(&attempts); err != nil {
+		return false, err
+	}
+	if attempts >= len(providerRetryAfter) || now.Before(parseTS(opened).Add(providerRetryAfter[attempts])) {
+		return false, nil
+	}
+	if attempts > 0 {
+		var last string
+		if err := tx.QueryRowContext(ctx, `SELECT created_at FROM provider_block_retries WHERE episode_id=? AND attempt=?`, episode, attempts).Scan(&last); err != nil {
+			return false, err
+		}
+		if now.Before(parseTS(last).Add(providerRetryGap)) {
+			return false, nil
+		}
+	}
+	a, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE id=?`, agent))
+	if err != nil {
+		return false, err
+	}
+	switch {
+	case a.RunID != run, a.Status == api.AgentClosed, a.Status == api.AgentExited, a.Status == api.AgentRetired,
+		a.Role == api.AgentRoleDeployment, !agentOnlineAt(a, now):
+		return false, nil
+	}
+	project, err := scanTask(tx.QueryRowContext(ctx, `SELECT `+taskCols+` FROM tasks WHERE tasks.id=?`, task))
+	if err != nil {
+		return false, err
+	}
+	if project.Status != api.TaskOpen || (project.PauseState != "" && project.PauseState != api.ProjectPauseActive) {
+		return false, nil
+	}
+	if held, err := budgetHeldRun(ctx, tx, task, agent, run); err != nil || held {
+		return false, err
+	}
+	var obligation string
+	err = tx.QueryRowContext(ctx, `SELECT id FROM obligations WHERE task_id=? AND agent_id=? AND state<>? AND needs<>? ORDER BY message_seq LIMIT 1`, task, agent, api.ObligationClosed, api.ObligationNeedsDelivery).Scan(&obligation)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	wake := newObligationID("wake")
+	result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO provider_block_retries(episode_id,attempt,task_id,agent_id,run_id,obligation_id,wake_job_id,created_at) VALUES(?,?,?,?,?,?,?,?)`,
+		episode, attempts+1, task, agent, run, obligation, wake, ts(now))
+	if err != nil {
+		return false, err
+	}
+	if n, err := result.RowsAffected(); err != nil || n == 0 {
+		return false, err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO wake_jobs (id,task_id,obligation_id,agent_id,due_at,state,created_at) VALUES (?,?,?,?,?,?,?)`,
+		wake, task, obligation, agent, ts(now), wakePending, ts(now)); err != nil {
+		return false, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE obligations SET wakes=wakes+1 WHERE id=?`, obligation); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	s.notify(task)
+	return true, nil
+}
+
+// ProviderBlockSweep queues the retry wakes that are due
+// (providerBlockRetrySweep) and sends the owner notices that waited for the
+// grace period: one per project and runtime when it is an outage (two or more live
 // agents of the runtime blocked and none working), otherwise one per episode.
 // An open outage ends as soon as that condition stops holding.
 // It runs for paused projects too and returns the number of notices posted.
 func (s *Store) ProviderBlockSweep(ctx context.Context, now time.Time) (int, error) {
+	_, retryErr := s.providerBlockRetrySweep(ctx, now)
 	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT e.task_id,e.runtime FROM provider_block_episodes e JOIN tasks t ON t.id=e.task_id WHERE e.owner_state=? AND t.status=?
  UNION SELECT o.task_id,o.runtime FROM provider_outages o JOIN tasks t ON t.id=o.task_id WHERE o.closed_at='' AND t.status=?`, providerOwnerPending, api.TaskOpen, api.TaskOpen)
 	if err != nil {
@@ -329,7 +479,7 @@ func (s *Store) ProviderBlockSweep(ctx context.Context, now time.Time) (int, err
 		return 0, err
 	}
 	posted := 0
-	var firstErr error
+	firstErr := retryErr
 	for _, sc := range scopes {
 		n, err := s.sweepProviderScope(ctx, sc.task, sc.runtime, now)
 		posted += n
