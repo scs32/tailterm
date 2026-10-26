@@ -1,0 +1,12 @@
+{"type":"session_meta","timestamp":"2026-10-25T16:16:00.000Z","payload":{"id":"44444444-4444-4444-8444-444444444444","originator":"codex_cli_rs"}}
+{"type":"turn_context","timestamp":"2026-10-25T16:16:00.100Z","payload":{"model":"gpt-6-astra","approval_policy":"never"}}
+{"type":"event_msg","timestamp":"2026-10-25T16:16:11.000Z","payload":{"type":"task_started"}}
+{"type":"response_item","timestamp":"2026-10-25T16:16:11.100Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Synthetic fixture prompt."}]}}
+{"type":"event_msg","timestamp":"2026-10-25T16:16:12.000Z","payload":{"type":"task_complete","last_agent_message":null,"error":{"codex_error_info":{"response_too_many_failed_attempts":{"http_status_code":429}},"message":"exceeded retry limit, last status: 429 Too Many Requests"}}}
+{"type":"event_msg","timestamp":"2026-10-25T16:21:11.000Z","payload":{"type":"task_started"}}
+{"type":"response_item","timestamp":"2026-10-25T16:21:11.100Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Synthetic fixture prompt."}]}}
+{"type":"event_msg","timestamp":"2026-10-25T16:21:12.000Z","payload":{"type":"task_complete","last_agent_message":null,"error":{"codex_error_info":{"response_too_many_failed_attempts":{"http_status_code":429}},"message":"exceeded retry limit, last status: 429 Too Many Requests"}}}
+{"type":"event_msg","timestamp":"2026-10-25T16:26:11.000Z","payload":{"type":"task_started"}}
+{"type":"response_item","timestamp":"2026-10-25T16:26:11.100Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Synthetic fixture prompt."}]}}
+{"type":"response_item","timestamp":"2026-10-25T16:26:14.000Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Synthetic fixture reply."}]}}
+{"type":"event_msg","timestamp":"2026-10-25T16:26:15.000Z","payload":{"type":"task_complete","last_agent_message":"Synthetic fixture reply."}}

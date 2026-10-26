@@ -2222,6 +2222,137 @@ func TestActivityProviderBlockedRepeat(t *testing.T) {
 	}
 }
 
+// Codex's own retry limit and overload forms (bug wi_ce7310979bc45479, order
+// #46760, criterion a1). A turn that ended Codex's retries is a block at its
+// first failure; an overload follows the repeat threshold.
+func TestActivityProviderBlockedCodexRetryLimit(t *testing.T) {
+	const observed = `"codex_error_info":{"response_too_many_failed_attempts":{"http_status_code":429}},"message":"exceeded retry limit, last status: 429 Too Many Requests"`
+	fixture := providerFixture(t, "codex-retry-limit-429")
+	if !strings.Contains(fixture, observed) {
+		t.Fatal("fixture does not carry the observed retry-limit error")
+	}
+	want := api.ProviderBlock{Provider: "openai", Runtime: "codex", Model: "gpt-6-astra", Class: "rate_limited", Code: "response_too_many_failed_attempts", Status: 429, Since: providerTime(t, "2026-10-25T16:16:12Z")}
+	// A running agent: the first failed turn already blocks.
+	got := providerState(providerCursor(t, "codex", "codex-retry-limit-429", 5))
+	if got.State != "provider_blocked" || !api.SameProviderBlock(got.Provider, &want) || !got.Provider.Valid() {
+		t.Fatalf("first failed turn %+v %+v", got, got.Provider)
+	}
+	// The second failure extends the block and keeps its since; model output
+	// in a later turn clears it.
+	if got := providerState(providerCursor(t, "codex", "codex-retry-limit-429", 8)); got.State != "provider_blocked" || !api.SameProviderBlock(got.Provider, &want) {
+		t.Fatalf("second failed turn %+v", got)
+	}
+	if got := providerState(providerCursor(t, "codex", "codex-retry-limit-429", -1)); got.State != "idle" || got.Reason != "" || got.Provider != nil {
+		t.Fatalf("after recovery %+v", got)
+	}
+	// The message alone, with an untyped info, is the same block; a 5xx in it
+	// is a server error, and an unclassified status is no block at all.
+	for _, tc := range []struct {
+		info, message, class string
+		status               int
+	}{
+		{`"other"`, "exceeded retry limit, last status: 429 Too Many Requests", "rate_limited", 429},
+		{`"other"`, "exceeded retry limit, last status: 503 Service Unavailable", "server_error", 503},
+		{`{"response_too_many_failed_attempts":{"http_status_code":502}}`, "anything", "server_error", 502},
+		{`"other"`, "exceeded retry limit, last status: 400 Bad Request", "", 0},
+		{`{"response_too_many_failed_attempts":{"http_status_code":200}}`, "something else", "", 0},
+	} {
+		c := &activityCursor{}
+		line := `{"type":"event_msg","timestamp":"2026-10-25T16:16:12Z","payload":{"type":"task_complete","error":{"codex_error_info":` + tc.info + `,"message":"` + tc.message + `"}}}`
+		if err := parseCodexActivity([]byte(line), c); err != nil {
+			t.Fatal(err)
+		}
+		got := providerState(c)
+		if tc.class == "" {
+			if got.State != "idle" || got.Provider != nil || c.ProviderBlock != nil {
+				t.Fatalf("%s %s classified %+v", tc.info, tc.message, got)
+			}
+			continue
+		}
+		if got.State != "provider_blocked" || got.Provider.Class != tc.class || got.Provider.Status != tc.status || got.Provider.Code != "response_too_many_failed_attempts" {
+			t.Fatalf("%s %s %+v %+v", tc.info, tc.message, got, got.Provider)
+		}
+	}
+	// "unexpected status" keeps its threshold of two failed turns.
+	if got := providerState(providerCursor(t, "codex", "codex-429", 5)); got.State != "idle" || got.Provider != nil {
+		t.Fatalf("unexpected status 429 blocked at once %+v", got)
+	}
+
+	// A done agent woken into the failure with an open obligation is reported
+	// blocked at that first failed turn, and nothing of the message is kept.
+	cols, rows := 200, 50
+	stubPaneSize(t, &cols, &rows)
+	b, h, _, tick := stuckFixture(t, "codex")
+	h.agent.Status = api.AgentDone
+	path := filepath.Join(os.Getenv("HOME"), ".codex", "sessions", "2026", "09", "29", "rollout-test-"+b.Thread+".jsonl")
+	lines := strings.Split(strings.TrimSpace(fixture), "\n")
+	write := func(n int) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(strings.Join(lines[:n], "\n")+"\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Date(2026, 10, 25, 16, 16, 0, 0, time.UTC)
+	write(2)
+	if err := tick(now); err != nil {
+		t.Fatal(err)
+	}
+	h.obligations = 1
+	write(5)
+	if err := tick(now.Add(16 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	last := h.reports[len(h.reports)-1]
+	if last.State != "provider_blocked" || !api.SameProviderBlock(last.Provider, &want) {
+		t.Fatalf("woken done agent %+v", h.reports)
+	}
+	report, err := json.Marshal(h.reports)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cursor, err := os.ReadFile(filepath.Join(relayDir(), bindingKey(b)+".activity.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, data := range map[string][]byte{"report": report, "cursor": cursor} {
+		for _, text := range []string{"exceeded retry limit", "Too Many Requests", "last status"} {
+			if strings.Contains(string(data), text) {
+				t.Fatalf("%s contains %q: %s", name, text, data)
+			}
+		}
+	}
+	var saved activityCursor
+	if err := json.Unmarshal(cursor, &saved); err != nil || saved.ProviderBlock == nil || !saved.ProviderBlock.Exhausted {
+		t.Fatalf("cursor lost the exhausted mark: %s %v", cursor, err)
+	}
+}
+
+func TestActivityProviderBlockedCodexServerOverloaded(t *testing.T) {
+	fixture := providerFixture(t, "codex-server-overloaded")
+	if !strings.Contains(fixture, `"codex_error_info":"server_overloaded","message":"Selected model is at capacity. Please try a different model."`) {
+		t.Fatal("fixture does not carry the observed overload error")
+	}
+	if got := providerState(providerCursor(t, "codex", "codex-server-overloaded", 5)); got.State != "idle" || got.Reason != api.ProviderErrorTurnReasonPrefix+" (server_error)" || got.Provider != nil {
+		t.Fatalf("one overload %+v", got)
+	}
+	want := api.ProviderBlock{Provider: "openai", Runtime: "codex", Model: "gpt-6-astra", Class: "server_error", Code: "server_overloaded", Since: providerTime(t, "2026-10-26T14:30:20Z")}
+	got := providerState(providerCursor(t, "codex", "codex-server-overloaded", 8))
+	if got.State != "provider_blocked" || !api.SameProviderBlock(got.Provider, &want) || !got.Provider.Valid() {
+		t.Fatalf("second overload %+v %+v", got, got.Provider)
+	}
+	c := providerCursor(t, "codex", "codex-server-overloaded", 8)
+	data, err := json.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "capacity") || strings.Contains(string(data), "different model") || strings.Contains(string(data), `"exhausted"`) {
+		t.Fatalf("cursor keeps message text or an exhausted mark: %s", data)
+	}
+	if got := providerState(providerCursor(t, "codex", "codex-server-overloaded", -1)); got.State != "idle" || got.Reason != "" || got.Provider != nil {
+		t.Fatalf("after recovery %+v", got)
+	}
+}
+
 func TestActivityProviderBlockedTick(t *testing.T) {
 	cols, rows := 200, 50
 	stubPaneSize(t, &cols, &rows)

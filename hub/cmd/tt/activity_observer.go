@@ -139,6 +139,9 @@ type providerBlockCursor struct {
 	Status  int       `json:"status,omitempty"`
 	Since   time.Time `json:"since"`
 	Count   int       `json:"count"`
+	// Exhausted records that a failure of the block already ended a run of
+	// the runtime's own retries, so it counts as repeated at once.
+	Exhausted bool `json:"exhausted,omitempty"`
 }
 
 type activityThresholds struct {
@@ -413,6 +416,9 @@ func finishActivityCall(c *activityCursor, id string, now time.Time) {
 var (
 	providerModelName   = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,64}$`)
 	codexProviderStatus = regexp.MustCompile(`^unexpected status ([0-9]{3})\b`)
+	// Codex ends a turn with this once its own retries are used up
+	// (bug wi_ce7310979bc45479, order #46760).
+	codexRetryLimitStatus = regexp.MustCompile(`^exceeded retry limit, last status: ([0-9]{3})\b`)
 )
 
 // noteProviderModel keeps the last well-formed model name. Claude Code's
@@ -456,20 +462,57 @@ func claudeProviderClass(code string, status int, text string) string {
 	return providerStatusClass(status)
 }
 
-// codexProviderClass classifies a Codex task_complete error message of the
-// form "unexpected status NNN ...". Only the status is taken from it.
-func codexProviderClass(message string) (string, int) {
+// codexProviderFailure is a classified Codex task_complete error. Exhausted
+// marks a failure that ended Codex's own retries.
+type codexProviderFailure struct {
+	class, code string
+	status      int
+	exhausted   bool
+}
+
+// codexProviderClass classifies a Codex task_complete error from its typed
+// codex_error_info and its message. Only the status is taken from the message:
+// "unexpected status NNN ...", or "exceeded retry limit, last status: NNN ..."
+// when the info is not the typed retry form. The typed forms are the object
+// response_too_many_failed_attempts with an http_status_code, which has
+// exhausted the retries, and the string server_overloaded.
+func codexProviderClass(message string, info json.RawMessage) codexProviderFailure {
+	var code string
+	if json.Unmarshal(info, &code) == nil {
+		if code == "server_overloaded" {
+			return codexProviderFailure{class: api.ProviderBlockServerError, code: code}
+		}
+	} else {
+		var typed struct {
+			Retries *struct {
+				Status int `json:"http_status_code"`
+			} `json:"response_too_many_failed_attempts"`
+		}
+		if json.Unmarshal(info, &typed) == nil && typed.Retries != nil && typed.Retries.Status >= 400 && typed.Retries.Status <= 599 {
+			if class := providerStatusClass(typed.Retries.Status); class != "" {
+				return codexProviderFailure{class: class, code: "response_too_many_failed_attempts", status: typed.Retries.Status, exhausted: true}
+			}
+		}
+		code = ""
+	}
+	if m := codexRetryLimitStatus.FindStringSubmatch(message); m != nil {
+		status, _ := strconv.Atoi(m[1])
+		if class := providerStatusClass(status); class != "" {
+			return codexProviderFailure{class: class, code: "response_too_many_failed_attempts", status: status, exhausted: true}
+		}
+		return codexProviderFailure{}
+	}
 	m := codexProviderStatus.FindStringSubmatch(message)
 	if m == nil {
-		return "", 0
+		return codexProviderFailure{}
 	}
 	status, _ := strconv.Atoi(m[1])
-	return providerStatusClass(status), status
+	return codexProviderFailure{class: providerStatusClass(status), code: code, status: status}
 }
 
 // noteProviderFailure records one failed turn. The same class again extends
 // the block and keeps its since; a different class starts a new one.
-func noteProviderFailure(c *activityCursor, runtime, class, code string, status int, at time.Time) {
+func noteProviderFailure(c *activityCursor, runtime, class, code string, status int, exhausted bool, at time.Time) {
 	if !claudeAPIErrorCode.MatchString(code) {
 		code = ""
 	}
@@ -479,20 +522,22 @@ func noteProviderFailure(c *activityCursor, runtime, class, code string, status 
 	if b := c.ProviderBlock; b != nil && b.Class == class {
 		b.Count++
 		b.Code, b.Status = code, status
+		b.Exhausted = b.Exhausted || exhausted
 		return
 	}
-	c.ProviderBlock = &providerBlockCursor{Runtime: runtime, Class: class, Code: code, Status: status, Since: at, Count: 1}
+	c.ProviderBlock = &providerBlockCursor{Runtime: runtime, Class: class, Code: code, Status: status, Since: at, Count: 1, Exhausted: exhausted}
 }
 
 // reportableProviderBlock is the block to report, or nil. A usage limit or an
 // authentication failure blocks at once; a rate limit or server error only
-// after the repeat threshold of failed turns in a row.
+// after the repeat threshold of failed turns in a row, or at once when a
+// failure already ended the runtime's own retries.
 func reportableProviderBlock(c *activityCursor, threshold activityThresholds) *api.ProviderBlock {
 	b := c.ProviderBlock
 	if b == nil {
 		return nil
 	}
-	if b.Class != api.ProviderBlockUsageLimit && b.Class != api.ProviderBlockAuth && b.Count < max(threshold.ProviderRepeat, 2) {
+	if b.Class != api.ProviderBlockUsageLimit && b.Class != api.ProviderBlockAuth && !b.Exhausted && b.Count < max(threshold.ProviderRepeat, 2) {
 		return nil
 	}
 	model := c.Model
@@ -538,11 +583,9 @@ func parseCodexActivity(line []byte, c *activityCursor) error {
 			c.SeenTurn, c.TurnComplete, c.TurnEndReason = true, true, ""
 			if p.Error == nil {
 				c.ProviderBlock = nil
-			} else if class, status := codexProviderClass(p.Error.Message); class != "" {
-				var code string
-				_ = json.Unmarshal(p.Error.Info, &code)
-				noteProviderFailure(c, "codex", class, code, status, now)
-				c.TurnEndReason = "turn ended by provider error (" + class + ")"
+			} else if f := codexProviderClass(p.Error.Message, p.Error.Info); f.class != "" {
+				noteProviderFailure(c, "codex", f.class, f.code, f.status, f.exhausted, now)
+				c.TurnEndReason = api.ProviderErrorTurnReasonPrefix + " (" + f.class + ")"
 			}
 		case "token_count":
 			u := p.Info.Total
@@ -812,7 +855,7 @@ func parseClaudeActivity(line []byte, c *activityCursor) error {
 				}
 			}
 			if class := claudeProviderClass(apiError.Error, apiError.Status, text); class != "" {
-				noteProviderFailure(c, "claude", class, apiError.Error, apiError.Status, now)
+				noteProviderFailure(c, "claude", class, apiError.Error, apiError.Status, false, now)
 			}
 		}
 		if msg.ID != "" && len(msg.Usage) > 0 {

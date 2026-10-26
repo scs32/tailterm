@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"regexp"
+	"strings"
 	"time"
 )
 
@@ -30,6 +31,10 @@ const (
 	// host, and the hub has recorded nothing from that run for the policy's
 	// silence (owner order #28057). Runner trigger only, with death evidence.
 	HandlerRotationReasonDeadPrimary = "dead_primary"
+	// The primary's current run has been provider blocked (rate_limited or
+	// server_error) past HandlerProviderBlockedAfter while it holds an open
+	// obligation (bug wi_ce7310979bc45479, order #46760). Runner trigger only.
+	HandlerRotationReasonProviderBlocked = "provider_blocked"
 
 	// The owner command may treat an unknown activity as idle; the runner
 	// requires an observed idle or finished_silent state.
@@ -51,6 +56,12 @@ const (
 	// or the run has not been silent for the policy's minutes.
 	HandlerRotationRefusedDeathUnconfirmed = "death_unconfirmed"
 	HandlerRotationRefusedNotSilent        = "not_silent"
+	// Commit only: the successor's exact run has not completed a turn with a
+	// model reply since the prepare (HandlerSuccessorReady).
+	HandlerRotationRefusedSuccessorNotReady = "successor_not_ready"
+	// A provider_blocked prepare only: the primary's current run is not in
+	// the blocked state the reason needs.
+	HandlerRotationRefusedNotBlocked = "not_blocked"
 
 	// Owner decision #14233, option A.
 	DefaultHandlerRotationMaxItems       int64 = 10
@@ -73,7 +84,31 @@ const (
 	// #28426): the session is present and its one pane holds nothing but the
 	// wrapper and one childless shell.
 	HandlerDeathStateIdleShell = "idle_shell"
+
+	// HandlerProviderBlockedAfter is how long a primary handler's rate_limited
+	// or server_error episode must have been open, with an open obligation,
+	// before the runner replaces it (order #46760, q2).
+	HandlerProviderBlockedAfter = 20 * time.Minute
+	// HandlerSuccessorReadyWait bounds how long a prepared rotation waits,
+	// from the successor's spawn, for the successor's first completed turn.
+	HandlerSuccessorReadyWait = 10 * time.Minute
 )
+
+// ProviderErrorTurnReasonPrefix starts the turn-end reason the relay reports
+// for a turn a provider error ended (docs/provider-blocked.md).
+const ProviderErrorTurnReasonPrefix = "turn ended by provider error"
+
+// HandlerSuccessorReady reports whether an activity report shows a completed
+// turn with a model reply: idle or finished_silent, no provider block, a
+// turn-end reason that is not a provider error, and output tokens. A
+// successor whose first turn failed at its provider, or that never ran one,
+// is not ready to take the primary's obligations.
+func HandlerSuccessorReady(a AgentActivity) bool {
+	if a.State != "idle" && a.State != "finished_silent" {
+		return false
+	}
+	return a.Provider == nil && !strings.HasPrefix(a.Reason, ProviderErrorTurnReasonPrefix) && a.Tokens.Output > 0
+}
 
 // HandlerDeathEvidence is what the handler's own host observed: the named
 // tmux session is absent from a readable listing, and the runtime process is
