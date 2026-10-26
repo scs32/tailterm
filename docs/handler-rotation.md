@@ -172,7 +172,9 @@ before a spec is saved or anything is spawned, because the resume would replay
 the journal's authorization and ignore the flags. The refusal names
 `tt handler rotate --abort --task ID`: abort the journaled rotation, then rotate
 again with the new authorization. The same check runs again under the journal
-lock, for a journal written after the first check. `tt handler rotation get` prints
+lock, for a journal written after the first check. An `aborted` journal is
+never resumed, so it is not checked: the rotation finishes its cleanup, then
+starts fresh with the flags given. `tt handler rotation get` prints
 `Authorized by NAME: REASON (runtime OLD -> NEW)`, `tt handler rotation list`
 appends `authorized-by="NAME"`, and the JSON record has `authorization`
 (`authorizedBy`, `reason`, `oldRuntime`, `successorRuntime`; the runtimes are
@@ -732,7 +734,10 @@ list. For each listed project:
   agent, run and handler revision. If the primary changed since the due list,
   the hub refuses the prepare as `handler_changed` or `not_primary`; the
   runner reports nothing, keeps no journal and reads the change with its next
-  due request.
+  due request. Only a refused prepare is silent: when the same call reaches
+  its commit and the hub refuses it as `handler_changed`, the tick reports it.
+  The rotation stays prepared with its journal, and the refusal says to abort
+  it.
 - A local journal for the project: resume that rotation, unless it has
   reached the resume ceiling below, or is `aborted` (the sweep above finishes
   it). A stuck one is aborted automatically when its old handler recovers or

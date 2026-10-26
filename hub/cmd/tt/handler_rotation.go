@@ -602,19 +602,29 @@ func rotateHandler(ctx context.Context, d rotationDeps, e env, c *api.Client, ta
 	return runHandlerRotation(ctx, d, e, c, task, reason, trigger, spec, auth, nil, nil)
 }
 
+// prepareRefusedError marks the hub's refusal of a prepare, which changed
+// nothing, from a refusal of a later step of the same call.
+type prepareRefusedError struct{ err error }
+
+func (e prepareRefusedError) Error() string { return e.err.Error() }
+func (e prepareRefusedError) Unwrap() error { return e.err }
+
 // staleDueEntry reports the hub's refusal of a prepare whose pinned handler
 // run or revision is no longer the project's primary: the due entry the
-// runner read is stale, and its next due request reads the change.
+// runner read is stale, and its next due request reads the change. A commit
+// refused for the same reason is not one: it is reported.
 func staleDueEntry(err error) bool {
 	code, ok := rotationRefusal(err)
-	return ok && (code == api.HandlerRotationRefusedStaleHandler || code == api.HandlerRotationRefusedNotPrimary)
+	return ok && errors.As(err, &prepareRefusedError{}) && (code == api.HandlerRotationRefusedStaleHandler || code == api.HandlerRotationRefusedNotPrimary)
 }
 
 // journalAuthorizationConflict refuses an owner authorization that differs
 // from the one this host's rotation journal records: a resume replays the
-// journal's authorization, so the flags would be silently ignored.
+// journal's authorization, so the flags would be silently ignored. An aborted
+// journal is never resumed: it is finished and a fresh rotation starts with
+// the flags given.
 func journalAuthorizationConflict(j *handlerRotationJournal, auth rotationAuthorization, task string) error {
-	if j == nil || !auth.set() || (j.AuthorizedBy == auth.by && j.AuthorizationReason == auth.reason) {
+	if j == nil || j.Phase == rotationPhaseAborted || !auth.set() || (j.AuthorizedBy == auth.by && j.AuthorizationReason == auth.reason) {
 		return nil
 	}
 	recorded := "no authorization"
@@ -740,7 +750,7 @@ func runHandlerRotation(ctx context.Context, d rotationDeps, e env, c *api.Clien
 			if removeErr := os.Remove(path); removeErr != nil {
 				return zero, removeErr
 			}
-			return zero, err
+			return zero, prepareRefusedError{err}
 		}
 		if err != nil {
 			return zero, fmt.Errorf("prepare unconfirmed; rerun to replay it: %w", err)

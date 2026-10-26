@@ -981,6 +981,94 @@ func TestHandlerRotationAuthorizedByRefusedWithDifferentJournal(t *testing.T) {
 	f.assertAuthorized(t, r)
 }
 
+// p8 (wi_0f6d57014268f0ee): only a prepare refused as handler_changed or
+// not_primary is a stale due entry. When the runner's fresh rotation reaches
+// its commit in the same call and the hub refuses the commit as
+// handler_changed, the tick reports it.
+func TestHandlerRotationRunnerReportsAStaleCommit(t *testing.T) {
+	ctx := context.Background()
+	f := newRotationCLI(t, handlerTemplateDigest("an older assignment"))
+	if err := saveHandlerSpec(f.spec); err != nil {
+		t.Fatal(err)
+	}
+	setRotationPolicy(t, f, api.HandlerRotationPolicyRequest{Enabled: true, OnTemplateChange: true})
+	db := f.db(t)
+	f.deps.after = func(phase string) error {
+		if phase == rotationPhaseSpawned {
+			if _, err := db.Exec(`UPDATE tasks SET handler_revision=handler_revision+1 WHERE id=?`, f.task.ID); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	err := f.runner().tick(ctx, f.e, f.c, "fixture")
+	if code, _ := rotationRefusal(err); code != api.HandlerRotationRefusedStaleHandler || staleDueEntry(err) {
+		t.Fatalf("a commit refused as handler_changed: %v", err)
+	}
+	if f.spawns != 1 || !f.journalExists() {
+		t.Fatalf("spawns=%d journal=%v", f.spawns, f.journalExists())
+	}
+	if rotations := f.rotations(t); len(rotations) != 1 || rotations[0].State != api.HandlerRotationPrepared {
+		t.Fatalf("rotations %+v", rotations)
+	}
+}
+
+// p9 (wi_0f6d57014268f0ee): an aborted journal is never resumed, so
+// tt handler rotate --authorized-by is not refused for the authorization it
+// records: the rotation finishes the aborted journal and starts fresh with the
+// flags given.
+func TestHandlerRotationAuthorizedByWithAnAbortedJournal(t *testing.T) {
+	ctx := context.Background()
+	f := crossRuntimeCLI(t)
+	f.request(t, f.old.Name, "Record the aborted authorization fixture item")
+	stop := errors.New("simulated crash")
+	f.deps.after = func(phase string) error {
+		if phase == rotationPhaseSpawned {
+			return stop
+		}
+		return nil
+	}
+	f.auth = crossRuntimeAuthorization
+	if _, err := f.rotate(t); !errors.Is(err, stop) {
+		t.Fatalf("expected the simulated crash, got %v", err)
+	}
+	f.deps.after = nil
+	aborted := f.rotations(t)[0]
+	successor, err := f.c.GetAgent(ctx, f.task.ID, aborted.SuccessorAgentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanup := f.deps.cleanup
+	f.deps.cleanup = func(context.Context, env, string, string) error { return errors.New("fixture cleanup failed") }
+	if _, err := abortHandlerRotation(ctx, f.deps, f.e, f.c, f.task.ID); err == nil {
+		t.Fatal("the failing cleanup was not reported")
+	}
+	f.deps.cleanup = cleanup
+	if j, err := loadRotationJournal(f.c.Base, f.task.ID); err != nil || j == nil || j.Phase != rotationPhaseAborted || j.AuthorizedBy != crossRuntimeAuthorization.by {
+		t.Fatalf("journal %+v %v", j, err)
+	}
+	other := rotationAuthorization{by: "someone else", reason: "a different reason"}
+	// The command's precheck passes: the error is the spec's, after it.
+	if err := cmdHandlerRotate(f.e, []string{"--task", f.task.ID, "--authorized-by", other.by, "--authorization-reason", other.reason, "--", "--unknown-flag", "x"}); err == nil ||
+		!strings.Contains(err.Error(), "launch spec accepts") || strings.Contains(err.Error(), "--abort") || strings.Contains(err.Error(), "resume") {
+		t.Fatalf("an aborted journal refused the authorization: %v", err)
+	}
+	if err := journalAuthorizationConflict(&handlerRotationJournal{Phase: rotationPhaseAborted, AuthorizedBy: "owner"}, other, f.task.ID); err != nil {
+		t.Fatalf("aborted journal conflict: %v", err)
+	}
+	f.auth = other
+	r, err := f.rotate(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.ID == aborted.ID || r.State != api.HandlerRotationCommitted || r.Authorization == nil || r.Authorization.AuthorizedBy != other.by || f.journalExists() {
+		t.Fatalf("fresh rotation %+v journal=%v", r, f.journalExists())
+	}
+	if owned, err := handlerOwned(ctx, f.c.Base, f.task.ID, successor.ID, successor.RunID, successor.Session, nil); err != nil || owned != nil {
+		t.Fatalf("the aborted successor's session is still present: %+v %v", owned, err)
+	}
+}
+
 // Round-one blocker b1 (#14244): a current handler launched with a prompt and
 // no saved spec on this host is not template-due and gets no owner notice.
 func TestHandlerRotationRunnerNoSpecCurrentTemplateIsNotDue(t *testing.T) {
