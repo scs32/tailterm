@@ -133,9 +133,14 @@ waits for usage-limit detection (`wi_72f41bd375032cf0`).
 
 To lower the limit, run `tt team queue limit --limit 1` (serial) or
 `--limit N`; it is refused while more entries than N are active, so wait for
-them or release failed ones first. Before rolling the hub back to a build
-older than the uncapped queue, set `--limit 2` (or 1): an older hub reads
-`none` as every slot reserved and stops launching until it is changed.
+them or release failed ones first. Lowering the limit skips the host
+admission gates: a decrease never adds load, so it is saved even when the
+host is over budget, below the disk reserve, or has an expired policy or a
+stale census, and the next claim is still gated (see
+[Team queue limit changes](project-queue.md#team-queue-limit-changes)).
+Before rolling the hub back to a build older than the uncapped queue, set
+`--limit 2` (or 1): an older hub reads `none` as every slot reserved and stops
+launching until it is changed.
 
 The owner provisions
 additional database handlers as ordinary continuing handler agents; the runner
@@ -532,7 +537,14 @@ removal makes its final check and deletes while holding the lock's own mutex
 check and the removal:
 
 - If the mutex stays busy for 2 seconds the path is kept `in-use` ("matrix
-  lock busy"). The sweep never reclaims a mutex and never writes `host.json`.
+  lock busy"). A mutex whose holder is dead is reclaimed, at most once per
+  removal: its pid is gone, or that pid now belongs to a process that started
+  more than 5 seconds after the holder's record was written. The reclaim uses
+  the host lock script's guard (`host.json.lock.reclaim`): only the guard's
+  holder removes the mutex, and only after re-reading the same owner token, so
+  a mutex taken meanwhile is never removed. A guard left by a process that is
+  gone is left for the operator. A scheduled run names each reclaim in its
+  journal line's `detail`. The sweep never writes `host.json`.
 - A path a run registered since classification is kept `in-use`. A lock file
   that turns unusable keeps the path and ends the pass.
 - No hold reaches 20 seconds: a matrix run that cannot update the lock file
@@ -544,9 +556,11 @@ check and the removal:
 
 **Scheduled sweep.** On every host, the relay runs the same pass with apply
 for each repository that the host's queue entries name, with the same keep
-rules, receipts and cache trim as the command. It is not run by `tt relay
---once` or `--status`. Settings are in `~/.config/tailterm/relay.json`, read
-at each check, so a change needs no relay restart:
+rules, receipts and cache trim as the command, and it never deletes what
+the "Never touched" list in [Cache trim](project-queue.md#cache-trim) names.
+It is not run by `tt relay --once` or `--status`. Settings are in
+`~/.config/tailterm/relay.json`, read at each check, so a change needs no
+relay restart:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -581,10 +595,15 @@ A matrix run does not skip the run: it keeps what it holds, and other trees go.
 *Journal.* Each attempt appends exactly one line to `worktree-sweep.jsonl` in
 the relay state directory (mode 0600), read with `tt team queue sweep-worktrees
 --journal [--limit 20] [--json]`, newest last. A state file that cannot be
-read or saved is the exception: only the first failure of the episode is
-journalled, and the state is tried again every five minutes. During a save
-fault each try saves the state first and applies no pass until it saves; the
-first try that saves sweeps and writes its line.
+read or saved is the exception: a fault episode writes one journal line, at
+its first failure, and the state is tried again at most every 5 minutes while
+it lasts. A save that works ends the episode; a read that works ends only a
+read fault. The episode is kept in the relay's memory, so a relay restart
+during a fault writes one more line. During a save fault each try saves the
+state first and applies no pass until it saves; the first try that saves
+sweeps and writes its line. The journal is bounded: an append that leaves it
+over 4 MiB rewrites it, under the journal's lock file, to the whole lines of
+its newest 1 MiB.
 
 ```json
 {"at":"…","source":"schedule","outcome":"swept","reason":"","repositories":1,
@@ -600,10 +619,17 @@ first try that saves sweeps and writes its line.
 homes and artifact scratch entries, `foldersRemoved` session temp folders, and `binariesRemoved` matrix test
 binaries; lines written before `binariesRemoved` existed lack it and counted
 those binaries in `treesRemoved`. `bytesFreed` covers all of them. `at` is the
-`at` of that run's lines in `worktree-cleanup.jsonl`. `freeBytesAfter` is the least free space over each
-repository's main checkout and artifacts root after the run, or `-1` when it
-could not be read. `exclusionExceeded` counts removals that outran the matrix
-hold limit. `noticesDropped` appears when a full pending list dropped a notice.
+`at` of that run's lines in `worktree-cleanup.jsonl`. `freeBytesAfter` is the
+least free space after the run over the managed volumes: each repository's
+main checkout and artifacts root, every cache the sweep decided on (a
+checkout's `node_modules`) and the Go build cache the trim last validated; it
+is `-1` when none could be read. `lowestVolume` names the path whose volume
+gave that reading and is absent when there was none. `repositoriesFailed`
+counts the repositories whose sweep returned an error, which `detail` names;
+it is absent when none did, and a run in which every repository failed is
+`failed` with reason `sweep`. `exclusionExceeded` counts removals that
+outran the matrix hold limit. `noticesDropped` appears when a full pending
+list dropped a notice.
 `uncitableTemp` is the manual report's `totals.uncitableTemp`: the session
 temp folders kept only because the artifacts root cannot cite them, and their
 size, outside `bytesFreed` because nothing is removed on their account. Every
@@ -611,21 +637,24 @@ line of a run that reached the sweep writes it, a zero included; a run skipped
 before the sweep, a Go build cache trim line and a line written before the
 field existed lack it. `--journal` names it when the count is above zero.
 
-*Low-space notice.* A run posts nothing while space is fine. An episode
-begins at the first swept run that ends below the threshold and ends at the
-first swept run at or above it; skipped and failed runs do neither. When an
-episode begins, the relay sends one NOTICE to the newest live owner helper on
-the hub, in that helper's project, or to the Board of the project of this
+*Low-space notice.* A run posts nothing while space is fine. The reading is
+`freeBytesAfter`, the lowest of the managed volumes above, so a cache on
+another volume counts. An episode begins at the first run whose reading is
+below the threshold and ends at the first run whose reading is at or above it;
+a run skipped before the sweep, or whose reading is `-1`, does neither. When
+an episode begins, the relay sends one NOTICE to the newest live owner helper
+on the hub, in that helper's project, or to the Board of the project of this
 host's newest queue entry when there is none. It names the free space, what
 the run freed, and the five largest kept trees with their keep reason, and,
 when `uncitableTemp` counts any folder, that count and size and why they are
-kept. The notice is saved in `worktree-sweep-state.json` before it is posted and
-replayed unchanged, with the same project, recipient, text and request
-identity (`worktree-sweep-low-<host>-<episode start>`), at every later swept
-run until the hub returns a post receipt for that identity. The journal shows
-the request identity in `noticePending` until then and the message number in
-`noticeSeq` once. Each episode has its own notice; at most 8 wait at a time,
-and the oldest is dropped, and journalled, when a ninth would join.
+kept. The notice is saved in `worktree-sweep-state.json` before it is posted
+and replayed unchanged, with the same project, recipient, text and request
+identity (`worktree-sweep-low-<host>-<episode start>`), at every later run
+that reaches the sweep until the hub returns a post receipt for that identity.
+The journal shows the request identity in `noticePending` until then and the
+message number in `noticeSeq` once. Each episode has its own notice; at most 8
+wait at a time, and the oldest is dropped, and journalled, when a ninth would
+join.
 
 The first scheduled run on a host deletes whatever a manual
 `--min-idle 6h --apply` would. Run the manual dry run with `--min-idle 6h`

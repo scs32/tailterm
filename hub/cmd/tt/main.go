@@ -45,7 +45,9 @@ Commands
   steward <template|setup|summary|rotate|rotation|policy>  the project's backlog steward (setup, rotate: owner)
   prompt-policy <get|set>      runtime prompt policy per prompt kind (set: owner)
   deployment <list|enqueue|claim|check|verification|merged|finish|block>  release ledger
-  verification <plan|receipt|history|enrollment>  handler-owned native verification records
+  verification <plan|receipt|history|enrollment>  native verification records
+                               plan: the item lead or the database handler; receipt: the plan's verifier,
+                               the lead or the handler (docs/project-queue.md "Validated team operations")
   work-items <command>         list/get/create/update/dispatch/history/evidence/triage for bugs and features
   queue <command>              list/get/history/changes/action/receipt for deliberate Queue work
   usage [--item ID] [--project ID] [--from TIME] [--to TIME] [--json]  token/cost ledger

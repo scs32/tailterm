@@ -116,11 +116,13 @@ it before the next run.
 
 ```sh
 node scripts/verify-matrix.mjs plan context.json plan.json
-# Database handler only, on the candidate CLI:
+# The item lead, or the database handler, on the candidate CLI
+# (callers: docs/project-queue.md, "Validated team operations"):
 tt verification plan --item ITEM --file plan.json --request-id KEY --generation 0
 # A distinct verifier, in a fresh detached checkout of the exact commit:
 node scripts/verify-matrix.mjs run plan.json /absolute/external/log-directory
-# Database handler only, after checking every log's exact digest:
+# The plan's verifier, the item lead or the database handler, after checking
+# every log's exact digest:
 tt verification receipt --item ITEM --file /absolute/external/log-directory/receipt.json --request-id KEY --generation 1
 tt verification history --item ITEM
 ```
