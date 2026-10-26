@@ -90,6 +90,8 @@ func cmdWithdraw(e env, args []string) error {
 	if err != nil {
 		return err
 	}
+	// The withdrawn order is this agent's own Board message: handling evidence.
+	recordUsageContext(e, task, "post", o.MessageSeq)
 	fmt.Printf("#%d %s (%s)\n", o.MessageSeq, o.Outcome, o.ID)
 	return nil
 }

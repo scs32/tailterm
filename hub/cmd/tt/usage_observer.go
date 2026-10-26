@@ -255,12 +255,14 @@ func (u *usageCursor) parseTokens(line []byte) error {
 	}
 	if runtime == "claude" {
 		if rec.Type == "user" {
+			// A typed prompt starts an activation. Meta, compact-summary and
+			// local command records are user records too, but not prompts.
 			var msg struct {
 				Content json.RawMessage `json:"content"`
 			}
 			_ = json.Unmarshal(rec.Message, &msg)
 			var content string
-			if json.Unmarshal(msg.Content, &content) == nil {
+			if json.Unmarshal(msg.Content, &content) == nil && claudeUserText(line) != "" {
 				begin()
 			}
 			return nil

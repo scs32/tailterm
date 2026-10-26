@@ -602,3 +602,130 @@ func TestUsageClaudeAbsentNullAndPresentThinkingPreservesOutput(t *testing.T) {
 		})
 	}
 }
+
+// Claude writes meta, compact-summary and local command records as user
+// records; only a real prompt starts an activation (wi_58b6a65733775c96).
+func TestUsageClaudeCommandAndMetaRecordsDoNotSplitActivation(t *testing.T) {
+	u := newSyntheticUsage(t, "claude")
+	request := func(at, id, stop string) string {
+		return fmt.Sprintf(`{"type":"assistant","timestamp":"%s","message":{"id":"%s","model":"m","stop_reason":"%s","usage":{"input_tokens":2,"cache_read_input_tokens":3,"cache_creation_input_tokens":4,"output_tokens":7,"output_tokens_details":{"thinking_tokens":1}}}}`, at, id, stop)
+	}
+	parseUsageLines(t, u,
+		`{"type":"user","timestamp":"2026-09-27T10:00:00Z","message":{"content":"synthetic prompt"}}`,
+		request("2026-09-27T10:00:01Z", "first", "tool_use"),
+		`{"type":"user","timestamp":"2026-09-27T10:00:02Z","message":{"content":[{"type":"tool_result","tool_use_id":"t","content":"synthetic"}]}}`,
+		`{"type":"user","isMeta":true,"timestamp":"2026-09-27T10:00:03Z","message":{"content":"synthetic caveat"}}`,
+		`{"type":"user","timestamp":"2026-09-27T10:00:04Z","message":{"content":"<command-name>/synthetic</command-name>"}}`,
+		`{"type":"user","timestamp":"2026-09-27T10:00:05Z","message":{"content":"<local-command-stdout>synthetic</local-command-stdout>"}}`,
+		request("2026-09-27T10:00:06Z", "second", "end_turn"),
+		`{"type":"user","isCompactSummary":true,"timestamp":"2026-09-27T10:00:06.5Z","message":{"content":"synthetic summary"}}`,
+		`{"type":"user","timestamp":"2026-09-27T10:00:07Z","message":{"content":"synthetic follow-up"}}`,
+		request("2026-09-27T10:00:08Z", "third", "end_turn"),
+	)
+	first, second, third := u.Turns["claude-first"], u.Turns["claude-second"], u.Turns["claude-third"]
+	if len(u.Turns) != 3 || first.Activation == "" || first.Activation != second.Activation {
+		t.Fatalf("command or meta record split the activation: %q, %q (%d turns)", first.Activation, second.Activation, len(u.Turns))
+	}
+	if third.Activation == "" || third.Activation == first.Activation {
+		t.Fatalf("a real prompt after end_turn did not start an activation: %q", third.Activation)
+	}
+}
+
+func usageJournal(t *testing.T, e env) []api.UsageEvidence {
+	t.Helper()
+	var entries []api.UsageEvidence
+	data, err := os.ReadFile(usageContextPath(e))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil || json.Unmarshal(data, &entries) != nil {
+		t.Fatal(string(data), err)
+	}
+	return entries
+}
+
+// An inbox read is never handling evidence, so it is not journaled and cannot
+// push real evidence out of the bounded journal (wi_b17032d2f27e6f13).
+func TestUsageInboxReadsAreNotJournaled(t *testing.T) {
+	t.Setenv("TAILTERM_RELAY_STATE", t.TempDir())
+	e := env{agent: "agt_1111111111111111", runID: "run_1111111111111111"}
+	recordUsageContext(e, "tsk_1111111111111111", "inbox", 4)
+	if got := usageJournal(t, e); len(got) != 0 {
+		t.Fatalf("inbox read journaled: %+v", got)
+	}
+	recordUsageContext(e, "tsk_1111111111111111", "ack", 5)
+	if got := usageJournal(t, e); len(got) != 1 || got[0].Operation != "ack" || got[0].Seq != 5 {
+		t.Fatalf("handling evidence: %+v", got)
+	}
+}
+
+// tt ask and tt withdraw act on the agent's own Board message, so a
+// successful call journals it as "post", the operation the hub accepts; a
+// refused call and tt event journal nothing (wi_da538fe57be990ab).
+func TestUsageAskAndWithdrawJournalOwnMessage(t *testing.T) {
+	t.Setenv("TAILTERM_RELAY_STATE", t.TempDir())
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "hub.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	by := api.Caller{Node: "fixture", User: "owner"}
+	task, err := st.CreateTask(ctx, api.CreateTaskRequest{Name: "Synthetic usage journal", Orchestrator: "lead"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lead, _ := st.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "lead", Host: "h", Session: "lead", Runtime: "codex"}, by)
+	worker, _ := st.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "worker", Host: "h", Session: "worker", Runtime: "codex"}, by)
+	srv := httptest.NewServer(server.New(st, func(*http.Request) (api.Caller, error) { return by, nil }))
+	t.Cleanup(srv.Close)
+	e := env{hub: srv.URL, task: task.ID, agent: lead.ID, runID: lead.RunID}
+	workerEnv := env{hub: srv.URL, task: task.ID, agent: worker.ID, runID: worker.RunID}
+
+	if _, err := captureCLIOutput(t, func() error { return cmdEvent(e, []string{"running", "--text", "synthetic"}) }); err != nil {
+		t.Fatal(err)
+	}
+	if got := usageJournal(t, e); len(got) != 0 {
+		t.Fatalf("tt event journaled: %+v", got)
+	}
+
+	file := askFixtureFile(t, askFixture())
+	var asked api.Message
+	out, err := captureCLIOutput(t, func() error {
+		return cmdAsk(e, []string{"--request-id", "usage-journal-ask", "--file", file, "--json"})
+	})
+	if err != nil || json.Unmarshal([]byte(out), &asked) != nil || asked.Seq < 1 {
+		t.Fatalf("ask: %q %v", out, err)
+	}
+	if got := usageJournal(t, e); len(got) != 1 || got[0].Operation != "post" || got[0].Seq != asked.Seq || got[0].TaskID != task.ID {
+		t.Fatalf("ask journal: %+v, want post #%d", got, asked.Seq)
+	}
+	refused := e
+	refused.agent, refused.runID = "agt_0000000000000009", "run_0000000000000009"
+	if _, err := captureCLIOutput(t, func() error {
+		return cmdAsk(refused, []string{"--request-id", "usage-journal-refused", "--file", file})
+	}); err == nil {
+		t.Fatal("hub accepted a decision from an unknown agent")
+	}
+	if got := usageJournal(t, refused); len(got) != 0 {
+		t.Fatalf("refused ask journaled: %+v", got)
+	}
+
+	order, err := st.PostMessage(ctx, task.ID, api.PostMessageRequest{AgentID: lead.ID, RunID: lead.RunID, To: worker.ID, Envelope: &api.Envelope{Kind: api.EnvelopeKindRequest, To: worker.Name, Subject: "Please inspect the candidate", Body: api.EnvelopeBody{Ask: "Look it over"}}}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seq := fmt.Sprint(order.Seq)
+	if _, err := captureCLIOutput(t, func() error { return cmdWithdraw(workerEnv, []string{seq, "--reason", "not yours"}) }); err == nil {
+		t.Fatal("another agent withdrew the order")
+	}
+	if got := usageJournal(t, workerEnv); len(got) != 0 {
+		t.Fatalf("refused withdraw journaled: %+v", got)
+	}
+	if _, err := captureCLIOutput(t, func() error { return cmdWithdraw(e, []string{seq, "--reason", "superseded"}) }); err != nil {
+		t.Fatal(err)
+	}
+	if got := usageJournal(t, e); len(got) != 2 || got[1].Operation != "post" || got[1].Seq != order.Seq || got[1].TaskID != task.ID {
+		t.Fatalf("withdraw journal: %+v, want post #%d", got, order.Seq)
+	}
+}

@@ -144,6 +144,8 @@ func cmdAsk(e env, args []string) error {
 		}
 		return fmt.Errorf("%w; storage is uncertain. Retry tt ask with the same --request-id %s and unchanged file to recover the original request", err, *key)
 	}
+	// The decision request is this agent's own Board message: handling evidence.
+	recordUsageContext(e, *task, "post", message.Seq)
 	if *asJSON {
 		printJSON(message)
 	} else {

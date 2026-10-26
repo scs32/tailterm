@@ -32,6 +32,8 @@ func normalizeUsageRole(role string) string {
 		return "reviewer"
 	case "Independent matrix verification":
 		return "verifier"
+	case "Plan review":
+		return "plan_reviewer"
 	default:
 		return role
 	}
@@ -93,15 +95,24 @@ func freezeUsageRole(ctx context.Context, tx *sql.Tx, p *usageRunProvenance) err
 func resolveUsage(ctx context.Context, tx *sql.Tx, task, agent, run string, t api.UsageTurn, p usageRunProvenance) (api.UsageProjection, error) {
 	out := api.UsageProjection{Turn: t, AgentID: agent, RunID: run, Role: p.Role, RoleSource: p.RoleSource, Phase: "hand-offs", PhaseReason: usageNoOpenOrder}
 	items := map[string]api.UsageAttribution{}
-	seen := map[string]bool{}
+	// seen records how a message was visited: 1 below a nearer linked message,
+	// whose links it does not credit, 2 crediting its own links. A message the
+	// turn handled directly is revisited to credit it, whatever order the
+	// handled messages are processed in.
+	seen := map[string]int{}
 	invalid := false
-	var visit func(api.MessageReference, int) error
-	visit = func(ref api.MessageReference, depth int) error {
+	var visit func(api.MessageReference, int, bool) error
+	visit = func(ref api.MessageReference, depth int, covered bool) error {
 		key := ref.TaskID + "/" + stringID(ref.Seq)
-		if seen[key] {
+		mode := 2
+		if covered {
+			mode = 1
+		}
+		first := seen[key] == 0
+		if seen[key] >= mode {
 			return nil
 		}
-		seen[key] = true
+		seen[key] = mode
 		if depth > 8 {
 			return nil // Bound ancestry without discarding the head's valid links.
 		}
@@ -113,7 +124,14 @@ func resolveUsage(ctx context.Context, tx *sql.Tx, task, agent, run string, t ap
 		if err != nil {
 			return err
 		}
-		out.Evidence = append(out.Evidence, ref)
+		if first {
+			out.Evidence = append(out.Evidence, ref)
+		}
+		// Only the nearest linked message on each path credits its items; the
+		// walk continues so Evidence still lists every ancestor. A link to an
+		// item in another project is ignored: it is neither credited nor
+		// invalid, so a message with only such links counts as unlinked.
+		linked := false
 		add := func(project, item string) {
 			if project == "" {
 				project = m.TaskID
@@ -123,11 +141,17 @@ func resolveUsage(ctx context.Context, tx *sql.Tx, task, agent, run string, t ap
 				invalid = true
 				return
 			}
+			if project != task {
+				return
+			}
 			if e := tx.QueryRowContext(ctx, `SELECT count(*) FROM work_items WHERE task_id=? AND id=?`, project, item).Scan(&n); e != nil || n != 1 {
 				invalid = true
 				return
 			}
-			items[project+"/"+item] = api.UsageAttribution{TaskID: project, ItemID: item, Reason: "handled Board evidence"}
+			linked = true
+			if !covered {
+				items[project+"/"+item] = api.UsageAttribution{TaskID: project, ItemID: item, Reason: "handled Board evidence"}
+			}
 		}
 		for _, link := range m.WorkItems {
 			add(link.ItemTaskID, link.ItemID)
@@ -144,13 +168,14 @@ func resolveUsage(ctx context.Context, tx *sql.Tx, task, agent, run string, t ap
 				}
 			}
 		}
+		covered = covered || linked
 		if m.ReplyTo > 0 {
-			if err = visit(api.MessageReference{TaskID: m.TaskID, Seq: m.ReplyTo}, depth+1); err != nil {
+			if err = visit(api.MessageReference{TaskID: m.TaskID, Seq: m.ReplyTo}, depth+1, covered); err != nil {
 				return err
 			}
 		}
 		if m.WorkOrderMessage != nil {
-			if err = visit(*m.WorkOrderMessage, depth+1); err != nil {
+			if err = visit(*m.WorkOrderMessage, depth+1, covered); err != nil {
 				return err
 			}
 		}
@@ -183,7 +208,7 @@ func resolveUsage(ctx context.Context, tx *sql.Tx, task, agent, run string, t ap
 			invalid = true
 			continue
 		}
-		if err = visit(api.MessageReference{TaskID: e.TaskID, Seq: e.Seq}, 0); err != nil {
+		if err = visit(api.MessageReference{TaskID: e.TaskID, Seq: e.Seq}, 0, false); err != nil {
 			return out, err
 		}
 	}
@@ -191,7 +216,7 @@ func resolveUsage(ctx context.Context, tx *sql.Tx, task, agent, run string, t ap
 	if len(items) == 0 && !persistent && p.Binding != nil {
 		b := p.Binding
 		items[b.ItemTaskID+"/"+b.ItemID] = api.UsageAttribution{TaskID: b.ItemTaskID, ItemID: b.ItemID, Reason: "exact admitted binding " + b.ContextDigest}
-		if err := visit(b.WorkOrderMessage, 0); err != nil {
+		if err := visit(b.WorkOrderMessage, 0, false); err != nil {
 			return out, err
 		}
 	}
@@ -244,6 +269,7 @@ type usagePhaseCache struct {
 	messages     map[string]*api.Message
 	reviews      map[string]api.ReviewConvergence
 	orderQueries int
+	messageLoads int
 }
 
 func newUsagePhaseCache() *usagePhaseCache {
@@ -288,6 +314,7 @@ func (c *usagePhaseCache) message(ctx context.Context, q queryRower, ref api.Mes
 	if m, ok := c.messages[key]; ok {
 		return m, nil
 	}
+	c.messageLoads++
 	m, err := loadMessage(q, ctx, ref.TaskID, ref.Seq)
 	if errors.Is(err, api.ErrNotFound) {
 		c.messages[key] = nil
@@ -332,7 +359,10 @@ func usageOrderKind(m *api.Message) bool {
 // agent wrote never govern. It reads only fields a stored projection keeps, so
 // ingest and every report apply the same rule.
 func classifyUsagePhase(ctx context.Context, q queryRower, p api.UsageProjection, c *usagePhaseCache) (string, string, int, int, error) {
-	if p.Role == "database_handler" {
+	// A stored projection keeps the role text it was frozen with; the phase
+	// reads its slug, so history recorded before a label was known reclassifies.
+	role := normalizeUsageRole(p.Role)
+	if role == "database_handler" {
 		return "handler bookkeeping", "authoritative handler role", 0, 0, nil
 	}
 	orders, err := c.agentOrders(ctx, q, p.AgentID)
@@ -407,10 +437,16 @@ func classifyUsagePhase(ctx context.Context, q queryRower, p api.UsageProjection
 	e := selected.Envelope
 	focused := e.Review != nil && e.Review.Mode == "focused"
 	general := e.Review != nil && e.Review.Mode == "general"
+	planning := e.Refs["phase"] == "planning" || e.Refs["phase"] == "intake"
 	switch {
-	case focused || p.Role == "verifier":
+	case focused || role == "verifier":
 		return "verification", reason, 0, 0, nil
-	case e.Kind == "review" || general || p.Role == "reviewer":
+	// A plan reviewer's order, and a plain request tagged as planning, are
+	// planning whoever holds them, so a reviewer asked for a plan review does
+	// not report as a review round.
+	case role == "plan_reviewer" || (e.Kind == "request" && !general && planning):
+		return "intake and planning", reason, 0, 0, nil
+	case e.Kind == "review" || general || role == "reviewer":
 		round, stage := 0, 0
 		for _, share := range p.Shares {
 			if share.ItemID == "" {
@@ -430,7 +466,7 @@ func classifyUsagePhase(ctx context.Context, q queryRower, p api.UsageProjection
 			reason += "; review round unavailable"
 		}
 		return "review", reason, round, stage, nil
-	case p.Role == "planner" || e.Refs["phase"] == "planning" || e.Refs["phase"] == "intake":
+	case role == "planner" || planning:
 		return "intake and planning", reason, 0, 0, nil
 	case e.Kind == "assign":
 		for _, share := range p.Shares {

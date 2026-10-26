@@ -3197,3 +3197,311 @@ func TestUsageTurnTotalsBackfillChecksChangedTurns(t *testing.T) {
 		t.Fatalf("the open after the backfill examined %d turns", n)
 	}
 }
+
+// usageStoredProjection reads one stored turn's projection.
+func usageStoredProjection(t *testing.T, s *Store, request string) api.UsageProjection {
+	t.Helper()
+	var raw string
+	if err := s.db.QueryRow(`SELECT projection FROM usage_turns WHERE request_id=?`, request).Scan(&raw); err != nil {
+		t.Fatal(request, err)
+	}
+	var p api.UsageProjection
+	if err := json.Unmarshal([]byte(raw), &p); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// usageShares is a projection's shares as item=1/denominator, in order.
+func usageShares(p api.UsageProjection) string {
+	out := []string{}
+	for _, share := range p.Shares {
+		out = append(out, fmt.Sprintf("%s=1/%d", share.ItemID, share.Denominator))
+	}
+	return strings.Join(out, ",")
+}
+
+// usageHandle reports one turn that acknowledged the given messages, in order.
+func usageHandle(t *testing.T, s *Store, task api.Task, a api.Agent, id string, handled ...api.Message) api.UsageProjection {
+	t.Helper()
+	turn := syntheticUsageTurn(id)
+	for i, m := range handled {
+		turn.Handled = append(turn.Handled, api.UsageEvidence{TaskID: task.ID, Seq: m.Seq, Operation: "ack", At: turn.At.Add(time.Duration(i) * time.Millisecond)})
+	}
+	if _, err := s.ReportUsage(context.Background(), task.ID, a.ID, usageBatch(a, id, turn)); err != nil {
+		t.Fatal(id, err)
+	}
+	return usageStoredProjection(t, s, id)
+}
+
+// A request is attributed to the items of the nearest linked message in each
+// handled message's chain, not to every linked ancestor (#12756 f2).
+func TestUsageNearestLinkedMessageGetsTheShare(t *testing.T) {
+	s, task, a, items, _ := usageFixture(t)
+	ctx := context.Background()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	link := func(item api.WorkItem) []api.MessageWorkItem {
+		return []api.MessageWorkItem{{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, Relationship: "primary"}}
+	}
+	post := func(key string, replyTo int64, links []api.MessageWorkItem) api.Message {
+		m, err := s.PostMessage(ctx, task.ID, api.PostMessageRequest{To: a.ID, ReplyTo: replyTo, RequestID: key, WorkItems: links, Text: "Synthetic chain message"}, by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	itemA, itemB := items[0], items[1]
+	m1 := post("chain-m1", 0, link(itemA))
+	m2 := post("chain-m2", m1.Seq, link(itemB))
+	m3 := post("chain-m3", m2.Seq, nil)
+	onlyB := itemB.ID + "=1/1"
+	both := strings.Join([]string{itemA.ID, itemB.ID}, ",")
+	if itemB.ID < itemA.ID {
+		both = strings.Join([]string{itemB.ID, itemA.ID}, ",")
+	}
+	halves := strings.ReplaceAll(both, ",", "=1/2,") + "=1/2"
+
+	p := usageHandle(t, s, task, a, "chain-m2", m2)
+	if got := usageShares(p); got != onlyB {
+		t.Fatalf("handling M2: shares %s, want %s", got, onlyB)
+	}
+	evidence := map[int64]bool{}
+	for _, ref := range p.Evidence {
+		evidence[ref.Seq] = true
+	}
+	if !evidence[m1.Seq] || !evidence[m2.Seq] || len(p.Evidence) != 2 {
+		t.Fatalf("handling M2: evidence %+v must still list M1 and M2", p.Evidence)
+	}
+	if got := usageShares(usageHandle(t, s, task, a, "chain-m3", m3)); got != onlyB {
+		t.Fatalf("handling unlinked M3: shares %s, want %s", got, onlyB)
+	}
+	if got := usageShares(usageHandle(t, s, task, a, "chain-m1-m2", m1, m2)); got != halves {
+		t.Fatalf("handling M1 then M2: shares %s, want %s", got, halves)
+	}
+	if got := usageShares(usageHandle(t, s, task, a, "chain-m2-m1", m2, m1)); got != halves {
+		t.Fatalf("handling M2 then M1: shares %s, want %s", got, halves)
+	}
+}
+
+// Attribution is same-project only (owner-helper answer #46949, option A): a
+// link to an item in another project is neither credited nor invalid, and a
+// message with only such links counts as unlinked (wi_a22b7dd61c94d414).
+func TestUsageCrossProjectLinksAreIgnored(t *testing.T) {
+	s, task, a, items, _ := usageFixture(t)
+	ctx := context.Background()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	other, err := s.CreateTask(ctx, api.CreateTaskRequest{Name: "Other synthetic project"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreign, err := s.CreateWorkItem(ctx, other.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Other project item", RequestID: "foreign-item"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refs := map[string]string{"itemTaskId": other.ID, "item": foreign.ID}
+	post := func(key string, replyTo int64, links []api.MessageWorkItem) api.Message {
+		m, err := s.PostMessage(ctx, task.ID, api.PostMessageRequest{To: a.ID, ReplyTo: replyTo, RequestID: key, WorkItems: links, Envelope: &api.Envelope{Kind: "request", To: a.ID, Subject: "Handle synthetic evidence", Refs: refs, Body: api.EnvelopeBody{Ask: "Record synthetic data"}}}, by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	mixed := post("cross-mixed", 0, []api.MessageWorkItem{{ItemTaskID: task.ID, ItemID: items[0].ID, ItemRevision: items[0].Revision, Relationship: "primary"}})
+	p := usageHandle(t, s, task, a, "cross-mixed", mixed)
+	if got := usageShares(p); got != items[0].ID+"=1/1" {
+		t.Fatalf("cross-project link credited: %s", got)
+	}
+	if strings.Contains(p.PhaseReason, "unresolved") {
+		t.Fatalf("cross-project link marked invalid: %q", p.PhaseReason)
+	}
+	only := post("cross-only", mixed.Seq, nil)
+	if got := usageShares(usageHandle(t, s, task, a, "cross-only", only)); got != items[0].ID+"=1/1" {
+		t.Fatalf("a message with only a cross-project link must count as unlinked: %s", got)
+	}
+	var rows int
+	if err := s.db.QueryRow(`SELECT count(*) FROM usage_item_shares WHERE item_task_id=?`, other.ID).Scan(&rows); err != nil || rows != 0 {
+		t.Fatalf("cross-project share rows: %d %v", rows, err)
+	}
+}
+
+// The plan reviewer's role text maps to a slug, and a stored projection that
+// kept the raw text still reads as intake and planning (wi_21f7dd24b4f5743f).
+func TestUsagePlanReviewRoleSelectsPlanning(t *testing.T) {
+	s, task, a, items, messages := usageFixture(t)
+	ctx := context.Background()
+	if _, err := s.db.Exec(`UPDATE agents SET role='' WHERE id=?`, a.ID); err != nil {
+		t.Fatal(err)
+	}
+	plan, _ := json.Marshal(map[string]any{"members": []any{map[string]any{"fields": map[string]any{"agentId": a.ID, "name": "plan-reviewer-fixture", "role": "Plan review"}, "runId": a.RunID}}})
+	if _, err := s.db.Exec(`INSERT INTO team_queue_entries(id,task_id,item_id,item_revision,order_seq,template,position,state,revision,host,cwd,pause_generation,launch_json,created_at,updated_at) VALUES(?,?,?,1,1,'planned',1,'running',1,'fixture','/tmp',0,?,?,?)`, api.NewID("tqe"), task.ID, items[0].ID, string(plan), ts(s.now()), ts(s.now())); err != nil {
+		t.Fatal(err)
+	}
+	turn := syntheticUsageTurn("plan-review")
+	turn.At = messages[0].CreatedAt.Add(time.Second)
+	turn.Handled = []api.UsageEvidence{{TaskID: task.ID, Seq: messages[0].Seq, Operation: "ack", At: turn.At}}
+	if _, err := s.ReportUsage(ctx, task.ID, a.ID, usageBatch(a, "plan-review", turn)); err != nil {
+		t.Fatal(err)
+	}
+	read := func() api.UsageItemReport {
+		t.Helper()
+		report, err := s.Usage(ctx, task.ID, api.UsageQuery{Item: items[0].ID})
+		if err != nil || len(report.Items) != 1 {
+			t.Fatal(report, err)
+		}
+		return report.Items[0]
+	}
+	if got := read(); got.Phases[0].Key != "intake and planning" || got.Roles[0].Key != "plan_reviewer" {
+		t.Fatalf("plan reviewer: phase %q role %q", got.Phases[0].Key, got.Roles[0].Key)
+	}
+	// Rewrite the stored projection as a binary that did not know the label
+	// recorded it: raw role text, hand-offs.
+	p := usageStoredProjection(t, s, "plan-review")
+	p.Role, p.Phase = "Plan review", "hand-offs"
+	raw, _ := json.Marshal(p)
+	if _, err := s.db.Exec(`UPDATE usage_turns SET projection=? WHERE request_id=?`, string(raw), "plan-review"); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(); got.Phases[0].Key != "intake and planning" {
+		t.Fatalf("stored raw Plan review role reads as %q", got.Phases[0].Key)
+	}
+}
+
+// A reviewer asked for a plan review by a REQUEST tagged as planning is
+// planning, not a review with no round; a REVIEW it holds is still review
+// (wi_6343ff6bfc4a57ca).
+func TestUsageReviewerPlanningRequestIsPlanning(t *testing.T) {
+	f := newUsagePhaseFixture(t)
+	const m, sec = time.Minute, time.Second
+	f.send(0, "lead", "builder", 0, usagePhaseAssign()) // freezes the item's criteria for the review
+	planning := usagePhaseRequest()
+	planning.Refs = map[string]string{"phase": "planning"}
+	order := f.send(1*m, "lead", "reviewer", 0, planning)
+	f.requests("reviewer", 1*m+sec, 1, f.handled("ack", order))
+	f.want(1*m+sec, "intake and planning / reviewer", "reviewer holding a planning REQUEST")
+	f.send(2*m, "reviewer", "lead", order.Seq, usagePhaseResult(nil))
+	review := f.send(3*m, "lead", "reviewer", 0, usagePhaseReview())
+	f.requests("reviewer", 3*m+sec, 1, f.handled("ack", review))
+	f.want(3*m+sec, "review round 1 / reviewer", "reviewer holding a REVIEW")
+	rows, err := f.s.db.Query(`SELECT projection FROM usage_turns WHERE agent_id=?`, f.agents["reviewer"].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var raw string
+		var p api.UsageProjection
+		if err = rows.Scan(&raw); err != nil || json.Unmarshal([]byte(raw), &p) != nil {
+			t.Fatal(raw, err)
+		}
+		if p.Phase == "intake and planning" && strings.Contains(p.PhaseReason, "review round unavailable") {
+			t.Fatalf("planning request reported a review round: %q", p.PhaseReason)
+		}
+	}
+}
+
+// An agent's own messages never govern its phase: a lead with no order of its
+// own that handled only the ASSIGN it posted is coordinating, not building
+// (wi_1c0ebfe7116bb069).
+func TestUsageOwnMessagesNeverGovernPhase(t *testing.T) {
+	f := newUsagePhaseFixture(t)
+	const m, sec = time.Minute, time.Second
+	assign := f.send(1*m, "lead", "builder", 0, usagePhaseAssign())
+	f.requests("lead", 1*m+sec, 1, f.handled("post", assign))
+	f.want(1*m+sec, "hand-offs / lead", "lead that posted the builder's ASSIGN")
+	f.requests("builder", 1*m+2*sec, 1, f.handled("ack", assign))
+	f.want(1*m+2*sec, "build / builder", "builder holding the ASSIGN")
+}
+
+// A report read costs one obligation query per agent and one load per order
+// message, however many requests reference them (wi_ccdaaf602ab01910).
+func TestUsageReportReadCostGrowsOnlyWithAgentsAndMessages(t *testing.T) {
+	f := newUsagePhaseFixture(t)
+	f.s.MaxAgents = 160 // room for 120 metered agents beside the fixture's team
+	const perAgent = 5
+	type order struct {
+		agent string
+		m     api.Message
+		d     time.Duration
+	}
+	orders := []order{}
+	addAgents := func(from, n int) {
+		for i := from; i < from+n; i++ {
+			name := fmt.Sprintf("worker-%03d", i)
+			a, err := f.s.AddAgent(f.ctx, f.task.ID, api.AddAgentRequest{Name: name, Host: "fixture", Session: name, Runtime: "codex"}, f.by)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.agents[name] = a
+			for j := 0; j < perAgent; j++ {
+				d := time.Duration(j+1) * time.Minute
+				f.clock = f.base.Add(d)
+				env := usagePhaseRequest()
+				env.To = a.Name
+				m, err := f.s.PostMessage(f.ctx, f.task.ID, api.PostMessageRequest{To: a.ID, Envelope: &env, RequestID: fmt.Sprintf("cost-order-%s-%d", name, j)}, f.by)
+				if err != nil {
+					t.Fatal(err)
+				}
+				orders = append(orders, order{name, m, d})
+			}
+		}
+	}
+	// One batch per agent keeps the ingest, not the read, from dominating the
+	// race suite's time.
+	record := func(list []order, each int) {
+		batches := map[string][]api.UsageTurn{}
+		names := []string{}
+		for _, o := range list {
+			if batches[o.agent] == nil {
+				names = append(names, o.agent)
+			}
+			for i := 0; i < each; i++ {
+				f.serial++
+				turn := syntheticUsageTurn(fmt.Sprintf("%s-%d", o.agent, f.serial))
+				turn.At = f.base.Add(o.d + time.Second)
+				turn.Handled = []api.UsageEvidence{f.handled("ack", o.m)}
+				batches[o.agent] = append(batches[o.agent], turn)
+			}
+		}
+		for _, name := range names {
+			a := f.agents[name]
+			f.serial++
+			if _, err := f.s.ReportUsage(f.ctx, f.task.ID, a.ID, usageBatch(a, fmt.Sprintf("%s-batch-%d", name, f.serial), batches[name]...)); err != nil {
+				t.Fatal(name, err)
+			}
+		}
+	}
+	read := func(turns int) (int, int, time.Duration) {
+		t.Helper()
+		cache := newUsagePhaseCache()
+		began := time.Now()
+		report, err := f.s.usageReport(f.ctx, f.task.ID, api.UsageQuery{}, cache)
+		took := time.Since(began)
+		if err != nil || report.Summary.Requests != turns {
+			t.Fatal(report.Summary, err)
+		}
+		return cache.orderQueries, cache.messageLoads, took
+	}
+	addAgents(0, 60)
+	record(orders, 1)
+	queries, loads, _ := read(300)
+	if queries != 60 || loads != 300 {
+		t.Fatalf("60 agents, 300 orders: %d obligation queries, %d message loads", queries, loads)
+	}
+	record(orders, 1)
+	if q, l, _ := read(600); q != queries || l != loads {
+		t.Fatalf("twice the requests: %d obligation queries, %d message loads, want %d and %d", q, l, queries, loads)
+	}
+	first := len(orders)
+	addAgents(60, 60)
+	record(orders[first:], 1)
+	q, l, took := read(900)
+	if q != 2*queries || l != 2*loads {
+		t.Fatalf("twice the agents and orders: %d obligation queries, %d message loads, want %d and %d", q, l, 2*queries, 2*loads)
+	}
+	// As in TestUsageReportReadCostBounded, only a build without -race bounds
+	// the wall clock.
+	if took > 2*time.Second && !raceBuilt() {
+		t.Fatalf("report over 900 turns, 120 agents and 600 orders took %s", took)
+	}
+	t.Logf("900 turns, 120 agents, 600 orders: %s, %d obligation queries, %d message loads", took, q, l)
+}

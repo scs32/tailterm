@@ -11,12 +11,14 @@ import (
 )
 
 // No transcript text, message body, credentials or tool arguments are journaled.
-// Inbox entries are candidates only; only successful handling operations meter.
+// Only successful handling operations are journaled: an inbox read is never
+// handling evidence, so it is not written and cannot crowd real evidence out of
+// the bounded journal.
 func usageContextPath(e env) string {
 	return filepath.Join(relayDir(), fmt.Sprintf("%s-%s.usage-context.json", e.agent, e.runID))
 }
 func recordUsageContext(e env, task, operation string, seq int64) {
-	if e.agent == "" || e.runID == "" || seq < 1 {
+	if e.agent == "" || e.runID == "" || seq < 1 || operation == "inbox" {
 		return
 	}
 	path := usageContextPath(e)
