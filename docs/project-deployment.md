@@ -436,9 +436,25 @@ or runs. A runner restarted between polls finds the journal and `run.json` and
 resumes the same run without starting another. A `starting` record with no pid
 (the save after the spawn failed, or the runner stopped in between) is resolved
 from the lock file: the entry whose `output` is the attempt directory is
-adopted. The receipt is read only once the run is gone, and imported only when
-eligible; the journal returns to `integrated` once the imported receipt is
-found.
+adopted. When the run has already left the list, only its own
+`host-lock.json` remains, and its outcome alone is not proof the run exited:
+the run records leaving the list before its interruption path removes its
+receipt. The `pid` and `requestedAt` that file records decide
+(wi_583c784aed186b11): a pid that is gone, or alive with a start time later
+than `requestedAt` plus one second (another process reused it), ends the run
+by its outcome; a pid alive with a start time no later than that is the run,
+adopted as `started` with that start time; no pid, or a start time or
+`requestedAt` that cannot be read, is held. The receipt is read only once the
+run is gone, and imported only when eligible; the journal returns to
+`integrated` once the imported receipt is found.
+
+**A reused pid.** A run whose pid is alive with a readable start time that
+differs from `processStartedAt` has exited: the pid now names another process
+(wi_583c784aed186b11). The runner treats it as gone at any poll, before or past
+the deadline, never signals it, and ends it by the post-exit rules of step 4
+below. Only a difference proves this: a run with no recorded start time, one
+recorded as `ps`'s rendered text before the ISO form, or a live start time that
+cannot be read now keeps the hold below, since the pid may still be the run.
 
 **Stopping a run.** The runner stops its own run only past
 `launchedAt + hostWaitMs + boundMs + 120 s + 60 s`, or when a requeued job finds
@@ -452,9 +468,9 @@ an earlier attempt's run still alive. It takes one step per poll:
    removes its home and releases the host lock.
 3. After 30 seconds, with the same proof, SIGKILL to the run's own process
    group. Check groups are separate groups and the runner never signals them.
-4. The run is confirmed stopped when its pid is gone and either its own
-   `host-lock.json` records that it left the list, or its lock entry, read
-   after the pid was gone, shows no check group still alive (nor any group in
+4. The run is confirmed stopped when its pid is gone (or reused, as above)
+   and either its own `host-lock.json` records that it left the list, or its
+   lock entry, read after the pid was gone, shows no check group still alive (nor any group in
    `run.json`). Only then is the job refused, as `Integrated matrix run
 exceeded its bound`.
 
@@ -469,9 +485,17 @@ reasons:
 - `matrix run launch unconfirmed`: a `starting` record whose run has not
   appeared in the lock file within 60 seconds. No timer refuses it: it is held
   until the run appears (and is adopted) or its `host-lock.json` shows it
-  left the list.
+  left the list, which is then decided by that file's pid as above.
 - `no process-instance proof for the matrix run pid`: the pid is alive but may
-  be another process.
+  be another process: the run has no recorded start time, or the pid's start
+  time cannot be read or compared. A start time that differs is no longer
+  held; the run has exited (see A reused pid).
+- `matrix run sidecar names no pid`: a `starting` record whose run left the
+  list, but its `host-lock.json` has no pid to prove it exited.
+- `no process-instance proof for the matrix run sidecar pid`: that pid is
+  alive, but its start time or the file's `requestedAt` cannot be read, so it
+  is neither proven the run nor proven another process. The notice names the
+  pid.
 - `matrix run pid still alive after SIGKILL`.
 - `a check group of the matrix run is still alive`: the notice names the groups.
 - `check group state cannot be shown`: the run is gone without a release record

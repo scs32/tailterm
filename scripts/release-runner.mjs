@@ -1732,9 +1732,10 @@ export class HostAdapter {
     } catch {return undefined;}
   }
   // The outcome the run itself recorded on leaving the list (released,
-  // wait-expired, withdrawn, or a failure while waiting); null until then.
+  // wait-expired, withdrawn, or a failure while waiting), with the pid and
+  // join time it recorded; null until then.
   matrixSidecar(dir){
-    try{const outcome=JSON.parse(readFileSync(join(dir,"host-lock.json"),"utf8"))?.outcome;return typeof outcome==="string" && !["waiting","holding"].includes(outcome)?outcome:null;}catch{return null;}
+    try{const record=JSON.parse(readFileSync(join(dir,"host-lock.json"),"utf8")),outcome=record?.outcome;return typeof outcome==="string" && !["waiting","holding"].includes(outcome)?{outcome,pid:record.pid,requestedAt:record.requestedAt}:null;}catch{return null;}
   }
   // One non-blocking step for an attempt that is not ended: "waiting",
   // "held" or "ended" (saved). With stop, the run is stopped now instead of at
@@ -1742,17 +1743,18 @@ export class HostAdapter {
   // only with process-instance proof: this process holds the live child, or
   // the pid's process start time is the one recorded at launch. A matching
   // pid and directory in the lock file is not proof. Check groups are never
-  // signalled. Held means the run could not be confirmed stopped; the job
-  // then keeps the fence until it can.
+  // signalled. A pid whose start time differs from the recorded one now
+  // names another process, so the run is gone. Held means the run could not
+  // be confirmed stopped; the job then keeps the fence until it can.
   resolveMatrixRun(dir,run,stop=false){
     const now=this.now(),child=this.matrixChildren.get(dir),found=this.matrixEntry(dir,run),sidecar=this.matrixSidecar(dir);
     const persist=()=>{try{this.saveRun(dir,run);return true;}catch{return false;}};
     const alive=()=>[...new Set([...(run.snapshot?.groups||[]),...(run.groups||[])])].filter(g=>!this.groupGone(g));
-    const held=reason=>{persist();this.matrixHeld={attempt:basename(dir),pid:run.pid??null,groups:run.state==="started"?alive():[],reason};return "held";};
+    const held=(reason,pid=run.pid)=>{persist();this.matrixHeld={attempt:basename(dir),pid:pid??null,groups:run.state==="started"?alive():[],reason};return "held";};
     const end=(reason,refusal)=>{Object.assign(run,{state:"ended",reason,endedAt:now,...(refusal?{refusal}:{})});if(!persist())return "waiting";this.matrixChildren.delete(dir);return "ended";};
     // A run that was not stopped and left a receipt ended normally, whatever
     // the record knew of it; the receipt's eligibility is checked at import.
-    const ending=()=>run.stopRequestedAt?end("stopped","Integrated matrix run exceeded its bound"):existsSync(join(dir,"receipt.json"))?end("receipt"):sidecar==="wait-expired"?end("wait-expired","Verification host wait expired"):end("no-receipt","Integrated matrix run ended without a receipt");
+    const ending=()=>run.stopRequestedAt?end("stopped","Integrated matrix run exceeded its bound"):existsSync(join(dir,"receipt.json"))?end("receipt"):sidecar?.outcome==="wait-expired"?end("wait-expired","Verification host wait expired"):end("no-receipt","Integrated matrix run ended without a receipt");
     if(found?.ambiguous)return held("host lock identity ambiguous");
     if(found?.entry)run.leaseId ||= found.entry.id;
     if(run.state==="unreadable"){this.matrixHeld={attempt:basename(dir),pid:null,groups:[],reason:"attempt record unreadable"};return "held";}
@@ -1766,13 +1768,26 @@ export class HostAdapter {
         Object.assign(run,{state:"started",pid,processStartedAt:ours?started:null,groups:[]});
         if(!persist())return "waiting";
       }
-      else if(sidecar)return ending();
+      else if(sidecar){
+        // Leaving the list is not proof the run exited: it releases before
+        // its interruption path removes its receipt. Its own pid decides: gone
+        // or begun after it joined (reused) ends it; begun by then is adopted.
+        const own=sidecar.pid;
+        if(!(Number.isSafeInteger(own) && own>1))return held("matrix run sidecar names no pid");
+        if(this.pidGone(own))return ending();
+        const started=this.processStartTime(own);
+        if(startKey(started)===null || !Number.isFinite(Date.parse(sidecar.requestedAt)))return held("no process-instance proof for the matrix run sidecar pid",own);
+        if(!startedBy(started,sidecar.requestedAt,1000))return ending();
+        Object.assign(run,{state:"started",pid:own,processStartedAt:started,groups:[]});
+        if(!persist())return "waiting";
+      }
       else if(!stop && now-run.launchedAt<(this.config.matrixLaunchGraceMs??MATRIX_LAUNCH_GRACE_MS))return "waiting";
       else return held("matrix run launch unconfirmed");
     }
     const mine=found && found.entry.pid===run.pid?found:null;
     if(mine?.role==="holder")run.groups=[...new Set([...(run.groups||[]),...(mine.entry.groups||[]).filter(Number.isSafeInteger)])];
-    const exited=child?child.exitCode!==null||child.signalCode!==null:this.pidGone(run.pid);
+    const reused=()=>startKey(run.processStartedAt)!==null && startMatch(run.processStartedAt,this.processStartTime(run.pid))==="other";
+    const exited=child?child.exitCode!==null||child.signalCode!==null:this.pidGone(run.pid)||reused();
     if(!exited){
       if(!stop && now<run.launchedAt+run.hostWaitMs+run.boundMs+RUN_TIMEOUT_GRACE_MS+MATRIX_DEADLINE_SLACK_MS){
         const holders=mine ? holdersOf(mine.state) : [];

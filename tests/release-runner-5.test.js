@@ -241,13 +241,47 @@ test("a5 (iii) a launch unconfirmed beyond the grace is held with the fence, nev
  for(const [outcome,reason] of [["wait-expired","Verification host wait expired"],["released","Integrated matrix run ended without a receipt"]]){
   const e=launch(t);assert.equal(await e.adapter.verifyIntegrated(e.integrated),false);e.tick(MATRIX_LAUNCH_GRACE_MS+1);
   assert.equal(await e.adapter.verifyIntegrated(e.integrated),false);assert.equal(e.adapter.matrixHeld.reason,"matrix run launch unconfirmed");
-  writeFileSync(join(e.dir,"host-lock.json"),JSON.stringify({outcome}));
+  writeFileSync(join(e.dir,"host-lock.json"),JSON.stringify({outcome,pid:exitedPid(),requestedAt:new Date().toISOString()}));
   await assert.rejects(e.adapter.verifyIntegrated(e.integrated),reasonIs(reason));assert.equal(e.run().state,"ended");assert.equal(e.starts(),1);
  }
  // A pid in the lock file that began after it joined is not proof of our run.
  const reused=launch(t);assert.equal(await reused.adapter.verifyIntegrated(reused.integrated),false);
  assert(updateHostState(reused.path,state=>{state.waiters.push({...holderEntry(reused.child.pid,reused.dir,{requestedAt:"2020-01-01T00:00:00.000Z"}),grantSeqAtRequest:0,overtakenBy:0});}).done);
  assert.equal(await reused.adapter.verifyIntegrated(reused.integrated),false);assert.deepEqual([reused.run().state,reused.run().processStartedAt],["started",null]);
+});
+// wi_583c784aed186b11 v1: an unconfirmed launch with no child or lock entry
+// ends from its sidecar only once the sidecar's own pid is gone or reused; a
+// pid begun by its join time is the run, adopted; no pid or no readable start
+// time is held by name.
+test("a5 (iii) v1 a starting record's sidecar ends the job only with exit proof from its own pid",async t=>{
+ const launch=(t,sidecar)=>{const h=lockHost(t);let clock=1000000;h.adapter.now=()=>clock;h.tick=ms=>{clock+=ms;};
+  h.adapter.startMatrixRun=(argv,dir)=>{h.calls.push({argv,dir});return exitedPid();};
+  const save=h.adapter.saveRun.bind(h.adapter);let saves=0;h.adapter.saveRun=(dir,run)=>{if(++saves===2)throw new Error("lost");save(dir,run);};
+  h.sidecar=async()=>{assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);assert.equal(h.run().state,"starting");writeFileSync(join(h.dir,"host-lock.json"),JSON.stringify({outcome:"released",...sidecar}));};
+  return h;};
+ const now=()=>new Date().toISOString();
+ // Its pid is alive and began by the time it joined: the run, still running, is adopted and waited for.
+ const live=idle(t);await new Promise(r=>live.once("spawn",r));
+ const adopted=launch(t,{pid:live.pid,requestedAt:now()});await adopted.sidecar();
+ assert.equal(await adopted.adapter.verifyIntegrated(adopted.integrated),false);
+ assert.deepEqual([adopted.run().state,adopted.run().pid,adopted.adapter.matrixHeld],["started",live.pid,null]);assert.match(adopted.run().processStartedAt,ISO_START);
+ assert.equal(await adopted.adapter.verifyIntegrated(adopted.integrated),false,"a live adopted run is waited for");assert.equal(adopted.run().state,"started");
+ // Its pid is alive but began after it joined: reused, so the run is gone and ends by its outcome.
+ const reused=launch(t,{pid:live.pid,requestedAt:"2020-01-01T00:00:00.000Z"});await reused.sidecar();
+ await assert.rejects(reused.adapter.verifyIntegrated(reused.integrated),reasonIs("Integrated matrix run ended without a receipt"));assert.equal(reused.run().state,"ended");
+ // Its pid is gone: today's ending.
+ const gone=launch(t,{pid:exitedPid(),requestedAt:now()});await gone.sidecar();
+ await assert.rejects(gone.adapter.verifyIntegrated(gone.integrated),reasonIs("Integrated matrix run ended without a receipt"));
+ // No pid, an unreadable start time or an unreadable join time: held by name, never ended or signalled.
+ for(const [sidecar,unreadable,reason,pid] of [[{},false,"matrix run sidecar names no pid",null],[{pid:"x",requestedAt:now()},false,"matrix run sidecar names no pid",null],
+  [{pid:live.pid,requestedAt:now()},true,"no process-instance proof for the matrix run sidecar pid",live.pid],[{pid:live.pid,requestedAt:"soon"},false,"no process-instance proof for the matrix run sidecar pid",live.pid]]){
+  const h=launch(t,sidecar);await h.sidecar();if(unreadable)h.adapter.processStartTime=()=>null;
+  for(let poll=0;poll<2;poll++){h.tick(3600000);assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);}
+  assert.deepEqual(h.adapter.matrixHeld,{attempt:h.integrated.integratedCommit+"-r0",pid,groups:[],reason});
+  assert.equal(matrixHeldNotice({id:"rel_fixture"},h.adapter.matrixHeld).text.includes(reason),true,"the held notice accepts the reason");
+  assert.equal(h.run().state,"starting");assert.deepEqual(h.signals,[]);
+ }
+ assert.equal(pidGone(live.pid),false,"never signalled");
 });
 test("a5 (iv) a new runner process resumes a started record without starting a run and with no release lock in its way",async t=>{
  const h=releaseHost(t),first=h.through(h.adapter);
@@ -275,7 +309,7 @@ test("a5 (v) a run that left on its wait bound refuses as Verification host wait
  // after the intent save and never saw it on the list) takes the receipt path.
  const passed=(receipt,sidecar)=>{const h=matrixHost(),dir=attemptDir(h.home,h.integrated.integratedCommit,0);mkdirSync(dir,{recursive:true});h.adapter.hostState=()=>null;
   writeFileSync(join(dir,"run.json"),JSON.stringify({version:1,state:"starting",launchedAt:Date.now()-600000,priority:"high",hostWaitMs:7200000,boundMs:7200000}));
-  writeFileSync(join(dir,"host-lock.json"),JSON.stringify(sidecar));if(receipt)writeFileSync(join(dir,"receipt.json"),JSON.stringify(receipt));return h;};
+  writeFileSync(join(dir,"host-lock.json"),JSON.stringify({pid:exitedPid(),requestedAt:new Date().toISOString(),...sidecar}));if(receipt)writeFileSync(join(dir,"receipt.json"),JSON.stringify(receipt));return h;};
  const ok=passed({environment:{},checks:[{exitCode:0}]},{outcome:"released"});
  assert.equal(await ok.adapter.verifyIntegrated(ok.integrated),false);assert.equal(ok.run().reason,"receipt");assert.equal(ok.run().refusal,undefined);
  assert.equal(ok.sends().length,1);assert.equal(ok.sends()[0].argv[ok.sends()[0].argv.indexOf("--subject")+1],"Import verification for the integrated release commit");assert.equal(ok.matrix().length,0,"no run was started");
@@ -310,13 +344,28 @@ test("a10 (ii) a run that ignores SIGTERM gets its own group killed after the gr
  await assert.rejects(h.adapter.verifyIntegrated(h.integrated),reasonIs("Integrated matrix run exceeded its bound"));
  assert.deepEqual(h.run().snapshot.groups,[]);assert.equal(h.run().snapshot.role,"holder");assert.equal(h.signals.length,2);
 });
-test("a10 (iii) a stale lock entry matching a reused pid is never signalled, and the job is held",async t=>{
+// wi_583c784aed186b11 e1: a pid whose start time differs from the recorded
+// one names another process, so the run is gone, before or past its deadline.
+test("a10 (iii) e1 a reused pid with another start time counts as exited, so the run ends by the post-exit rules and nothing is signalled",async t=>{
+ for(const late of [false,true]){
+  const h=lockHost(t),other=idle(t);let clock=5000000;h.adapter.now=()=>clock;h.adapter.startMatrixRun=(argv,dir)=>{h.calls.push({argv,dir});return other.pid;};
+  h.adapter.processStartTime=()=>"2026-01-01T00:00:00.000Z";
+  assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);assert.equal(h.run().processStartedAt,"2026-01-01T00:00:00.000Z");
+  // The pid now belongs to an unrelated live process; the lock file still names it for this directory.
+  delete h.adapter.processStartTime;assert.equal(startMatch("2026-01-01T00:00:00.000Z",h.adapter.processStartTime(other.pid)),"other");
+  assert(updateHostState(h.path,state=>{state.holders=[holderEntry(other.pid,h.dir)];}).done);
+  if(late)clock=h.deadline()+3600000;
+  await assert.rejects(h.adapter.verifyIntegrated(h.integrated),reasonIs("Integrated matrix run ended without a receipt"));
+  assert.deepEqual(h.signals,[]);assert.equal(pidGone(other.pid),false);assert.equal(h.adapter.matrixHeld,null);
+  assert.deepEqual([h.run().state,h.run().reason,h.run().stopRequestedAt],["ended","no-receipt",undefined]);assert.deepEqual(h.run().snapshot.groups,[]);
+ }
+});
+test("a10 (iii) e1 a live pid whose start time cannot be read now is held unsignalled past the deadline",async t=>{
  const h=lockHost(t),other=idle(t);let clock=5000000;h.adapter.now=()=>clock;h.adapter.startMatrixRun=(argv,dir)=>{h.calls.push({argv,dir});return other.pid;};
  h.adapter.processStartTime=()=>"2026-01-01T00:00:00.000Z";
- assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);assert.equal(h.run().processStartedAt,"2026-01-01T00:00:00.000Z");
- // The pid now belongs to an unrelated live process; the lock file still names it for this directory.
- delete h.adapter.processStartTime;assert.equal(startMatch("2026-01-01T00:00:00.000Z",h.adapter.processStartTime(other.pid)),"other");
+ assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);h.adapter.processStartTime=()=>null;
  assert(updateHostState(h.path,state=>{state.holders=[holderEntry(other.pid,h.dir)];}).done);
+ clock=h.deadline()-1;assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);assert.equal(h.adapter.matrixHeld,null,"before the deadline it waits");
  clock=h.deadline()+3600000;
  for(let poll=0;poll<3;poll++){clock+=MATRIX_STOP_GRACE_MS;assert.equal(await h.adapter.verifyIntegrated(h.integrated),false);}
  assert.deepEqual(h.signals,[]);assert.equal(pidGone(other.pid),false);
