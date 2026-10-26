@@ -768,12 +768,43 @@ Idle means all three: no job of the project is `claimed`, `merged` or
 every state but `current` a `verified` job stays unclaimed and its journal is
 not archived.
 
+A stale deployer that is not idle still restarts when its only owned job is
+held (wi_876c1eb560903f04): the ledger's only `claimed`, `merged` or `blocked`
+job is claimed by this agent and run, with nothing published and no receipt;
+its journal is of exactly that claim, in `prepared`, `integrated` or
+`refusing`, with no effects and not published; and no matrix run of it is
+unsettled, this process has no matrix child and no host release lock exists.
+The restarted runner then runs that job. A job whose release inputs are
+already bound (`inputsDigest`) qualifies only while its journal is `refusing`,
+which the restarted runner completes whatever the inputs; with bound inputs a
+`prepared` or `integrated` journal still drains (wi_56ac00ba2854fa3d c4).
+
+When the poll cannot read the job list (wi_56ac00ba2854fa3d c1), the code check
+still runs before the poll is held as before ("Deployment poll held (REASON)").
+It records `runner-code.json` and posts its `draining` or `refused` notice. With
+no ledger, idle is read from the deployer's own journal directory instead: no
+job journal (`rel_ID.json`, not an archived journal or an `-inputs.json`
+manifest) of this agent and run is in a phase other than `complete` or
+`refused`, every such journal parses, this process has no matrix child, and no
+host release lock exists at the lock path of any journal's task or at the lock
+path of the last job list this process read. Only then does it restart; there
+is no held job without a ledger. Otherwise it drains.
+
 **Restart.** A deployer that was told to stop does not restart. Otherwise it
 first prepares the checkout: `git status --porcelain` must be empty (ignored
 build outputs do not count), `HEAD` is moved to the published commit with `git
 checkout --detach` when it differs, and the six files on disk must then have
-the published digest. It records and announces the restart, then replaces its
-own process image with the same Node executable and arguments. The pid, agent
+the published digest. It then proves that the published runner loads
+(wi_56ac00ba2854fa3d c2): a child Node process imports the checkout's
+`scripts/release-runner.mjs`, and with it every watched file, within 20
+seconds, and must exit 0. The child is given no script path as an argument, so
+no entry point's own-path check matches and nothing runs but the imports; it
+gets the deployer's environment without the re-exec markers. A child that
+throws, exits non-zero or times out (it is then killed, as it is when the
+deployer is told to stop) refuses the restart with `load-failed`: no restart
+notice, no exec, one refused notice. Only after the check does it record and
+announce the restart, then replace its own process image with the same Node
+executable and arguments. The pid, agent
 and run stay the same. The new image is told which published digest the
 restart aimed at and which digest it came from. When it then finds itself
 `current` it posts "Deployer now runs the published scripts".
@@ -781,9 +812,10 @@ restart aimed at and which digest it came from. When it then finds itself
 **Refuse reasons and recovery.** A refusal is decided again at every poll, so
 one whose cause is removed clears by itself, with three exceptions.
 `loaded-unreadable` never clears in the same process, because the loaded
-digest is read only once, as the process starts. `exec-failed` and
-`restart-did-not-refresh` hold for as long as the published digest stays the
-same.
+digest is read only once, as the process starts. `exec-failed`, `load-failed`
+and `restart-did-not-refresh` hold for as long as the published digest stays
+the same: the child of `load-failed` is not spawned again for that digest, and
+a new published digest is checked afresh.
 
 | Reason                    | Meaning                                                                                                                   | Operator action                                                                                     |
 | ------------------------- | ------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
@@ -793,6 +825,7 @@ same.
 | `checkout-failed`         | `git status`, `git rev-parse` or the detached checkout failed.                                                            | Repair the worktree; the next poll retries.                                                         |
 | `disk-mismatch`           | After the checkout the six files are unreadable or are not the published bytes.                                           | Restore the files to the published commit; the next poll retries.                                   |
 | `exec-failed`             | Replacing the process image failed. This process does not try again for the same published digest.                        | Re-provision.                                                                                       |
+| `load-failed`             | The published runner did not load in a child process within its bound, so the process was not replaced by it.             | Fix the published scripts on `tasks-hub`; a new published digest is checked again. Or re-provision. |
 | `restart-did-not-refresh` | The process was already restarted for this published digest and is still stale: the restart did not change what it loads. | Re-provision, and check that the deployer's command starts the runner from the configured checkout. |
 
 Re-provision means the action every refusal notice names: run `tt deployment
@@ -804,7 +837,11 @@ followed a restart attempt, because only an idle deployer attempts one.
 directory, mode 0600: `agentId`, `runId`, `pid`, `startedAt`, `checkedAt`,
 `state`, `reason` when refused, `loaded` (`digest` and per-file `files`),
 `current` (the published `commit`, `digest` and `files`; null when unreadable),
-`changed` (the watched files that differ) and `restartedFrom` after a restart.
+`changed` (the watched files that differ), `restartedFrom` after a restart, and
+`restartGeneration`, the latest restart of this run (1 for its first), once the
+run has restarted. A restarted image learns its generation from the re-exec
+environment (`TAILTERM_RUNNER_REEXEC_GEN`); a new process of the same run
+continues from the generation this record holds.
 It is rewritten only when something other than `checkedAt` changes, so
 `checkedAt` is when the current state was first seen. Each release job's
 journal also records, in `code`, the `loaded` and `current` digests of the
@@ -826,8 +863,13 @@ set and the fixed reason tokens reach its text:
 
 The request id is `runner-code-RUN-LOADED-CURRENT-STATE`, with `-REASON` for a
 refusal and no time, so a restarted process resends the same notice and an
-unchanged poll posts nothing. The deployer's terminal prints one line for each
-of `draining`, `restart` and `refused`.
+unchanged poll posts nothing. From a run's second restart on, the `restart` and
+`restarted` ids end in `-rN`, the restart generation (wi_56ac00ba2854fa3d c5),
+and a held restart's `-held-JOB` follows it: a run that goes A to B, B to C and
+C back to B, or repeats A to B after a revert, gets a new id for each restart,
+while a retry of the same restart in one process repeats its id. A run's first
+restart and every `draining` and `refused` id are as before. The deployer's
+terminal prints one line for each of `draining`, `restart` and `refused`.
 
 **Failed CLI calls.** When a call of the configured `tt` fails, the journal
 directory keeps the evidence in `cli-failures.json`, mode 0600: for each
@@ -1014,7 +1056,9 @@ that notice stays unread until they next read their inbox.
   deployer cannot make is "Deployer is not claiming releases: ..." and wakes.
 - Request ids do not include the class. A notice an older runner posted
   untagged and a newer runner resends under the same request id is refused by
-  the hub as a reused id with other data: the original stays on the Board, the
+  the hub as a reused id with other data (restart and restarted ids carry the
+  restart generation from a run's second restart on, so a repeated restart
+  pair is not refused this way): the original stays on the Board, the
   deployer retries once per poll while the condition lasts (for a fence wait,
   a host wait or a code notice it prints "... not posted; the next poll
   retries." each time), and `cli-failures.json` keeps one counted record. This can only happen for a wait or hold that is still active across
@@ -2619,9 +2663,12 @@ notice and belongs to the transport wait.
   more, even if the reason changes.
 - **Fallback.** While a recipient cannot be resolved (no handler, or not
   exactly one live owner helper) or its post fails, the deployer prints `Held
-  claim notice not delivered to every recipient; the next poll retries.`,
-  posts the same notice once per job per run on the Board with no recipient,
-  and tries that recipient again at every poll. A Board notice is in every
+  claim notice not delivered to every recipient; the next poll retries.` once
+  per job per run, posts the same notice once per job per run on the Board
+  with no recipient, and tries that recipient again at every poll; a roster
+  read that found no single live owner helper is repeated at most every 5
+  minutes (wi_56ac00ba2854fa3d c3). Delivery once the recipient resolves is
+  unchanged. A Board notice is in every
   agent's inbox. This one is `wake=attention`, so it wakes the primary database
   handler and the owner helper when they are live (Which notices wake, above),
   and no other agent; read it as "someone was not reached". No failure here

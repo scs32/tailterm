@@ -5,11 +5,11 @@ import {mkdtempSync,mkdirSync,copyFileSync,writeFileSync,readFileSync,chmodSync,
 import {tmpdir} from "node:os";
 import {join,dirname,resolve} from "node:path";
 import {execFileSync,execFile,spawnSync} from "node:child_process";
-import {refusalText,heldClaimNotice,integrateCandidate,integrateBatch,NO_CHANGE,publishIntegration,revertCommit,moveReleaseRef,runRelease,HostAdapter,serveDeployment,releaseError,compatibilityArgv,dispatchCompatibility,validateNativeRelease,failureReason,failureDetail,matrixWaitNotice,RUNNER_CODE_FILES,LOADED_CODE,CODE_REASONS,codeDigest,diskCode,publishedCode,codeDecision,prepareCode,runnerCodeGate,codeRecord,codeNotice,cliFailureNotice,cliRetry,transportWait,transportWaitNotice} from "../scripts/release-runner.mjs";
+import {refusalText,heldClaimNotice,integrateCandidate,integrateBatch,NO_CHANGE,publishIntegration,revertCommit,moveReleaseRef,runRelease,HostAdapter,serveDeployment,releaseError,compatibilityArgv,dispatchCompatibility,validateNativeRelease,failureReason,failureDetail,matrixWaitNotice,RUNNER_CODE_FILES,LOADED_CODE,CODE_REASONS,codeDigest,diskCode,publishedCode,codeDecision,prepareCode,runnerCodeGate,codeRecord,codeNotice,cliFailureNotice,cliRetry,transportWait,transportWaitNotice,heldRetry,journalIdle,runnerLoads} from "../scripts/release-runner.mjs";
 import {acquireHostLock,readHostState as rawReadHostState,holdersOf} from "../scripts/verify-matrix-host-lock.mjs";
 import {createHash} from "node:crypto";
 import {RELEASE_READ_ATTEMPTS,wranglerBin} from "../scripts/release-inputs.mjs";
-import {releaseReply,releaseReplySource,git,bufferTT,fixture,change,job,fake,config,hash,stamped,importInputs,hostFixture,recorded,C,remoteHead,RUNNER,attemptDir,until,ended,idle,lockHost,reasonIs,MATRIX_A,uncoveredReason,matrixChangeRelease,READY_ID,READY_UP,READY_CAPTURE,READY_DOWN,readyAdapter,EXIT1,countedLiveCheck,readyRelease,TOKEN,NEXT_ACTION,conflictFixture,journalOf,refusesUnchanged,checkoutState,CODE_AGENT,CODE_RUN,SAFE_TEXT,codeRepo,codeHost,verifiedJob,codeGate,codeSends,HELD_ITEM,HELD_SECRET,HELD_HANDLER,HELD_HELPER,heldRoster,sendOf,heldRun,unwatchedImports,heldOwn,heldJournal,HELD_SUBJECT,three,race,covers,planned,stale,claimed} from "./release-runner-fixtures.mjs";
+import {releaseReply,releaseReplySource,git,bufferTT,fixture,change,job,fake,config,hash,stamped,importInputs,hostFixture,recorded,C,remoteHead,RUNNER,attemptDir,until,ended,idle,lockHost,reasonIs,MATRIX_A,uncoveredReason,matrixChangeRelease,READY_ID,READY_UP,READY_CAPTURE,READY_DOWN,readyAdapter,EXIT1,countedLiveCheck,readyRelease,TOKEN,NEXT_ACTION,conflictFixture,journalOf,refusesUnchanged,checkoutState,CODE_AGENT,CODE_RUN,SAFE_TEXT,codeRepo,codeHost,verifiedJob,codeGate,codeSends,HELD_ITEM,HELD_SECRET,HELD_HANDLER,HELD_HELPER,heldRoster,sendOf,heldRun,unwatchedImports,heldOwn,heldJournal,HELD_SUBJECT,three,race,covers,planned,stale,claimed,LIST_FAILS,failList,codeJournal,taskLock,codeServe,codeCommit,unloadable} from "./release-runner-fixtures.mjs";
 test("m5 end to end: a matrix change no owner approval covers refuses the job by name and leaves tasks-hub alone",async()=>{
  const r=matrixChangeRelease([{digest:hash(MATRIX_A),messageSeq:11}]);
  await assert.rejects(runRelease(r.c,r.a),/Release refused before publication/);
@@ -829,10 +829,34 @@ test("held r1 r2 with no live owner helper and no handler the Board notice is se
 if(a[0]==='agents'){console.log(JSON.stringify([{id:'agt_aa',role:'owner_helper',status:'running'},{id:'agt_bb',role:'owner_helper',status:'retired'}]));process.exit(0);}`);
  h.setJobs([{...verifiedJob("rel_held"),itemId:HELD_ITEM},verifiedJob("rel_next")]);
  const err=await heldRun(t,h,3,async()=>{});
- assert.equal(err,"Release claim held; handler reconciliation required.\nHeld claim notice not delivered to every recipient; the next poll retries.\n".repeat(3));
+ // The undelivered line is printed once per job and process (held c3).
+ assert.equal(err,"Release claim held; handler reconciliation required.\nHeld claim notice not delivered to every recipient; the next poll retries.\n"+"Release claim held; handler reconciliation required.\n".repeat(2));
  const sent=h.calls().filter(c=>c.argv[0]==="send").map(sendOf);assert.equal(sent.length,1);assert.equal(sent[0].to,null);assert.match(sent[0].requestId,/-board$/);
  assert.ok(sent[0].text.includes("Reason: hub: 409 conflict: release: job cannot be taken over (tt deployment claim exit 1)."));
  assert.equal(h.claims().filter(c=>c.argv.includes("rel_next")).length,3);
+});
+test("held c3 while no owner helper can be resolved the line prints once per job and the roster is read at most every five minutes",async t=>{
+ const cwd=mkdtempSync(join(tmpdir(),"release-held-"));t.after(()=>rmSync(cwd,{recursive:true,force:true}));
+ // Two held claims; the handler resolves, the owner helper appears only once the file "helper" exists.
+ const h=codeHost(t,cwd,`if(a[1]==='claim'&&flag('--job').startsWith('rel_held')){fs.writeSync(2,'tt: hub: 409 conflict: release: job cannot be taken over\\n');process.exit(1);}
+if(a[0]==='deployment'&&a[1]==='handler'){console.log(JSON.stringify({id:${JSON.stringify(HELD_HANDLER)}}));process.exit(0);}
+if(a[0]==='agents'){console.log(JSON.stringify(fs.existsSync(__dirname+'/helper')?[{id:${JSON.stringify(HELD_HELPER)},role:'owner_helper',status:'running'}]:[]));process.exit(0);}`);
+ h.setJobs([{...verifiedJob("rel_held1"),itemId:HELD_ITEM},{...verifiedJob("rel_held2"),itemId:HELD_ITEM},verifiedJob("rel_next")]);
+ const saved=heldRetry.now;t.after(()=>{heldRetry.now=saved;});
+ // Poll one at 0; poll two just inside five minutes; poll three at five minutes, with the helper live; poll four after it.
+ const clock=[0,299999,300000,300001];let poll=0;heldRetry.now=()=>clock[poll];
+ const rosterReads=[],readsNow=()=>h.calls().filter(c=>c.argv[0]==="agents").length;
+ const err=await heldRun(t,h,4,async()=>{rosterReads.push(readsNow());poll++;if(poll===2)writeFileSync(join(h.home,"helper"),"");});
+ // One read at poll one, none at poll two, then one per job when the helper resolves at poll three, and none after delivery.
+ assert.deepEqual(rosterReads,[1,1,3,3]);
+ const held="Release claim held; handler reconciliation required.\n",line="Held claim notice not delivered to every recipient; the next poll retries.\n";
+ assert.equal(err,(held+line).repeat(2)+held.repeat(6));
+ // Each job: its handler notice and Board copy at poll one, its helper notice once at poll three.
+ const sent=h.calls().filter(c=>c.argv[0]==="send").map(sendOf);
+ const idOf=id=>heldClaimNotice({...verifiedJob(id),itemId:HELD_ITEM},"claim","hub: 409 conflict: release: job cannot be taken over (tt deployment claim exit 1)",CODE_RUN).requestId;
+ assert.deepEqual(sent.map(s=>[s.to,s.requestId]),[[HELD_HANDLER,idOf("rel_held1")+"-handler"],[null,idOf("rel_held1")+"-board"],[HELD_HANDLER,idOf("rel_held2")+"-handler"],[null,idOf("rel_held2")+"-board"],[HELD_HELPER,idOf("rel_held1")+"-helper"],[HELD_HELPER,idOf("rel_held2")+"-helper"]]);
+ assert.deepEqual(sent.map(s=>s.refs.includes("wake=attention")),[false,true,false,true,false,false]);
+ assert.equal(h.claims().filter(c=>c.argv.includes("rel_next")).length,4);
 });
 test("held r3 the notice keeps only plain words, small numbers and hub ids of the refusal, and only well-formed job fields",()=>{
  assert.equal(refusalText("noise\ntt: hub: 409 conflict: release: job rel_0123abcd is claimed; reconcile it first\n"),"hub: 409 conflict: release: job rel_0123abcd is claimed; reconcile it first");
@@ -913,4 +937,178 @@ test("code b1 a stop signal during the restart poll means no re-exec and no clai
  // Without a signal the same gate does re-exec.
  const u=codeRepo(t),k=codeHost(t,u.cwd),idle=new AbortController();u.at(u.a,u.b);const third=codeGate(u.codeA);
  await k.poll(third.gate,undefined,{once:true,signal:idle.signal});assert.equal(third.execs.length,1);
+});
+// A failed job-list read (wi_56ac00ba2854fa3d c1).
+const DRAIN_LINE="Deployer code is out of date; no new release is claimed and a restart follows the active work.\n",RESTART_LINE="Deployer restarting itself onto the published scripts.\n",REFUSED_LINE="Deployer code is out of date and it cannot restart itself; no release is claimed until it is re-provisioned.\n";
+test("code c1 a poll whose job list cannot be read still records its code and drains while its own journal shows an unfinished job",async t=>{
+ // [name, arrange(h,r) returning an undo or nothing]
+ const cases=[
+  ...["waiting_inputs","blocked","refusing",undefined].map(phase=>[`this run's journal is ${phase}`,h=>{codeJournal(h,"rel_own",{phase});}]),
+  ["a journal is unreadable",h=>{writeFileSync(join(h.home,"rel_bad.json"),"{not json");}],
+  ["this process has a live matrix child",()=>{const children=new HostAdapter({},{}).matrixChildren,key="code-c1-fixture";children.set(key,{});return ()=>children.delete(key);}],
+  ["a host release lock exists at a journal's task lock path",(h,r)=>{codeJournal(h,"rel_other",{agentId:"agt_other",runId:"run_other",phase:"waiting_inputs",taskId:"tsk_c1"});const lock=taskLock(r.cwd,"tsk_c1");mkdirSync(dirname(lock),{recursive:true});writeFileSync(lock,"{}");return ()=>rmSync(lock,{force:true});}],
+ ];
+ for(const [name,arrange] of cases){
+  const r=codeRepo(t),h=codeHost(t,r.cwd,LIST_FAILS),{gate,execs}=codeGate(r.codeA);r.at(r.a,r.b);h.setJobs([verifiedJob()]);failList(h);
+  const undo=arrange(h,r)||(()=>{});t.after(undo);let err;
+  try{err=await h.poll(gate)+await h.poll(gate);}finally{undo();}
+  assert.equal(execs.length,0,name);assert.equal(r.head(),r.a,name);assert.equal(h.claims().length,0,name);
+  assert.equal(h.record().state,"draining",name);assert.equal(h.record().current.digest,r.codeB.digest,name);
+  assert.deepEqual(codeSends(h).map(s=>s.requestId),[`runner-code-${CODE_RUN}-${r.codeA.digest.slice(0,12)}-${r.codeB.digest.slice(0,12)}-draining`],name);
+  // The failed list call keeps its own notice, as before.
+  assert.ok(h.sends().filter(s=>!s.requestId.startsWith("runner-code-")).every(s=>s.requestId.startsWith(`cli-failure-${CODE_RUN}-`)),name);
+  assert.ok(err.startsWith(DRAIN_LINE+"Deployment poll held ("),name);assert.equal(err.split("Deployment poll held (").length-1,2,name);
+ }
+ // The last ledger's lock path counts too: read once with a blocked job of a task, then the list fails while that lock exists.
+ const r=codeRepo(t),h=codeHost(t,r.cwd,LIST_FAILS),{gate,execs}=codeGate(r.codeA),lock=taskLock(r.cwd,"tsk_last");r.at(r.a,r.b);
+ h.setJobs([{id:"rel_blocked",state:"blocked",generation:3,commit:"d".repeat(40),taskId:"tsk_last"}]);t.after(()=>rmSync(lock,{force:true}));
+ const err=await codeServe(t,h,gate,[()=>{failList(h);mkdirSync(dirname(lock),{recursive:true});writeFileSync(lock,"{}");}],(n,err)=>n<2||err.includes("Deployment poll held ("));rmSync(lock,{force:true});
+ assert.equal(execs.length,0);assert.equal(r.head(),r.a);assert.equal(h.record().state,"draining");assert.equal(codeSends(h).length,1);assert.equal(err.split("Deployment poll held (").length-1,1);
+ // Without that lock the same second poll restarts.
+ const s=codeRepo(t),g=codeHost(t,s.cwd,LIST_FAILS),free=codeGate(s.codeA);s.at(s.a,s.b);
+ g.setJobs([{id:"rel_blocked",state:"blocked",generation:3,commit:"d".repeat(40),taskId:"tsk_last"}]);
+ await codeServe(t,g,free.gate,[()=>{failList(g);}],n=>n<2||free.execs.length===1);assert.equal(free.execs.length,1);assert.equal(s.head(),s.b);
+});
+test("code c1 an idle runner whose job list cannot be read restarts once onto the published scripts",async t=>{
+ const r=codeRepo(t),h=codeHost(t,r.cwd,LIST_FAILS),{gate,execs}=codeGate(r.codeA);r.at(r.a,r.b);h.setJobs([verifiedJob()]);failList(h);
+ // Only a finished journal of this run, unfinished journals of other runs, and files that are not journals.
+ codeJournal(h,"rel_done",{phase:"complete"});codeJournal(h,"rel_refused",{phase:"refused"});codeJournal(h,"rel_other",{agentId:"agt_other",runId:"run_other",phase:"waiting_matrix"});codeJournal(h,"rel_agent",{agentId:"agt_other",phase:"refusing"});
+ writeFileSync(join(h.home,"rel_done-g2-inputs.json"),"{not json");writeFileSync(join(h.home,"rel_old.json.set-aside-g1"),"{not json");writeFileSync(join(h.home,"rel_old.json.unclaimed-g2"),"{not json");
+ const seen=[];gate.execve=(...args)=>{execs.push(args);seen.push({record:h.record(),head:r.head()});};
+ const err=await h.poll(gate);
+ assert.equal(execs.length,1);assert.equal(r.head(),r.b);assert.equal(h.claims().length,0);assert.equal(seen[0].record.state,"restart");assert.equal(seen[0].head,r.b);
+ assert.equal(h.record().state,"restart");assert.deepEqual(codeSends(h).map(s=>s.subject),["Deployer is restarting itself onto the published scripts"]);
+ assert.equal(execs[0][2].TAILTERM_RUNNER_REEXEC,r.codeB.digest);assert.ok(err.startsWith(RESTART_LINE+"Deployment poll held ("),err);
+ // The predicate alone.
+ const base={journalDirectory:h.home,cwd:r.cwd,agent:CODE_AGENT,run:CODE_RUN,lastLock:null,matrixChildren:0};
+ assert.equal(journalIdle(base),true);
+ for(const over of [{matrixChildren:1},{matrixChildren:undefined},{agent:undefined},{run:""},{journalDirectory:join(h.home,"absent")}])assert.equal(journalIdle({...base,...over}),false,JSON.stringify(over));
+ const lock=taskLock(r.cwd,"tsk_any");mkdirSync(dirname(lock),{recursive:true});writeFileSync(lock,"{}");t.after(()=>rmSync(lock,{force:true}));
+ assert.equal(journalIdle({...base,lastLock:lock}),false);rmSync(lock);assert.equal(journalIdle({...base,lastLock:lock}),true);
+});
+test("code c1 a runner that cannot read its job list and cannot restart refuses with its notice",async t=>{
+ const r=codeRepo(t),h=codeHost(t,r.cwd,LIST_FAILS),{gate,execs}=codeGate(r.codeA);r.at(r.a,r.b);h.setJobs([verifiedJob()]);failList(h);writeFileSync(join(r.cwd,"untracked.txt"),"x");
+ const err=await h.poll(gate)+await h.poll(gate);
+ assert.equal(execs.length,0);assert.equal(r.head(),r.a);assert.equal(h.claims().length,0);assert.equal(h.record().state,"refused");assert.equal(h.record().reason,"checkout-dirty");
+ assert.deepEqual(codeSends(h).map(s=>s.requestId.split("-").slice(5).join("-")),["refused-checkout-dirty"]);assert.ok(err.startsWith(REFUSED_LINE+"Deployment poll held ("),err);
+ // An unreadable published ref stays silent, as when a ledger was read.
+ const plain=mkdtempSync(join(tmpdir(),"release-code-plain-"));t.after(()=>rmSync(plain,{recursive:true,force:true}));
+ const q=codeHost(t,plain,LIST_FAILS);q.setJobs([verifiedJob()]);failList(q);const quiet=codeGate(r.codeA);
+ assert.match(await q.poll(quiet.gate),/^Deployment poll held \(/);assert.deepEqual(codeSends(q),[]);assert.equal(q.record().reason,"published-unreadable");assert.equal(quiet.execs.length,0);
+});
+// The published runner's load check (wi_56ac00ba2854fa3d c2).
+test("code c2 a published runner that does not load is refused once, with no exec, and is not retried for that digest",{timeout:60000},async t=>{
+ for(const mode of ["throw","hang"]){
+  const r=codeRepo(t),h=codeHost(t,r.cwd),counter=join(h.home,"loads-"+mode),bad=codeCommit(r,r.a,unloadable(counter,mode));r.at(r.a,bad.commit);h.setJobs([verifiedJob()]);
+  const {gate,execs}=codeGate(r.codeA,{loadTimeoutMs:300}),started=Date.now();
+  const err=await h.poll(gate)+await h.poll(gate)+await h.poll(gate);
+  assert.ok(Date.now()-started<15000,mode);
+  assert.equal(readFileSync(counter,"utf8"),"x",mode);assert.equal(execs.length,0,mode);assert.equal(h.claims().length,0,mode);
+  assert.equal(h.record().state,"refused",mode);assert.equal(h.record().reason,"load-failed",mode);
+  assert.deepEqual(codeSends(h).map(s=>s.requestId),[`runner-code-${CODE_RUN}-${r.codeA.digest.slice(0,12)}-${bad.code.digest.slice(0,12)}-refused-load-failed`],mode);
+  assert.equal(codeSends(h)[0].subject,"Deployer is not claiming releases: its scripts are out of date",mode);assert.match(codeSends(h)[0].text,/Reason: load-failed\. Action: run tt deployment setup/,mode);
+  assert.equal(err,"Deployer code is out of date and it cannot restart itself; no release is claimed until it is re-provisioned.\n",mode);
+  // A new published digest is checked again, and restarts once it loads.
+  const fixed=codeCommit(r,r.a,"// release-runner.mjs fixed\n");r.at(r.head(),fixed.commit);
+  await h.poll(gate);assert.equal(execs.length,1,mode);assert.equal(r.head(),fixed.commit,mode);assert.equal(h.record().state,"restart",mode);assert.equal(readFileSync(counter,"utf8"),"x",mode);
+  assert.deepEqual(codeSends(h).map(s=>s.requestId.split("-").slice(5).join("-")),["refused-load-failed","restart"],mode);
+ }
+ assert.ok(CODE_REASONS.includes("load-failed"));
+});
+test("code c2 the load check imports the published runner without running its entry",{timeout:60000},async t=>{
+ // A tt on PATH that logs any call: the import must make none.
+ const bin=mkdtempSync(join(tmpdir(),"release-load-bin-"));t.after(()=>rmSync(bin,{recursive:true,force:true}));
+ const log=join(bin,"calls");writeFileSync(join(bin,"tt"),`#!/bin/sh\necho "$@" >> ${JSON.stringify(log)}\n`);chmodSync(join(bin,"tt"),0o755);
+ const path=process.env.PATH;process.env.PATH=bin+":"+path;t.after(()=>{process.env.PATH=path;});
+ const r=codeRepo(t,true);r.at(r.b,r.b);
+ const before=readdirSync(join(r.cwd,"scripts")).sort();
+ assert.equal(await runnerLoads(r.cwd,{timeoutMs:20000}),true);
+ assert.equal(existsSync(log),false);assert.equal(git(r.cwd,"status","--porcelain"),"");assert.deepEqual(readdirSync(join(r.cwd,"scripts")).sort(),before);assert.deepEqual(readdirSync(bin).sort(),["tt"]);
+ // It really imports: a watched file that fails to parse fails the check, and a missing runner does too.
+ writeFileSync(join(r.cwd,"scripts","release-probe.mjs"),readFileSync(join(r.cwd,"scripts","release-probe.mjs"),"utf8")+"\n)(\n");
+ assert.equal(await runnerLoads(r.cwd,{timeoutMs:20000}),false);
+ assert.equal(await runnerLoads(join(r.cwd,"absent"),{timeoutMs:20000}),false);
+ // A stop signal kills a child that never settles.
+ const hung=codeRepo(t),counter=join(bin,"hung"),slow=codeCommit(hung,hung.a,unloadable(counter,"hang"));hung.at(slow.commit,slow.commit);
+ const halt=new AbortController(),began=Date.now(),pending=runnerLoads(hung.cwd,{timeoutMs:60000,signal:halt.signal});
+ for(const end=Date.now()+20000;!existsSync(counter)&&Date.now()<end;)await new Promise(r=>setTimeout(r,10));
+ halt.abort();assert.equal(await pending,false);assert.ok(Date.now()-began<20000);
+ // An idle restart over stand-in scripts checks the load, then re-executes once; a stop during the check ends the runner with no exec.
+ const s=codeRepo(t),h=codeHost(t,s.cwd),order=[];s.at(s.a,s.b);h.setJobs([verifiedJob()]);
+ const {gate,execs}=codeGate(s.codeA,{execve:(...args)=>{execs.push(args);order.push("exec");}}),loads=gate.loads;gate.loads=function(cwd){order.push("load:"+git(cwd,"rev-parse","HEAD"));return loads.call(this,cwd);};
+ await h.poll(gate);assert.deepEqual(order,["load:"+s.b,"exec"]);assert.equal(execs.length,1);assert.deepEqual(codeSends(h).map(s=>s.subject),["Deployer is restarting itself onto the published scripts"]);
+ const u=codeRepo(t),k=codeHost(t,u.cwd),stop=new AbortController();u.at(u.a,u.b);k.setJobs([verifiedJob()]);
+ const halted=codeGate(u.codeA);halted.gate.loads=async()=>{stop.abort();return true;};
+ assert.equal(await k.poll(halted.gate,undefined,{signal:stop.signal}),"");assert.equal(halted.execs.length,0);assert.equal(k.claims().length,0);assert.deepEqual(k.sends(),[]);
+});
+// A request id per restart (wi_56ac00ba2854fa3d c5). Each gate stands in for
+// one process of the run, with what the re-exec environment would give it.
+const reexecGate=(from,to,generation,over={})=>codeGate(to,{marker:to.digest,restartedFrom:from.digest,restartGeneration:generation,...over});
+const short12=c=>c.digest.slice(0,12),idFor=(l,c,kind)=>`runner-code-${CODE_RUN}-${short12(l)}-${short12(c)}-${kind}`;
+test("code c5 each restart in a run has its own request id: A to B to C to B",async t=>{
+ const r=codeRepo(t),h=codeHost(t,r.cwd),C=codeCommit(r,r.b,"// release-runner.mjs c\n"),A=r.codeA,B=r.codeB;r.at(r.a,r.b);
+ const execs=[];const spy=over=>({...over,execve:(...args)=>{execs.push(args[2].TAILTERM_RUNNER_REEXEC_GEN);}});
+ // A to B (generation 1), then the process on B.
+ await h.poll(codeGate(A,spy()).gate);assert.equal(r.head(),r.b);
+ const onB=reexecGate(A,B,1,spy()).gate;await h.poll(onB);
+ // B to C (generation 2), then the process on C.
+ r.at(r.head(),C.commit);await h.poll(onB);assert.equal(r.head(),C.commit);
+ const onC=reexecGate(B,C.code,2,spy()).gate;await h.poll(onC);
+ // C back to B (generation 3), then the process on B again.
+ r.at(r.head(),r.b);await h.poll(onC);assert.equal(r.head(),r.b);
+ await h.poll(reexecGate(C.code,B,3,spy()).gate);
+ const ids=codeSends(h).map(s=>s.requestId);
+ assert.deepEqual(ids,[idFor(A,B,"restart"),idFor(B,B,"restarted"),idFor(B,C.code,"restart-r2"),idFor(C.code,C.code,"restarted-r2"),idFor(C.code,B,"restart-r3"),idFor(B,B,"restarted-r3")]);
+ assert.equal(new Set(ids).size,ids.length);assert.deepEqual(execs,["1","2","3"]);
+ // The hub's liveness sweep matches these subjects, which do not change.
+ assert.deepEqual(codeSends(h).map(s=>s.subject),Array(3).fill(["Deployer is restarting itself onto the published scripts","Deployer now runs the published scripts"]).flat());
+ assert.equal(h.record().state,"current");assert.equal(h.record().restartGeneration,3);
+ for(const id of ids)assert.match(id,/^[A-Za-z0-9_-]{1,128}$/);
+});
+test("code c5 a retry of the same restart repeats its id, and a repeated A to B after a revert gets a new one",async t=>{
+ // Two polls of one process restart onto the same published code: one id, sent once, the same generation in both execs.
+ {
+  const r=codeRepo(t),h=codeHost(t,r.cwd),{gate,execs}=codeGate(r.codeA);r.at(r.a,r.b);
+  await h.poll(gate);await h.poll(gate);
+  assert.equal(execs.length,2);assert.deepEqual(execs.map(e=>e[2].TAILTERM_RUNNER_REEXEC_GEN),["1","1"]);
+  assert.deepEqual(codeSends(h).map(s=>s.requestId),[idFor(r.codeA,r.codeB,"restart")]);assert.equal(h.record().restartGeneration,1);
+ }
+ // A to B, B to A after a revert, then A to B again.
+ const r=codeRepo(t),h=codeHost(t,r.cwd),A=r.codeA,B=r.codeB;r.at(r.a,r.b);
+ await h.poll(codeGate(A).gate);
+ const onB=reexecGate(A,B,1);r.at(r.head(),r.a);await h.poll(onB.gate);assert.equal(r.head(),r.a);
+ const onA=reexecGate(B,A,2);r.at(r.head(),r.b);await h.poll(onA.gate);assert.equal(r.head(),r.b);
+ assert.deepEqual(onA.execs.map(e=>e[2].TAILTERM_RUNNER_REEXEC_GEN),["3"]);
+ const ids=codeSends(h).map(s=>s.requestId);
+ assert.deepEqual(ids,[idFor(A,B,"restart"),idFor(B,A,"restart-r2"),idFor(A,B,"restart-r3")]);assert.notEqual(ids[2],ids[0]);assert.equal(new Set(ids).size,ids.length);
+});
+test("code c5 draining and refused ids are unchanged and the generation survives a new process of the same run",async t=>{
+ const r=codeRepo(t),home=mkdtempSync(join(tmpdir(),"release-code-gen-"));t.after(()=>rmSync(home,{recursive:true,force:true}));
+ const saved=[process.env.TAILTERM_AGENT,process.env.TAILTERM_RUN];process.env.TAILTERM_AGENT=CODE_AGENT;process.env.TAILTERM_RUN=CODE_RUN;
+ t.after(()=>{for(const [i,k] of ["TAILTERM_AGENT","TAILTERM_RUN"].entries()){if(saved[i]===undefined)delete process.env[k];else process.env[k]=saved[i];}});
+ const at=(decision,generation)=>codeRecord({journalDirectory:home},{loaded:r.codeA,marker:null,restartedFrom:null,restartGeneration:generation,now:()=>0},decision,r.codeB);
+ const draining=at({state:"draining"},2),refused=at({state:"refused",reason:"exec-failed"},2);
+ assert.equal(draining.restartGeneration,2);assert.equal(codeNotice(draining).requestId,idFor(r.codeA,r.codeB,"draining"));assert.equal(codeNotice(refused).requestId,idFor(r.codeA,r.codeB,"refused-exec-failed"));
+ assert.equal(codeNotice(at({state:"restart"},2)).requestId,idFor(r.codeA,r.codeB,"restart-r2"));assert.equal(codeNotice(at({state:"restart",heldJob:"rel_held"},2)).requestId,idFor(r.codeA,r.codeB,"restart-r2-held-rel_held"));
+ // The first restart and no restart at all carry no suffix and no field.
+ rmSync(join(home,"runner-code.json"));assert.equal(codeNotice(at({state:"restart"},1)).requestId,idFor(r.codeA,r.codeB,"restart"));
+ rmSync(join(home,"runner-code.json"));assert.equal("restartGeneration" in at({state:"draining"},null),false);
+ for(const bad of [0,-1,1.5,"2",1000000,null])assert.equal(codeNotice({...at({state:"restart"},null),restartGeneration:bad}).requestId,idFor(r.codeA,r.codeB,"restart"),String(bad));
+ // A new process of the run, with no re-exec environment, over a record at generation 2: its restart is the third.
+ const s=codeRepo(t),h=codeHost(t,s.cwd);s.at(s.a,s.b);
+ writeFileSync(join(h.home,"runner-code.json"),JSON.stringify({version:1,agentId:CODE_AGENT,runId:CODE_RUN,state:"current",restartGeneration:2}));
+ const fresh=codeGate(s.codeA);await h.poll(fresh.gate);
+ assert.deepEqual(codeSends(h).map(x=>x.requestId),[idFor(s.codeA,s.codeB,"restart-r3")]);assert.equal(fresh.execs[0][2].TAILTERM_RUNNER_REEXEC_GEN,"3");assert.equal(h.record().restartGeneration,3);
+ // A record of another run starts again at the first restart.
+ const u=codeRepo(t),k=codeHost(t,u.cwd);u.at(u.a,u.b);
+ writeFileSync(join(k.home,"runner-code.json"),JSON.stringify({version:1,agentId:CODE_AGENT,runId:"run_other",state:"current",restartGeneration:5}));
+ const other=codeGate(u.codeA);await k.poll(other.gate);
+ assert.deepEqual(codeSends(k).map(x=>x.requestId),[idFor(u.codeA,u.codeB,"restart")]);assert.equal(other.execs[0][2].TAILTERM_RUNNER_REEXEC_GEN,"1");
+ // The gate reads the generation from the re-exec environment; a restart begun without one is the first.
+ const env=["TAILTERM_RUNNER_REEXEC_GEN","TAILTERM_RUNNER_REEXEC_FROM"].map(k=>[k,process.env[k]]);
+ t.after(()=>{for(const [k,v] of env){if(v===undefined)delete process.env[k];else process.env[k]=v;}});
+ process.env.TAILTERM_RUNNER_REEXEC_FROM=r.codeA.digest;
+ for(const [value,expected] of [["4",4],["999999",999999],["0",1],["07",1],["abc",1],["1000000",1],[undefined,1]]){if(value===undefined)delete process.env.TAILTERM_RUNNER_REEXEC_GEN;else process.env.TAILTERM_RUNNER_REEXEC_GEN=value;assert.equal(runnerCodeGate().restartGeneration,expected,String(value));}
+ delete process.env.TAILTERM_RUNNER_REEXEC_FROM;process.env.TAILTERM_RUNNER_REEXEC_GEN="4";assert.equal(runnerCodeGate().restartGeneration,4);
+ delete process.env.TAILTERM_RUNNER_REEXEC_GEN;assert.equal(runnerCodeGate().restartGeneration,null);
 });

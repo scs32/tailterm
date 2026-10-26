@@ -1,7 +1,7 @@
 import { readReleaseSummaries, readReleaseDetail, releaseProjection, bookendReleaseLedger, deploymentBaselines, fileSHA256, RELEASE_READ_ATTEMPTS, pinnedWrangler, wranglerBin } from "./release-inputs.mjs";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { openSync, closeSync, fsyncSync, writeFileSync, readFileSync, renameSync, mkdirSync, mkdtempSync, existsSync, rmSync, rmdirSync, copyFileSync, cpSync, chmodSync, statSync, lstatSync, realpathSync, readdirSync, constants } from "node:fs";
 import { join, resolve, dirname, basename, isAbsolute } from "node:path";
@@ -233,6 +233,9 @@ export function cliFailureNotice(failure, run) {
 // poll. The file holds only times, the job id and childReason's fixed
 // phrases. Tests replace now.
 export const transportWait = {escalateMs: 600000, now: () => Date.now()};
+// A held claim notice's owner-helper lookup that failed is not repeated for
+// rosterMs (wi_56ac00ba2854fa3d c3). Tests replace now.
+export const heldRetry = {rosterMs: 300000, now: () => Date.now()};
 const transportWaitPath = dir => join(dir, "transport-wait.json");
 function readTransportWait(dir) {
   try { const wait = JSON.parse(readFileSync(transportWaitPath(dir), "utf8")); return wait?.version === 1 && Number.isFinite(Date.parse(wait.since)) ? wait : null; } catch { return null; }
@@ -2191,7 +2194,7 @@ const validCode=c=>HEX64.test(c?.digest||"") && RUNNER_CODE_FILES.every(n=>HEX64
 // digest means the re-exec did not change what this process loads. held is
 // the id of the runner's sole owned job when that job is held (heldRestartJob):
 // a stale runner that is not idle restarts with it, and heldJob names it.
-export const CODE_REASONS=["loaded-unreadable","published-unreadable","restart-did-not-refresh","checkout-dirty","checkout-failed","disk-mismatch","exec-failed"];
+export const CODE_REASONS=["loaded-unreadable","published-unreadable","restart-did-not-refresh","checkout-dirty","checkout-failed","disk-mismatch","exec-failed","load-failed"];
 export function codeDecision({loaded,published,idle,marker,held}){
   if(!validCode(loaded))return {state:"refused",reason:"loaded-unreadable"};
   if(!validCode(published) || !sha(published.commit))return {state:"refused",reason:"published-unreadable"};
@@ -2206,7 +2209,8 @@ export function codeDecision({loaded,published,idle,marker,held}){
 const HELD_PHASES=["prepared","integrated","refusing"];
 // The one job a stale runner may restart with, or null. The ledger's only
 // claimed, merged or blocked job is claimed by this agent and run; the hub
-// shows nothing published, no receipt and no inputs binding; its journal is
+// shows nothing published, no receipt and no inputs binding unless the
+// journal is refusing (wi_56ac00ba2854fa3d c4); its journal is
 // readable, of exactly this claim, in a held phase, with no effects and not
 // published, and is not one a requeue lets runRelease archive and start again;
 // no matrix run of the job is unsettled, this process has no matrix child and
@@ -2217,14 +2221,38 @@ export function heldRestartJob({jobs,details,agent,run,journalDirectory,lock,mat
     if(active.length!==1 || !agent || !run)return null;
     const job=details.get(active[0].id);
     if(!job || job.id!==active[0].id || active[0].state!=="claimed" || job.state!=="claimed" || job.agentId!==agent || job.runId!==run || !sha(job.commit))return null;
-    if(job.published===true || job.receipt || job.inputsDigest)return null;
+    if(job.published===true || job.receipt)return null;
     if(matrixChildren!==0 || existsSync(lock) || matrixRunUnsettled(journalDirectory,job))return null;
     const path=join(journalDirectory,job.id+".json"),prior=JSON.parse(readFileSync(path,"utf8")),recovery=job.reconciliations?.at(-1);
     if(prior?.jobId!==job.id || prior.commit!==job.commit || prior.agentId!==agent || prior.runId!==run || (prior.taskId!==undefined && prior.taskId!==job.taskId) || (prior.pauseGeneration!==undefined && prior.pauseGeneration!==job.pauseGeneration))return null;
     if(!HELD_PHASES.includes(prior.phase) || !Array.isArray(prior.effects) || prior.effects.length || prior.published!==undefined && prior.published!==false)return null;
     if(recovery?.disposition==="requeue" && recovery.journalDigest===fileDigest(path))return null;
+    // Bound release inputs are held only by a refusal, which runRelease
+    // finishes whatever the inputs; a prepared or integrated job keeps them.
+    if(job.inputsDigest && prior.phase!=="refusing")return null;
     return job.id;
   }catch{return null;}
+}
+// Whether a runner that could not read the job list is idle by its own
+// journals (wi_56ac00ba2854fa3d c1): no journal of this agent and run in a
+// non-final phase, no matrix child of this process, and no host release lock
+// at the lock path of any journal's task or at the last ledger's lock path.
+// Archived journals and input manifests are not journals here. False on any
+// doubt, an unreadable journal included.
+const FINAL_PHASES=["complete","refused"];
+export function journalIdle({journalDirectory,cwd,agent,run,lastLock,matrixChildren}){
+  try{
+    if(matrixChildren!==0 || !agent || !run)return false;
+    const locks=new Set(lastLock?[lastLock]:[]);
+    for(const name of readdirSync(journalDirectory)){
+      if(!/^rel_[A-Za-z0-9_-]{1,64}\.json$/.test(name) || name.endsWith("-inputs.json"))continue;
+      const journal=JSON.parse(readFileSync(join(journalDirectory,name),"utf8"));
+      if(!journal || typeof journal!=="object")return false;
+      locks.add(hostLockPath(cwd,{taskId:journal.taskId}));
+      if(journal.agentId===agent && journal.runId===run && !FINAL_PHASES.includes(journal.phase))return false;
+    }
+    return ![...locks].some(lock=>existsSync(lock));
+  }catch{return false;}
 }
 // Journal phases a clean stop may unclaim: the claim waits for the handler's
 // own step (the inputs binding or the integrated matrix import) or for the
@@ -2262,43 +2290,81 @@ export function prepareCode(cwd,published){
   let disk;try{disk=diskCode(join(cwd,"scripts"));}catch{throw releaseError("disk-mismatch");}
   if(disk.digest!==published.digest)throw releaseError("disk-mismatch");
 }
+// Whether the published runner in the checkout loads (wi_56ac00ba2854fa3d
+// c2): a child imports scripts/release-runner.mjs, and with it every watched
+// file, within timeoutMs. No path is passed as an argument, so no daemon
+// entry's argv guard matches and nothing runs but the imports. True only on
+// exit 0. A stop signal kills the child.
+export function runnerLoads(cwd,{timeoutMs=20000,signal}={}){
+  const env=Object.fromEntries(Object.entries(process.env).filter(([k])=>!k.startsWith("TAILTERM_RUNNER_REEXEC")));
+  const url=pathToFileURL(join(cwd,"scripts","release-runner.mjs")).href;
+  return new Promise(done=>{
+    try{
+      const child=spawn(process.execPath,["--input-type=module","-e",`await import(${JSON.stringify(url)});process.exit(0);`],{cwd,env,stdio:"ignore",timeout:timeoutMs,killSignal:"SIGKILL",...(signal?{signal}:{})});
+      child.once("error",()=>done(false));child.once("exit",(code,signal)=>done(code===0 && !signal));
+    }catch{done(false);}
+  });
+}
 // The gate serveDeployment consults before every claim; only the daemon entry
 // builds it, and tests replace its parts. exec replaces this process image
 // (same pid, parent, agent and run) and returns only in tests, or when a stop
 // signal arrived first: the new image would not know it was told to stop.
-// noticed and said hold what this process already posted and printed.
+// noticed and said hold what this process already posted and printed. loads
+// is the published runner's load check (runnerLoads) after prepare.
+// restartGeneration is which restart of this run made this process (1 for
+// the first), from the re-exec environment; a restart begun by a runner that
+// passed none counts as the first (wi_56ac00ba2854fa3d c5).
 const stopSignalTurn=()=>new Promise(done=>setImmediate(()=>setImmediate(done)));
+const generationOf=v=>Number.isSafeInteger(v) && v>=1 && v<=999999?v:0;
 export function runnerCodeGate(over={}){
-  const from=process.env.TAILTERM_RUNNER_REEXEC_FROM;
-  return {loaded:LOADED_CODE,marker:process.env.TAILTERM_RUNNER_REEXEC||null,restartedFrom:HEX64.test(from||"")?from:null,
+  const from=process.env.TAILTERM_RUNNER_REEXEC_FROM,gen=process.env.TAILTERM_RUNNER_REEXEC_GEN,generation=/^[1-9][0-9]{0,5}$/.test(gen||"")?Number(gen):0;
+  return {loaded:LOADED_CODE,marker:process.env.TAILTERM_RUNNER_REEXEC||null,restartedFrom:HEX64.test(from||"")?from:null,restartGeneration:generation||(HEX64.test(from||"")?1:null),
     published:publishedCode,prepare:prepareCode,now:()=>Date.now(),execve:(file,argv,env)=>process.execve(file,argv,env),
-    async exec(published,signal){
+    loadTimeoutMs:20000,loads(cwd,signal){return runnerLoads(cwd,{timeoutMs:this.loadTimeoutMs,signal});},
+    async exec(published,signal,generation){
       // Whatever this process printed reaches a piped terminal before it is replaced.
       await new Promise(done=>{setTimeout(done,1000).unref();process.stderr.write("",()=>done());});
       // A signal that arrived during this poll's synchronous work is handled
       // only once the event loop turns, so it is given that turn.
       await stopSignalTurn();if(signal?.aborted)return;
-      this.execve(process.execPath,[process.execPath,...process.execArgv,...process.argv.slice(1)],{...process.env,TAILTERM_RUNNER_REEXEC:published.digest,TAILTERM_RUNNER_REEXEC_FROM:this.loaded.digest});
+      this.execve(process.execPath,[process.execPath,...process.execArgv,...process.argv.slice(1)],{...process.env,TAILTERM_RUNNER_REEXEC:published.digest,TAILTERM_RUNNER_REEXEC_FROM:this.loaded.digest,TAILTERM_RUNNER_REEXEC_GEN:String(generation)});
     },
     noticed:new Set(),said:new Set(),...over};
 }
+// The restart generation the last runner-code.json of this agent and run
+// recorded, or 0.
+function recordedGeneration(prior){
+  return prior && prior.agentId===(process.env.TAILTERM_AGENT||null) && prior.runId===(process.env.TAILTERM_RUN||null)?generationOf(prior.restartGeneration):0;
+}
+function readCodeRecord(config){try{return JSON.parse(readFileSync(join(config.journalDirectory,"runner-code.json"),"utf8"));}catch{return null;}}
+// The generation of a restart onto published: one more than any this run
+// reached, kept for that published code so a retry of the same restart in
+// this process repeats it.
+export function restartGeneration(config,code,published){
+  if(code.restartFor?.digest!==published.digest)code.restartFor={digest:published.digest,generation:Math.max(generationOf(code.restartGeneration),recordedGeneration(readCodeRecord(config)))+1};
+  return code.restartFor.generation;
+}
 // JOURNAL/runner-code.json (0600): the code this process loaded and the
-// published code it was last compared with. Rewritten only when something
+// published code it was last compared with, and the latest restart
+// generation of this run when there is one. Rewritten only when something
 // other than checkedAt changes, so checkedAt is when this state was first seen.
 export function codeRecord(config,code,decision,published){
   const iso=ms=>new Date(ms).toISOString(),loaded=validCode(code.loaded)?{digest:code.loaded.digest,files:code.loaded.files}:null;
   const current=validCode(published)&&sha(published.commit)?{commit:published.commit,digest:published.digest,files:published.files}:null;
   code.startedAt??=iso(code.now());
+  const path=join(config.journalDirectory,"runner-code.json"),unchecked=r=>JSON.stringify({...r,checkedAt:null}),prior=readCodeRecord(config);
+  const generation=Math.max(generationOf(code.restartFor?.generation),generationOf(code.restartGeneration),recordedGeneration(prior));
   const record={version:1,agentId:process.env.TAILTERM_AGENT||null,runId:process.env.TAILTERM_RUN||null,pid:process.pid,startedAt:code.startedAt,checkedAt:iso(code.now()),state:decision.state,...(decision.reason?{reason:decision.reason}:{}),...(decision.state==="restart"&&decision.heldJob?{heldJob:decision.heldJob}:{}),
-    loaded,current,changed:loaded&&current?RUNNER_CODE_FILES.filter(n=>loaded.files[n]!==current.files[n]):[],...(loaded&&code.restartedFrom&&[loaded.digest,scriptsDigest(loaded.files)].includes(code.marker)?{restartedFrom:code.restartedFrom}:{})};
-  const path=join(config.journalDirectory,"runner-code.json"),unchecked=r=>JSON.stringify({...r,checkedAt:null});
-  let prior=null;try{prior=JSON.parse(readFileSync(path,"utf8"));}catch{}
+    loaded,current,changed:loaded&&current?RUNNER_CODE_FILES.filter(n=>loaded.files[n]!==current.files[n]):[],...(loaded&&code.restartedFrom&&[loaded.digest,scriptsDigest(loaded.files)].includes(code.marker)?{restartedFrom:code.restartedFrom}:{}),...(generation?{restartGeneration:generation}:{})};
   if(prior && unchecked(prior)===unchecked(record))return prior;
   save(path,record);return record;
 }
 // Board notices about the runner's code. Only 12-hex prefixes, names from
 // RUNNER_CODE_FILES and fixed reason tokens reach the text. The request id
-// has no time in it, so a restarted process resends the same notice.
+// has no time in it, so a restarted process resends the same notice. From a
+// run's second restart on, the restart and restarted ids end in -rN, its
+// restart generation, so a run that restarts between the same scripts again
+// sends a new notice rather than one the hub refuses as a reused id.
 const RESTART_ACTION="Action: run tt deployment setup for the deployer with its current run as predecessor (docs/project-deployment.md).";
 const short=v=>HEX64.test(v||"")||sha(v)?v.slice(0,12):"none";
 export function codeNotice(record,kind=record?.state){
@@ -2306,7 +2372,8 @@ export function codeNotice(record,kind=record?.state){
   const run=NAME(record.runId),loaded=short(record.loaded?.digest),current=short(record.current?.digest),reason=CODE_REASONS.includes(record.reason)?record.reason:"unclassified";
   const changed=(Array.isArray(record.changed)?record.changed:[]).filter(n=>RUNNER_CODE_FILES.includes(n)).join(", ")||"none";
   const seen=`Deployer run ${run} loaded scripts ${loaded}; ${record.current?`published tasks-hub ${short(record.current.commit)} has ${current}`:"the published tasks-hub scripts could not be read"}. Changed: ${changed}.`;
-  const requestId=`runner-code-${run}-${loaded}-${current}-${kind}${kind==="refused"?"-"+reason:""}`;
+  const generation=generationOf(record.restartGeneration),restartId=["restart","restarted"].includes(kind) && generation>=2?`-r${generation}`:"";
+  const requestId=`runner-code-${run}-${loaded}-${current}-${kind}${kind==="refused"?"-"+reason:restartId}`;
   if(kind==="draining")return {requestId,wake:WAKE.routine,subject:"Deployer code is out of date; it restarts itself after the current release",text:`${seen} It claims no new release, and restarts itself onto the published scripts once no release, matrix run or host release lock is active.`};
   // A restart with a held job is its own notice and names the job.
   if(kind==="restart" && record.heldJob!==undefined){const job=NAME(record.heldJob);return {requestId:`${requestId}-held-${job}`,wake:WAKE.routine,subject:"Deployer is restarting itself onto the published scripts with a held job",text:`${seen} Its only owned release ${job} is held, with no release effects, nothing published, no unsettled matrix run and no host release lock, so it restarts itself now with that held job and the same agent and run; the published scripts then run the job. A notice that it runs the published scripts follows; if none arrives the deployer did not come back. ${RESTART_ACTION}`};}
@@ -2676,10 +2743,17 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
   // helper, directed so both are woken. While a recipient cannot be resolved
   // or its post fails, one Board notice without a recipient stands in and that
   // recipient is tried again at the next poll. Only that Board copy carries
-  // the wake class. Nothing here changes the skip.
+  // the wake class. Nothing here changes the skip. A roster read that found
+  // no single live owner helper is tried again only after heldRetry.rosterMs;
+  // the handler lookup and a failed post are tried at every poll.
+  let rosterMissAt=null;
   const HELD_TO={handler:reader=>reader.handler(),helper:reader=>{
-    const live=JSON.parse(reader.command([config.tt||"tt","agents","--json"])).filter(a=>a?.role==="owner_helper" && !["closed","exited"].includes(a.status));
-    if(live.length!==1 || !/^agt_[a-f0-9]+$/.test(live[0].id||""))throw releaseError("One live owner helper required");return live[0].id;}};
+    if(rosterMissAt!==null && heldRetry.now()-rosterMissAt<heldRetry.rosterMs)throw releaseError("Owner helper roster read deferred");
+    try{
+      const live=JSON.parse(reader.command([config.tt||"tt","agents","--json"])).filter(a=>a?.role==="owner_helper" && !["closed","exited"].includes(a.status));
+      if(live.length!==1 || !/^agt_[a-f0-9]+$/.test(live[0].id||""))throw releaseError("One live owner helper required");
+      rosterMissAt=null;return live[0].id;
+    }catch(error){rosterMissAt=heldRetry.now();throw error;}}};
   const heldNotify=(reader,job,kind,reason)=>{
     const notice=heldClaimNotice(job,kind,reason,process.env.TAILTERM_RUN);if(!notice)return;
     const send=(suffix,to)=>say(reader,[config.tt||"tt","send","--kind","notice",...(to?["--to",to]:[]),"--subject",notice.subject,"--text",notice.text,"--request-id",`${notice.requestId}-${suffix}`,"--ref",`release-job=${notice.jobId}`,...(notice.item?["--ref",`item=${notice.item}`]:[]),...(notice.commit?["--ref",`commit=${notice.commit}`]:[]),...(to?[]:wakeRef(notice.wake))]);
@@ -2689,7 +2763,8 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
       try{send(name,resolve(reader));posted.add(`${notice.key} ${name}`);}catch{missed=true;}
     }
     if(!missed)return;
-    process.stderr.write("Held claim notice not delivered to every recipient; the next poll retries.\n");
+    // Once per job and process: the retries below are silent.
+    if(!posted.has(`undelivered ${notice.jobId}`)){posted.add(`undelivered ${notice.jobId}`);process.stderr.write("Held claim notice not delivered to every recipient; the next poll retries.\n");}
     if(posted.has(`${notice.key} board`))return;
     try{send("board");posted.add(`${notice.key} board`);}catch{}
   };
@@ -2735,6 +2810,56 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
   // information for the hub's notice; the hub decides nothing by it.
   const progressState={withdrawn:false};
   const reporter=progress===true?Object.assign(new HostAdapter(config,{}),{progressOn:true,progressState}):null;
+  // The runner's own code, once per poll and before any claim. It restarts
+  // when idle: no claimed, merged or blocked job, no matrix run of this
+  // process and no host release lock. It also restarts when its only owned
+  // job is held (heldRestartJob), so a fix for a stuck job can be loaded.
+  // Whatever is decided, a stale runner claims nothing below; a job it
+  // already owns is otherwise still run. With no ledger (a failed read) the
+  // runner is idle only by journalIdle, and has no held job. STOP: a stop
+  // signal arrived, and the caller returns.
+  const STOP=Symbol("stop");let lastLock=null;
+  const gateTurn=async(reader,ledger)=>{
+    let published=null;try{published=code.published(config.cwd);}catch{}
+    let idle,held=null;
+    if(ledger){
+      const {jobs,details,lock}=ledger;
+      idle=!jobs.some(j=>["claimed","merged","blocked"].includes(j.state)) && MATRIX_CHILDREN.size===0 && !existsSync(lock);
+      held=idle?null:heldRestartJob({jobs,details,agent:process.env.TAILTERM_AGENT,run:process.env.TAILTERM_RUN,journalDirectory:config.journalDirectory,lock,matrixChildren:MATRIX_CHILDREN.size});
+    }else idle=journalIdle({journalDirectory:config.journalDirectory,cwd:config.cwd,agent:process.env.TAILTERM_AGENT,run:process.env.TAILTERM_RUN,lastLock,matrixChildren:MATRIX_CHILDREN.size});
+    let decision=codeDecision({loaded:code.loaded,published,idle,marker:code.marker,held});
+    // A re-exec that failed in this process is not tried again for the same
+    // published code, so its refusal is not rewritten on every poll.
+    if(decision.state==="restart" && code.execFailed===published.digest)decision={state:"refused",reason:"exec-failed"};
+    // Nor is a published runner that did not load spawned again.
+    if(decision.state==="restart" && code.loadFailed===published.digest)decision={state:"refused",reason:"load-failed"};
+    // A runner told to stop does not restart: nothing below moves the
+    // checkout, replaces the process or claims once the signal is set.
+    if(decision.state==="restart"){await stopSignalTurn();if(signal?.aborted)return STOP;}
+    if(decision.state==="restart"){
+      try{code.prepare(config.cwd,published);}
+      catch(error){const reason=failureReason(error);decision={state:"refused",reason:CODE_REASONS.includes(reason)?reason:"checkout-failed"};}
+    }
+    // The published runner must load before this process is replaced by it.
+    if(decision.state==="restart"){
+      let loads=false;try{loads=await code.loads(config.cwd,signal)===true;}catch{}
+      if(signal?.aborted)return STOP;
+      if(!loads){code.loadFailed=published.digest;decision={state:"refused",reason:"load-failed"};}
+    }
+    if(decision.state==="restart"){
+      // Recorded and announced first: a successful exec never returns.
+      const generation=restartGeneration(config,code,published);
+      codeNotify(reader,codeRecord(config,code,decision,published));
+      try{await code.exec(published,signal,generation);}catch{code.execFailed=published.digest;decision={state:"refused",reason:"exec-failed"};}
+      if(signal?.aborted)return STOP;
+    }
+    const codeNow=codeRecord(config,code,decision,published);
+    // An unreadable published ref is announced only when it withholds a
+    // claim (below), so a poll with nothing to claim stays silent.
+    if(codeNow.state==="current"){if(codeNow.restartedFrom)codeNotify(reader,codeNow,"restarted");}
+    else if(codeNow.reason!=="published-unreadable")codeNotify(reader,codeNow);
+    return codeNow;
+  };
   reporter?.progress({phase:"start"});
   while(!signal?.aborted){
     let reader=null;const ran=[];let ended={};
@@ -2775,44 +2900,21 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
         return {jobs,baselines,details,lock};
       }
     };
-    const {jobs,baselines,details,lock}=readLedger();
+    // A failed ledger read still runs the code gate (wi_56ac00ba2854fa3d
+    // c1), with idleness taken from this run's own journals, before the
+    // failure holds the poll as it did.
+    let ledger=null,readError=null;
+    try{ledger=readLedger();}catch(error){readError=error;}
+    if(!ledger){
+      if(code){let turn=null;try{turn=await gateTurn(reader,null);}catch{}if(turn===STOP)return;}
+      throw readError;
+    }
+    const {jobs,baselines,details,lock}=ledger;lastLock=lock;
     const recovery=[...details.values()];
     reconcileReceipts(config,recovery);reconcileHostLocks(config,recovery);
     try{pruneJournal(config,jobs,{keepDists:[baselines.tailos]});}catch{process.stderr.write("Journal retention sweep failed; remaining backup copies kept.\n");}
-    // The runner's own code, once per poll and before any claim. It restarts
-    // when idle: no claimed, merged or blocked job, no matrix run of this
-    // process and no host release lock. It also restarts when its only owned
-    // job is held (heldRestartJob), so a fix for a stuck job can be loaded.
-    // Whatever is decided, a stale runner claims nothing below; a job it
-    // already owns is otherwise still run.
     let codeNow=null;
-    if(code){
-      let published=null;try{published=code.published(config.cwd);}catch{}
-      const idle=!jobs.some(j=>["claimed","merged","blocked"].includes(j.state)) && MATRIX_CHILDREN.size===0 && !existsSync(lock);
-      const held=idle?null:heldRestartJob({jobs,details,agent:process.env.TAILTERM_AGENT,run:process.env.TAILTERM_RUN,journalDirectory:config.journalDirectory,lock,matrixChildren:MATRIX_CHILDREN.size});
-      let decision=codeDecision({loaded:code.loaded,published,idle,marker:code.marker,held});
-      // A re-exec that failed in this process is not tried again for the same
-      // published code, so its refusal is not rewritten on every poll.
-      if(decision.state==="restart" && code.execFailed===published.digest)decision={state:"refused",reason:"exec-failed"};
-      // A runner told to stop does not restart: nothing below moves the
-      // checkout, replaces the process or claims once the signal is set.
-      if(decision.state==="restart"){await stopSignalTurn();if(signal?.aborted)return;}
-      if(decision.state==="restart"){
-        try{code.prepare(config.cwd,published);}
-        catch(error){const reason=failureReason(error);decision={state:"refused",reason:CODE_REASONS.includes(reason)?reason:"checkout-failed"};}
-      }
-      if(decision.state==="restart"){
-        // Recorded and announced first: a successful exec never returns.
-        codeNotify(reader,codeRecord(config,code,decision,published));
-        try{await code.exec(published,signal);}catch{code.execFailed=published.digest;decision={state:"refused",reason:"exec-failed"};}
-        if(signal?.aborted)return;
-      }
-      codeNow=codeRecord(config,code,decision,published);
-      // An unreadable published ref is announced only when it withholds a
-      // claim (below), so a poll with nothing to claim stays silent.
-      if(codeNow.state==="current"){if(codeNow.restartedFrom)codeNotify(reader,codeNow,"restarted");}
-      else if(codeNow.reason!=="published-unreadable")codeNotify(reader,codeNow);
-    }
+    if(code){codeNow=await gateTurn(reader,{jobs,details,lock});if(codeNow===STOP)return;}
     const skipped=new Set();
     for (;;) {
       const summary=runnableJob(jobs,process.env.TAILTERM_AGENT,process.env.TAILTERM_RUN,skipped);

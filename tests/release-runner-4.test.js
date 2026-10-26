@@ -44,7 +44,8 @@ test("held s1 each failed guard leaves the stale runner draining as before: no r
   ["the journal is published",(h,r,own)=>{heldJournal(h,own,{published:true});}],
   ["the journal's published flag is not a boolean",(h,r,own)=>{heldJournal(h,own,{published:"no"});}],
   ["the hub shows the job published",()=>[heldOwn({published:true})]],
-  ["the hub shows bound release inputs",()=>[heldOwn({inputsDigest:"f".repeat(64)})]],
+  // A refusing journal with bound inputs restarts (held c4); the other held phases do not.
+  ...["prepared","integrated"].map(phase=>[`the hub shows bound release inputs and the journal phase is ${phase}`,(h,r,own)=>{heldJournal(h,own,{phase});return [heldOwn({inputsDigest:"f".repeat(64)})];}]),
   ["a matrix run of the job is started",h=>{attempt(h,JSON.stringify({state:"started"}));}],
   ["a matrix run of the job is starting",h=>{attempt(h,JSON.stringify({state:"starting"}));}],
   ["a matrix run record of the job is unreadable",h=>{attempt(h,"{not json");}],
@@ -55,8 +56,13 @@ test("held s1 each failed guard leaves the stale runner draining as before: no r
   const r=codeRepo(t),h=codeHost(t,r.cwd),own=heldOwn(),{gate,execs}=codeGate(r.codeA),released=[];r.at(r.a,r.b);heldJournal(h,own);
   const arranged=arrange(h,r,own),undo=typeof arranged==="function"?arranged:()=>{};t.after(undo);h.setJobs(Array.isArray(arranged)?arranged:[own]);
   let err;try{err=await h.poll(gate,async c=>{released.push(c.job.id);});err+=await h.poll(gate,async c=>{released.push(c.job.id);});}finally{undo();}
-  // An unreadable journal of an active job holds the whole poll before the code gate, as it did.
-  if(name==="the journal is unreadable"){assert.equal(execs.length,0);assert.equal(r.head(),r.a);assert.deepEqual(h.sends(),[]);assert.deepEqual(released,[]);assert.equal(existsSync(join(h.home,"runner-code.json")),false);assert.match(err,/^Deployment poll held \(/);continue;}
+  // An unreadable journal of an active job holds the whole poll, but the code gate still runs (code c1): it drains, as the journal makes it not idle.
+  if(name==="the journal is unreadable"){
+   assert.equal(execs.length,0);assert.equal(r.head(),r.a);assert.deepEqual(released,[]);assert.equal(h.claims().length,0);
+   assert.equal(h.record().state,"draining");assert.deepEqual(codeSends(h).map(s=>s.subject),[DRAINING_SUBJECT]);assert.deepEqual(h.sends().map(s=>s.subject),[DRAINING_SUBJECT]);
+   assert.ok(err.startsWith("Deployer code is out of date; no new release is claimed and a restart follows the active work.\nDeployment poll held ("),err);assert.equal(err.split("Deployment poll held (").length-1,2);
+   continue;
+  }
   assert.equal(execs.length,0,name);assert.equal(r.head(),r.a,name);assert.equal(h.claims().length,0,name);
   assert.equal(h.record().state,"draining",name);assert.equal(h.record().heldJob,undefined,name);
   assert.deepEqual(codeSends(h).map(s=>s.subject),[DRAINING_SUBJECT],name);
@@ -130,6 +136,41 @@ test("held s5 no restart loop: a restart that did not refresh, a dirty checkout 
  assert.deepEqual(released,[["rel_held","claimed",CODE_AGENT,CODE_RUN,join(h.home,"rel_held.json"),{loaded:r.codeB.digest,current:r.codeB.digest},before]]);
  assert.equal(execs.length,0);assert.equal(h.claims().length,0);assert.equal(h.record().state,"current");assert.equal(h.record().restartedFrom,r.codeA.digest);
  assert.deepEqual(codeSends(h).map(s=>s.subject),["Deployer now runs the published scripts"]);
+});
+test("held c4 a held job with bound release inputs restarts with its refusing journal, and prepared or integrated journals with bound inputs still drain",async t=>{
+ const bound=heldOwn({inputsDigest:"f".repeat(64)});
+ // The predicate: refusing with bound inputs is the held job; other phases, an effect or a publication are not.
+ {
+  const r=codeRepo(t),h=codeHost(t,r.cwd),lock=join(tmpdir(),"tailterm-release-locks",hash(r.cwd+"\0fixture")+".lock");
+  const at=over=>{heldJournal(h,bound,over);return heldRestartJob({jobs:[bound],details:new Map([[bound.id,bound]]),agent:CODE_AGENT,run:CODE_RUN,journalDirectory:h.home,lock,matrixChildren:0});};
+  assert.equal(at({}),"rel_held");
+  for(const phase of ["prepared","integrated"])assert.equal(at({phase}),null,phase);
+  // Without bound inputs the prepared and integrated phases are held as before.
+  for(const phase of ["prepared","integrated","refusing"]){heldJournal(h,bound,{phase});assert.equal(heldRestartJob({jobs:[heldOwn()],details:new Map([[bound.id,heldOwn()]]),agent:CODE_AGENT,run:CODE_RUN,journalDirectory:h.home,lock,matrixChildren:0}),"rel_held",phase);}
+  for(const over of [{effects:[{target:"hub"}]},{published:true},{effects:undefined}])assert.equal(at(over),null,JSON.stringify(over));
+  for(const job of [{...bound,published:true},{...bound,receipt:{}}])assert.equal(heldRestartJob({jobs:[job],details:new Map([[job.id,job]]),agent:CODE_AGENT,run:CODE_RUN,journalDirectory:h.home,lock,matrixChildren:0}),null);
+  heldJournal(h,bound);assert.equal(heldRestartJob({jobs:[bound],details:new Map([[bound.id,bound]]),agent:CODE_AGENT,run:CODE_RUN,journalDirectory:h.home,lock,matrixChildren:1}),null);
+ }
+ // One poll: the refusing job restarts with the runner, its journal untouched.
+ const r=codeRepo(t),h=codeHost(t,r.cwd),{gate,execs}=codeGate(r.codeA),released=[];r.at(r.a,r.b);heldJournal(h,bound);h.setJobs([bound]);
+ const before=readFileSync(join(h.home,"rel_held.json"),"utf8");
+ await h.poll(gate,async c=>{released.push(c.job.id);});
+ assert.equal(execs.length,1);assert.equal(r.head(),r.b);assert.equal(h.record().state,"restart");assert.equal(h.record().heldJob,"rel_held");
+ assert.deepEqual(codeSends(h).map(s=>[s.subject,s.requestId]),[[HELD_SUBJECT,`runner-code-${CODE_RUN}-${r.codeA.digest.slice(0,12)}-${r.codeB.digest.slice(0,12)}-restart-held-rel_held`]]);
+ assert.equal(readFileSync(join(h.home,"rel_held.json"),"utf8"),before);assert.equal(h.claims().length,0);
+ // Prepared or integrated with bound inputs: draining, no exec, and the job is still run.
+ for(const phase of ["prepared","integrated"]){
+  const r=codeRepo(t),h=codeHost(t,r.cwd),{gate,execs}=codeGate(r.codeA),released=[];r.at(r.a,r.b);heldJournal(h,bound,{phase});h.setJobs([bound]);
+  await h.poll(gate,async c=>{released.push(c.job.id);});
+  assert.equal(execs.length,0,phase);assert.equal(r.head(),r.a,phase);assert.equal(h.record().state,"draining",phase);assert.deepEqual(codeSends(h).map(s=>s.subject),[DRAINING_SUBJECT],phase);assert.deepEqual(released,["rel_held"],phase);
+ }
+ // After the restart: current code, the refusing job goes to the release path and nothing restarts again.
+ {
+  const r=codeRepo(t),h=codeHost(t,r.cwd),released=[];r.at(r.b,r.b);heldJournal(h,bound);h.setJobs([bound]);
+  const {gate,execs}=codeGate(r.codeB,{marker:r.codeB.digest,restartedFrom:r.codeA.digest});
+  await h.poll(gate,async c=>{released.push([c.job.id,c.job.inputsDigest,readFileSync(c.journalPath,"utf8")]);});
+  assert.deepEqual(released,[["rel_held","f".repeat(64),before]]);assert.equal(execs.length,0);assert.equal(h.record().state,"current");assert.equal(h.claims().length,0);
+ }
 });
 test("select1 a docs-only job on a base older than the tip selects the docs checks only",async()=>{
  const m=matrixRepo(),docs=m.accept(1,"docs/a.md","a\n");ignorePrerequisites(m.f.cwd);placePrerequisites(m.f.cwd);

@@ -414,6 +414,42 @@ export const verifiedJob=(id="rel_code")=>({id,state:"verified",generation:1,com
 // The gate with a spy in place of the process replacement.
 export function codeGate(loaded,over={}){const execs=[];return {execs,gate:runnerCodeGate({loaded,marker:null,restartedFrom:null,now:()=>Date.parse("2026-10-06T06:00:00Z"),execve:(...args)=>{execs.push(args);},...over})};}
 export const codeSends=h=>h.sends().filter(s=>s.requestId.startsWith("runner-code-"));
+// A commit on parent that writes one watched file of a codeRepo copy, and the
+// published code at it; HEAD and tasks-hub are left where they were.
+export function codeCommit(r,parent,text,file="release-runner.mjs"){
+ const head=r.head(),ref=git(r.cwd,"rev-parse","refs/heads/tasks-hub");
+ git(r.cwd,"checkout","--quiet","--detach",parent);writeFileSync(join(r.cwd,"scripts",file),text);git(r.cwd,"add",".");git(r.cwd,"commit","--quiet","-m","code");
+ const commit=r.head();git(r.cwd,"update-ref","refs/heads/tasks-hub",commit);const code=publishedCode(r.cwd);
+ git(r.cwd,"update-ref","refs/heads/tasks-hub",ref);git(r.cwd,"checkout","--quiet","--detach",head);
+ return {commit,code};
+}
+// A published runner that does not load (c2): it appends to counter on every
+// import, then throws or never settles.
+export const unloadable=(counter,mode)=>`import {appendFileSync} from "node:fs";appendFileSync(${JSON.stringify(counter)},"x");\n`+(mode==="hang"?"await new Promise(r=>setTimeout(r,1e9));\n":"throw new Error(\"SYNTHETIC load failure\");\n");
+// A failed job-list read (wi_56ac00ba2854fa3d c1): codeHost's extra snippet
+// that fails deployment list while the file list-fails is in its home.
+export const LIST_FAILS="if(a[1]==='list'&&fs.existsSync(__dirname+'/list-fails'))process.exit(2);";
+export const failList=h=>writeFileSync(join(h.home,"list-fails"),"");
+// A journal of this agent and run (or of another, by over) in its home.
+export const codeJournal=(h,id,over={})=>writeFileSync(join(h.home,id+".json"),JSON.stringify({version:1,jobId:id,commit:"c".repeat(40),agentId:CODE_AGENT,runId:CODE_RUN,effects:[],...over}));
+// The host release lock path of a task for a checkout, as the runner names it.
+export const taskLock=(cwd,taskId="fixture")=>join(tmpdir(),"tailterm-release-locks",hash(cwd+"\0"+taskId)+".lock");
+// One deployer process of several polls, with the mocked 30 s wait ticked
+// between them; between[i] runs before poll i+2. ended(n,stderr) says poll n
+// (1-based) is over, for a poll that waits on a child process. Returns its stderr.
+export async function codeServe(t,h,code,between=[],ended=()=>true){
+ const saved=[process.env.TAILTERM_AGENT,process.env.TAILTERM_RUN],write=process.stderr.write;let err="";
+ process.env.TAILTERM_AGENT=CODE_AGENT;process.env.TAILTERM_RUN=CODE_RUN;process.stderr.write=(chunk,encoding,done=encoding)=>{err+=chunk;if(typeof done==="function")done();return true;};
+ const controller=new AbortController();t.mock.timers.enable({apis:["setTimeout"]});
+ const settle=async n=>{for(let i=0;i<50;i++)await new Promise(r=>setImmediate(r));for(const end=Date.now()+20000;!ended(n,err);){if(Date.now()>end)assert.fail("timed out waiting for poll "+n);await new Promise(r=>setImmediate(r));}};
+ try{
+  const serving=serveDeployment(h.config,{signal:controller.signal,code,release:async()=>{}});
+  await settle(1);
+  for(const [i,step] of between.entries()){step();t.mock.timers.tick(30000);await settle(i+2);}
+  controller.abort();t.mock.timers.tick(30000);await serving;
+ }finally{t.mock.timers.reset();process.stderr.write=write;for(const [i,k] of ["TAILTERM_AGENT","TAILTERM_RUN"].entries()){if(saved[i]===undefined)delete process.env[k];else process.env[k]=saved[i];}}
+ return err;
+}
 // Held claim notice (wi_03c526946b24ce35). One deployer run of several polls
 // over a fake hub whose stderr for a refused claim carries a synthetic secret
 // and the private journal path.
