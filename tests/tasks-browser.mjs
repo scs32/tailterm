@@ -886,10 +886,56 @@ export async function exerciseTaskRestore(page, hub, ssh) {
     );
   }, "marker tab");
 
-  // Cycle 3: the marker comes back and nothing stale attaches.
+  // Cycle 3: the marker comes back and nothing stale attaches. The hub hangs
+  // on the project reads: the plain marker tab, saved last, reconnects while
+  // it does, and the project panes bind once it answers.
+  const stripIds = () =>
+    page
+      .locator("#tabs [data-tab]")
+      .evaluateAll((nodes) => nodes.map((n) => n.dataset.tab));
+  const homeId = () =>
+    page.locator(".tab-strip > .home-tab [data-tab]").getAttribute("data-tab");
+  const stripBefore = await stripIds();
+  const homeBefore = await homeId();
   ssh.attachLog.length = 0;
   await lock();
+  const projectReads = new RegExp(
+    `/fixture-hub/v1/tasks/(${L.task.id}|${N.task.id})(\\?|$)`,
+  );
+  // Unrouting continues any request its handler still holds, so the held
+  // reads are continued first and a read after the release falls through.
+  const heldReads = new Set();
+  const continued = [];
+  let releaseHub,
+    released = false;
+  const hubAnswers = new Promise((resolve) => (releaseHub = resolve));
+  const holdRead = (route) => {
+    if (released) return route.fallback();
+    heldReads.add(route.request().url().match(projectReads)[1]);
+    const done = hubAnswers.then(() => route.continue());
+    continued.push(done);
+    return done;
+  };
+  await page.route(projectReads, holdRead);
   await unlock();
+  await waitFor(
+    () =>
+      heldReads.has(L.task.id) &&
+      heldReads.has(N.task.id) &&
+      ssh.attachLog.includes("marker"),
+    "held project reads and the marker attach",
+  );
+  const whileHeld = [...ssh.attachLog];
+  assert.equal(await restored(), 0, "restore waits on the hub");
+  for (const name of ["l2", "n1", "n3", "helper-rs"])
+    assert.ok(
+      !whileHeld.includes(name),
+      `${name} waits for the hub (attached ${whileHeld.join(",")})`,
+    );
+  released = true;
+  releaseHub();
+  await Promise.all(continued);
+  await page.unroute(projectReads, holdRead);
   await waitFor(restored, "cycle 3 restore", 90000);
   await waitFor(async () => {
     tabs = await inventory();
@@ -903,7 +949,18 @@ export async function exerciseTaskRestore(page, hub, ssh) {
   assert.ok(cycle3.includes("marker"), "marker tab restored");
   for (const name of ["p1", "p2", "l1", "l3", "n2"])
     assert.ok(!cycle3.includes(name), `${name} is not attached in cycle 3`);
+  for (const name of ["l2", "n1", "n3"])
+    assert.equal(
+      cycle3.filter((n) => n === name).length,
+      1,
+      `${name} attaches once in cycle 3`,
+    );
+  assert.deepEqual(await stripIds(), stripBefore, "cycle 3 keeps tab order");
+  assert.equal(await homeId(), homeBefore, "cycle 3 keeps Home");
   await helperWindow("after the third restore", helperBox);
+  console.log(
+    `Plain tab first while the hub hangs: marker reconnected while ${[...heldReads].length} project reads were held; l2, n1 and n3 bound once the hub answered, in the saved tab order.`,
+  );
 
   // A browser refresh restores the same way.
   await hub.navigateWithHubHeld(page, () => page.reload());

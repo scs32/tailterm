@@ -280,14 +280,35 @@ async function restoreWorkspace(value) {
       ...(snapshot?.groups || []).map((g) => g.taskId),
     ].filter(Boolean);
     // Without saved project panes, the startup discovery settles bindings.
-    const hub = saved.some((s) => s.task)
-      ? await (async () => {
+    // Plain tabs need no hub read, so they reconnect while it runs; project
+    // panes still wait for it. The read never rejects.
+    const hubRead = saved.some((s) => s.task)
+      ? (async () => {
           // Reconnecting would wait for Tailscale anyway; wait before the hub read.
           if (staticMode && data.hub?.url)
             await waitForTailscale().catch(() => {});
           return (await taskHub?.preflight(projectIds)) || new Map();
         })()
-      : new Map();
+      : Promise.resolve(new Map());
+    const savedHome = new Set(snapshot?.home ? leaves(snapshot.home.tree) : []);
+    const reconnect = async ({ item, server, task }, role) => {
+      const t = await connect(server, item.tmux, item.session, {
+        restoreId: item.id,
+        resumeOnly: item.tmux,
+        target: item.target,
+        decoration: item.decoration,
+        fontSize: item.fontSize,
+        task: task ? bindingOf({ ...task, role }) : undefined,
+        role,
+        home: savedHome.has(item.id),
+      });
+      if (t) await t.initialReady;
+    };
+    if (snapshot?.tabs.length) {
+      notice("Restoring your terminal workspace...");
+      for (const entry of saved) if (!entry.task) await reconnect(entry);
+    }
+    const hub = await hubRead;
     const dropped = new Set(
       [...hub]
         .filter(([, detail]) => detail === null || !liveProject(detail.task))
@@ -299,40 +320,32 @@ async function restoreWorkspace(value) {
         (layout) => !dropped.has(layout.taskId),
       ),
     );
-    const savedHome = new Set(snapshot?.home ? leaves(snapshot.home.tree) : []);
     if (snapshot?.tabs.length) {
-      notice("Restoring your terminal workspace...");
-      for (const { item, server, task } of saved) {
+      for (const entry of saved) {
+        const { item, server, task } = entry;
+        if (!task) continue;
         let role;
-        if (task) {
-          const detail = hub.get(task.taskId);
-          const verdict = restoreVerdict(task, detail);
-          const agent = detail?.agents?.find((a) => a.id === task.agentId);
-          // A known roster decides home by role; otherwise the saved place.
-          if (agent) role = homeAgent(agent) ? "owner_helper" : "";
-          if (
-            !["keep", "unknown"].includes(verdict) ||
-            (verdict === "keep" &&
-              item.tmux &&
-              sessionCheckNeeded(agent) &&
-              (await sessionExists(server, item.session)) === false)
-          ) {
-            clearAgentBookmark(task.taskId, task.agentId, task.runId);
-            continue;
-          }
+        const detail = hub.get(task.taskId);
+        const verdict = restoreVerdict(task, detail);
+        const agent = detail?.agents?.find((a) => a.id === task.agentId);
+        // A known roster decides home by role; otherwise the saved place.
+        if (agent) role = homeAgent(agent) ? "owner_helper" : "";
+        if (
+          !["keep", "unknown"].includes(verdict) ||
+          (verdict === "keep" &&
+            item.tmux &&
+            sessionCheckNeeded(agent) &&
+            (await sessionExists(server, item.session)) === false)
+        ) {
+          clearAgentBookmark(task.taskId, task.agentId, task.runId);
+          continue;
         }
-        const t = await connect(server, item.tmux, item.session, {
-          restoreId: item.id,
-          resumeOnly: item.tmux,
-          target: item.target,
-          decoration: item.decoration,
-          fontSize: item.fontSize,
-          task: task ? bindingOf({ ...task, role }) : undefined,
-          role,
-          home: savedHome.has(item.id),
-        });
-        if (t) await t.initialReady;
+        await reconnect(entry, role);
       }
+      // Plain tabs connected first; put tabs back in their saved order.
+      const order = new Map(saved.map(({ item }, i) => [item.id, i]));
+      const rank = (t) => order.get(t.id) ?? saved.length;
+      tabs.sort((a, b) => rank(a) - rank(b));
       for (const taskId of dropped)
         void api("/hub/forget-task", "POST", { taskId })
           .then((updated) => {
@@ -1942,7 +1955,7 @@ function openAppearanceDialog(family) {
     <h3>Rendering</h3><div class="appearance-toggles"><label><input type="checkbox" data-preference="gpuRendering" ${appearance.gpuRendering ? "checked" : ""} ${webglSupported() ? "" : "disabled"}>GPU rendering (WebGL)</label></div><p class="fine">${webglSupported() ? "Faster scrolling and output for large histories and grouped panes. Font ligatures such as -> and => only render with GPU rendering off." : "WebGL is unavailable in this browser; the standard renderer is in use."}</p>
     <h3>Attention sound</h3><div class="appearance-toggles"><label><input type="checkbox" data-preference="attentionSound" ${appearance.attentionSound ? "checked" : ""}>Play a gentle chime</label></div><button id="preview-attention-sound">Preview sound</button><p class="fine">Off by default. Chimes for bells, command completion, and connection problems in unattended tabs, at most once every five seconds. Ordinary output stays silent. Keep Tailterm open and interact once after loading to enable browser audio.</p>
     <details class="dialog-details"><summary>Keyboard & selection tips</summary><p class="fine">Switch grouped panes with Option + Shift + arrow keys on Mac, or Ctrl + Alt + arrow keys on Windows/Linux.</p>
-    <p class="fine">While dragging a pane header, hold Left Option (Alt) to split right or Shift + Left Option to split above. From the keyboard, open Commands (⌘/Ctrl + Shift + P) → Move current pane.</p>
+    <p class="fine">While dragging a pane header, hold Left Option (Alt) to split right or Shift + Left Option to split above. On Windows, Left Alt + Shift may also switch the keyboard layout. From the keyboard, open Commands (⌘/Ctrl + Shift + P) → Move current pane.</p>
     <p class="fine">Hold Shift while dragging to select text when tmux handles the mouse. Plain Ctrl+C still interrupts a command. Remote clipboard read requests are never answered.</p></details>`,
   );
   // Preview terminal font changes without reflowing the controls being clicked.
