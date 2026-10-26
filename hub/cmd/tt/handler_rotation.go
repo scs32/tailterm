@@ -54,6 +54,13 @@ func handlerRotationJournalPath(hub, task string) string {
 	return filepath.Join(relayDir(), "handler-rotation-"+rotationStateKey(hub, task)+".json")
 }
 
+// rotationBackoffPath is the host's back-off record after an automatic
+// ceiling abort. Its prefix is not handler-rotation-, so no journal reader
+// sees it.
+func rotationBackoffPath(hub, task string) string {
+	return filepath.Join(relayDir(), "handler-backoff-"+rotationStateKey(hub, task)+".json")
+}
+
 // newHandlerSpec accepts only launch settings: --flag value or --flag=value
 // for the flags a handler launch uses. Identity, project and hub come from
 // the rotation.
@@ -180,6 +187,9 @@ const (
 	rotationPhasePrepared  = "prepared"
 	rotationPhaseSpawned   = "spawned"
 	rotationPhaseCommitted = "committed"
+	// rotationPhaseAborted is a rotation the hub has aborted whose successor
+	// cleanup has not been confirmed; it is never resumed, only finished.
+	rotationPhaseAborted = "aborted"
 )
 
 func loadRotationJournal(hub, task string) (*handlerRotationJournal, error) {
@@ -195,7 +205,7 @@ func loadRotationJournal(hub, task string) (*handlerRotationJournal, error) {
 		return nil, errors.New("handler rotation journal is invalid; inspect it before retrying")
 	}
 	switch j.Phase {
-	case rotationPhasePreparing, rotationPhasePrepared, rotationPhaseSpawned, rotationPhaseCommitted:
+	case rotationPhasePreparing, rotationPhasePrepared, rotationPhaseSpawned, rotationPhaseCommitted, rotationPhaseAborted:
 	default:
 		return nil, errors.New("handler rotation journal has an unknown phase")
 	}
@@ -589,7 +599,29 @@ func newRotationKey(prefix string) string {
 // authorization lets a new rotation change the runtime, model or arm; a
 // resumed rotation uses the one in its journal.
 func rotateHandler(ctx context.Context, d rotationDeps, e env, c *api.Client, task, reason, trigger string, spec handlerSpec, auth rotationAuthorization) (api.HandlerRotation, error) {
-	return runHandlerRotation(ctx, d, e, c, task, reason, trigger, spec, auth, nil)
+	return runHandlerRotation(ctx, d, e, c, task, reason, trigger, spec, auth, nil, nil)
+}
+
+// staleDueEntry reports the hub's refusal of a prepare whose pinned handler
+// run or revision is no longer the project's primary: the due entry the
+// runner read is stale, and its next due request reads the change.
+func staleDueEntry(err error) bool {
+	code, ok := rotationRefusal(err)
+	return ok && (code == api.HandlerRotationRefusedStaleHandler || code == api.HandlerRotationRefusedNotPrimary)
+}
+
+// journalAuthorizationConflict refuses an owner authorization that differs
+// from the one this host's rotation journal records: a resume replays the
+// journal's authorization, so the flags would be silently ignored.
+func journalAuthorizationConflict(j *handlerRotationJournal, auth rotationAuthorization, task string) error {
+	if j == nil || !auth.set() || (j.AuthorizedBy == auth.by && j.AuthorizationReason == auth.reason) {
+		return nil
+	}
+	recorded := "no authorization"
+	if j.AuthorizedBy != "" {
+		recorded = fmt.Sprintf("the authorization of %s", j.AuthorizedBy)
+	}
+	return fmt.Errorf("this host's rotation journal for the project records %s, not the --authorized-by and --authorization-reason given; resume it with the same authorization, or abort it with tt handler rotate --abort --task %s and rotate again", recorded, task)
 }
 
 // deathUnconfirmedRefusal reports a hub refusal that says a dead primary is
@@ -600,9 +632,12 @@ func deathUnconfirmedRefusal(err error) bool {
 }
 
 // runHandlerRotation is rotateHandler with the host's death evidence, which
-// only the runner's dead primary branch passes for a new rotation. A resumed
-// rotation uses the evidence in its journal.
-func runHandlerRotation(ctx context.Context, d rotationDeps, e env, c *api.Client, task, reason, trigger string, spec handlerSpec, auth rotationAuthorization, evidence *api.HandlerDeathEvidence) (api.HandlerRotation, error) {
+// only the runner's dead primary branch passes for a new rotation, and the
+// due entry the runner acts on. A new rotation with a due entry prepares
+// against that entry's exact agent, run and handler revision, so the hub
+// refuses it if the primary changed since the due list. A resumed rotation
+// uses the identity and evidence in its journal.
+func runHandlerRotation(ctx context.Context, d rotationDeps, e env, c *api.Client, task, reason, trigger string, spec handlerSpec, auth rotationAuthorization, evidence *api.HandlerDeathEvidence, due *api.HandlerRotationDue) (api.HandlerRotation, error) {
 	var zero api.HandlerRotation
 	hub := strings.TrimRight(c.Base, "/")
 	path := handlerRotationJournalPath(hub, task)
@@ -613,6 +648,16 @@ func runHandlerRotation(ctx context.Context, d rotationDeps, e env, c *api.Clien
 	defer unlock()
 	j, err := loadRotationJournal(hub, task)
 	if err != nil {
+		return zero, err
+	}
+	// An aborted rotation's successor is cleaned up before a fresh one starts.
+	if j != nil && j.Phase == rotationPhaseAborted {
+		if err = finishAbortedRotation(ctx, d, e, c, task, path, j); err != nil {
+			return zero, err
+		}
+		j = nil
+	}
+	if err = journalAuthorizationConflict(j, auth, task); err != nil {
 		return zero, err
 	}
 	save := func(phase string) error {
@@ -626,10 +671,6 @@ func runHandlerRotation(ctx context.Context, d rotationDeps, e env, c *api.Clien
 		return nil
 	}
 	if j == nil {
-		detail, err := c.GetTask(ctx, task)
-		if err != nil {
-			return zero, err
-		}
 		rotations, err := c.ListHandlerRotations(ctx, task)
 		if err != nil {
 			return zero, err
@@ -639,14 +680,28 @@ func runHandlerRotation(ctx context.Context, d rotationDeps, e env, c *api.Clien
 				return zero, fmt.Errorf("handler rotation %s is prepared without this host's journal; run tt handler rotate --abort --task %s", r.ID, task)
 			}
 		}
-		old, ok := currentPrimaryHandler(detail)
-		// Only a dead primary rotation may name a handler whose wrapper
-		// reported exited; the hub decides whether it is the primary.
-		if exited, found := exitedHandlerNamed(detail, evidence); found {
-			old, ok = exited, true
-		}
-		if !ok {
-			return zero, errors.New("the project has no open database handler to rotate")
+		var old api.Agent
+		var revision int64
+		if due != nil {
+			// The runner's due entry, exactly: the hub refuses the prepare as
+			// stale or not the primary if it changed since the due list.
+			old, revision = due.Agent, due.HandlerRevision
+		} else {
+			detail, err := c.GetTask(ctx, task)
+			if err != nil {
+				return zero, err
+			}
+			var ok bool
+			old, ok = currentPrimaryHandler(detail)
+			// Only a dead primary rotation may name a handler whose wrapper
+			// reported exited; the hub decides whether it is the primary.
+			if exited, found := exitedHandlerNamed(detail, evidence); found {
+				old, ok = exited, true
+			}
+			if !ok {
+				return zero, errors.New("the project has no open database handler to rotate")
+			}
+			revision = detail.Task.HandlerRevision
 		}
 		if old.Host != d.host() {
 			return zero, fmt.Errorf("handler %s runs on %s; rotate it from that host", old.Name, old.Host)
@@ -668,8 +723,8 @@ func runHandlerRotation(ctx context.Context, d rotationDeps, e env, c *api.Clien
 		if reason == "" {
 			reason = api.HandlerRotationReasonManual
 		}
-		j = &handlerRotationJournal{Version: 1, Hub: hub, Task: task, PrepareRequestID: newRotationKey("rotation-prepare"), HandlerRevision: detail.Task.HandlerRevision,
-			OldAgentID: old.ID, OldRunID: old.RunID, SuccessorAgentID: api.NewID("agt"), SuccessorName: api.HandlerSuccessorName(old.Name, detail.Task.HandlerRevision),
+		j = &handlerRotationJournal{Version: 1, Hub: hub, Task: task, PrepareRequestID: newRotationKey("rotation-prepare"), HandlerRevision: revision,
+			OldAgentID: old.ID, OldRunID: old.RunID, SuccessorAgentID: api.NewID("agt"), SuccessorName: api.HandlerSuccessorName(old.Name, revision),
 			Reason: reason, Trigger: trigger, AuthorizedBy: auth.by, AuthorizationReason: auth.reason, DeathEvidence: evidence}
 		if err = save(rotationPhasePreparing); err != nil {
 			return zero, err
@@ -773,7 +828,7 @@ func runHandlerRotation(ctx context.Context, d rotationDeps, e env, c *api.Clien
 				state, detail, commit.DeathEvidence = d.probe(ctx, hub, old)
 			}
 			if state != handlerProbeGone || commit.DeathEvidence == nil {
-				if abortErr := abortJournaledRotation(ctx, d, e, c, task, path, j.RotationID); abortErr != nil {
+				if abortErr := abortJournaledRotation(ctx, d, e, c, task, path, j); abortErr != nil {
 					return zero, fmt.Errorf("the second death probe of %s says %s (%s); aborting the rotation failed and will retry: %w", old.Name, state, detail, abortErr)
 				}
 				return zero, fmt.Errorf("%w: the second probe of %s says %s (%s); the rotation was aborted and it stays primary", errDeathNotConfirmed, old.Name, state, detail)
@@ -784,7 +839,7 @@ func runHandlerRotation(ctx context.Context, d rotationDeps, e env, c *api.Clien
 				return zero, notReady()
 			}
 			if j.Reason == api.HandlerRotationReasonDeadPrimary && deathUnconfirmedRefusal(err) {
-				if abortErr := abortJournaledRotation(ctx, d, e, c, task, path, j.RotationID); abortErr != nil {
+				if abortErr := abortJournaledRotation(ctx, d, e, c, task, path, j); abortErr != nil {
 					return zero, fmt.Errorf("the hub refused the commit (%v); aborting the rotation failed and will retry: %w", err, abortErr)
 				}
 				return zero, fmt.Errorf("%w: %v; the rotation was aborted and the old handler stays primary", errDeathNotConfirmed, err)
@@ -792,6 +847,10 @@ func runHandlerRotation(ctx context.Context, d rotationDeps, e env, c *api.Clien
 			return zero, err
 		}
 		if err = save(rotationPhaseCommitted); err != nil {
+			return zero, err
+		}
+		// A committed rotation ends any back-off for the old primary.
+		if err = os.Remove(rotationBackoffPath(hub, task)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return zero, err
 		}
 	}
@@ -909,7 +968,70 @@ func (r *rotationRunner) abortStuckRotation(ctx context.Context, e env, c *api.C
 		(j.Phase != rotationPhasePrepared && j.Phase != rotationPhaseSpawned) {
 		return err
 	}
-	return abortJournaledRotation(ctx, r.deps, e, c, d.TaskID, path, j.RotationID)
+	if !oldHandlerRecovered(d, j) {
+		if err = recordRotationBackoff(hub, d.TaskID, j, r.deps.now()); err != nil {
+			return err
+		}
+	}
+	return abortJournaledRotation(ctx, r.deps, e, c, d.TaskID, path, j)
+}
+
+// rotationBackoff records the runner's automatic abort of a stuck rotation at
+// its ceiling: until Until, the runner prepares no fresh rotation for the
+// same old agent, run and reason. Aborts counts the ceiling aborts of that
+// run and reason; each one doubles the interval.
+type rotationBackoff struct {
+	Version    int       `json:"version"`
+	Hub        string    `json:"hub"`
+	Task       string    `json:"task"`
+	OldAgentID string    `json:"oldAgentId"`
+	OldRunID   string    `json:"oldRunId"`
+	Reason     string    `json:"reason"`
+	RotationID string    `json:"rotationId"`
+	Aborts     int       `json:"aborts"`
+	Until      time.Time `json:"until"`
+}
+
+// rotationBackoffMax caps the back-off interval, which starts at
+// rotationStuckAbortAfter.
+const rotationBackoffMax = 24 * time.Hour
+
+func loadRotationBackoff(hub, task string) *rotationBackoff {
+	data, err := os.ReadFile(rotationBackoffPath(hub, task))
+	if err != nil {
+		return nil
+	}
+	var b rotationBackoff
+	if json.Unmarshal(data, &b) != nil || b.Version != 1 || b.Hub != strings.TrimRight(hub, "/") || b.Task != task {
+		return nil
+	}
+	return &b
+}
+
+// recordRotationBackoff saves the back-off for a ceiling abort of j. A later
+// ceiling abort for the same old run and reason doubles the interval; a retry
+// of the same abort counts once.
+func recordRotationBackoff(hub, task string, j *handlerRotationJournal, now time.Time) error {
+	b := rotationBackoff{Version: 1, Hub: strings.TrimRight(hub, "/"), Task: task, OldAgentID: j.OldAgentID, OldRunID: j.OldRunID, Reason: j.Reason, RotationID: j.RotationID, Aborts: 1}
+	if prior := loadRotationBackoff(hub, task); prior != nil && prior.OldAgentID == b.OldAgentID && prior.OldRunID == b.OldRunID && prior.Reason == b.Reason {
+		if prior.RotationID == b.RotationID {
+			return nil
+		}
+		b.Aborts = prior.Aborts + 1
+	}
+	interval := rotationStuckAbortAfter
+	for i := 1; i < b.Aborts && interval < rotationBackoffMax; i++ {
+		interval *= 2
+	}
+	b.Until = now.UTC().Add(min(interval, rotationBackoffMax))
+	return writePrivateJSON(rotationBackoffPath(hub, task), b)
+}
+
+// rotationBackedOff reports whether a fresh rotation of the due entry's exact
+// run for reason waits out a back-off. Another run or reason ignores it.
+func rotationBackedOff(hub string, d api.HandlerRotationDue, reason string, now time.Time) bool {
+	b := loadRotationBackoff(hub, d.TaskID)
+	return b != nil && b.OldAgentID == d.Agent.ID && b.OldRunID == d.Agent.RunID && b.Reason == reason && now.Before(b.Until)
 }
 
 // errDeathNotConfirmed marks a dead primary rotation the runner aborted
@@ -917,19 +1039,82 @@ func (r *rotationRunner) abortStuckRotation(ctx context.Context, e env, c *api.C
 var errDeathNotConfirmed = errors.New("dead primary not confirmed")
 
 // abortJournaledRotation aborts the prepared rotation this host's journal
-// names, cleans up its successor's session and removes the journal. The
+// names, saves the journal as aborted, cleans up its successor's session and
+// removes the journal. A failed cleanup keeps the aborted journal, which the
+// runner retries at later ticks whether or not the project is still due. The
 // caller holds the journal lock.
-func abortJournaledRotation(ctx context.Context, d rotationDeps, e env, c *api.Client, task, path, rotationID string) error {
-	r, err := c.HandlerRotationAction(ctx, task, api.HandlerRotationRequest{Operation: api.HandlerRotationAbort, RequestID: "rotation-abort-" + rotationID, RotationID: rotationID})
+func abortJournaledRotation(ctx context.Context, d rotationDeps, e env, c *api.Client, task, path string, j *handlerRotationJournal) error {
+	if _, err := c.HandlerRotationAction(ctx, task, api.HandlerRotationRequest{Operation: api.HandlerRotationAbort, RequestID: "rotation-abort-" + j.RotationID, RotationID: j.RotationID}); err != nil {
+		return err
+	}
+	j.Phase = rotationPhaseAborted
+	if err := writePrivateJSON(path, *j); err != nil {
+		return err
+	}
+	return finishAbortedRotation(ctx, d, e, c, task, path, j)
+}
+
+// finishAbortedRotation cleans up the successor session of a rotation the hub
+// has aborted, then removes the journal. A failed cleanup keeps the journal
+// for the next attempt. The caller holds the journal lock.
+func finishAbortedRotation(ctx context.Context, d rotationDeps, e env, c *api.Client, task, path string, j *handlerRotationJournal) error {
+	_, err := c.GetAgent(ctx, task, j.SuccessorAgentID)
+	var httpErr *api.HTTPError
+	switch {
+	case err == nil:
+		if err = d.cleanup(ctx, e, task, j.SuccessorAgentID); err != nil {
+			return fmt.Errorf("rotation aborted; successor session cleanup will retry: %w", err)
+		}
+	case errors.As(err, &httpErr) && httpErr.Status == http.StatusNotFound:
+		// The successor never registered: there is no session to clean up.
+	default:
+		return fmt.Errorf("rotation aborted; successor session cleanup will retry: %w", err)
+	}
+	return os.Remove(path)
+}
+
+// sweepAbortedRotations finishes every aborted rotation this host journaled
+// for hub, so a successor whose cleanup failed is retried even when its
+// project is no longer due. It reads local files only unless one exists.
+func sweepAbortedRotations(ctx context.Context, d rotationDeps, e env, c *api.Client) error {
+	hub := strings.TrimRight(c.Base, "/")
+	paths, err := filepath.Glob(filepath.Join(relayDir(), "handler-rotation-*.json"))
 	if err != nil {
 		return err
 	}
-	if _, err = c.GetAgent(ctx, task, r.SuccessorAgentID); err == nil {
-		if err = d.cleanup(ctx, e, task, r.SuccessorAgentID); err != nil {
-			return fmt.Errorf("rotation aborted; successor session cleanup will retry: %w", err)
+	var errs []error
+	for _, path := range paths {
+		var saved struct {
+			Hub   string `json:"hub"`
+			Task  string `json:"task"`
+			Phase string `json:"phase"`
+		}
+		if data, err := os.ReadFile(path); err != nil || json.Unmarshal(data, &saved) != nil || saved.Hub != hub || saved.Phase != rotationPhaseAborted ||
+			path != handlerRotationJournalPath(hub, saved.Task) {
+			continue
+		}
+		if err := finishJournaledAbort(ctx, d, e, c, saved.Task); err != nil {
+			errs = append(errs, fmt.Errorf("handler rotation %s: %w", saved.Task, err))
 		}
 	}
-	return os.Remove(path)
+	return errors.Join(errs...)
+}
+
+// finishJournaledAbort finishes the project's aborted rotation under the
+// journal lock; a journal that is gone or no longer aborted is left alone.
+func finishJournaledAbort(ctx context.Context, d rotationDeps, e env, c *api.Client, task string) error {
+	hub := strings.TrimRight(c.Base, "/")
+	path := handlerRotationJournalPath(hub, task)
+	unlock, err := handlerLock(ctx, path)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	j, err := loadRotationJournal(hub, task)
+	if err != nil || j == nil || j.Phase != rotationPhaseAborted {
+		return err
+	}
+	return finishAbortedRotation(ctx, d, e, c, task, path, j)
 }
 
 // abortHandlerRotation aborts the project's prepared rotation, closes and
@@ -949,6 +1134,12 @@ func abortHandlerRotation(ctx context.Context, d rotationDeps, e env, c *api.Cli
 	}
 	if j != nil && j.Phase == rotationPhaseCommitted {
 		return zero, errors.New("the rotation is committed; rerun tt handler rotate to finish the old session's cleanup")
+	}
+	if j != nil && j.Phase == rotationPhaseAborted {
+		if err = finishAbortedRotation(ctx, d, e, c, task, path, j); err != nil {
+			return zero, err
+		}
+		return c.GetHandlerRotation(ctx, task, j.RotationID)
 	}
 	rotations, err := c.ListHandlerRotations(ctx, task)
 	if err != nil {
@@ -975,14 +1166,17 @@ func abortHandlerRotation(ctx context.Context, d rotationDeps, e env, c *api.Cli
 	if err != nil {
 		return zero, err
 	}
+	if j != nil {
+		// The journal now records the abort, so a failed cleanup is retried.
+		j.RotationID, j.SuccessorAgentID, j.Phase = open.ID, r.SuccessorAgentID, rotationPhaseAborted
+		if err = writePrivateJSON(path, *j); err != nil {
+			return r, err
+		}
+		return r, finishAbortedRotation(ctx, d, e, c, task, path, j)
+	}
 	if _, err = c.GetAgent(ctx, task, r.SuccessorAgentID); err == nil {
 		if err = d.cleanup(ctx, e, task, r.SuccessorAgentID); err != nil {
 			return r, fmt.Errorf("rotation aborted; successor session cleanup will retry: %w", err)
-		}
-	}
-	if j != nil {
-		if err = os.Remove(path); err != nil {
-			return r, err
 		}
 	}
 	return r, nil
@@ -1112,6 +1306,17 @@ func cmdHandlerRotate(e env, args []string) error {
 	if *abort {
 		r, err = abortHandlerRotation(ctx, deps, e, c, *task)
 	} else {
+		// A different authorization than the journal's would be ignored by
+		// the resume: refuse before a spec is saved or anything is spawned.
+		if auth.set() {
+			j, err := loadRotationJournal(strings.TrimRight(c.Base, "/"), *task)
+			if err != nil {
+				return err
+			}
+			if err = journalAuthorizationConflict(j, auth, *task); err != nil {
+				return err
+			}
+		}
 		var spec *handlerSpec
 		if len(spawnArgs) > 0 {
 			saved, specErr := newHandlerSpec(c.Base, *task, spawnArgs)
@@ -1517,17 +1722,19 @@ func (r *rotationRunner) tick(ctx context.Context, e env, c *api.Client, host st
 	if now.Before(r.quietTil) {
 		return nil
 	}
+	// Aborted rotations are finished first, whether or not they are listed.
+	sweepErr := sweepAbortedRotations(ctx, r.deps, e, c)
 	list, err := c.HandlerRotationsDue(ctx, host, handlerTemplateDigest(""))
 	if err != nil {
-		return err
+		return errors.Join(sweepErr, err)
 	}
 	if len(list.Entries) == 0 {
 		r.quietTil = now.Add(rotationQuietCache)
-		return nil
+		return sweepErr
 	}
 	r.quietTil = now.Add(r.interval)
 	hub := strings.TrimRight(c.Base, "/")
-	var errs []error
+	errs := []error{sweepErr}
 	for _, d := range list.Entries {
 		spec, err := loadHandlerSpec(hub, d.TaskID)
 		if err != nil {
@@ -1540,6 +1747,10 @@ func (r *rotationRunner) tick(ctx context.Context, e env, c *api.Client, host st
 			continue
 		}
 		if journal != nil {
+			// The sweep already tried an aborted rotation; it is never resumed.
+			if journal.Phase == rotationPhaseAborted {
+				continue
+			}
 			// Resume this host's rotation; a busy refusal waits for the next tick.
 			if spec == nil {
 				errs = append(errs, fmt.Errorf("handler rotation %s: the launch spec was removed during a rotation", d.TaskID))
@@ -1591,7 +1802,7 @@ func (r *rotationRunner) tick(ctx context.Context, e env, c *api.Client, host st
 			// A busy primary the hub no longer hears from. It is never idle, so
 			// no limit applies; it is replaced only when it has been silent
 			// long enough and this host confirms it gone.
-			if d.SilenceMet {
+			if d.SilenceMet && !rotationBackedOff(hub, d, api.HandlerRotationReasonDeadPrimary, r.deps.now()) {
 				if err := r.replaceDeadPrimary(ctx, e, c, host, d, spec); err != nil {
 					errs = append(errs, err)
 				}
@@ -1608,7 +1819,10 @@ func (r *rotationRunner) tick(ctx context.Context, e env, c *api.Client, host st
 				}
 				continue
 			}
-			if _, err := rotateHandler(ctx, r.deps, e, c, d.TaskID, api.HandlerRotationReasonProviderBlocked, api.HandlerRotationTriggerRunner, *spec, rotationAuthorization{}); err != nil && !rotationWait(err) {
+			if rotationBackedOff(hub, d, api.HandlerRotationReasonProviderBlocked, r.deps.now()) {
+				continue
+			}
+			if _, err := runHandlerRotation(ctx, r.deps, e, c, d.TaskID, api.HandlerRotationReasonProviderBlocked, api.HandlerRotationTriggerRunner, *spec, rotationAuthorization{}, nil, &d); err != nil && !rotationWait(err) && !staleDueEntry(err) {
 				errs = append(errs, fmt.Errorf("handler rotation %s: %w", d.TaskID, err))
 			}
 			continue
@@ -1628,10 +1842,10 @@ func (r *rotationRunner) tick(ctx context.Context, e env, c *api.Client, host st
 			}
 			continue
 		}
-		if !d.Idle {
+		if !d.Idle || rotationBackedOff(hub, d, reasons[0], r.deps.now()) {
 			continue
 		}
-		if _, err := rotateHandler(ctx, r.deps, e, c, d.TaskID, reasons[0], api.HandlerRotationTriggerRunner, *spec, rotationAuthorization{}); err != nil && !rotationWait(err) {
+		if _, err := runHandlerRotation(ctx, r.deps, e, c, d.TaskID, reasons[0], api.HandlerRotationTriggerRunner, *spec, rotationAuthorization{}, nil, &d); err != nil && !rotationWait(err) && !staleDueEntry(err) {
 			errs = append(errs, fmt.Errorf("handler rotation %s: %w", d.TaskID, err))
 		}
 	}
@@ -1652,7 +1866,7 @@ func (r *rotationRunner) replaceDeadPrimary(ctx context.Context, e env, c *api.C
 	if state != handlerProbeGone || evidence == nil {
 		return nil
 	}
-	if _, err := runHandlerRotation(ctx, r.deps, e, c, d.TaskID, api.HandlerRotationReasonDeadPrimary, api.HandlerRotationTriggerRunner, *spec, rotationAuthorization{}, evidence); err != nil && !rotationBusy(err) && !deathUnconfirmedRefusal(err) {
+	if _, err := runHandlerRotation(ctx, r.deps, e, c, d.TaskID, api.HandlerRotationReasonDeadPrimary, api.HandlerRotationTriggerRunner, *spec, rotationAuthorization{}, evidence, &d); err != nil && !rotationBusy(err) && !deathUnconfirmedRefusal(err) && !staleDueEntry(err) {
 		return fmt.Errorf("handler rotation %s: %w", d.TaskID, err)
 	}
 	return nil
@@ -1751,14 +1965,16 @@ func requestIdentityConflict(err error) bool {
 }
 
 // stuckRotationAutoAbort is the stuck notice's statement of when the runner
-// aborts the rotation itself. It names no time, so the notice reads the same
-// at every tick and after a restart.
+// aborts the rotation itself and how long it then backs off. It names no
+// clock time, so the notice reads the same at every tick and after a restart.
 func stuckRotationAutoAbort(reason string) string {
 	when := fmt.Sprintf("%d minutes after it went stuck", int(rotationStuckAbortAfter/time.Minute))
 	if reason == api.HandlerRotationReasonProviderBlocked {
 		when = "when the old handler completes a turn again, or " + when + ", whichever comes first"
 	}
-	return "The runner aborts the rotation automatically " + when + ": the old handler then stays the primary with its leases and obligations, queue dispatch, which leases neither handler while the rotation is prepared, resumes, and a rotation that is still due starts fresh."
+	return "The runner aborts the rotation automatically " + when + ": the old handler then stays the primary with its leases and obligations, and queue dispatch, which leases neither handler while the rotation is prepared, resumes. " +
+		fmt.Sprintf("After an abort at the time limit, the runner prepares no new rotation for the same handler run and reason for %d minutes, doubling after each such abort up to %d hours; a changed run or reason starts one at its next tick, and tt handler rotate at once.",
+			int(rotationStuckAbortAfter/time.Minute), int(rotationBackoffMax/time.Hour))
 }
 
 // stuckRotationRecovery is the stuck notice's advice for the journal's

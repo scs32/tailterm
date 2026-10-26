@@ -141,18 +141,14 @@ func stewardUniqueViolation(ctx context.Context, q queryRower, task string, err 
 	return stewardActiveRefusal(holder)
 }
 
-// recordStewardRun keeps the template digest of an exact steward run. The
-// first digest recorded for a run wins.
-func (s *Store) recordStewardRun(ctx context.Context, a api.Agent, digest string) error {
+// recordStewardRun keeps the template digest of an exact steward run, in
+// the transaction that starts the run. The first digest recorded for a run
+// wins. The caller has checked the digest with validRunRecord.
+func recordStewardRun(ctx context.Context, q execer, a api.Agent, digest string, now time.Time) error {
 	if a.Role != api.AgentRoleBacklogSteward || digest == "" || a.RunID == "" {
 		return nil
 	}
-	if len(digest) != 64 || strings.Trim(digest, "0123456789abcdef") != "" {
-		return api.ErrInvalid
-	}
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	_, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO steward_runs(task_id,agent_id,run_id,template_digest,created_at) VALUES(?,?,?,?,?)`, a.TaskID, a.ID, a.RunID, digest, ts(s.now()))
+	_, err := q.ExecContext(ctx, `INSERT OR IGNORE INTO steward_runs(task_id,agent_id,run_id,template_digest,created_at) VALUES(?,?,?,?,?)`, a.TaskID, a.ID, a.RunID, digest, ts(now))
 	return err
 }
 

@@ -315,22 +315,35 @@ func (s *Store) loadSuccessor(ctx context.Context, a *api.Agent) error {
 	return err
 }
 
+// validRunRecord checks the template digest, model and reasoning a launch
+// asks to record for the run it starts, before anything is written.
+func validRunRecord(req api.AddAgentRequest) error {
+	if req.TemplateDigest != "" && req.Role != api.AgentRoleDatabaseHandler && req.Role != api.AgentRoleBacklogSteward {
+		return api.ErrInvalid
+	}
+	// Handler arms record a database handler run's model and reasoning.
+	if (req.HandlerModel != "" || req.HandlerReasoning != "") && req.Role != api.AgentRoleDatabaseHandler {
+		return api.ErrInvalid
+	}
+	if req.TemplateDigest != "" && (len(req.TemplateDigest) != 64 || strings.Trim(req.TemplateDigest, "0123456789abcdef") != "") {
+		return api.ErrInvalid
+	}
+	if !validArmField(req.HandlerModel) || !validArmField(req.HandlerReasoning) {
+		return api.ErrInvalid
+	}
+	return nil
+}
+
 // recordHandlerRun keeps the prompt template digest, model and reasoning of
-// an exact handler run. The first record for a run wins, so a retried launch
-// cannot rewrite it.
-func (s *Store) recordHandlerRun(ctx context.Context, a api.Agent, digest, model, reasoning string) error {
-	if a.Role != api.AgentRoleDatabaseHandler || (digest == "" && model == "" && reasoning == "") || a.RunID == "" {
+// an exact handler run, in the transaction that starts the run, so a failed
+// record fails the registration. The first record for a run wins, so a
+// retried launch cannot rewrite it. The caller has checked the values with
+// validRunRecord.
+func recordHandlerRun(ctx context.Context, q execer, a api.Agent, req api.AddAgentRequest, now time.Time) error {
+	if a.Role != api.AgentRoleDatabaseHandler || (req.TemplateDigest == "" && req.HandlerModel == "" && req.HandlerReasoning == "") || a.RunID == "" {
 		return nil
 	}
-	if digest != "" && (len(digest) != 64 || strings.Trim(digest, "0123456789abcdef") != "") {
-		return api.ErrInvalid
-	}
-	if !validArmField(model) || !validArmField(reasoning) {
-		return api.ErrInvalid
-	}
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	_, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO handler_runs(task_id,agent_id,run_id,template_digest,model,reasoning,created_at) VALUES(?,?,?,?,?,?,?)`, a.TaskID, a.ID, a.RunID, digest, model, reasoning, ts(s.now()))
+	_, err := q.ExecContext(ctx, `INSERT OR IGNORE INTO handler_runs(task_id,agent_id,run_id,template_digest,model,reasoning,created_at) VALUES(?,?,?,?,?,?,?)`, a.TaskID, a.ID, a.RunID, req.TemplateDigest, req.HandlerModel, req.HandlerReasoning, ts(now))
 	return err
 }
 

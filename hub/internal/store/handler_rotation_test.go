@@ -709,6 +709,112 @@ func TestHandlerRotationTemplateDigestRecordedPerRun(t *testing.T) {
 	}
 }
 
+// p2 (wi_0f6d57014268f0ee): a run's template digest, model and reasoning are
+// written in the transaction that starts the run, so a failed record leaves
+// no half-registered run.
+func TestHandlerRotationRunRecordIsAtomicWithRegistration(t *testing.T) {
+	ctx := context.Background()
+	digest := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	failOn := func(t *testing.T, f *rotationFixture, table string) func() {
+		t.Helper()
+		if _, err := f.s.db.Exec(`CREATE TRIGGER fixture_fail BEFORE INSERT ON ` + table + ` BEGIN SELECT RAISE(ABORT,'fixture'); END`); err != nil {
+			t.Fatal(err)
+		}
+		return func() {
+			if _, err := f.s.db.Exec(`DROP TRIGGER fixture_fail`); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	added := func(t *testing.T, f *rotationFixture, id string) int {
+		t.Helper()
+		return countRows(t, f.s, `SELECT count(*) FROM events WHERE task_id=? AND agent_id=? AND kind=?`, f.task.ID, id, api.EventAgentAdded)
+	}
+	t.Run("fresh handler", func(t *testing.T) {
+		f := newRotationFixture(t)
+		req := api.AddAgentRequest{AgentID: api.NewID("agt"), Role: api.AgentRoleDatabaseHandler, Name: "atomic-handler", Host: "mini", Session: "atomic",
+			TemplateDigest: digest, HandlerModel: "gpt-5", HandlerReasoning: "high"}
+		restore := failOn(t, f, "handler_runs")
+		if _, err := f.s.AddAgent(ctx, f.task.ID, req, f.by); err == nil {
+			t.Fatal("a failed run record registered the handler")
+		}
+		if n := countRows(t, f.s, `SELECT count(*) FROM agents WHERE id=?`, req.AgentID); n != 0 || added(t, f, req.AgentID) != 0 {
+			t.Fatalf("a failed record left %d agent row(s) or an agent_added event", n)
+		}
+		restore()
+		a, err := f.s.AddAgent(ctx, f.task.ID, req, f.by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var d, m, r string
+		if err = f.s.db.QueryRow(`SELECT template_digest,model,reasoning FROM handler_runs WHERE agent_id=? AND run_id=?`, a.ID, a.RunID).Scan(&d, &m, &r); err != nil || d != digest || m != "gpt-5" || r != "high" {
+			t.Fatalf("retried record: %q %q %q %v", d, m, r, err)
+		}
+	})
+	t.Run("exited handler restart", func(t *testing.T) {
+		f := newRotationFixture(t)
+		if _, err := f.s.db.Exec(`UPDATE agents SET status='exited' WHERE id=?`, f.old.ID); err != nil {
+			t.Fatal(err)
+		}
+		req := api.AddAgentRequest{AgentID: f.old.ID, Role: api.AgentRoleDatabaseHandler, Name: f.old.Name, Host: f.old.Host, Session: f.old.Session, Runtime: f.old.Runtime, Cwd: f.old.Cwd,
+			ExpectedRunID: f.old.RunID, TemplateDigest: digest, HandlerModel: "gpt-5"}
+		events := added(t, f, f.old.ID)
+		restore := failOn(t, f, "handler_runs")
+		if _, err := f.s.AddAgent(ctx, f.task.ID, req, f.by); err == nil {
+			t.Fatal("a failed run record restarted the handler")
+		}
+		if a, err := f.s.GetAgent(ctx, f.old.ID); err != nil || a.Status != api.AgentExited || a.RunID != f.old.RunID || added(t, f, f.old.ID) != events {
+			t.Fatalf("a failed record changed the exited handler: %+v %v", a, err)
+		}
+		restore()
+		a, err := f.s.AddAgent(ctx, f.task.ID, req, f.by)
+		if err != nil || a.RunID == f.old.RunID {
+			t.Fatalf("restart: %+v %v", a, err)
+		}
+		var d, m string
+		if err = f.s.db.QueryRow(`SELECT template_digest,model FROM handler_runs WHERE agent_id=? AND run_id=?`, a.ID, a.RunID).Scan(&d, &m); err != nil || d != digest || m != "gpt-5" {
+			t.Fatalf("restart record: %q %q %v", d, m, err)
+		}
+	})
+	t.Run("steward", func(t *testing.T) {
+		f := newRotationFixture(t)
+		id := api.NewID("agt")
+		req := api.AddAgentRequest{Role: api.AgentRoleBacklogSteward, AgentID: id, Name: "backlog-steward", Host: "mini", Session: "tt-steward-" + strings.TrimPrefix(id, "agt_"),
+			Runtime: "claude", Cwd: "/tmp", TemplateDigest: digest}
+		restore := failOn(t, f, "steward_runs")
+		if _, err := f.s.AddAgent(ctx, f.task.ID, req, f.by); err == nil {
+			t.Fatal("a failed run record registered the steward")
+		}
+		if n := countRows(t, f.s, `SELECT count(*) FROM agents WHERE id=?`, id); n != 0 || added(t, f, id) != 0 {
+			t.Fatalf("a failed record left %d steward row(s) or an agent_added event", n)
+		}
+		restore()
+		a, err := f.s.AddAgent(ctx, f.task.ID, req, f.by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var d string
+		if err = f.s.db.QueryRow(`SELECT template_digest FROM steward_runs WHERE agent_id=? AND run_id=?`, a.ID, a.RunID).Scan(&d); err != nil || d != digest {
+			t.Fatalf("steward record: %q %v", d, err)
+		}
+	})
+	t.Run("invalid values write nothing", func(t *testing.T) {
+		f := newRotationFixture(t)
+		for name, req := range map[string]api.AddAgentRequest{
+			"digest":    {AgentID: api.NewID("agt"), Role: api.AgentRoleDatabaseHandler, Name: "bad-digest", Host: "mini", Session: "bad", TemplateDigest: "XYZ"},
+			"model":     {AgentID: api.NewID("agt"), Role: api.AgentRoleDatabaseHandler, Name: "bad-model", Host: "mini", Session: "bad", HandlerModel: "bad model\n"},
+			"reasoning": {AgentID: api.NewID("agt"), Role: api.AgentRoleDatabaseHandler, Name: "bad-reasoning", Host: "mini", Session: "bad", HandlerReasoning: "bad reasoning\n"},
+		} {
+			if _, err := f.s.AddAgent(ctx, f.task.ID, req, f.by); !errors.Is(err, api.ErrInvalid) {
+				t.Fatalf("%s: %v", name, err)
+			}
+			if n := countRows(t, f.s, `SELECT count(*) FROM agents WHERE id=?`, req.AgentID); n != 0 {
+				t.Fatalf("%s: an invalid record registered the agent", name)
+			}
+		}
+	})
+}
+
 // Owner-authorized change of the primary's runtime, model or arm
 // (wi_f250a91c85367e6f, order #20511).
 

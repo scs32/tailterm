@@ -62,6 +62,9 @@ type rotationCLI struct {
 	// unready keeps a launched successor from reporting its first completed
 	// turn, as a provider failure before its first activity report would.
 	unready bool
+	// afterDue runs in the fixture hub once it has answered a due request,
+	// for a change between the runner's due list and its prepare.
+	afterDue atomic.Pointer[func()]
 }
 
 func newRotationCLI(t *testing.T, oldDigest string) *rotationCLI {
@@ -101,6 +104,11 @@ func newRotationCLI(t *testing.T, oldDigest string) *rotationCLI {
 			}
 		}
 		handler.ServeHTTP(w, r)
+		if strings.HasSuffix(r.URL.Path, "/handler-rotations/due") {
+			if fn := f.afterDue.Load(); fn != nil {
+				(*fn)()
+			}
+		}
 	}))
 	t.Cleanup(srv.Close)
 	if f.c, err = api.NewClient(srv.URL, 5*time.Second); err != nil {
@@ -819,6 +827,158 @@ func TestHandlerRotationRunnerSpacesDueRequestsWhileEnabled(t *testing.T) {
 	if f.dueCalls.Load() != 2 {
 		t.Fatalf("due requests after the interval: %d", f.dueCalls.Load())
 	}
+}
+
+// p1 (wi_0f6d57014268f0ee): the runner prepares against the due entry's exact
+// agent, run and handler revision. When the primary changes between the due
+// list and the prepare, the hub refuses it and the runner reports nothing:
+// no error, no journal, no successor and no message. Its next due request
+// reads the change and prepares against the new identity.
+func TestHandlerRotationRunnerPinsTheDueRun(t *testing.T) {
+	ctx := context.Background()
+	for name, change := range map[string]struct {
+		code   string
+		mutate func(t *testing.T, f *rotationCLI, db *sql.DB)
+	}{
+		"handler revision": {api.HandlerRotationRefusedStaleHandler, func(t *testing.T, f *rotationCLI, db *sql.DB) {
+			if _, err := db.Exec(`UPDATE tasks SET handler_revision=handler_revision+1 WHERE id=?`, f.task.ID); err != nil {
+				t.Error(err)
+			}
+		}},
+		"handler run": {api.HandlerRotationRefusedNotPrimary, func(t *testing.T, f *rotationCLI, db *sql.DB) {
+			if _, err := db.Exec(`UPDATE agents SET run_id=? WHERE id=?`, api.NewID("run"), f.old.ID); err != nil {
+				t.Error(err)
+			}
+		}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newRotationCLI(t, handlerTemplateDigest("an older assignment"))
+			if err := saveHandlerSpec(f.spec); err != nil {
+				t.Fatal(err)
+			}
+			setRotationPolicy(t, f, api.HandlerRotationPolicyRequest{Enabled: true, OnTemplateChange: true})
+			db := f.db(t)
+			due, err := f.c.HandlerRotationsDue(ctx, "fixture", handlerTemplateDigest(""))
+			if err != nil || len(due.Entries) != 1 {
+				t.Fatalf("due: %+v %v", due, err)
+			}
+			pinned := due.Entries[0]
+			once := func() {
+				change.mutate(t, f, db)
+				f.afterDue.Store(nil)
+			}
+			f.afterDue.Store(&once)
+			r := f.runner()
+			posts, actions, dueCalls := f.posts.Load(), f.actions.Load(), f.dueCalls.Load()
+			f.tick(t, r)
+			if f.actions.Load()-actions != 1 || f.spawns != 0 || f.journalExists() || f.posts.Load() != posts || len(f.rotations(t)) != 0 {
+				t.Fatalf("a stale due entry: actions=%d spawns=%d journal=%v posts=%d rotations=%+v", f.actions.Load()-actions, f.spawns, f.journalExists(), f.posts.Load()-posts, f.rotations(t))
+			}
+			// The hub's refusal is the one the pinned identity gets.
+			if _, err := runHandlerRotation(ctx, f.deps, f.e, f.c, f.task.ID, api.HandlerRotationReasonTemplate, api.HandlerRotationTriggerRunner, f.spec, rotationAuthorization{}, nil, &pinned); !staleDueEntry(err) {
+				t.Fatalf("a prepare pinned to the old identity: %v", err)
+			} else if code, _ := rotationRefusal(err); code != change.code {
+				t.Fatalf("refusal %q, want %q", code, change.code)
+			}
+			if f.journalExists() || f.spawns != 0 {
+				t.Fatal("a refused pinned prepare kept a journal or spawned")
+			}
+			// The next due request reads the new identity and prepares against
+			// it once that run is idle.
+			current, err := f.c.GetAgent(ctx, f.task.ID, f.old.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.activity(t, current, "idle", "", 0)
+			stop := errors.New("stop after prepare")
+			f.deps.after = func(p string) error {
+				if p == rotationPhasePrepared {
+					return stop
+				}
+				return nil
+			}
+			r.deps = f.deps
+			if err := r.tick(ctx, f.e, f.c, "fixture"); !errors.Is(err, stop) {
+				t.Fatalf("second tick: %v", err)
+			}
+			if f.dueCalls.Load()-dueCalls != 2 {
+				t.Fatalf("due requests: %d", f.dueCalls.Load()-dueCalls)
+			}
+			detail, err := f.c.GetTask(ctx, f.task.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rotations := f.rotations(t)
+			if len(rotations) != 1 || rotations[0].State != api.HandlerRotationPrepared || rotations[0].OldRunID != current.RunID || rotations[0].HandlerRevision != detail.Task.HandlerRevision {
+				t.Fatalf("rotation after the re-read: %+v, want run %s revision %d", rotations, current.RunID, detail.Task.HandlerRevision)
+			}
+		})
+	}
+}
+
+// p3 (wi_0f6d57014268f0ee): tt handler rotate --authorized-by refuses, before
+// it saves a spec or spawns, when this host's journal records a different
+// authorization, and names tt handler rotate --abort. The same authorization
+// resumes as before.
+func TestHandlerRotationAuthorizedByRefusedWithDifferentJournal(t *testing.T) {
+	f := crossRuntimeCLI(t)
+	f.request(t, f.old.Name, "Record the authorization fixture item")
+	stop, stopped := errors.New("simulated crash"), false
+	f.deps.after = func(phase string) error {
+		if phase == rotationPhasePrepared && !stopped {
+			stopped = true
+			return stop
+		}
+		return nil
+	}
+	f.auth = crossRuntimeAuthorization
+	if _, err := f.rotate(t); !errors.Is(err, stop) {
+		t.Fatalf("expected the simulated crash, got %v", err)
+	}
+	journalPath := handlerRotationJournalPath(f.c.Base, f.task.ID)
+	journal, err := os.ReadFile(journalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	specPath := handlerSpecPath(f.c.Base, f.task.ID)
+	spec, _ := os.ReadFile(specPath)
+	abort := "tt handler rotate --abort --task " + f.task.ID
+	for name, flags := range map[string][]string{
+		"other name":   {"--authorized-by", "someone else", "--authorization-reason", crossRuntimeAuthorization.reason},
+		"other reason": {"--authorized-by", crossRuntimeAuthorization.by, "--authorization-reason", "a different reason"},
+	} {
+		args := append(append([]string{"--task", f.task.ID}, flags...), "--", "--run", "codex", "--runtime", "codex", "--cwd", t.TempDir(), "--prompt", "another assignment")
+		actions := f.actions.Load()
+		if err := cmdHandlerRotate(f.e, args); err == nil || !strings.Contains(err.Error(), abort) {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if f.actions.Load() != actions || f.spawns != 0 {
+			t.Fatalf("%s: a refused authorization sent %d action(s) and %d spawn(s)", name, f.actions.Load()-actions, f.spawns)
+		}
+		if now, _ := os.ReadFile(specPath); !bytes.Equal(now, spec) {
+			t.Fatalf("%s: a refused authorization saved a new launch spec", name)
+		}
+		if now, _ := os.ReadFile(journalPath); !bytes.Equal(now, journal) {
+			t.Fatalf("%s: a refused authorization changed the journal", name)
+		}
+	}
+	// The same refusal holds under the journal lock, for a journal written
+	// after the command's first check.
+	f.auth = rotationAuthorization{by: "someone else", reason: "a different reason"}
+	if _, err := f.rotate(t); err == nil || !strings.Contains(err.Error(), abort) || f.spawns != 0 {
+		t.Fatalf("rotate with a different authorization: %v spawns=%d", err, f.spawns)
+	}
+	if now, _ := os.ReadFile(journalPath); !bytes.Equal(now, journal) {
+		t.Fatal("a refused rotate changed the journal")
+	}
+	// The same authorization resumes it.
+	f.auth = crossRuntimeAuthorization
+	r, err := f.rotate(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.assertRotated(t, r, 1)
+	f.assertAuthorized(t, r)
 }
 
 // Round-one blocker b1 (#14244): a current handler launched with a prompt and
@@ -2644,6 +2804,242 @@ func TestHandlerRotationRunnerAbortsStuckRotationWhenTheOldHandlerRecovers(t *te
 	}
 	if n := len(f.rotations(t)); n != 1 || f.spawns != 1 {
 		t.Fatalf("rotations %d spawns %d after the abort", n, f.spawns)
+	}
+}
+
+// p6 (wi_0f6d57014268f0ee): an automatic abort whose successor cleanup fails
+// keeps its journal as aborted. The runner retries the cleanup at later ticks
+// although the recovered project is no longer due, never resumes it, and
+// removes the journal and the successor's session once cleanup works.
+func TestHandlerRotationRunnerRetriesAbortedJournalWhenNotDue(t *testing.T) {
+	ctx := context.Background()
+	f, r, clock := newBlockedStuckRotation(t)
+	stuck := f.rotations(t)[0]
+	successor, err := f.c.GetAgent(ctx, f.task.ID, stuck.SuccessorAgentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := func() *ownedSession {
+		t.Helper()
+		owned, err := handlerOwned(ctx, f.c.Base, f.task.ID, successor.ID, successor.RunID, successor.Session, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return owned
+	}
+	if session() == nil {
+		t.Fatal("the stuck successor has no session to clean up")
+	}
+	cleanup := r.deps.cleanup
+	r.deps.cleanup = func(context.Context, env, string, string) error { return errors.New("fixture cleanup failed") }
+	f.oldReports(t, clock.Add(time.Second), nil)
+	*clock = clock.Add(time.Minute)
+	if err := f.try(r); err == nil || !strings.Contains(err.Error(), "fixture cleanup failed") {
+		t.Fatalf("abort with a failing cleanup: %v", err)
+	}
+	if j := f.journal(t); j.Phase != rotationPhaseAborted || j.RotationID != stuck.ID {
+		t.Fatalf("kept journal %+v", j)
+	}
+	if rotations := f.rotations(t); len(rotations) != 1 || rotations[0].State != api.HandlerRotationAborted {
+		t.Fatalf("rotations %+v", rotations)
+	}
+	if loadRotationBackoff(f.c.Base, f.task.ID) != nil {
+		t.Fatal("an abort after the old handler recovered recorded a back-off")
+	}
+	due, err := f.c.HandlerRotationsDue(ctx, "fixture", handlerTemplateDigest(""))
+	if err != nil || len(due.Entries) != 0 {
+		t.Fatalf("the recovered project is still listed: %+v %v", due, err)
+	}
+	actions, spawns, polls, notices := f.actions.Load(), f.spawns, f.agentPolls.Load(), len(f.stuckNotices(t))
+	quiet := func() {
+		now := r.now().Add(rotationQuietCache + time.Second)
+		r.now = func() time.Time { return now }
+	}
+	// Later ticks retry the cleanup, and a restarted runner does too; none
+	// resumes the rotation, launches a successor or posts a notice.
+	for i := 0; i < 2; i++ {
+		quiet()
+		if err := f.try(r); err == nil || !strings.Contains(err.Error(), "fixture cleanup failed") {
+			t.Fatalf("retry %d: %v", i+1, err)
+		}
+	}
+	restarted := f.runner()
+	restarted.deps.cleanup = r.deps.cleanup
+	if err := f.try(restarted); err == nil || !strings.Contains(err.Error(), "fixture cleanup failed") {
+		t.Fatalf("restarted runner: %v", err)
+	}
+	if f.actions.Load() != actions || f.spawns != spawns || len(f.stuckNotices(t)) != notices || f.agentPolls.Load()-polls != 3 {
+		t.Fatalf("retries: actions %d spawns %d notices %d successor reads %d", f.actions.Load()-actions, f.spawns-spawns, len(f.stuckNotices(t))-notices, f.agentPolls.Load()-polls)
+	}
+	if j := f.journal(t); j.Phase != rotationPhaseAborted || session() == nil {
+		t.Fatalf("journal %+v or the session went away before cleanup worked", j)
+	}
+	// Cleanup works again: the next tick removes the session and the journal.
+	r.deps.cleanup = cleanup
+	quiet()
+	if err := f.try(r); err != nil {
+		t.Fatalf("restored cleanup: %v", err)
+	}
+	if f.journalExists() || session() != nil {
+		t.Fatalf("journal=%v session=%+v after the restored cleanup", f.journalExists(), session())
+	}
+	if rotations := f.rotations(t); len(rotations) != 1 || f.spawns != spawns {
+		t.Fatalf("rotations %+v spawns %d", rotations, f.spawns)
+	}
+}
+
+// p6: a manual abort journals the abort too, and a rerun with an aborted
+// journal finishes its cleanup before it starts anything else.
+func TestHandlerRotationManualAbortKeepsAnAbortedJournalUntilCleanup(t *testing.T) {
+	ctx := context.Background()
+	f := newStuckRotation(t)
+	if err := f.try(f.runner()); err == nil || !strings.Contains(err.Error(), "did not come online") {
+		t.Fatalf("first tick: %v", err)
+	}
+	stuck := f.rotations(t)[0]
+	cleanup := f.deps.cleanup
+	f.deps.cleanup = func(context.Context, env, string, string) error { return errors.New("fixture cleanup failed") }
+	if _, err := abortHandlerRotation(ctx, f.deps, f.e, f.c, f.task.ID); err == nil || !strings.Contains(err.Error(), "fixture cleanup failed") {
+		t.Fatalf("manual abort: %v", err)
+	}
+	if j := f.journal(t); j.Phase != rotationPhaseAborted || j.RotationID != stuck.ID {
+		t.Fatalf("journal %+v", j)
+	}
+	// A rerun of the abort finishes the cleanup and reports the aborted rotation.
+	f.deps.cleanup = cleanup
+	r, err := abortHandlerRotation(ctx, f.deps, f.e, f.c, f.task.ID)
+	if err != nil || r.ID != stuck.ID || r.State != api.HandlerRotationAborted || f.journalExists() {
+		t.Fatalf("rerun of the abort: %+v %v journal=%v", r, err, f.journalExists())
+	}
+	if loadRotationBackoff(f.c.Base, f.task.ID) != nil {
+		t.Fatal("a manual abort recorded a back-off")
+	}
+}
+
+// p7 (wi_0f6d57014268f0ee): after an automatic abort at the ceiling, a rotation
+// still due for the same old run and reason is not prepared again until a
+// back-off of rotationStuckAbortAfter has passed, doubling after each such
+// abort. A restarted runner keeps it, another run or reason ignores it, and a
+// committed rotation ends it.
+func TestHandlerRotationRunnerBacksOffAfterCeilingAbort(t *testing.T) {
+	ctx := context.Background()
+	f := newStuckRotation(t)
+	clock := time.Now().UTC()
+	f.deps.clock = func() time.Time { return clock }
+	r := f.runner()
+	f.toCeiling(t, r)
+	stuck := f.assertHeld(t)
+	clock = clock.Add(rotationStuckAbortAfter)
+	if err := f.try(r); err != nil {
+		t.Fatalf("tick at the ceiling: %v", err)
+	}
+	f.assertAutoAborted(t, stuck)
+	b := loadRotationBackoff(f.c.Base, f.task.ID)
+	if b == nil || b.OldAgentID != f.old.ID || b.OldRunID != f.old.RunID || b.Reason != api.HandlerRotationReasonTemplate || b.Aborts != 1 || !b.Until.Equal(clock.Add(rotationStuckAbortAfter)) {
+		t.Fatalf("back-off %+v", b)
+	}
+	// Within the back-off: no prepare, no successor and no notice, for this
+	// runner and a restarted one, although the project is still due.
+	actions, spawns, notices := f.actions.Load(), f.spawns, len(f.stuckNotices(t))
+	for _, step := range []time.Duration{0, time.Minute, rotationStuckAbortAfter - 2*time.Minute} {
+		clock = clock.Add(step)
+		if err := f.try(r); err != nil {
+			t.Fatalf("tick within the back-off: %v", err)
+		}
+	}
+	f.restarts(t, 1)
+	if f.actions.Load() != actions || f.spawns != spawns || len(f.stuckNotices(t)) != notices || len(f.rotations(t)) != 1 {
+		t.Fatalf("within the back-off: actions %d spawns %d notices %d rotations %d", f.actions.Load()-actions, f.spawns-spawns, len(f.stuckNotices(t))-notices, len(f.rotations(t)))
+	}
+	due, err := f.c.HandlerRotationsDue(ctx, "fixture", handlerTemplateDigest(""))
+	if err != nil || len(due.Entries) != 1 {
+		t.Fatalf("due %+v %v", due, err)
+	}
+	if !rotationBackedOff(f.c.Base, due.Entries[0], api.HandlerRotationReasonTemplate, clock) ||
+		rotationBackedOff(f.c.Base, due.Entries[0], api.HandlerRotationReasonTokens, clock) {
+		t.Fatal("the back-off must hold for its reason only")
+	}
+	other := due.Entries[0]
+	other.Agent.RunID = api.NewID("run")
+	if rotationBackedOff(f.c.Base, other, api.HandlerRotationReasonTemplate, clock) {
+		t.Fatal("the back-off held for another run")
+	}
+	// Past the back-off the rotation is prepared again; a second ceiling
+	// abort doubles the interval.
+	clock = clock.Add(2 * time.Minute)
+	f.toCeiling(t, r)
+	if n := len(f.rotations(t)); n != 2 {
+		t.Fatalf("rotations after the back-off: %d", n)
+	}
+	clock = clock.Add(rotationStuckAbortAfter)
+	if err := f.try(r); err != nil {
+		t.Fatalf("second ceiling abort: %v", err)
+	}
+	if b := loadRotationBackoff(f.c.Base, f.task.ID); b == nil || b.Aborts != 2 || !b.Until.Equal(clock.Add(2*rotationStuckAbortAfter)) {
+		t.Fatalf("doubled back-off %+v", b)
+	}
+	clock = clock.Add(rotationStuckAbortAfter + time.Minute)
+	actions = f.actions.Load()
+	if err := f.try(r); err != nil || f.actions.Load() != actions {
+		t.Fatalf("within the doubled back-off: %v actions %d", err, f.actions.Load()-actions)
+	}
+	// A record for another run of the handler does not hold this one.
+	stale := *loadRotationBackoff(f.c.Base, f.task.ID)
+	stale.OldRunID = api.NewID("run")
+	if err := writePrivateJSON(rotationBackoffPath(f.c.Base, f.task.ID), stale); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.try(r); err == nil || !strings.Contains(err.Error(), "did not come online") || f.actions.Load() != actions+1 {
+		t.Fatalf("another run's back-off held the prepare: %v", err)
+	}
+	// A committed rotation ends the back-off.
+	if _, err := abortHandlerRotation(ctx, f.deps, f.e, f.c, f.task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := writePrivateJSON(rotationBackoffPath(f.c.Base, f.task.ID), b); err != nil {
+		t.Fatal(err)
+	}
+	f.online = true
+	if _, err := f.rotate(t); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(rotationBackoffPath(f.c.Base, f.task.ID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a committed rotation kept the back-off: %v", err)
+	}
+}
+
+// recordRotationBackoff counts one abort per rotation, doubles the interval
+// per abort of the same run and reason, caps it, and restarts for another
+// run or reason.
+func TestHandlerRotationBackoffInterval(t *testing.T) {
+	t.Setenv("TAILTERM_RELAY_STATE", t.TempDir())
+	hub, task := "http://hub.test", api.NewID("tsk")
+	now := time.Now().UTC()
+	j := &handlerRotationJournal{OldAgentID: "agt_old", OldRunID: "run_old", Reason: api.HandlerRotationReasonTemplate}
+	abort := func(rotation string) *rotationBackoff {
+		t.Helper()
+		j.RotationID = rotation
+		if err := recordRotationBackoff(hub, task, j, now); err != nil {
+			t.Fatal(err)
+		}
+		return loadRotationBackoff(hub, task)
+	}
+	for i, want := range []time.Duration{time.Hour, 2 * time.Hour, 4 * time.Hour, 8 * time.Hour, 16 * time.Hour, 24 * time.Hour, 24 * time.Hour} {
+		b := abort(fmt.Sprintf("hro_%d", i))
+		if b.Aborts != i+1 || !b.Until.Equal(now.Add(want)) {
+			t.Fatalf("abort %d: %+v, want %s", i+1, b, want)
+		}
+	}
+	if b := abort("hro_6"); b.Aborts != 7 {
+		t.Fatalf("a retried abort counted again: %+v", b)
+	}
+	j.Reason = api.HandlerRotationReasonTokens
+	if b := abort("hro_7"); b.Aborts != 1 || !b.Until.Equal(now.Add(time.Hour)) {
+		t.Fatalf("another reason: %+v", b)
+	}
+	j.OldRunID = "run_new"
+	if b := abort("hro_8"); b.Aborts != 1 {
+		t.Fatalf("another run: %+v", b)
 	}
 }
 

@@ -166,7 +166,13 @@ tt handler rotate --task TASK \
   `arm_changed`).
 
 The authorization is saved on the rotation at prepare, so a rerun or a runner
-resume needs no flags; the journal carries them. `tt handler rotation get` prints
+resume needs no flags; the journal carries them. A rerun with
+`--authorized-by` whose name or reason differs from the journal's is refused
+before a spec is saved or anything is spawned, because the resume would replay
+the journal's authorization and ignore the flags. The refusal names
+`tt handler rotate --abort --task ID`: abort the journaled rotation, then rotate
+again with the new authorization. The same check runs again under the journal
+lock, for a journal written after the first check. `tt handler rotation get` prints
 `Authorized by NAME: REASON (runtime OLD -> NEW)`, `tt handler rotation list`
 appends `authorized-by="NAME"`, and the JSON record has `authorization`
 (`authorizedBy`, `reason`, `oldRuntime`, `successorRuntime`; the runtimes are
@@ -179,16 +185,23 @@ names who authorized the change and why.
 
 A rotation is a keyed, two-phase hub record (`handler_rotations`). The host
 routine keeps a journal of its phases next to the spec: `preparing`, `prepared`,
-`spawned`, then `committed`.
+`spawned`, then `committed`, or `aborted` for a rotation the hub has aborted
+whose successor cleanup is not yet confirmed.
 
 1. **Prepare.** The hub checks that the old handler is idle (see refusals). It
-   records the old run and a preallocated successor ID. The successor's name is
+   records the old run and a preallocated successor ID. The prepare names the
+   old agent, its exact run and the handler revision it expects. The owner's
+   `tt handler rotate` reads the current primary; a runner rotation names the
+   exact agent, run and revision of the due entry it acts on. If the primary
+   changed since, the hub refuses it (`handler_changed` or `not_primary`) and
+   nothing is saved. The successor's name is
    the base name plus `-r<handler_revision+1>`, for example `db-handler-r2`. From
    then on, queue dispatch leases neither handler.
 2. **Launch.** The host runs `tt spawn --role database_handler
    --handler-successor` with the saved spec. The successor gets the primary
    handler prompt, plus a line telling it to wait for the handoff NOTICE. Its
-   template digest is recorded for its exact run.
+   template digest, model and reasoning are recorded for its exact run in the
+   same transaction as the registration that starts the run.
 3. **Wait.** The routine waits up to two minutes for the successor to come
    online, then for its first completed turn, up to 10 minutes from its launch
    (see [Successor readiness](#successor-readiness)). Until then the rotation
@@ -215,7 +228,11 @@ and `ensureHandler` is idempotent), never re-issues twice (commit is keyed), and
 never cleans up twice. A prepare whose response was lost is replayed with the same
 key. `--abort` works only from prepared. It closes a registered successor and
 cleans up its session. It leaves the old handler primary and open and moves no
-obligations. A new prepare is allowed afterwards.
+obligations. A new prepare is allowed afterwards. Once the hub confirms an
+abort, the host saves the journal as `aborted`, then cleans up the successor
+and removes the journal. If the cleanup fails, the `aborted` journal stays:
+`--abort` again, a rerun of `tt handler rotate`, or the runner's next tick
+finishes the cleanup first. An `aborted` journal is never resumed.
 
 ## Successor readiness
 
@@ -690,7 +707,11 @@ policy set`. A stale revision is refused.
   same way for Codex (cached input included) and Claude.
 - **Template**: the handler template digest is SHA-256 over the static primary
   handler guidance, the queue acceptance briefing and the saved `--prompt`.
-  `tt spawn` records it for each handler run in `handler_runs`. A run with no
+  `tt spawn` records it for each handler run in `handler_runs`, with the run's
+  model and reasoning, in the same transaction as the registration that starts
+  the run: a failed record fails the registration, so no run is saved without
+  the values its launch carried. A backlog steward run's digest is recorded the
+  same way in `steward_runs`. A run with no
   recorded digest (a legacy run) counts as changed. The runner compares against
   the digest of its host's saved prompt.
 
@@ -702,11 +723,20 @@ receipt. A host whose handler died therefore keeps ticking. It then makes one
 `GET /v1/handler-rotations/due?host=H&templateDigest=D` request. The relay
 loops every 3 seconds, so the tick spaces these requests: at most one a minute
 while a listed policy is enabled, and an empty answer is cached for 5 minutes.
-For each listed project:
+Before the request, the tick finishes every `aborted` journal this host keeps
+for the hub, listed or not: it cleans up the successor's session, then removes
+the journal; a failure is tried again at the next tick that asks for the due
+list. For each listed project:
 
+- Each rotation the runner starts prepares against the due entry's exact
+  agent, run and handler revision. If the primary changed since the due list,
+  the hub refuses the prepare as `handler_changed` or `not_primary`; the
+  runner reports nothing, keeps no journal and reads the change with its next
+  due request.
 - A local journal for the project: resume that rotation, unless it has
-  reached the resume ceiling below. A stuck one is aborted automatically when
-  its old handler recovers or after 60 minutes (below).
+  reached the resume ceiling below, or is `aborted` (the sweep above finishes
+  it). A stuck one is aborted automatically when its old handler recovers or
+  after 60 minutes (below).
 - Due and idle with a saved spec: rotate, with trigger `runner` and the first
   due reason.
 - Due but busy: nothing this tick. It rotates on the first idle tick.
@@ -829,17 +859,30 @@ The abort is the one `tt handler rotate --abort` makes, keyed
 the primary with its leases and obligations; none moves to the successor and
 none is created for it. It closes the successor and cleans up its session, and
 removes the journal. With no rotation prepared, queue dispatch leases the old
-handler again. A rotation that is still due starts fresh at a later tick, with
-its own count and its own stuck notice.
+handler again.
+
+After an abort when the old handler recovered, a rotation that is still due
+starts fresh at a later tick, with its own count and its own stuck notice.
+After an abort at the stuck ceiling, the runner backs off instead of preparing
+the same failing rotation again at its next tick. It saves a host record
+(`handler-backoff-*.json` in the relay state, so a relay restart keeps it) of
+the old agent, its exact run and the reason, and prepares no new rotation for
+that same run and reason for 60 minutes. Each later ceiling abort of the same
+run and reason doubles the interval, up to 24 hours. A due entry with another
+run or another reason ignores the record and prepares at its next tick; a
+committed rotation removes it; `tt handler rotate` ignores it; an abort when the
+old handler recovered, or a manual `--abort`, records none. The stuck notice
+states the back-off.
 
 The stuck notice goes first: the runner aborts only at a tick where every
 recipient has been told, and posts nothing about the rotation after the abort.
 The notice states this rule. Before either trigger the rotation stays prepared
-and the runner posts nothing more. A failed abort or cleanup keeps the journal,
-and the next tick tries again with the same key. The runner sees the project
-only while the hub lists it on the due list: always while its limit policy is
-enabled, and otherwise while a `provider_blocked` rotation is prepared or its
-primary is a dead candidate or provider blocked.
+and the runner posts nothing more. A failed abort keeps the journal, and the
+next tick that lists the project tries again with the same key. A failed
+cleanup after the hub confirmed the abort keeps the journal as `aborted`, and
+every later tick that asks for the due list retries the cleanup, then removes
+the journal, even once the project is no longer listed (for example, a
+recovered `provider_blocked` primary with its limit policy off).
 
 ## API
 

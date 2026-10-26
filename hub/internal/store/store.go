@@ -505,35 +505,22 @@ func scanAgent(row interface{ Scan(...any) error }) (api.Agent, error) {
 }
 
 func (s *Store) AddAgent(ctx context.Context, taskID string, req api.AddAgentRequest, by api.Caller) (api.Agent, error) {
-	if req.TemplateDigest != "" && req.Role != api.AgentRoleDatabaseHandler && req.Role != api.AgentRoleBacklogSteward {
-		return api.Agent{}, api.ErrInvalid
+	if err := validRunRecord(req); err != nil {
+		return api.Agent{}, err
 	}
-	// Handler arms record a database handler run's model and reasoning.
-	if (req.HandlerModel != "" || req.HandlerReasoning != "") && req.Role != api.AgentRoleDatabaseHandler {
-		return api.Agent{}, api.ErrInvalid
+	return s.addAgent(ctx, taskID, req, by)
+}
+
+// recordRun keeps a handler or steward run's template digest, model and
+// reasoning in the transaction that starts the run. Handler rotation compares
+// a run's template with the current one; only a call that starts a run
+// records, so replaying the launch of an existing legacy run never marks its
+// older prompt current.
+func recordRun(ctx context.Context, tx execer, a api.Agent, req api.AddAgentRequest, now time.Time) error {
+	if err := recordHandlerRun(ctx, tx, a, req, now); err != nil {
+		return err
 	}
-	priorRun := ""
-	if (req.TemplateDigest != "" || req.HandlerModel != "" || req.HandlerReasoning != "") && req.AgentID != "" {
-		if prior, err := s.GetAgent(ctx, req.AgentID); err == nil {
-			priorRun = prior.RunID
-		}
-	}
-	a, err := s.addAgent(ctx, taskID, req, by)
-	if err != nil {
-		return a, err
-	}
-	// Handler rotation compares a run's template with the current one. Only a
-	// run this call started records one: replaying the launch of an existing
-	// legacy run must not mark its older prompt current.
-	if a.RunID != priorRun {
-		if err = s.recordHandlerRun(ctx, a, req.TemplateDigest, req.HandlerModel, req.HandlerReasoning); err != nil {
-			return a, err
-		}
-		if err = s.recordStewardRun(ctx, a, req.TemplateDigest); err != nil {
-			return a, err
-		}
-	}
-	return a, nil
+	return recordStewardRun(ctx, tx, a, req.TemplateDigest, now)
 }
 
 func (s *Store) addAgent(ctx context.Context, taskID string, req api.AddAgentRequest, by api.Caller) (api.Agent, error) {
@@ -715,6 +702,11 @@ func (s *Store) addAgent(ctx context.Context, taskID string, req api.AddAgentReq
 						return api.Agent{}, fmt.Errorf("%w: database handler run changed during restart", api.ErrConflict)
 					}
 					if _, err = s.insertEvent(ctx, tx, taskID, api.EventAgentAdded, existing.ID, existing.Name, map[string]any{"runId": runID, "role": existing.Role}, by); err != nil {
+						return api.Agent{}, err
+					}
+					restarted := existing
+					restarted.RunID = runID
+					if err = recordRun(ctx, tx, restarted, req, s.now()); err != nil {
 						return api.Agent{}, err
 					}
 					if err = tx.Commit(); err != nil {
@@ -971,6 +963,9 @@ AND NOT EXISTS (SELECT 1 FROM agent_work_item_bindings r JOIN agents ra ON ra.id
 		eventData["workItem"] = a.WorkItem
 	}
 	if _, err = s.insertEvent(ctx, tx, taskID, api.EventAgentAdded, a.ID, a.Name, eventData, by); err != nil {
+		return a, err
+	}
+	if err = recordRun(ctx, tx, a, req, now); err != nil {
 		return a, err
 	}
 	if err = tx.Commit(); err != nil {
