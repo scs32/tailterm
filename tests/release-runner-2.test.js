@@ -1222,6 +1222,16 @@ test("p1 provisioning refuses a source whose commit cannot be read before changi
  assert.deepEqual({status:r.status,stdout:r.stdout,stderr:r.stderr},{status:1,stdout:"",stderr:reason+"\n"});
  assert.deepEqual(c.installs,[]);assert.equal(git(c.cwd,"status","--porcelain"),"");
 });
+// wi_e1c6a2b0a92aa83b: a plain directory inside a committed repository would name that repository's commit.
+test("p1 provisioning refuses a source nested inside another repository before changing anything",()=>{
+ const outer=mkdtempSync(join(tmpdir(),"provision-outer-"));git(outer,"init","-q");git(outer,"-c","user.email=f@example.invalid","-c","user.name=F","commit","-q","--allow-empty","-m","outer");
+ const from=join(outer,"nested");mkdirSync(from);placePrerequisites(from);
+ const p=provisionFixture();
+ assert.throws(()=>provisionPrerequisites(p.cwd,{from,run:p.run}),e=>failureReason(e)==="Prerequisite source is not a repository top level: git rev-parse --show-toplevel differs");
+ assert.deepEqual(p.installs,[],"npm ci never ran");
+ for(const x of MATRIX_PREREQUISITES)assert.ok(!existsSync(join(p.cwd,x)),x+" not copied");
+ assert.equal(git(p.cwd,"status","--porcelain"),"");
+});
 test("p1 the provisioning command prints the prerequisites, or only the named reason",()=>{
  const p=provisionFixture();mkdirSync(join(p.cwd,"node_modules"));writeFileSync(join(p.cwd,"node_modules/.package-lock.json"),"{}");
  const out=JSON.parse(execFileSync(process.execPath,[RUNNER,"--provision-prerequisites","--from",p.from],{cwd:p.cwd,encoding:"utf8"}));

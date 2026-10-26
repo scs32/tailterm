@@ -1192,8 +1192,9 @@ function copyGoLicenses(cwd, source, print) {
 // missing, then every other missing file is copied from the source checkout,
 // with the licence texts that match a copied module list (print says whether
 // they came). An existing file is never overwritten. Copied entries name the
-// source's commit; a source whose HEAD cannot be read is refused before
-// anything changes, when anything would be copied (wi_adf23937db2c4d0c).
+// source's commit; a source whose HEAD cannot be read, or that is not its
+// repository's top level, is refused before anything changes, when anything
+// would be copied (wi_adf23937db2c4d0c, wi_e1c6a2b0a92aa83b).
 export function provisionPrerequisites(cwd, { from, run = (argv, dir) => execFileSync(argv[0], argv.slice(1), { cwd: dir, stdio: "ignore", timeout: 900000 }), print = (line) => process.stderr.write(line + "\n") } = {}) {
   let source;
   try { source = isAbsolute(from) && statSync(from).isDirectory() ? realpathSync(from) : null; } catch { source = null; }
@@ -1204,6 +1205,11 @@ export function provisionPrerequisites(cwd, { from, run = (argv, dir) => execFil
     // stderr is dropped: the CLI's stderr carries only the reason.
     try { sourceCommit = execFileSync("git", ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"], { cwd: source, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim(); } catch {}
     if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(sourceCommit ?? "")) throw reasonError("Prerequisite source commit unreadable: git rev-parse HEAD failed");
+    // A plain directory inside another repository reads that repository's
+    // HEAD, so the commit counts only from a top level (wi_e1c6a2b0a92aa83b).
+    let top;
+    try { top = realpathSync(execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: source, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim()); } catch {}
+    if (top !== source) throw reasonError("Prerequisite source is not a repository top level: git rev-parse --show-toplevel differs");
   }
   if (!existsSync(join(cwd, marker))) {
     try { run(["npm", "ci"], cwd); } catch { throw reasonError("Prerequisite install failed: npm ci"); }
