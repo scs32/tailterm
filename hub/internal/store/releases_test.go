@@ -7346,6 +7346,47 @@ func TestReleaseWindowReadsRevertRecordedOnBlock(t *testing.T) {
 	}
 }
 
+// wi_e9b15b14264c30fe e1/e2: the runner revert-journals a block only after it
+// published, so a block with a revert on a job the hub still holds as claimed
+// (its merged never saved) marks the job published, and the window ledger
+// reads it like any published job: a failed revert is a cause, a committed one
+// is not. A bare block of a claimed job leaves it unpublished, as before.
+func TestReleaseWindowSeesRevertOnBlockOfClaimedJob(t *testing.T) {
+	commit := strings.Repeat("e", 40)
+	for _, shape := range []string{"committed", "failed", "bare"} {
+		t.Run(shape, func(t *testing.T) {
+			f := newWindowRefusalFixture(t)
+			f.clock("2026-10-18T21:00:00-07:00")
+			j := windowEnqueue(t, f.s, f.task, f.h, "enqueue-store", releaseEntryChanged(t, f.s, f.task, "store", "store", "hub/internal/store/x.go"))
+			j = f.act("claim-store", "claim", j, nil)
+			if j.State != "claimed" || j.Published {
+				t.Fatalf("claimed job %+v", j)
+			}
+			var revert *api.ReleaseRevert
+			switch shape {
+			case "committed":
+				revert = &api.ReleaseRevert{Outcome: "committed", Commit: commit, BugRequestID: j.ID + "-revert-bug"}
+			case "failed":
+				revert = &api.ReleaseRevert{Outcome: "failed"}
+			}
+			j = f.act("block", "block", j, func(r *api.ReleaseRequest) { r.Revert = revert })
+			if j.State != "blocked" || j.Published != (revert != nil) || !reflect.DeepEqual(j.Revert, revert) {
+				t.Fatalf("blocked %s job published=%v %+v revert %+v", shape, j.Published, j, j.Revert)
+			}
+			if saved, err := releaseLoad(context.Background(), f.s.db, f.task.ID, j.ID); err != nil || saved.Published != j.Published {
+				t.Fatal("saved blocked job", saved.Published, err)
+			}
+			want := ""
+			if shape == "failed" {
+				want = "job " + j.ID + " was published and is not released"
+			}
+			if got := f.cause(); got != want {
+				t.Fatalf("ledger cause of the blocked %s job %q, want %q", shape, got, want)
+			}
+		})
+	}
+}
+
 // wi_816228d539a80c48 a5 (r5): the later-release proof compares parsed times,
 // never rows. A refusal and an S1 job's rows are reordered in the isolated
 // database, as set-aside moves job rows and VACUUM may renumber the receipts:

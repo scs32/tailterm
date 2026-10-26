@@ -355,9 +355,17 @@ handler. Three things make that run succeed or fail for a named reason
   copied from `SOURCE` (the owner's root checkout,
   `/Users/stephenspeicher/projects/tailterm`), never overwriting an existing
   file. All five are gitignored, and a checkout left dirty is refused. It prints
-  each path with its sha256 and `present`, `copied` or `installed`, and fails,
-  spawning nothing, with `Missing matrix prerequisites: PATHS` naming every file
-  missing from both checkouts. It is idempotent. A copied
+  each path with its sha256 and `present`, `copied` or `installed`; a `copied`
+  entry also names `sourceCommit`, the source checkout's `HEAD`, which a
+  matrix run prints as `from COMMIT` on that prerequisite's line. Whenever a
+  file would be copied, the source is checked first, before `npm ci` or any
+  copy: a source whose `HEAD` cannot be read fails with `Prerequisite source
+  commit unreadable: git rev-parse HEAD failed`, and a directory that is not
+  its repository's top level (it would read the enclosing repository's
+  `HEAD`) fails with `Prerequisite source is not a repository top level: git
+  rev-parse --show-toplevel differs`. It fails, spawning nothing, with
+  `Missing matrix prerequisites: PATHS` naming every file missing from both
+  checkouts. It is idempotent. A copied
   `.build/go-modules.txt` brings the source's `.build/go-licenses/` licence
   copies with it, whole, only when the source's
   `.build/go-licenses/go-modules.txt` matches the copied list byte for byte and
@@ -1816,8 +1824,9 @@ seen and the wait go into the journal effect for TailOS (`liveCheck`,
 (for example "TailOS live check last saw COMMIT after 90 s."). A rolled_back or
 blocked hub receipt carries them too, per target, with a null left out (see
 "Failure diagnostics in the receipt" below).
-The pinned rollback probe argv from `release-inputs.mjs` has no `--config`, so
-the automated TailOS rollback uses the default 90 s window.
+The pinned rollback probe argv from `release-inputs.mjs` ends with `--config`
+and the deployer's config path for every target, so the automated TailOS
+rollback reads the same `url` and `switchWindowMs` as the live check.
 
 **Hub and bridge readiness window.** A TrueNAS app restart, and the hub's
 migrations on a large database, take longer than one read, so the hub and bridge
@@ -1992,6 +2001,13 @@ by the receipt revert rules (`committed` needs its commit, any commit must be
 a full SHA, the bug request ID is at most 128 bytes with no space or line
 break), refuses a revert on any operation but block (400), and saves it on the
 job as `revert: {outcome, commit, bugRequestId}`, shown by `tt deployment get`.
+The runner journals a revert only after it published
+(`scripts/release-runner.mjs`, the `state.published && !state.revert` step), so
+a block that carries one also marks the job `published`, even when the hub
+still held it `claimed` because the `merged` save never reached it: the
+quiet-window ledger then lists the job as unreleased for a `failed` revert and
+leaves it out for a `committed` one (`wi_e9b15b14264c30fe`). A bare block, and a
+block of a job already `published`, keep the job's `published` as it was.
 The handler's later refuse reconcile keeps it, and also records the job's
 `settledAt` (the hub time of that reconcile), which the quiet-window ledger
 reads.

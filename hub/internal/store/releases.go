@@ -1178,6 +1178,11 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 					}
 					revert := *req.Revert
 					j.Revert = &revert
+					// The runner journals a revert only after it published
+					// (scripts/release-runner.mjs:1351-1354), so a block that
+					// carries one proves publication even when the hub never
+					// saved merged, and the window ledger must see the job.
+					j.Published = true
 				}
 				j.State = "blocked"
 				if batch != nil {
