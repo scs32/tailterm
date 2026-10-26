@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -3125,4 +3126,253 @@ func reissuedSeqs(r api.HandlerRotation) string {
 	}
 	out, _ := json.Marshal(seqs)
 	return string(out)
+}
+
+// A provider-blocked primary handler (bug wi_ce7310979bc45479, order #46760,
+// criterion a6). blockedFixture is a rotation fixture on a controllable clock
+// with the limit policy off and the dead primary replacement at silence, an
+// open request held by the primary, and the primary's run blocked by class
+// since the clock's start.
+type blockedFixture struct {
+	*rotationFixture
+	clock, opened time.Time
+	request       api.Message
+}
+
+func newBlockedFixture(t *testing.T, class string, silence int64) *blockedFixture {
+	t.Helper()
+	// The clock starts so that the 20-minute bound falls just before real
+	// time: a successor's online status is read by the real clock.
+	f := &blockedFixture{rotationFixture: newRotationFixture(t), clock: time.Now().UTC().Add(-api.HandlerProviderBlockedAfter - 5*time.Second)}
+	f.s.now = func() time.Time { return f.clock }
+	ctx := context.Background()
+	policy, err := f.s.HandlerRotationPolicy(ctx, f.task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.s.SetHandlerRotationPolicy(ctx, f.task.ID, api.HandlerRotationPolicyRequest{ExpectedRevision: policy.Revision, Enabled: false, DeadSilenceMinutes: &silence}); err != nil {
+		t.Fatal(err)
+	}
+	f.request = f.send(t, f.worker, api.EnvelopeKindRequest, f.old.ID, "Record the blocked handler fixture item", false)
+	f.opened = f.clock
+	p := &api.ProviderBlock{Provider: "openai", Runtime: "codex", Model: "gpt-6-astra", Class: class, Code: "response_too_many_failed_attempts", Status: 429, Since: f.clock}
+	if class == api.ProviderBlockAuth {
+		p.Code, p.Status = "other", 401
+	}
+	if _, err = f.s.ReportActivity(ctx, f.task.ID, f.old.ID, api.ActivityReport{RequestID: api.NewID("act"), RunID: f.old.RunID, Activity: api.AgentActivity{State: "provider_blocked", ObservedAt: f.clock, Provider: p}}); err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+
+// at moves the clock to opened+d and refreshes the primary's heartbeat.
+func (f *blockedFixture) at(t *testing.T, d time.Duration) {
+	t.Helper()
+	f.clock = f.opened.Add(d)
+	if _, err := f.s.db.Exec(`UPDATE agents SET last_seen_at=? WHERE id=?`, ts(f.clock), f.old.ID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// due reports whether the host's due list names the primary provider_blocked.
+func (f *blockedFixture) due(t *testing.T) bool {
+	t.Helper()
+	list, err := f.s.HandlerRotationsDue(context.Background(), "mini", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range list.Entries {
+		if d.TaskID == f.task.ID {
+			return slices.Contains(d.DueReasons, api.HandlerRotationReasonProviderBlocked)
+		}
+	}
+	return false
+}
+
+func (f *blockedFixture) prepareBlocked(t *testing.T, key string, change func(*api.HandlerRotationRequest)) (api.HandlerRotation, error) {
+	t.Helper()
+	task, err := f.s.GetTask(context.Background(), f.task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := api.HandlerRotationRequest{Operation: api.HandlerRotationPrepare, RequestID: key, ExpectedHandlerRevision: task.HandlerRevision, OldAgentID: f.old.ID, OldRunID: f.old.RunID,
+		SuccessorAgentID: api.NewID("agt"), SuccessorName: api.HandlerSuccessorName(f.old.Name, task.HandlerRevision), Reason: api.HandlerRotationReasonProviderBlocked, Trigger: api.HandlerRotationTriggerRunner}
+	if change != nil {
+		change(&req)
+	}
+	return f.s.HandlerRotationAction(context.Background(), f.task.ID, req, f.by)
+}
+
+func TestHandlerRotationDueProviderBlocked(t *testing.T) {
+	for _, class := range []string{api.ProviderBlockRateLimited, api.ProviderBlockServerError} {
+		f := newBlockedFixture(t, class, api.DefaultHandlerDeadSilenceMinutes)
+		f.at(t, api.HandlerProviderBlockedAfter-time.Second)
+		if f.due(t) {
+			t.Fatalf("%s listed at 19m59s", class)
+		}
+		// Due at 20 minutes, with the limit policy off.
+		f.at(t, api.HandlerProviderBlockedAfter)
+		if !f.due(t) {
+			t.Fatalf("%s not listed at 20m", class)
+		}
+		// Offline is not the blocked case.
+		f.clock = f.clock.Add(time.Hour)
+		if f.due(t) {
+			t.Fatalf("%s listed while offline", class)
+		}
+	}
+	// Not with the replacement off, an auth block, or no open obligation.
+	f := newBlockedFixture(t, api.ProviderBlockRateLimited, 0)
+	f.at(t, time.Hour)
+	if f.due(t) {
+		t.Fatal("listed with dead silence 0")
+	}
+	f = newBlockedFixture(t, api.ProviderBlockAuth, api.DefaultHandlerDeadSilenceMinutes)
+	f.at(t, time.Hour)
+	if f.due(t) {
+		t.Fatal("listed for an auth block")
+	}
+	f = newBlockedFixture(t, api.ProviderBlockRateLimited, api.DefaultHandlerDeadSilenceMinutes)
+	if _, err := f.s.db.Exec(`UPDATE obligations SET state=? WHERE agent_id=?`, api.ObligationClosed, f.old.ID); err != nil {
+		t.Fatal(err)
+	}
+	f.at(t, time.Hour)
+	if f.due(t) {
+		t.Fatal("listed with no open obligation")
+	}
+	// Recovery closes the episode: no longer due.
+	f = newBlockedFixture(t, api.ProviderBlockRateLimited, api.DefaultHandlerDeadSilenceMinutes)
+	f.at(t, time.Hour)
+	f.idle(t, f.old)
+	if f.due(t) {
+		t.Fatal("listed after recovery")
+	}
+}
+
+func TestHandlerRotationProviderBlockedPrepare(t *testing.T) {
+	f := newBlockedFixture(t, api.ProviderBlockRateLimited, api.DefaultHandlerDeadSilenceMinutes)
+	f.at(t, api.HandlerProviderBlockedAfter)
+	for name, change := range map[string]func(*api.HandlerRotationRequest){
+		"owner trigger":  func(r *api.HandlerRotationRequest) { r.Trigger = api.HandlerRotationTriggerOwner },
+		"authorization":  func(r *api.HandlerRotationRequest) { r.AuthorizedBy, r.AuthorizationReason = "owner", "fixture" },
+		"death evidence": func(r *api.HandlerRotationRequest) { r.DeathEvidence = &api.HandlerDeathEvidence{Host: "mini"} },
+	} {
+		if _, err := f.prepareBlocked(t, "blocked-"+strings.ReplaceAll(name, " ", "-"), change); !errors.Is(err, api.ErrInvalid) {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	f.at(t, api.HandlerProviderBlockedAfter-time.Second)
+	if _, err := f.prepareBlocked(t, "blocked-early", nil); refusalCode(err) != api.HandlerRotationRefusedNotBlocked {
+		t.Fatalf("early prepare: %v", err)
+	}
+	if n := countRows(t, f.s, `SELECT count(*) FROM handler_rotations WHERE task_id=?`, f.task.ID); n != 0 {
+		t.Fatalf("refused prepares left %d rotations", n)
+	}
+	f.at(t, api.HandlerProviderBlockedAfter)
+	r, err := f.prepareBlocked(t, "blocked-due", nil)
+	if err != nil || r.State != api.HandlerRotationPrepared || r.Reason != api.HandlerRotationReasonProviderBlocked || r.Trigger != api.HandlerRotationTriggerRunner {
+		t.Fatalf("due prepare %+v %v", r, err)
+	}
+	// Prepared, it stays listed for the runner to resume even with the limit
+	// policy off, also after the block clears.
+	f.idle(t, f.old)
+	list, err := f.s.HandlerRotationsDue(context.Background(), "mini", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Entries) != 1 || list.Entries[0].OpenRotation == nil || list.Entries[0].OpenRotation.ID != r.ID {
+		t.Fatalf("prepared rotation not listed: %+v", list.Entries)
+	}
+	// The other conditions refuse it too.
+	for _, setup := range []func(g *blockedFixture){
+		func(g *blockedFixture) { g.clock = g.clock.Add(time.Hour) }, // offline
+		func(g *blockedFixture) {
+			if _, err := g.s.db.Exec(`UPDATE obligations SET state=? WHERE agent_id=?`, api.ObligationClosed, g.old.ID); err != nil {
+				t.Fatal(err)
+			}
+		},
+	} {
+		g := newBlockedFixture(t, api.ProviderBlockRateLimited, api.DefaultHandlerDeadSilenceMinutes)
+		g.at(t, time.Hour)
+		setup(g)
+		if _, err := g.prepareBlocked(t, "blocked-refused", nil); refusalCode(err) != api.HandlerRotationRefusedNotBlocked {
+			t.Fatalf("prepare: %v", err)
+		}
+	}
+	g := newBlockedFixture(t, api.ProviderBlockAuth, api.DefaultHandlerDeadSilenceMinutes)
+	g.at(t, time.Hour)
+	if _, err := g.prepareBlocked(t, "blocked-auth", nil); refusalCode(err) != api.HandlerRotationRefusedNotBlocked {
+		t.Fatalf("auth prepare: %v", err)
+	}
+}
+
+func TestHandlerRotationProviderBlockedOwnerNoticeOnce(t *testing.T) {
+	ownerNotices := func(f *blockedFixture) []api.Message {
+		t.Helper()
+		messages, err := f.s.ListMessages(context.Background(), f.task.ID, 0, "", 500)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []api.Message
+		for _, m := range messages {
+			if m.Envelope != nil && m.Envelope.Subject == providerBlockedReplacedSubject {
+				out = append(out, m)
+			}
+		}
+		return out
+	}
+	for _, withHelper := range []bool{true, false} {
+		f := newBlockedFixture(t, api.ProviderBlockRateLimited, api.DefaultHandlerDeadSilenceMinutes)
+		var helper api.Agent
+		if withHelper {
+			helper = f.agent(t, "owner-helper", "")
+			if _, err := f.s.db.Exec(`UPDATE agents SET role=? WHERE id=?`, api.AgentRoleOwnerHelper, helper.ID); err != nil {
+				t.Fatal(err)
+			}
+		}
+		f.at(t, api.HandlerProviderBlockedAfter)
+		r, err := f.prepareBlocked(t, "blocked-prepare", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.successor(t, r, api.HandlerArm{Runtime: f.old.Runtime})
+		committed, err := f.commit(r, "rotation-commit-"+r.ID)
+		if err != nil || committed.State != api.HandlerRotationCommitted || committed.Receipt.Reissued != 1 {
+			t.Fatalf("commit %+v %v", committed, err)
+		}
+		notices := ownerNotices(f)
+		if len(notices) != 1 || notices[0].Seq != committed.Receipt.OwnerNoticeSeq || notices[0].To != helper.ID {
+			t.Fatalf("helper=%v notices %+v receipt %+v", withHelper, notices, committed.Receipt)
+		}
+		text := notices[0].Envelope.Body.Text
+		for _, want := range []string{f.old.Name, r.SuccessorName, "rate_limited", f.opened.Format(time.RFC3339), "1 open obligation(s) moved", "wi_ce7310979bc45479"} {
+			if !strings.Contains(text, want) {
+				t.Fatalf("notice lacks %q: %s", want, text)
+			}
+		}
+		for _, key := range []string{"rotation-commit-" + r.ID, "rotation-commit-replay"} {
+			if again, err := f.commitAsIs(r, key); err != nil || again.ID != committed.ID {
+				t.Fatalf("replay %s: %+v %v", key, again, err)
+			}
+		}
+		if n := len(ownerNotices(f)); n != 1 {
+			t.Fatalf("replays posted %d notices", n)
+		}
+	}
+	// A block that clears before the commit: the rotation completes as an
+	// ordinary one once the successor is ready, and the notice says so.
+	f := newBlockedFixture(t, api.ProviderBlockRateLimited, api.DefaultHandlerDeadSilenceMinutes)
+	f.at(t, api.HandlerProviderBlockedAfter)
+	r, err := f.prepareBlocked(t, "blocked-prepare", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.idle(t, f.old)
+	f.successor(t, r, api.HandlerArm{Runtime: f.old.Runtime})
+	if committed, err := f.commit(r, "rotation-commit-"+r.ID); err != nil || committed.State != api.HandlerRotationCommitted {
+		t.Fatalf("commit after recovery %+v %v", committed, err)
+	}
+	if notices := ownerNotices(f); len(notices) != 1 || !strings.Contains(notices[0].Envelope.Body.Text, "it cleared before the commit") {
+		t.Fatalf("notices %+v", notices)
+	}
 }

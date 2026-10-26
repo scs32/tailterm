@@ -1060,6 +1060,44 @@ func deadPrimaryNoticeText(t api.Task, r api.HandlerRotation, old, successor api
 	return b.String()
 }
 
+const providerBlockedReplacedSubject = "A provider-blocked primary database handler was replaced automatically"
+
+// openOwnerHelper is the project's newest open owner helper, or the zero agent
+// (a board-wide notice) when there is none.
+func openOwnerHelper(ctx context.Context, tx *sql.Tx, task string) (api.Agent, error) {
+	helper, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND role=? AND status NOT IN (?,?) ORDER BY created_at DESC LIMIT 1`, task, api.AgentRoleOwnerHelper, api.AgentClosed, api.AgentExited))
+	if errors.Is(err, sql.ErrNoRows) {
+		return api.Agent{}, nil
+	}
+	return helper, err
+}
+
+// providerBlockedReplacedText is the owner helper's notice of a committed
+// provider_blocked rotation: the old and new handler, the block's class and
+// since from the old run's latest rate_limited or server_error episode, and
+// the obligations moved.
+func providerBlockedReplacedText(ctx context.Context, tx *sql.Tx, t api.Task, r api.HandlerRotation, old, successor api.Agent, h api.HandlerRotationHandoff) (string, error) {
+	var class, since, cleared string
+	err := tx.QueryRowContext(ctx, `SELECT class,since,cleared_at FROM provider_block_episodes WHERE task_id=? AND agent_id=? AND run_id=? AND class IN (?,?) ORDER BY julianday(opened_at) DESC LIMIT 1`,
+		t.ID, old.ID, old.RunID, api.ProviderBlockRateLimited, api.ProviderBlockServerError).Scan(&class, &since, &cleared)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return "", err
+	}
+	block := "an unrecorded provider block"
+	if class != "" {
+		block = fmt.Sprintf("a %s provider block since %s", class, parseTS(since).UTC().Format(time.RFC3339))
+		if cleared != "" {
+			block += " (it cleared before the commit)"
+		}
+	}
+	policy, err := loadHandlerRotationPolicy(ctx, tx, t.ID)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("Primary database handler %s (%s / %s) held open obligations while stopped by %s for at least %s, so the host runner replaced it with %s by handler rotation %s once %s had completed a turn. %d open obligation(s) moved to %s. No other action is needed. Read the handoff with tt handler rotation get %s --task %s. This replacement shares the dead primary switch; to turn both off for this project: %s (bug wi_ce7310979bc45479, order #46760).",
+		old.Name, old.ID, old.RunID, block, api.HandlerProviderBlockedAfter, successor.Name, r.ID, successor.Name, len(h.Reissued), successor.Name, r.ID, t.ID, deadPrimaryOffHint(t.ID, policy.Revision)), nil
+}
+
 func handlerRotationReceipt(ctx context.Context, tx *sql.Tx, task, requestID, operation, hash string) (string, bool, error) {
 	var priorOperation, priorHash, rotation string
 	err := tx.QueryRowContext(ctx, `SELECT operation,payload_hash,rotation_id FROM handler_rotation_requests WHERE task_id=? AND request_id=?`, task, requestID).Scan(&priorOperation, &priorHash, &rotation)
@@ -1143,8 +1181,15 @@ func (s *Store) HandlerRotationAction(ctx context.Context, task string, req api.
 func (s *Store) prepareHandlerRotation(ctx context.Context, tx *sql.Tx, t api.Task, req api.HandlerRotationRequest, by api.Caller) (api.HandlerRotation, error) {
 	var zero api.HandlerRotation
 	switch req.Reason {
-	case api.HandlerRotationReasonManual, api.HandlerRotationReasonItems, api.HandlerRotationReasonTokens, api.HandlerRotationReasonTemplate, api.HandlerRotationReasonDeadPrimary:
+	case api.HandlerRotationReasonManual, api.HandlerRotationReasonItems, api.HandlerRotationReasonTokens, api.HandlerRotationReasonTemplate, api.HandlerRotationReasonDeadPrimary,
+		api.HandlerRotationReasonProviderBlocked:
 	default:
+		return zero, api.ErrInvalid
+	}
+	// Only the host runner replaces a provider-blocked primary, never with an
+	// owner authorization.
+	blocked := req.Reason == api.HandlerRotationReasonProviderBlocked
+	if blocked && (req.Trigger != api.HandlerRotationTriggerRunner || req.AuthorizedBy != "" || req.AuthorizationReason != "") {
 		return zero, api.ErrInvalid
 	}
 	// Only the host runner replaces a dead primary, only with its host's
@@ -1229,6 +1274,18 @@ func (s *Store) prepareHandlerRotation(ctx context.Context, tx *sql.Tx, t api.Ta
 		}
 	} else if refusal := busy.refusal(req.Trigger); refusal != nil {
 		return zero, refusal
+	}
+	if blocked {
+		// The hub checks the due condition itself, for the exact old run.
+		policy, err := loadHandlerRotationPolicy(ctx, tx, t.ID)
+		if err != nil {
+			return zero, err
+		}
+		if _, ok, err := providerBlockedPrimary(ctx, tx, t.ID, policy, old, busy, now); err != nil {
+			return zero, err
+		} else if !ok {
+			return zero, &api.HandlerRotationRefusal{Code: api.HandlerRotationRefusedNotBlocked, Detail: fmt.Sprintf("handler %s is not online and idle with a rate_limited or server_error block open for %s and an open obligation, or the dead primary replacement is off", old.Name, api.HandlerProviderBlockedAfter)}
+		}
 	}
 	r := api.HandlerRotation{ID: api.NewID("hrot"), TaskID: t.ID, RequestID: req.RequestID, State: api.HandlerRotationPrepared, Reason: req.Reason, Trigger: req.Trigger,
 		HandlerRevision: t.HandlerRevision, OldAgentID: old.ID, OldRunID: old.RunID, OldName: old.Name, SuccessorAgentID: req.SuccessorAgentID,
@@ -1459,14 +1516,31 @@ func (s *Store) commitHandlerRotation(ctx context.Context, tx *sql.Tx, t api.Tas
 	if err = tx.QueryRowContext(ctx, `SELECT max(seq) FROM messages WHERE task_id=? AND to_agent=?`, t.ID, successor.ID).Scan(&noticeSeq); err != nil {
 		return zero, err
 	}
-	if dead {
-		// The owner helper's copy; with no open owner helper it is board-wide.
-		helper, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND role=? AND status NOT IN (?,?) ORDER BY created_at DESC LIMIT 1`, t.ID, api.AgentRoleOwnerHelper, api.AgentClosed, api.AgentExited))
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+	providerBlocked := r.Reason == api.HandlerRotationReasonProviderBlocked
+	if providerBlocked {
+		// The owner helper is told once, in this transaction: a replayed
+		// commit returns the saved record above and posts nothing.
+		helper, err := openOwnerHelper(ctx, tx, t.ID)
+		if err != nil {
 			return zero, err
 		}
-		if errors.Is(err, sql.ErrNoRows) {
-			helper = api.Agent{}
+		text, err := providerBlockedReplacedText(ctx, tx, t, r, old, successor, handoff)
+		if err != nil {
+			return zero, err
+		}
+		refs := map[string]string{"handlerRotation": r.ID, "cause": "provider-blocked-handler"}
+		if err = s.postBrokerNotice(ctx, tx, t, helper, successor.Name, providerBlockedReplacedSubject, providerBlockedReplacedSubject, text, refs); err != nil {
+			return zero, err
+		}
+		if err = tx.QueryRowContext(ctx, `SELECT max(seq) FROM messages WHERE task_id=?`, t.ID).Scan(&ownerNoticeSeq); err != nil {
+			return zero, err
+		}
+	}
+	if dead {
+		// The owner helper's copy; with no open owner helper it is board-wide.
+		helper, err := openOwnerHelper(ctx, tx, t.ID)
+		if err != nil {
+			return zero, err
 		}
 		refs := map[string]string{"handlerRotation": r.ID, "escalation": "owner", "cause": "dead-primary-handler"}
 		if err = s.postBrokerNotice(ctx, tx, t, helper, successor.Name, subject, fallback, text, refs); err != nil {
@@ -1492,6 +1566,9 @@ func (s *Store) commitHandlerRotation(ctx context.Context, tx *sql.Tx, t api.Tas
 		commitEvidenceJSON, r.CommitDeathEvidence = string(data), req.DeathEvidence
 		r.Receipt.LeasesMoved, r.Receipt.OwnerNoticeSeq = len(handoff.LiveLeases), ownerNoticeSeq
 	}
+	if providerBlocked {
+		r.Receipt.OwnerNoticeSeq = ownerNoticeSeq
+	}
 	handoffJSON, _ := json.Marshal(handoff)
 	receiptJSON, _ := json.Marshal(r.Receipt)
 	if _, err = tx.ExecContext(ctx, `UPDATE handler_rotations SET state=?,successor_run_id=?,handoff_json=?,receipt_json=?,updated_at=?,old_runtime=?,successor_runtime=?,commit_evidence_json=? WHERE id=? AND state='prepared'`,
@@ -1507,6 +1584,9 @@ func (s *Store) commitHandlerRotation(ctx context.Context, tx *sql.Tx, t api.Tas
 	if dead {
 		payload["reason"], payload["leasesMoved"], payload["ownerNoticeSeq"], payload["commitDeathEvidence"] = r.Reason, len(handoff.LiveLeases), ownerNoticeSeq, req.DeathEvidence
 	}
+	if providerBlocked {
+		payload["reason"], payload["ownerNoticeSeq"] = r.Reason, ownerNoticeSeq
+	}
 	if authorized {
 		r.Authorization.OldRuntime, r.Authorization.SuccessorRuntime = old.Runtime, successor.Runtime
 		payload["authorizedBy"], payload["authorizationReason"] = r.Authorization.AuthorizedBy, r.Authorization.Reason
@@ -1517,9 +1597,51 @@ func (s *Store) commitHandlerRotation(ctx context.Context, tx *sql.Tx, t api.Tas
 	return r, nil
 }
 
-// snapshotHandlerHandoff lists what the successor inherits besides the
-// obligations it receives. Legacy required deliveries stay pinned to the old
-// run: they are listed here, not moved.
+// blockedPrimary is a primary handler's provider block that makes it due for
+// replacement (bug wi_ce7310979bc45479, order #46760, q2).
+type blockedPrimary struct {
+	class       string
+	since       time.Time
+	openedAt    time.Time
+	obligations int
+}
+
+// providerBlockedPrimary reports whether primary a, on its current run, is due
+// for a provider_blocked replacement: the policy's dead primary replacement is
+// on, the run is online and idle for the runner, it has an open rate_limited
+// or server_error episode that opened at least api.HandlerProviderBlockedAfter
+// ago, and it holds an obligation that needs more than delivery.
+func providerBlockedPrimary(ctx context.Context, q queryRower, task string, policy api.HandlerRotationPolicy, a api.Agent, busy handlerBusy, now time.Time) (blockedPrimary, bool, error) {
+	var b blockedPrimary
+	if policy.DeadSilenceMinutes <= 0 || !handlerSeenWithin(a, now) || !busy.idle() || a.Status == api.AgentClosed || a.Status == api.AgentExited {
+		return b, false, nil
+	}
+	rows, err := q.QueryContext(ctx, `SELECT class,since,opened_at FROM provider_block_episodes WHERE task_id=? AND agent_id=? AND run_id=? AND cleared_at='' AND class IN (?,?)`,
+		task, a.ID, a.RunID, api.ProviderBlockRateLimited, api.ProviderBlockServerError)
+	if err != nil {
+		return b, false, err
+	}
+	found := false
+	for rows.Next() {
+		var class, since, opened string
+		if err := rows.Scan(&class, &since, &opened); err != nil {
+			rows.Close()
+			return b, false, err
+		}
+		if at := parseTS(opened); !found || at.Before(b.openedAt) {
+			b, found = blockedPrimary{class: class, since: parseTS(since), openedAt: at}, true
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil || !found || now.Sub(b.openedAt) < api.HandlerProviderBlockedAfter {
+		return b, false, err
+	}
+	if err := q.QueryRowContext(ctx, `SELECT count(*) FROM obligations WHERE task_id=? AND agent_id=? AND state<>? AND needs<>?`, task, a.ID, api.ObligationClosed, api.ObligationNeedsDelivery).Scan(&b.obligations); err != nil {
+		return b, false, err
+	}
+	return b, b.obligations > 0, nil
+}
+
 // successorReady reports whether the successor's exact current run has an
 // activity report observed at or after since that shows a completed turn with
 // a model reply (api.HandlerSuccessorReady). Receipts are read by agent and
@@ -1547,6 +1669,9 @@ func successorReady(ctx context.Context, q queryRower, task string, successor ap
 	return false, rows.Err()
 }
 
+// snapshotHandlerHandoff lists what the successor inherits besides the
+// obligations it receives. Legacy required deliveries stay pinned to the old
+// run: they are listed here, not moved.
 func (s *Store) snapshotHandlerHandoff(ctx context.Context, tx *sql.Tx, t api.Task, old api.Agent, busy handlerBusy) (api.HandlerRotationHandoff, error) {
 	h := api.HandlerRotationHandoff{Reissued: []api.HandlerRotationReissue{}, LiveLeases: busy.leases, PendingScopeConfirmations: []api.HandlerRotationScope{},
 		AuthoredOpen: []api.HandlerRotationAuthored{}, AllocationIntents: []api.HandlerRotationIntent{}, QueueClaims: []api.HandlerRotationQueueClaim{},
@@ -1738,7 +1863,20 @@ func (s *Store) HandlerRotationsDue(ctx context.Context, host, templateDigest st
 		now := s.now()
 		d.Online = handlerSeenWithin(primary, now)
 		d.DeadCandidate = policy.DeadSilenceMinutes > 0 && !d.Online && !d.Idle && unreadable == nil
-		if !policy.Enabled && !d.DeadCandidate && unreadable == nil {
+		// A provider-blocked primary is replaced with the limit policy off
+		// too, and its prepared rotation stays listed so the runner can
+		// resume it after the block clears.
+		blocked := false
+		if !exited && unreadable == nil {
+			if _, blocked, err = providerBlockedPrimary(ctx, s.db, t.ID, policy, primary, busy, now); err != nil {
+				return out, err
+			}
+		}
+		if d.OpenRotation, err = openHandlerRotation(ctx, s.db, t.ID); err != nil {
+			return out, err
+		}
+		blockedRotation := d.OpenRotation != nil && d.OpenRotation.Reason == api.HandlerRotationReasonProviderBlocked
+		if !policy.Enabled && !d.DeadCandidate && !blocked && !blockedRotation && unreadable == nil {
 			continue
 		}
 		if !d.Online {
@@ -1785,12 +1923,12 @@ func (s *Store) HandlerRotationsDue(ctx context.Context, host, templateDigest st
 		if policy.Enabled && policy.OnTemplateChange && templateDigest != "" && !d.DigestMatches {
 			d.DueReasons = append(d.DueReasons, api.HandlerRotationReasonTemplate)
 		}
+		if blocked {
+			d.DueReasons = append(d.DueReasons, api.HandlerRotationReasonProviderBlocked)
+		}
 		if unreadable != nil {
 			d.ActivityState = "unreadable: " + unreadable.Error()
 			d.Idle, d.DeadCandidate, d.SilenceMet, d.DueReasons = false, false, false, []string{}
-		}
-		if d.OpenRotation, err = openHandlerRotation(ctx, s.db, t.ID); err != nil {
-			return out, err
 		}
 		out.Entries = append(out.Entries, d)
 	}

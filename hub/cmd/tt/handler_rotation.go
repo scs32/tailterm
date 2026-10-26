@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -156,6 +157,9 @@ type handlerRotationJournal struct {
 	// with no successor online; it is kept here so a relay restart keeps it.
 	ResumeFailures  int    `json:"resumeFailures,omitempty"`
 	LastResumeError string `json:"lastResumeError,omitempty"`
+	// SpawnedAt is when the successor's launch was recorded: its first
+	// completed turn is awaited until api.HandlerSuccessorReadyWait after it.
+	SpawnedAt time.Time `json:"spawnedAt,omitempty"`
 }
 
 // rotationAuthorization is the owner's authorization for a rotation that may
@@ -206,12 +210,40 @@ type rotationDeps struct {
 	// probe reads, on this host only, whether a handler's process and session
 	// are gone. A nil probe confirms nothing.
 	probe handlerDeathProbe
+	// readyWait is how long one call polls, every readyPoll, for the online
+	// successor's first completed turn before it returns a wait; the runner
+	// uses 0 and checks once per tick. clock is the readiness clock; nil is
+	// time.Now.
+	readyWait time.Duration
+	readyPoll time.Duration
+	clock     func() time.Time
+}
+
+func (d rotationDeps) now() time.Time {
+	if d.clock != nil {
+		return d.clock()
+	}
+	return time.Now()
 }
 
 func productionRotationDeps() rotationDeps {
 	runner := productionTeamRunner()
 	return rotationDeps{spawn: cmdSpawn, cleanup: runner.cleanup, host: spawn.Host, online: 2 * time.Minute, poll: 2 * time.Second,
-		probe: productionDeathProbe().probe}
+		probe: productionDeathProbe().probe, readyPoll: 10 * time.Second}
+}
+
+// errSuccessorNotReady is a wait, not a failure: the successor is online but
+// has not completed a turn yet, and api.HandlerSuccessorReadyWait has not
+// passed since its launch. The rotation stays prepared and the old handler
+// keeps every obligation.
+var errSuccessorNotReady = errors.New("the successor has not completed a turn yet")
+
+// successorMayBeReady reads the successor's current activity without writing.
+// A completed turn with a model reply is ready; any output at all in this run
+// means a reply was made, so the hub, which reads every report of the run,
+// decides at commit.
+func successorMayBeReady(a api.Agent) bool {
+	return a.Activity != nil && (api.HandlerSuccessorReady(*a.Activity) || a.Activity.Tokens.Output > 0)
 }
 
 // A death probe answers gone, alive or unknown. Only gone carries evidence,
@@ -496,7 +528,8 @@ func rotationRefusal(err error) (string, bool) {
 		case api.HandlerRotationRefusedLiveLease, api.HandlerRotationRefusedWorking, api.HandlerRotationRefusedPendingTool, api.HandlerRotationRefusedOpen,
 			api.HandlerRotationRefusedPaused, api.HandlerRotationRefusedNotPrimary, api.HandlerRotationRefusedSuccessor, api.HandlerRotationRefusedNameTaken,
 			api.HandlerRotationRefusedAgentCaller, api.HandlerRotationRefusedStaleHandler,
-			api.HandlerRotationRefusedDeathUnconfirmed, api.HandlerRotationRefusedNotSilent:
+			api.HandlerRotationRefusedDeathUnconfirmed, api.HandlerRotationRefusedNotSilent,
+			api.HandlerRotationRefusedSuccessorNotReady, api.HandlerRotationRefusedNotBlocked:
 			return httpErr.Code, true
 		}
 	}
@@ -506,6 +539,14 @@ func rotationRefusal(err error) (string, bool) {
 func rotationBusy(err error) bool {
 	code, ok := rotationRefusal(err)
 	return ok && (code == api.HandlerRotationRefusedLiveLease || code == api.HandlerRotationRefusedWorking || code == api.HandlerRotationRefusedPendingTool)
+}
+
+// rotationWait reports an outcome the runner waits out without counting or
+// logging it: a busy handler, a successor that has not completed a turn yet,
+// or a primary that is no longer provider blocked when the hub checks.
+func rotationWait(err error) bool {
+	code, _ := rotationRefusal(err)
+	return rotationBusy(err) || errors.Is(err, errSuccessorNotReady) || code == api.HandlerRotationRefusedNotBlocked
 }
 
 // currentPrimaryHandler applies the hub's rule to a task detail: the
@@ -659,6 +700,7 @@ func runHandlerRotation(ctx context.Context, d rotationDeps, e env, c *api.Clien
 		if err := d.spawn(launch, args); err != nil {
 			return zero, successorStartError{fmt.Errorf("successor launch unconfirmed; rerun to resume or abort with tt handler rotate --abort: %w", err)}
 		}
+		j.SpawnedAt = d.now().UTC()
 		if err = save(rotationPhaseSpawned); err != nil {
 			return zero, err
 		}
@@ -677,6 +719,42 @@ func runHandlerRotation(ctx context.Context, d rotationDeps, e env, c *api.Clien
 			case <-ctx.Done():
 				return zero, ctx.Err()
 			case <-time.After(d.poll):
+			}
+		}
+		// Online is not ready: the successor's exact run must complete a turn
+		// with a model reply before it takes the obligations (bug
+		// wi_ce7310979bc45479). Until then, and for at most
+		// api.HandlerSuccessorReadyWait from its launch, this is a wait.
+		if j.SpawnedAt.IsZero() {
+			// Journaled before readiness existed: the bound starts now.
+			j.SpawnedAt = d.now().UTC()
+			if err := writePrivateJSON(path, *j); err != nil {
+				return zero, err
+			}
+		}
+		readyBy := j.SpawnedAt.Add(api.HandlerSuccessorReadyWait)
+		notReady := func() error {
+			if !d.now().Before(readyBy) {
+				return successorStartError{fmt.Errorf("successor %s did not complete a turn within %s of its launch; the rotation stays prepared and the old handler keeps its obligations: rerun to resume or abort with tt handler rotate --abort", j.SuccessorName, api.HandlerSuccessorReadyWait)}
+			}
+			return fmt.Errorf("%w: successor %s, waiting until %s", errSuccessorNotReady, j.SuccessorName, readyBy.UTC().Format(time.RFC3339))
+		}
+		pollUntil := d.now().Add(d.readyWait)
+		for {
+			a, err := c.GetAgent(ctx, task, j.SuccessorAgentID)
+			if err != nil {
+				return zero, err
+			}
+			if successorMayBeReady(a) {
+				break
+			}
+			if !d.now().Before(readyBy) || !d.now().Before(pollUntil) {
+				return zero, notReady()
+			}
+			select {
+			case <-ctx.Done():
+				return zero, ctx.Err()
+			case <-time.After(d.readyPoll):
 			}
 		}
 		commit := api.HandlerRotationRequest{Operation: api.HandlerRotationCommit, RequestID: "rotation-commit-" + j.RotationID, RotationID: j.RotationID}
@@ -699,6 +777,9 @@ func runHandlerRotation(ctx context.Context, d rotationDeps, e env, c *api.Clien
 			}
 		}
 		if _, err := c.HandlerRotationAction(ctx, task, commit); err != nil {
+			if code, _ := rotationRefusal(err); code == api.HandlerRotationRefusedSuccessorNotReady {
+				return zero, notReady()
+			}
 			if j.Reason == api.HandlerRotationReasonDeadPrimary && deathUnconfirmedRefusal(err) {
 				if abortErr := abortJournaledRotation(ctx, d, e, c, task, path, j.RotationID); abortErr != nil {
 					return zero, fmt.Errorf("the hub refused the commit (%v); aborting the rotation failed and will retry: %w", err, abortErr)
@@ -953,9 +1034,13 @@ func cmdHandlerRotate(e env, args []string) error {
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	// The command waits for the successor's first completed turn, up to the
+	// readiness bound, on top of its own budget; the runner checks once per
+	// tick instead.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute+api.HandlerSuccessorReadyWait)
 	defer cancel()
 	deps := productionRotationDeps()
+	deps.readyWait = api.HandlerSuccessorReadyWait
 	var r api.HandlerRotation
 	if *abort {
 		r, err = abortHandlerRotation(ctx, deps, e, c, *task)
@@ -1258,7 +1343,7 @@ const rotationQuietCache = 5 * time.Minute
 // the runner makes before it stops and tells the owner helper and the handler.
 const rotationResumeCeiling = 3
 
-const rotationStuckSubject = "A handler rotation is stuck because its successor never came online"
+const rotationStuckSubject = "A handler rotation is stuck because its successor never came online or never completed a turn"
 
 var hostRotationRunner = &rotationRunner{deps: productionRotationDeps(), now: time.Now, interval: time.Minute, notified: map[string]bool{}}
 
@@ -1396,7 +1481,7 @@ func (r *rotationRunner) tick(ctx context.Context, e env, c *api.Client, host st
 				continue
 			}
 			_, err := rotateHandler(ctx, r.deps, e, c, d.TaskID, journal.Reason, journal.Trigger, *spec, rotationAuthorization{})
-			if err != nil && !rotationBusy(err) && !deathUnconfirmedRefusal(err) {
+			if err != nil && !rotationWait(err) && !deathUnconfirmedRefusal(err) {
 				errs = append(errs, fmt.Errorf("handler rotation %s: %w", d.TaskID, err))
 			}
 			if errors.As(err, &successorStartError{}) {
@@ -1425,6 +1510,21 @@ func (r *rotationRunner) tick(ctx context.Context, e env, c *api.Client, host st
 			}
 			continue
 		}
+		// A primary stopped by a provider rate limit or server error while it
+		// holds obligations is replaced whatever the limit policy says (bug
+		// wi_ce7310979bc45479); the hub re-checks the block at prepare.
+		if slices.Contains(d.DueReasons, api.HandlerRotationReasonProviderBlocked) {
+			if spec == nil {
+				if err := r.notifyMissingSpec(ctx, c, host, d, []string{api.HandlerRotationReasonProviderBlocked}); err != nil {
+					errs = append(errs, err)
+				}
+				continue
+			}
+			if _, err := rotateHandler(ctx, r.deps, e, c, d.TaskID, api.HandlerRotationReasonProviderBlocked, api.HandlerRotationTriggerRunner, *spec, rotationAuthorization{}); err != nil && !rotationWait(err) {
+				errs = append(errs, fmt.Errorf("handler rotation %s: %w", d.TaskID, err))
+			}
+			continue
+		}
 		// The hub lists a project for a dead primary even with its limit
 		// policy off, so the limits need the policy checked here.
 		if !d.Policy.Enabled {
@@ -1443,7 +1543,7 @@ func (r *rotationRunner) tick(ctx context.Context, e env, c *api.Client, host st
 		if !d.Idle {
 			continue
 		}
-		if _, err := rotateHandler(ctx, r.deps, e, c, d.TaskID, reasons[0], api.HandlerRotationTriggerRunner, *spec, rotationAuthorization{}); err != nil && !rotationBusy(err) {
+		if _, err := rotateHandler(ctx, r.deps, e, c, d.TaskID, reasons[0], api.HandlerRotationTriggerRunner, *spec, rotationAuthorization{}); err != nil && !rotationWait(err) {
 			errs = append(errs, fmt.Errorf("handler rotation %s: %w", d.TaskID, err))
 		}
 	}
@@ -1530,7 +1630,7 @@ func (r *rotationRunner) notifyStuckRotation(ctx context.Context, c *api.Client,
 			old = a.Name + " (" + a.ID + ")"
 		}
 	}
-	text := fmt.Sprintf("The rotation of database handler %s in project %s (%s) on host %s is stuck: its successor %s (%s) was not online after %d failed resume attempts by the runner. Last error: %s. The runner has stopped resuming it. The rotation stays prepared, no other successor is launched, and the old handler stays the primary with its leases and obligations. %s",
+	text := fmt.Sprintf("The rotation of database handler %s in project %s (%s) on host %s is stuck: its successor %s (%s) was not online, or did not complete a turn, after %d failed resume attempts by the runner. Last error: %s. The runner has stopped resuming it. The rotation stays prepared, no other successor is launched, and the old handler stays the primary with its leases and obligations. %s",
 		old, detail.Task.Name, d.TaskID, host, j.SuccessorName, j.SuccessorAgentID, j.ResumeFailures, noticeSafeError(j.LastResumeError), stuckRotationRecovery(j.Phase, d.TaskID))
 	for _, to := range recipients {
 		requestID := key + "-board"

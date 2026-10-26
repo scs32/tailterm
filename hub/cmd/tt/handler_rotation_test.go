@@ -59,6 +59,9 @@ type rotationCLI struct {
 	failPosts atomic.Int32
 	// auth is the owner's authorization passed to rotate; zero for an ordinary rotation.
 	auth rotationAuthorization
+	// unready keeps a launched successor from reporting its first completed
+	// turn, as a provider failure before its first activity report would.
+	unready bool
 }
 
 func newRotationCLI(t *testing.T, oldDigest string) *rotationCLI {
@@ -183,6 +186,23 @@ func (f *rotationCLI) spawn(_ env, args []string) error {
 	}
 	if f.online {
 		if _, err = f.c.PostEvent(ctx, f.task.ID, api.PostEventRequest{AgentID: a.ID, RunID: a.RunID, Kind: api.EventStarted}); err != nil {
+			return err
+		}
+		if !f.unready {
+			return reportReadyTurn(ctx, f.c, f.task.ID, a)
+		}
+	}
+	return nil
+}
+
+// reportReadyTurn reports what the relay reports for a successor's first
+// successful turn: working, then a completed turn with a model reply. A
+// rotation commit needs it (bug wi_ce7310979bc45479, order #46760).
+func reportReadyTurn(ctx context.Context, c *api.Client, task string, a api.Agent) error {
+	for _, state := range []string{"working", "idle"} {
+		now := time.Now().UTC()
+		activity := api.AgentActivity{State: state, ObservedAt: now, LastEventAt: now, Tokens: api.TokenTotals{Output: 1, Total: 1}}
+		if _, err := c.ReportActivity(ctx, task, a.ID, api.ActivityReport{RequestID: api.NewID("act"), RunID: a.RunID, Activity: activity}); err != nil {
 			return err
 		}
 	}
@@ -2040,8 +2060,10 @@ func newExitedRunner(t *testing.T, answers ...string) *exitedRunner {
 			if err != nil {
 				return err
 			}
-			_, err = f.c.PostEvent(ctx, f.task.ID, api.PostEventRequest{AgentID: a.ID, RunID: a.RunID, Kind: api.EventStarted})
-			return err
+			if _, err = f.c.PostEvent(ctx, f.task.ID, api.PostEventRequest{AgentID: a.ID, RunID: a.RunID, Kind: api.EventStarted}); err != nil {
+				return err
+			}
+			return reportReadyTurn(ctx, f.c, f.task.ID, a)
 		},
 		cleanup: func(_ context.Context, _ env, _, agent string) error {
 			x.cleaned = append(x.cleaned, agent)
@@ -2439,6 +2461,9 @@ func (f *stuckRotation) bringOnline(t *testing.T, agentID string) {
 		t.Fatal(err)
 	}
 	if _, err = f.c.PostEvent(context.Background(), f.task.ID, api.PostEventRequest{AgentID: a.ID, RunID: a.RunID, Kind: api.EventStarted}); err != nil {
+		t.Fatal(err)
+	}
+	if err = reportReadyTurn(context.Background(), f.c, f.task.ID, a); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -2913,8 +2938,10 @@ func newLostExitRunner(t *testing.T) *lostExitRunner {
 			if err != nil {
 				return err
 			}
-			_, err = f.c.PostEvent(ctx, f.task.ID, api.PostEventRequest{AgentID: a.ID, RunID: a.RunID, Kind: api.EventStarted})
-			return err
+			if _, err = f.c.PostEvent(ctx, f.task.ID, api.PostEventRequest{AgentID: a.ID, RunID: a.RunID, Kind: api.EventStarted}); err != nil {
+				return err
+			}
+			return reportReadyTurn(ctx, f.c, f.task.ID, a)
 		},
 		cleanup: func(_ context.Context, _ env, _, agent string) error {
 			x.cleaned = append(x.cleaned, agent)
@@ -3115,5 +3142,264 @@ func TestHandlerRotationRetriedExitReportReplacesPrimary(t *testing.T) {
 	old, _ := f.c.GetAgent(ctx, f.task.ID, f.old.ID)
 	if err != nil || detail.Task.PrimaryHandlerID != rot.SuccessorAgentID || old.Status != api.AgentClosed || len(x.cleaned) != 1 || x.cleaned[0] != f.old.ID {
 		t.Fatalf("primary: %+v old %s cleaned %v %v", detail.Task, old.Status, x.cleaned, err)
+	}
+}
+
+// A successor that comes online but never completes a turn, as when its
+// provider refuses its first request before any activity report (bug
+// wi_ce7310979bc45479, order #46760, criterion a5): the rotation stays
+// prepared and uncounted for api.HandlerSuccessorReadyWait from the launch,
+// the old handler keeps every obligation and no wake goes to the successor;
+// after it, three counted resumes end in one stuck notice to each recipient.
+func TestHandlerRotationStartupProviderFailure(t *testing.T) {
+	f := newStuckRotation(t)
+	f.online, f.unready = true, true
+	f.deps.online = 3 * time.Second
+	clock := time.Now().UTC()
+	f.deps.clock = func() time.Time { return clock }
+	r := f.runner()
+	r.deps = f.deps
+	tick := func(at time.Duration) error {
+		t.Helper()
+		clock = clock.Add(at)
+		return f.try(r)
+	}
+	start := clock
+	journal := func() handlerRotationJournal {
+		t.Helper()
+		j, err := loadRotationJournal(f.c.Base, f.task.ID)
+		if err != nil || j == nil {
+			t.Fatalf("journal %+v %v", j, err)
+		}
+		return *j
+	}
+	successorHolds := func(successor string) {
+		t.Helper()
+		db := f.db(t)
+		var obligations, wakes, messages int
+		if err := db.QueryRow(`SELECT (SELECT count(*) FROM obligations WHERE agent_id=?),(SELECT count(*) FROM wake_jobs WHERE agent_id=?),(SELECT count(*) FROM messages WHERE to_agent=?)`,
+			successor, successor, successor).Scan(&obligations, &wakes, &messages); err != nil {
+			t.Fatal(err)
+		}
+		if obligations+wakes+messages != 0 {
+			t.Fatalf("successor got obligations=%d wakes=%d messages=%d", obligations, wakes, messages)
+		}
+	}
+	// The start: prepared and launched; online, but not ready, is a wait.
+	if err := tick(0); err != nil {
+		t.Fatalf("first tick: %v", err)
+	}
+	rotation := f.assertHeld(t)
+	if j := journal(); j.Phase != rotationPhaseSpawned || !j.SpawnedAt.Equal(start) || j.ResumeFailures != 0 {
+		t.Fatalf("journal after the launch %+v", j)
+	}
+	successor, err := f.c.GetAgent(context.Background(), f.task.ID, rotation.SuccessorAgentID)
+	if err != nil || !successor.Online {
+		t.Fatalf("successor %+v %v", successor, err)
+	}
+	// Up to the bound: waits, never counted, and nothing moves.
+	for _, at := range []time.Duration{time.Minute, 4 * time.Minute, 4*time.Minute + 59*time.Second} {
+		if err := tick(at); err != nil {
+			t.Fatalf("wait at %s: %v", clock.Sub(start), err)
+		}
+	}
+	f.assertHeld(t)
+	successorHolds(rotation.SuccessorAgentID)
+	if j := journal(); j.ResumeFailures != 0 || len(f.stuckNotices(t)) != 0 || f.spawns != 1 {
+		t.Fatalf("before the bound: failures=%d notices=%d spawns=%d", j.ResumeFailures, len(f.stuckNotices(t)), f.spawns)
+	}
+	// At the bound: three counted resumes, then one stuck notice each.
+	for i := 1; i <= rotationResumeCeiling; i++ {
+		at := time.Minute
+		if i == 1 {
+			at = time.Second
+		}
+		if err := tick(at); err == nil || !strings.Contains(err.Error(), "did not complete a turn") {
+			t.Fatalf("resume %d at %s: %v", i, clock.Sub(start), err)
+		}
+		if n := len(f.stuckNotices(t)); (i < rotationResumeCeiling && n != 0) || (i == rotationResumeCeiling && n != 2) {
+			t.Fatalf("notices after resume %d: %d", i, n)
+		}
+	}
+	for i := 0; i < 3; i++ {
+		if err := tick(time.Minute); err != nil {
+			t.Fatalf("tick after the ceiling: %v", err)
+		}
+	}
+	if to := f.noticesTo(t); len(to) != 2 || to[f.helper.ID] != 1 || to[f.old.ID] != 1 {
+		t.Fatalf("stuck notices %v", to)
+	}
+	text := f.stuckNotices(t)[0].Envelope.Body.Text
+	if !strings.Contains(text, "did not complete a turn") {
+		t.Fatalf("stuck notice: %s", text)
+	}
+	f.assertHeld(t)
+	successorHolds(rotation.SuccessorAgentID)
+	if f.spawns != 1 {
+		t.Fatalf("spawns %d", f.spawns)
+	}
+
+	// The command polls up to its own bound and returns the same wait; once
+	// the successor completes a turn it commits.
+	g := newStuckRotation(t)
+	g.online, g.unready = true, true
+	g.deps.online, g.deps.readyWait, g.deps.readyPoll = 3*time.Second, 300*time.Millisecond, 20*time.Millisecond
+	if _, err := g.rotate(t); !errors.Is(err, errSuccessorNotReady) {
+		t.Fatalf("command before the successor is ready: %v", err)
+	}
+	held := g.assertHeld(t)
+	next, err := g.c.GetAgent(context.Background(), g.task.ID, held.SuccessorAgentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reportReadyTurn(context.Background(), g.c, g.task.ID, next); err != nil {
+		t.Fatal(err)
+	}
+	done, err := g.rotate(t)
+	if err != nil || done.State != api.HandlerRotationCommitted || done.SuccessorAgentID != held.SuccessorAgentID {
+		t.Fatalf("command after the first turn: %+v %v", done, err)
+	}
+}
+
+// The runner replaces a primary that a provider rate limit has stopped for 20
+// minutes while it holds obligations, with the limit policy off (bug
+// wi_ce7310979bc45479, order #46760, criteria a6 and a7). A retry wake fired
+// before the rotation, a runner re-tick and a commit replay leave every
+// obligation on exactly one live handler, and the owner helper is told once.
+func TestHandlerRotationProviderBlockedFallback(t *testing.T) {
+	f := newRotationCLI(t, handlerTemplateDigest("handler assignment"))
+	ctx := context.Background()
+	if err := saveHandlerSpec(f.spec); err != nil {
+		t.Fatal(err)
+	}
+	setRotationPolicy(t, f, api.HandlerRotationPolicyRequest{Enabled: false})
+	reg, err := f.c.RegisterOwnerHelper(ctx, f.task.ID, api.RegisterOwnerHelperRequest{Host: "fixture", Session: "owner", Runtime: "claude", RequestID: "blocked-helper"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := f.request(t, f.old.Name, "Record the first blocked handler fixture item")
+	byRole := f.request(t, "role:"+api.RoleDatabaseHandler, "Record the second blocked handler fixture item")
+	// The hub's clock reaches the 20-minute bound just before real time: a
+	// successor's online status is read by the real clock.
+	start := time.Now().UTC().Add(-api.HandlerProviderBlockedAfter - 10*time.Second)
+	clock := start
+	f.st.SetClockForTest(func() time.Time { return clock })
+	db := f.db(t)
+	at := func(d time.Duration) {
+		t.Helper()
+		clock = start.Add(d)
+		if _, err := db.Exec(`UPDATE agents SET last_seen_at=? WHERE id=?`, clock.Format(time.RFC3339Nano), f.old.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	block := api.ProviderBlock{Provider: "openai", Runtime: "codex", Model: "gpt-6-astra", Class: api.ProviderBlockRateLimited, Code: "response_too_many_failed_attempts", Status: 429, Since: start}
+	if _, err = f.c.ReportActivity(ctx, f.task.ID, f.old.ID, api.ActivityReport{RequestID: api.NewID("act"), RunID: f.old.RunID, Activity: api.AgentActivity{State: "provider_blocked", ObservedAt: start, Provider: &block}}); err != nil {
+		t.Fatal(err)
+	}
+	// The hub's retry wake at 5 minutes reaches the old handler first.
+	at(5 * time.Minute)
+	if _, err = f.st.ProviderBlockSweep(ctx, clock); err != nil {
+		t.Fatal(err)
+	}
+	var retries int
+	if err = db.QueryRow(`SELECT count(*) FROM wake_jobs w JOIN provider_block_retries r ON r.wake_job_id=w.id WHERE w.agent_id=?`, f.old.ID).Scan(&retries); err != nil || retries != 1 {
+		t.Fatalf("retry wakes %d %v", retries, err)
+	}
+	r := f.runner()
+	at(api.HandlerProviderBlockedAfter - time.Second)
+	f.tick(t, r)
+	if n := len(f.rotations(t)); n != 0 {
+		t.Fatalf("rotated at 19m59s: %d", n)
+	}
+	// An empty due list keeps a runner quiet for rotationQuietCache; a fresh
+	// runner, as after that cache, asks again.
+	at(api.HandlerProviderBlockedAfter)
+	r = f.runner()
+	f.tick(t, r)
+	rotations := f.rotations(t)
+	if len(rotations) != 1 || rotations[0].State != api.HandlerRotationCommitted || rotations[0].Reason != api.HandlerRotationReasonProviderBlocked || rotations[0].Trigger != api.HandlerRotationTriggerRunner {
+		t.Fatalf("rotations %+v", rotations)
+	}
+	rotation, err := f.c.GetHandlerRotation(ctx, f.task.ID, rotations[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	detail, err := f.c.GetTask(ctx, f.task.ID)
+	if err != nil || detail.Task.PrimaryHandlerID != rotation.SuccessorAgentID {
+		t.Fatalf("primary %q, want %s: %v", detail.Task.PrimaryHandlerID, rotation.SuccessorAgentID, err)
+	}
+	// Every obligation is on exactly one live handler: closed on the old one
+	// and open once on the successor.
+	owned := func() map[string]int {
+		t.Helper()
+		rows, err := db.Query(`SELECT o.agent_id,o.message_seq FROM obligations o JOIN agents a ON a.id=o.agent_id WHERE o.task_id=? AND o.state<>? AND o.needs<>? AND a.status NOT IN ('closed','exited')`, f.task.ID, api.ObligationClosed, api.ObligationNeedsDelivery)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		out := map[string]int{}
+		for rows.Next() {
+			var agent string
+			var seq int64
+			if err := rows.Scan(&agent, &seq); err != nil {
+				t.Fatal(err)
+			}
+			out[fmt.Sprintf("%s/%d", agent, seq)]++
+		}
+		return out
+	}
+	want := map[string]int{}
+	moved := map[int64]bool{}
+	for _, p := range rotation.Handoff.Reissued {
+		want[fmt.Sprintf("%s/%d", rotation.SuccessorAgentID, p.NewMessageSeq)] = 1
+		moved[p.OldMessageSeq] = true
+	}
+	if !moved[byName.Seq] || !moved[byRole.Seq] || len(moved) != 2 {
+		t.Fatalf("moved %v, want %d and %d", moved, byName.Seq, byRole.Seq)
+	}
+	if got := owned(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("open obligations %v, want %v", got, want)
+	}
+	helperNotices := func() int {
+		t.Helper()
+		messages, err := f.c.ListMessages(ctx, f.task.ID, 0, "", 500)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n := 0
+		for _, m := range messages {
+			if m.Envelope != nil && m.Envelope.Subject == "A provider-blocked primary database handler was replaced automatically" {
+				if m.To != reg.Registration.AgentID {
+					t.Fatalf("notice to %q, want the owner helper", m.To)
+				}
+				n++
+			}
+		}
+		return n
+	}
+	if n := helperNotices(); n != 1 {
+		t.Fatalf("owner helper notices %d", n)
+	}
+	// A runner re-tick and a commit replay change nothing.
+	due := f.dueCalls.Load()
+	for i := 0; i < 3; i++ {
+		at(api.HandlerProviderBlockedAfter + time.Duration(i+1)*time.Minute)
+		f.tick(t, f.runner())
+	}
+	if f.dueCalls.Load() != due+3 {
+		t.Fatalf("re-ticks asked the hub %d times", f.dueCalls.Load()-due)
+	}
+	again, err := f.c.HandlerRotationAction(ctx, f.task.ID, api.HandlerRotationRequest{Operation: api.HandlerRotationCommit, RequestID: "rotation-commit-" + rotation.ID, RotationID: rotation.ID})
+	if err != nil || again.ID != rotation.ID || again.State != api.HandlerRotationCommitted {
+		t.Fatalf("commit replay %+v %v", again, err)
+	}
+	if n := len(f.rotations(t)); n != 1 {
+		t.Fatalf("a second rotation started: %d", n)
+	}
+	if got := owned(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("after re-tick and replay %v, want %v", got, want)
+	}
+	if n := helperNotices(); n != 1 || f.spawns != 1 {
+		t.Fatalf("owner helper notices %d spawns %d", n, f.spawns)
 	}
 }

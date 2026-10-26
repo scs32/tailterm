@@ -2,7 +2,9 @@
 
 Feature `wi_611e4d3c6992a664`, work order #11573; plan
 [handler-rotation-plan.md](handler-rotation-plan.md); default thresholds from
-owner decision #14233.
+owner decision #14233. [Successor readiness](#successor-readiness) and
+[a provider-blocked primary](#a-provider-blocked-primary): bug
+`wi_ce7310979bc45479`, order #46760, assignment #46804.
 
 A project's database handler is the one long-lived role. Rotation replaces it
 with a fresh session that starts with the current prompt. The fresh session takes
@@ -188,13 +190,16 @@ routine keeps a journal of its phases next to the spec: `preparing`, `prepared`,
    handler prompt, plus a line telling it to wait for the handoff NOTICE. Its
    template digest is recorded for its exact run.
 3. **Wait.** The routine waits up to two minutes for the successor to come
-   online. If it does not, the rotation stays prepared. The runner resumes it
-   only up to a ceiling; see
+   online, then for its first completed turn, up to 10 minutes from its launch
+   (see [Successor readiness](#successor-readiness)). Until then the rotation
+   stays prepared. The runner resumes it only up to a ceiling; see
    [A successor that never comes online](#a-successor-that-never-comes-online).
 4. **Commit.** In one hub transaction, the hub:
    - re-checks that the old handler is idle
    - verifies the successor is online on the same host and directory, and on
      the same runtime and arm unless the rotation carries an authorization
+   - verifies the successor's exact run has completed a turn with a model reply
+     since the prepare
    - re-issues every open obligation the old handler holds (by role or by name)
      to the successor, keeping `via_role` and item links; each old one closes as
      `superseded`
@@ -211,6 +216,40 @@ never cleans up twice. A prepare whose response was lost is replayed with the sa
 key. `--abort` works only from prepared. It closes a registered successor and
 cleans up its session. It leaves the old handler primary and open and moves no
 obligations. A new prepare is allowed afterwards.
+
+## Successor readiness
+
+Bug `wi_ce7310979bc45479`, order #46760. On 2026-10-25 a successor came online
+(its wrapper's heartbeat), the commit moved every obligation to it, and its
+first turn then failed on a provider 429 before it ran any `tt` command. It
+never bound to the relay, so no wake reached it and the obligations waited for
+a person. Online is therefore not readiness.
+
+- **At commit** the hub refuses `successor_not_ready`, and moves nothing,
+  unless the activity receipts hold a report from the successor's exact agent
+  and current run, observed at or after the prepare, that shows a completed
+  turn with a model reply: state `idle` or `finished_silent`, no provider
+  block, a turn-end reason that is not a provider error (`turn ended by
+  provider error`), and output tokens above zero. Receipts are read by agent
+  and run, so the old handler's activity and an earlier run of the successor
+  never count. This applies to every reason, a dead primary included.
+- **The host routine** reads the successor's current activity first, without
+  writing, and commits only when it shows that turn or any output in the run;
+  the hub decides from all of the run's reports. `tt handler rotate` polls
+  every 10 seconds; the runner checks once per tick.
+- **Until 10 minutes after the launch** (`spawnedAt` in the journal; a journal
+  without it starts the 10 minutes at its first resume) a successor that is
+  not ready is a wait: the rotation stays prepared, the runner neither counts
+  nor logs it, and the old handler keeps every obligation. Nothing is sent to
+  the successor, so the wait does not depend on a relay wake reaching it.
+- **After 10 minutes** each resume that still finds it not ready is a counted
+  failure ("did not complete a turn within 10m0s"), and at the
+  [ceiling](#a-successor-that-never-comes-online) the runner stops with one
+  stuck notice each to the owner helper and the handler.
+
+A prepared rotation can therefore last about 13 minutes: the two minute online
+wait, the 10 minute readiness bound and three counted resumes a minute apart.
+Queue dispatch leases neither handler meanwhile, as for any prepared rotation.
 
 ## Refusals
 
@@ -230,7 +269,8 @@ The rotation row, successor and obligations stay as they were.
 | `successor_unavailable` | At commit, the successor is not a registered, online handler on the old handler's host, runtime and directory. An [authorized change](#changing-the-primarys-runtime-or-model) may differ in runtime only. |
 | `agent_caller` | The request carries an agent identity. |
 | `arm_changed` | At commit, the project has a saved [handler arm policy](handler-ab.md), the old run belongs to one of its arms and the successor does not belong to the same arm. `tt handler rotate` refuses before spawning in that case when the saved spec's `--model` or `--reasoning` differs from the old run's. Without a policy, or for a run in no arm, a model change is accepted. An [authorized change](#changing-the-primarys-runtime-or-model) skips this check and does not write the policy. |
-
+| `successor_not_ready` | At commit, for every reason: the successor's exact run has no report since the prepare of a completed turn with a model reply. See [Successor readiness](#successor-readiness). |
+| `not_blocked` | A [provider-blocked](#a-provider-blocked-primary) prepare only: the old run is not online and idle with a `rate_limited` or `server_error` episode open for 20 minutes and an obligation that needs more than delivery, or the dead primary replacement is off. |
 | `death_unconfirmed` | A [dead primary](#a-dead-primary) rotation only: the host's evidence is missing, stale, from another host or run, names no session, or does not state both the session and the process gone; or the hub had a heartbeat from the run within 90 seconds; or the handler is not busy; or the replacement is off for the project. For a [primary whose wrapper reported exited](#a-primary-whose-wrapper-reported-exited): the hub has no exit report from the wrapper as the run's newest start, heartbeat or exit, or that report changed since prepare; the evidence carries no exit from the host's receipt; or it states an `idle_shell` session without the pane's process. |
 | `not_silent` | A dead primary rotation only: the run's last recorded activity is more recent than the project's silence, the run has no recorded activity at all, or it recorded activity after the rotation was prepared. |
 
@@ -544,6 +584,52 @@ receipt's `exitedAt`, and the hub is unchanged: the accepted report is an
 ordinary wrapper exit report, so the silence starts at its acceptance, not at
 the exit.
 
+## A provider-blocked primary
+
+Bug `wi_ce7310979bc45479`, order #46760 (q2). A primary that a provider rate
+limit or server error stops is idle, healthy and online, so neither the limits
+nor the dead primary rule replace it. The hub first retries it with bounded
+wakes ([provider-blocked.md](provider-blocked.md#retry-wakes)). If it is still
+blocked after 20 minutes while it holds work, the host runner replaces it.
+
+The hub lists the primary with due reason `provider_blocked` when all hold:
+
+- the project's dead primary replacement is on (`deadSilenceMinutes` above 0);
+  `enabled`, which governs the limits, does not matter
+- the primary's current run is online by the hub's clock and idle for the
+  runner (`provider_blocked` counts as idle)
+- that run has an open `rate_limited` or `server_error` episode that opened at
+  least 20 minutes ago (`api.HandlerProviderBlockedAfter`, frozen); `auth` and
+  `usage_limit` keep their own recovery
+- it holds at least one obligation that needs more than delivery
+
+The due list keeps such a project with `enabled` false, and keeps listing a
+prepared `provider_blocked` rotation so the runner can resume it.
+
+The runner handles this reason before the limit policy and the limits. With a
+saved spec it rotates with reason `provider_blocked` and trigger `runner`;
+without one it posts the missing-spec notice. The prepare must come from the
+runner, with no authorization and no death evidence (otherwise 400), and the
+hub re-checks the conditions above for the exact old run (`not_blocked`
+otherwise). The commit uses the ordinary idle check and
+[successor readiness](#successor-readiness). A successor on the same account
+that is rate limited too never becomes ready: the rotation ends in the stuck
+notice and the old handler keeps its obligations, while its retry wakes go on.
+If the old handler recovers before the commit, the rotation still completes as
+an ordinary one once the successor is ready.
+
+The commit posts, in its own transaction, one NOTICE "A provider-blocked
+primary database handler was replaced automatically" to the project's owner
+helper (to the Board when none is open). It names the old and new handler, the
+block's class and since (and whether it cleared before the commit), the number
+of obligations moved and the policy command that turns the replacement off. A
+replayed commit returns the saved record and posts nothing; the receipt's
+`ownerNoticeSeq` names the notice. Obligations move by the ordinary keyed
+re-issue, once each.
+
+The switch is the dead primary's: `tt handler policy set --task TASK
+--revision N --dead-silence-minutes 0` turns both off.
+
 ## Handoff contents
 
 `tt handler rotation get` shows the snapshot saved at commit:
@@ -624,15 +710,20 @@ For each listed project:
 - A [dead candidate](#a-dead-primary) whose silence is met: probe this host
   and, only on gone, rotate with reason `dead_primary`. It is handled before
   the limits and never by them.
+- Due reason `provider_blocked`: rotate with that reason, or post the
+  missing-spec notice; see [A provider-blocked primary](#a-provider-blocked-primary).
+  It is handled before the limits and whatever `enabled` says.
 - Policy disabled: the project is listed only while its primary is a dead
-  candidate, and the runner acts on no limit for it.
+  candidate or provider blocked, or a `provider_blocked` rotation is prepared,
+  and the runner acts on no limit for it.
 
 ### A successor that never comes online
 
 A prepared rotation whose successor cannot start, because of a bad launch spec
 or a host out of capacity, is not resumed without end. The runner counts each
-resume that ends with the launch unconfirmed or the successor not online
-within the two minute wait. The count is kept with the rotation in the host
+resume that ends with the launch unconfirmed, the successor not online
+within the two minute wait, or the successor not
+[ready](#successor-readiness) 10 minutes after its launch. The count is kept with the rotation in the host
 journal (`resumeFailures`, `lastResumeError`), so a relay restart does not
 reset it.
 
@@ -662,8 +753,9 @@ After 3 failed resumes of one rotation the runner stops resuming it:
   on a later tick.
 
 The run that prepares the rotation is not a resume, so the successor gets
-four chances in all. A busy refusal and a dead primary refusal are waits and
-are not counted. A successor that comes online on a resume below the ceiling
+four chances in all. A busy refusal, a dead primary refusal, a `not_blocked`
+refusal and a successor that is online but not yet ready within its 10 minutes
+are waits and are not counted. A successor that comes online on a resume below the ceiling
 commits as usual, and nothing is posted.
 
 Recovery is by hand, on the handler's host, after fixing the launch (the saved
@@ -704,7 +796,7 @@ queue dispatch still leases neither handler, as for any prepared rotation.
 | `GET/PUT /v1/tasks/{id}/handler-rotation/policy` | Read, or save with `expectedRevision` |
 | `POST /v1/tasks/{id}/handler-rotations` | `operation` `prepare`, `commit` or `abort`, keyed by `requestId` |
 | `GET /v1/tasks/{id}/handler-rotations[/{rid}]` | List, or read one |
-| `GET /v1/handler-rotations/due?host=H&templateDigest=D` | Runner due list, with `online`, `lastActivityAt`, `deadCandidate` and `silenceMet` per primary |
+| `GET /v1/handler-rotations/due?host=H&templateDigest=D` | Runner due list, with `online`, `lastActivityAt`, `deadCandidate` and `silenceMet` per primary; `dueReasons` may include `provider_blocked` |
 
 Reusing a request ID with the same input returns the saved record without
 writing anything. Reusing it with different input is refused.
@@ -788,6 +880,13 @@ directory are inert without the new CLI.
   cannot be reached at commit, is still retried on every tick.
 - The hub does not reprovision a handler when the count reaches zero; that is
   follow-up `wi_42be87739d7bbfc9`.
+- Readiness comes from the relay's activity report for the successor's run. A
+  Codex successor binds to the relay only through its own `tt` commands, so one
+  whose first turns never run one is never ready; it ends in the stuck notice
+  and the old handler keeps its obligations.
+- A runner whose due list was empty asks again only after 5 minutes, so a
+  `provider_blocked` replacement in a project with nothing else listed can come
+  up to 5 minutes after the 20 minute bound.
 - `tt close` still refuses a database handler that is neither retired nor
   exited on the client side, including a non-primary one the hub would accept
   while another handler is available. Retire it first, then close it.

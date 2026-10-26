@@ -2354,6 +2354,10 @@ func TestTeamRunnerFrozenLaunchFollowsDeadPrimaryHandoff(t *testing.T) {
 			if _, err = hub.c.PostEvent(ctx, f.task.ID, api.PostEventRequest{AgentID: successor.ID, RunID: successor.RunID, Kind: api.EventRunning}); err != nil {
 				t.Fatal(err)
 			}
+			// A commit needs the successor's first completed turn (wi_ce7310979bc45479).
+			if err = reportReadyTurn(ctx, hub.c, f.task.ID, successor); err != nil {
+				t.Fatal(err)
+			}
 			time.Sleep(2 * time.Millisecond) // the second observation is later than the first
 			if r, err = f.st.HandlerRotationAction(ctx, f.task.ID, api.HandlerRotationRequest{Operation: api.HandlerRotationCommit, RequestID: "rotation-commit-" + r.ID, RotationID: r.ID, DeathEvidence: evidence()}, by); err != nil {
 				t.Fatalf("commit: %v", err)
