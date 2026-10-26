@@ -580,17 +580,32 @@ removes a closed, cleaned team's clean verifier checkouts as soon as the entry
 is accepted.
 
 A run is due one interval after the last swept run. A skipped or failed
-attempt is tried again 5 minutes later. The whole run is skipped, with the
+attempt is tried again 5 minutes later, except a run in which every
+repository failed, which counts as a run (below). The whole run is skipped, with the
 reason in the journal, when:
 
 - `off`: the switch is off. This is journalled once, when the switch is first
   seen off, not at every check.
 - `settings`: `relay.json` cannot be trusted, as above.
 - `cleanup-active`: another sweep or a closeout holds the cleanup lock.
-- `matrix-lock`: the matrix lock file cannot be trusted, as above.
+- `matrix-lock`: the matrix lock file cannot be trusted, as above, before
+  the pass starts.
 - `hub`: a roster or queue read failed, so the protections are unknown.
 
-A matrix run does not skip the run: it keeps what it holds, and other trees go.
+A matrix run that holds or waits for the host does not skip the run: it keeps
+what it holds, and other trees go. The matrix lock can still decide the
+outcome of a run that has swept, in this order:
+
+- The lock file turned unusable during the pass, which ended it: `failed`
+  with reason `matrix-lock`.
+- Otherwise, any path was kept because the mutex stayed busy: `skipped` with
+  reason `matrix-lock`, and `detail` gives the count and the holder.
+- Otherwise, every repository's sweep returned an error: `failed` with reason
+  `sweep`.
+
+Trees removed before the end stay removed. A `matrix-lock` outcome is not a
+swept run, so it is tried again 5 minutes later; a `failed` run with reason
+`sweep` counts as a run, so the next one waits a full interval.
 
 *Journal.* Each attempt appends exactly one line to `worktree-sweep.jsonl` in
 the relay state directory (mode 0600), read with `tt team queue sweep-worktrees
@@ -626,9 +641,10 @@ checkout's `node_modules`) and the Go build cache the trim last validated; it
 is `-1` when none could be read. `lowestVolume` names the path whose volume
 gave that reading and is absent when there was none. `repositoriesFailed`
 counts the repositories whose sweep returned an error, which `detail` names;
-it is absent when none did, and a run in which every repository failed is
-`failed` with reason `sweep`. `exclusionExceeded` counts removals that
-outran the matrix hold limit. `noticesDropped` appears when a full pending
+it is absent when none did. A run in which every repository failed is
+`failed` with reason `sweep` unless the matrix lock decided the outcome first
+(above). `exclusionExceeded` counts removals that outran the matrix hold
+limit. `noticesDropped` appears when a full pending
 list dropped a notice.
 `uncitableTemp` is the manual report's `totals.uncitableTemp`: the session
 temp folders kept only because the artifacts root cannot cite them, and their

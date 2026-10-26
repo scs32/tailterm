@@ -3,8 +3,10 @@
 When an order or plan designates acceptance criteria for independent verification,
 the lead lists their IDs in `body.verificationCriteria` on the frozen ASSIGN and
 REVIEW. The general reviewer reports `pending-verification` for those IDs. The
-handler-imported eligible receipt for the exact accepted candidate, current scope
-and assignment determines whether they pass. Reviewer-owned criteria still need
+imported eligible receipt for the exact accepted candidate, current scope and
+assignment determines whether they pass; the plan's verifier, the item lead or
+the database handler imports it (docs/project-queue.md, "Validated team
+operations"). Reviewer-owned criteria still need
 passing verdicts, and a missing, stale or ineligible receipt blocks acceptance.
 
 Feature `wi_f23f767415ef9b30`, owner order #11571, assignment #11766,
@@ -15,8 +17,10 @@ Round-one correction #11865, exact Start #11877/release #11881 and owner decisio
 #11866 add the immutable post-rollout enrollment boundary. Corrected ownership
 #11887 is the 47-path manifest; initial 13385477 is diagnostic only.
 
-The builder freezes a commit. The handler independently freezes a version 1
-plan before the verifier runs it. Plan selection uses the union of the saved
+The builder freezes a commit. The item lead or the database handler, not the
+builder, freezes a version 1 plan before the verifier runs it (callers:
+docs/project-queue.md, "Validated team operations"). Plan selection uses the
+union of the saved
 concrete ownership manifest and every base-to-candidate changed path, including
 both rename sides and deletions. `verification/matrix.json` inventories every
 standalone local browser entrypoint; imported helpers are covered by those parents.
@@ -82,8 +86,9 @@ readers precedes it is refused before admission with
 
 The normalized ownership manifest is handler-approved scope evidence, linked to
 the raw assignment and its canonical ownership digest. The runner never parses
-assignment prose. The handler must independently reproduce matrix selection from
-that manifest and the full diff before saving a plan. The hub stores the approved
+assignment prose. Whoever freezes the plan (the item lead or the database
+handler) must independently reproduce matrix selection from that manifest and
+the full diff before saving it. The hub stores the approved
 checks/digest independently of the producer receipt; it cannot inspect a remote
 repository or attest command execution.
 
@@ -510,7 +515,8 @@ lifecycle changes; altered payloads or competing generations conflict without
 partial writes. A new plan invalidates the prior receipt without deleting it.
 Scope/assignment changes and any different accepted SHA fail eligibility.
 Administrative priority/status revisions retain the original evidence provenance.
-The handler must freeze a new plan whenever the candidate matrix changes.
+The item lead or the database handler must freeze a new plan whenever the
+candidate matrix changes.
 One plan or receipt save may be up to 1 MiB (`api.MaxVerificationBody`); a full
 69-check receipt with retries is about 76 KB. Other hub requests keep the shared
 64 KiB limit.
@@ -1016,20 +1022,23 @@ and a `client/` fix runs unit and browser checks. Unknown paths still refuse, an
 so do a dirty or attached worktree and a fix equal to its previous candidate. The
 run uses the same runner, retries and clean-detached checks. It writes
 `targeted-receipt.json`, marked `targeted: true`, and never `receipt.json`. A
-targeted receipt is advisory iteration evidence. It has no plan binding, and the
-handler never imports it. The full plan runs once, on the final candidate.
+targeted receipt is advisory iteration evidence. It has no plan binding, and no
+verifier, lead or handler imports it. The full plan runs once, on the final
+candidate.
 
 Both `plan`/`run` and `targeted` refuse a base that the candidate does not
 contain: `plan`/`run` with "candidate is not a fast-forward of its base; rebase
 onto the current tip", and `targeted` by naming the fix candidate, the previous
 candidate it does not contain and their merge base. Equal and linear commits are accepted. At acceptance,
-`tt team queue accept` and the leased handler's done save read the item's current
+`tt team queue accept` and the done save (the item lead's or the leased
+handler's) read the item's current
 verification plan. `--commit` must equal the plan commit, and the accepted
 worktree must be a fast-forward of the plan base. That base is saved as the
 acceptance base, so a candidate built on an older base is refused with "not a
 fast-forward of the recorded base". Items without a plan keep the queue entry's
-base. The team rebases onto the current tasks-hub tip before the handler freezes
-the final plan, so the verified commit is exactly what merges.
+base. The team rebases onto the current tasks-hub tip before the item lead or
+the database handler freezes the final plan, so the verified commit is exactly
+what merges.
 
 ## Store race shards
 
@@ -1889,7 +1898,8 @@ and `knownFailures`, each with `checkId`, `bugTaskId` and `bugId`. The initial
 baseline Bug `wi_be7bbed81d4009c1`; the flaky board-compose check is excluded.
 Any list or retry-policy change requires a new owner matrix approval token.
 The runner derives the selected exceptions and retry policy from those exact
-bytes; the handler independently reproduces the plan and the store checks every
+bytes; the plan's freezer independently reproduces the plan and the store
+checks every
 linked bug exists, is a bug, and remains open/in progress/blocked. Closing or
 dismissing a linked bug removes eligibility for every other item until a new
 plan resolves the entry, and a new plan can never list a closed bug.
@@ -1937,9 +1947,11 @@ shows passing. Optional new fields preserve existing v1 canonical digests and
 legacy single-attempt receipts; legacy failures still block completion.
 
 The full matrix must run on a clean detached frozen candidate with new owner
-approval and a handler-saved plan. Its successful exit means gate eligibility,
-not that every raw check passed. Independent execution and handler import/readback
-remain required before acceptance. This successor introduces no AIV submission,
+approval and a saved plan (frozen by the item lead or the database handler).
+Its successful exit means gate eligibility, not that every raw check passed.
+Independent execution and receipt import/readback (by the plan's verifier, the
+item lead or the database handler) remain required before acceptance. This
+successor introduces no AIV submission,
 baseline test repairs, live data changes or deployment.
 
 ## Concurrent resource inventory and evidence
