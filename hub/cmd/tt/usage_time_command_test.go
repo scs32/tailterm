@@ -144,6 +144,12 @@ func TestUsageTimeCommandClassification(t *testing.T) {
 		{"cmd is a variable", "codex", "custom_tool_call", "exec", raw(`const cmd="tt wait"; text(await tools.exec_command({cmd}));`), want{usageToolOrdinary, false}},
 		{"cmd is a concatenation", "codex", "custom_tool_call", "exec", raw(`text(await tools.exec_command({cmd:"tt wait"+x}));`), want{usageToolOrdinary, false}},
 		{"another tool beside the wait", "codex", "custom_tool_call", "exec", raw(`await tools.apply_patch({input:"x"}); await tools.exec_command({cmd:"tt wait"});`), want{usageToolOrdinary, false}},
+		// A tools access the lexer cannot read as tools.NAME( fails, so work
+		// it hides is never counted as waiting.
+		{"bracket tools access beside the wait", "codex", "custom_tool_call", "exec", raw(`tools["exec_command"]({cmd:"go test ./..."}); await tools.exec_command({cmd:"tt wait"});`), want{usageToolOrdinary, false}},
+		{"alias of tools beside the wait", "codex", "custom_tool_call", "exec", raw(`const t = tools; await t.exec_command({cmd:"go test ./..."}); await tools.exec_command({cmd:"tt wait"});`), want{usageToolOrdinary, false}},
+		{"alias of exec_command beside the wait", "codex", "custom_tool_call", "exec", raw(`const run = tools.exec_command; await run({cmd:"go test ./..."}); await tools.exec_command({cmd:"tt wait"});`), want{usageToolOrdinary, false}},
+		{"other identifiers named like tools", "codex", "custom_tool_call", "exec", raw(`const tools2 = 1; r.tools = []; await tools.exec_command({cmd:"tt wait"});`), want{usageToolWaiting, true}},
 		{"wait text only inside a string", "codex", "custom_tool_call", "exec", raw(`text("tools.exec_command({cmd:'tt wait'})"); await tools.exec_command({cmd:"ls"});`), want{usageToolOrdinary, false}},
 		{"wait text only inside a comment", "codex", "custom_tool_call", "exec", raw("// tools.exec_command({cmd:'tt wait'})\nawait tools.exec_command({cmd:\"ls\"});"), want{usageToolOrdinary, false}},
 		{"snippet with no exec_command", "codex", "custom_tool_call", "exec", raw(`text("tt wait")`), want{usageToolOrdinary, false}},

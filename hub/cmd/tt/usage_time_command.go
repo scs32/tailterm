@@ -92,8 +92,8 @@ func usageToolCommands(runtime, kind, name string, payload json.RawMessage) ([]s
 
 // usageExecSnippetCommands is a small lexer over a Codex exec JavaScript
 // snippet. It skips string, template and comment tokens and collects the cmd
-// of every tools.exec_command({...}) call. Any other tools.NAME( call, a cmd
-// that is not a plain string literal, or an unterminated token fails.
+// of every tools.exec_command({...}) call. Any other use of tools, a cmd that
+// is not a plain string literal, or an unterminated token fails.
 func usageExecSnippetCommands(src string) ([]string, bool) {
 	var commands []string
 	i := 0
@@ -124,9 +124,11 @@ func usageExecSnippetCommands(src string) ([]string, bool) {
 			if src[start:i] != "tools" || (start > 0 && src[start-1] == '.') {
 				continue
 			}
+			// Any other use of tools (bracket access, an alias, a stored
+			// method) could hide a call this lexer cannot read.
 			j := usageJSSpace(src, i)
 			if j >= len(src) || src[j] != '.' {
-				continue
+				return nil, false
 			}
 			j = usageJSSpace(src, j+1)
 			nameStart := j
@@ -135,10 +137,7 @@ func usageExecSnippetCommands(src string) ([]string, bool) {
 			}
 			name := src[nameStart:j]
 			j = usageJSSpace(src, j)
-			if j >= len(src) || src[j] != '(' {
-				continue
-			}
-			if name != "exec_command" {
+			if j >= len(src) || src[j] != '(' || name != "exec_command" {
 				return nil, false
 			}
 			cmd, next, ok := usageExecCommandArgument(src, usageJSSpace(src, j+1))
