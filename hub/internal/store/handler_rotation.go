@@ -1353,6 +1353,15 @@ func (s *Store) commitHandlerRotation(ctx context.Context, tx *sql.Tx, t api.Tas
 			return zero, refusal
 		}
 	}
+	// Online is not readiness: a successor whose first turn fails at its
+	// provider would hold every obligation, unbound and unwakeable (bug
+	// wi_ce7310979bc45479). Nothing moves until its exact run has completed a
+	// turn with a model reply since the prepare; the old handler keeps all.
+	if ready, err := successorReady(ctx, tx, t.ID, successor, r.CreatedAt); err != nil {
+		return zero, err
+	} else if !ready {
+		return zero, &api.HandlerRotationRefusal{Code: api.HandlerRotationRefusedSuccessorNotReady, Detail: fmt.Sprintf("successor %s has not completed a turn with a model reply since the prepare; %s keeps its obligations until it does", successor.Name, old.Name)}
+	}
 	handoff, err := s.snapshotHandlerHandoff(ctx, tx, t, old, busy)
 	if err != nil {
 		return zero, err
@@ -1511,6 +1520,33 @@ func (s *Store) commitHandlerRotation(ctx context.Context, tx *sql.Tx, t api.Tas
 // snapshotHandlerHandoff lists what the successor inherits besides the
 // obligations it receives. Legacy required deliveries stay pinned to the old
 // run: they are listed here, not moved.
+// successorReady reports whether the successor's exact current run has an
+// activity report observed at or after since that shows a completed turn with
+// a model reply (api.HandlerSuccessorReady). Receipts are read by agent and
+// run, so the old handler's activity and an earlier run of the successor
+// never count.
+func successorReady(ctx context.Context, q queryRower, task string, successor api.Agent, since time.Time) (bool, error) {
+	rows, err := q.QueryContext(ctx, `SELECT payload FROM agent_activity_receipts WHERE task_id=? AND agent_id=? AND run_id=?`, task, successor.ID, successor.RunID)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var payload string
+		if err := rows.Scan(&payload); err != nil {
+			return false, err
+		}
+		var a api.AgentActivity
+		if json.Unmarshal([]byte(payload), &a) != nil {
+			continue
+		}
+		if !a.ObservedAt.Before(since) && api.HandlerSuccessorReady(a) {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
 func (s *Store) snapshotHandlerHandoff(ctx context.Context, tx *sql.Tx, t api.Task, old api.Agent, busy handlerBusy) (api.HandlerRotationHandoff, error) {
 	h := api.HandlerRotationHandoff{Reissued: []api.HandlerRotationReissue{}, LiveLeases: busy.leases, PendingScopeConfirmations: []api.HandlerRotationScope{},
 		AuthoredOpen: []api.HandlerRotationAuthored{}, AllocationIntents: []api.HandlerRotationIntent{}, QueueClaims: []api.HandlerRotationQueueClaim{},

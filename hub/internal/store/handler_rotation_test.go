@@ -126,8 +126,51 @@ func (f *rotationFixture) prepare(t *testing.T, key string, successor api.Agent,
 		Reason: api.HandlerRotationReasonManual, Trigger: api.HandlerRotationTriggerOwner}, f.by)
 }
 
+// commit makes the registered successor ready, as its first successful turn
+// would (readyTurn), then commits. commitAsIs leaves readiness to the test.
 func (f *rotationFixture) commit(r api.HandlerRotation, key string) (api.HandlerRotation, error) {
+	if err := f.readyTurn(r); err != nil {
+		return api.HandlerRotation{}, err
+	}
+	return f.commitAsIs(r, key)
+}
+
+func (f *rotationFixture) commitAsIs(r api.HandlerRotation, key string) (api.HandlerRotation, error) {
 	return f.s.HandlerRotationAction(context.Background(), f.task.ID, api.HandlerRotationRequest{Operation: api.HandlerRotationCommit, RequestID: key, RotationID: r.ID}, f.by)
+}
+
+// readyTurn reports, for the rotation's successor when it is registered and
+// not yet ready, a working turn and then a completed one with a model reply,
+// observed no earlier than the prepare: the readiness a commit needs (bug
+// wi_ce7310979bc45479, order #46760).
+func (f *rotationFixture) readyTurn(r api.HandlerRotation) error {
+	ctx := context.Background()
+	a, err := scanAgent(f.s.db.QueryRow(`SELECT `+agentCols+` FROM agents WHERE task_id=? AND id=?`, f.task.ID, r.SuccessorAgentID))
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && (a.Status == api.AgentClosed || a.Status == api.AgentExited)) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if ok, err := successorReady(ctx, f.s.db, f.task.ID, a, r.CreatedAt); err != nil || ok {
+		return err
+	}
+	return reportReadyTurn(f.s, f.task.ID, a, r.CreatedAt)
+}
+
+// reportReadyTurn reports a working turn, then a completed one with output.
+func reportReadyTurn(s *Store, task string, a api.Agent, notBefore time.Time) error {
+	at := s.now().UTC()
+	if at.Before(notBefore) {
+		at = notBefore
+	}
+	for i, state := range []string{"working", "idle"} {
+		activity := api.AgentActivity{State: state, ObservedAt: at, LastEventAt: at, Tokens: api.TokenTotals{Output: 1, Total: 1}}
+		if _, err := s.ReportActivity(context.Background(), task, a.ID, api.ActivityReport{RequestID: fmt.Sprintf("ready-%s-%d-%s", a.RunID, i, api.NewID("act")), RunID: a.RunID, Activity: activity}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func refusalCode(err error) string {
@@ -1209,6 +1252,9 @@ func (f *deadPrimaryFixture) prepareDead(t *testing.T, key string, change func(*
 }
 
 func (f *deadPrimaryFixture) commitDead(r api.HandlerRotation, key string, ev *api.HandlerDeathEvidence) (api.HandlerRotation, error) {
+	if err := f.readyTurn(r); err != nil {
+		return api.HandlerRotation{}, err
+	}
 	return f.s.HandlerRotationAction(context.Background(), f.task.ID, api.HandlerRotationRequest{Operation: api.HandlerRotationCommit, RequestID: key, RotationID: r.ID, DeathEvidence: ev}, f.by)
 }
 
@@ -2973,4 +3019,110 @@ func TestPrimaryHandlerFallbackOrdersByParsedTime(t *testing.T) {
 		t.Fatal(err)
 	}
 	pick(aux.ID, aux.ID, false)
+}
+
+// Successor readiness at commit (bug wi_ce7310979bc45479, order #46760,
+// criterion a4): nothing moves until the successor's exact run has completed
+// a turn with a model reply since the prepare.
+func TestHandlerRotationSuccessorReadiness(t *testing.T) {
+	f := newRotationFixture(t)
+	ctx := context.Background()
+	for i := 0; i < 3; i++ {
+		f.send(t, f.worker, api.EnvelopeKindRequest, f.old.ID, fmt.Sprintf("Record synthetic readiness item %d", i), false)
+	}
+	r, err := f.prepare(t, "ready-prepare", api.Agent{}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	successor, err := f.s.AddAgent(ctx, f.task.ID, api.AddAgentRequest{AgentID: r.SuccessorAgentID, Role: api.AgentRoleDatabaseHandler, Name: r.SuccessorName, Host: "mini", Session: "tt-handler-ready", Runtime: f.old.Runtime, Cwd: f.old.Cwd}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.s.PostEvent(ctx, f.task.ID, api.PostEventRequest{AgentID: successor.ID, RunID: successor.RunID, Kind: api.EventStarted}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	before := openObligations(t, f.s, f.task.ID)
+	n := 0
+	report := func(a api.Agent, activity api.AgentActivity) {
+		t.Helper()
+		n++
+		if activity.ObservedAt.IsZero() {
+			activity.ObservedAt = time.Now().UTC()
+		}
+		if _, err := f.s.ReportActivity(ctx, f.task.ID, a.ID, api.ActivityReport{RequestID: fmt.Sprintf("ready-report-%d", n), RunID: a.RunID, Activity: activity}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	refused := func(what string) {
+		t.Helper()
+		if _, err := f.commitAsIs(r, "ready-commit-"+strings.ReplaceAll(what, " ", "-")); refusalCode(err) != api.HandlerRotationRefusedSuccessorNotReady {
+			t.Fatalf("%s: commit %v, want %s", what, err, api.HandlerRotationRefusedSuccessorNotReady)
+		}
+		f.assertNothingMoved(t, before)
+		if c := countRows(t, f.s, `SELECT count(*) FROM obligations WHERE agent_id=?`, successor.ID); c != 0 {
+			t.Fatalf("%s: successor holds %d obligations", what, c)
+		}
+	}
+	refused("no activity")
+	// The predecessor's own completed turns are not the successor's.
+	report(f.old, api.AgentActivity{State: "working", Tokens: api.TokenTotals{Output: 9}})
+	report(f.old, api.AgentActivity{State: "idle", Tokens: api.TokenTotals{Output: 10}})
+	refused("predecessor activity")
+	// An earlier run of the successor, and this run before the prepare.
+	ready, _ := json.Marshal(api.AgentActivity{State: "idle", ObservedAt: time.Now().UTC(), Tokens: api.TokenTotals{Output: 5}})
+	if _, err := f.s.db.Exec(`INSERT INTO agent_activity_receipts(task_id,request_id,agent_id,run_id,payload,request_payload) VALUES(?,?,?,?,?,'{}')`, f.task.ID, "ready-earlier-run", successor.ID, "run_fixtureearlier01", string(ready)); err != nil {
+		t.Fatal(err)
+	}
+	report(successor, api.AgentActivity{State: "working", ObservedAt: r.CreatedAt.Add(-time.Second), Tokens: api.TokenTotals{Output: 4}})
+	report(successor, api.AgentActivity{State: "idle", ObservedAt: r.CreatedAt.Add(-time.Second), Tokens: api.TokenTotals{Output: 5}})
+	refused("earlier run or before the prepare")
+	// Turns of this run that are not a completed model reply.
+	report(successor, api.AgentActivity{State: "provider_blocked", Tokens: api.TokenTotals{Output: 5}, Provider: &api.ProviderBlock{Provider: "openai", Runtime: "codex", Model: "gpt-6-astra", Class: api.ProviderBlockRateLimited, Code: "response_too_many_failed_attempts", Status: 429, Since: time.Now().UTC()}})
+	refused("provider blocked")
+	report(successor, api.AgentActivity{State: "finished_silent", Reason: api.ProviderErrorTurnReasonPrefix + " (rate_limited)", Tokens: api.TokenTotals{Output: 5}})
+	refused("provider error turn end")
+	report(successor, api.AgentActivity{State: "idle", Tokens: api.TokenTotals{}})
+	refused("no output")
+	report(successor, api.AgentActivity{State: "working", Tokens: api.TokenTotals{Output: 6}})
+	refused("turn still running")
+	// One completed turn of the exact run with a model reply.
+	report(successor, api.AgentActivity{State: "idle", Tokens: api.TokenTotals{Output: 6}})
+	committed, err := f.commitAsIs(r, "ready-commit")
+	if err != nil || committed.State != api.HandlerRotationCommitted || committed.Receipt == nil || committed.Receipt.Reissued != 3 {
+		t.Fatalf("ready commit %+v %v", committed, err)
+	}
+	// Each moved request is one open obligation of the successor, for the
+	// re-issue the handoff names.
+	moved := func() int {
+		c := 0
+		for _, p := range committed.Handoff.Reissued {
+			c += countRows(t, f.s, `SELECT count(*) FROM obligations WHERE agent_id=? AND state<>? AND message_seq=?`, successor.ID, api.ObligationClosed, p.NewMessageSeq)
+		}
+		return c + countRows(t, f.s, `SELECT count(*) FROM obligations WHERE agent_id=? AND needs<>? AND message_seq NOT IN (SELECT value FROM json_each(?))`, successor.ID, api.ObligationNeedsDelivery, reissuedSeqs(committed))
+	}
+	if m := moved(); m != 3 || countRows(t, f.s, `SELECT count(*) FROM obligations WHERE agent_id=? AND state<>?`, f.old.ID, api.ObligationClosed) != 0 {
+		t.Fatalf("moved %d", m)
+	}
+	// A replayed commit, by its key or another, returns the saved record and
+	// moves nothing again.
+	for _, key := range []string{"ready-commit", "ready-commit-replay"} {
+		again, err := f.commitAsIs(r, key)
+		if err != nil || again.ID != committed.ID || again.Receipt == nil || again.Receipt.NoticeSeq != committed.Receipt.NoticeSeq {
+			t.Fatalf("replay %s: %+v %v", key, again, err)
+		}
+	}
+	if m := moved(); m != 3 {
+		t.Fatalf("replay moved %d", m)
+	}
+}
+
+func reissuedSeqs(r api.HandlerRotation) string {
+	var seqs []int64
+	if r.Handoff != nil {
+		for _, p := range r.Handoff.Reissued {
+			seqs = append(seqs, p.NewMessageSeq)
+		}
+	}
+	out, _ := json.Marshal(seqs)
+	return string(out)
 }
