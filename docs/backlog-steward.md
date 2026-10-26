@@ -285,9 +285,11 @@ the decision:
   never reorder the project queue.
 
 For an approved batch, the steward records it in the summary and asks the
-handler for one shared work-order message naming every item and the combined
-ownership. Until multi-item queue entries exist (`wi_faeef2716575d0eb`), a batch
-is queued as adjacent entries.
+handler for one single-item work order per item. Each order names the batch
+and the combined ownership in its text, and the batch is queued as adjacent
+entries. The hub launches only an order linked to exactly one primary item;
+an order linking several items fails at its first registration. This holds
+until multi-item queue entries exist (`wi_faeef2716575d0eb`).
 
 ## Backlog summary
 
