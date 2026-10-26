@@ -1042,7 +1042,16 @@ func relayWakeJob(ctx context.Context, b runtimeBinding, p *relayProgress, c *ap
 			p.LastAttempt = now // inbox retry keeps the normal 15-second spacing
 		}
 	}
-	reportErr := c.ReportWakeJob(ctx, b.Task, job.ID, report)
+	reportCtx := ctx
+	if ctx.Err() != nil {
+		// The pass deadline expired while the wake ran, perhaps killing codex
+		// queue after it queued the message. Report on a short context of its
+		// own: an unreported lease expires and the hub wakes the agent again.
+		var cancel context.CancelFunc
+		reportCtx, cancel = context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+	}
+	reportErr := c.ReportWakeJob(reportCtx, b.Task, job.ID, report)
 	if report.Status != "accepted" {
 		// Avoid a second attempt into the same busy pane in this pass. The
 		// persisted inbox fallback will retry at normal spacing.
@@ -1079,10 +1088,17 @@ func nativeQueue(ctx context.Context, b runtimeBinding, prompt string) error {
 		command.Env = append(command.Env, "CODEX_HOME="+b.CodexHome)
 	}
 	out, err := command.CombinedOutput()
+	confirmed := strings.Contains(string(out), "Queued message")
+	if err != nil && confirmed {
+		// The message is queued although the command then failed, usually
+		// killed at the pass deadline. Reporting a failure would queue it again.
+		fmt.Fprintf(os.Stderr, "[tt relay] %s Codex queued the message, then codex queue failed: %v: %.500s\n", b.Agent, err, strings.TrimSpace(string(out)))
+		return nil
+	}
 	if err != nil {
 		return fmt.Errorf("Codex queue failed: %w: %.500s", err, strings.TrimSpace(string(out)))
 	}
-	if !strings.Contains(string(out), "Queued message") {
+	if !confirmed {
 		return fmt.Errorf("Codex did not confirm a queued message: %.500s", out)
 	}
 	return nil

@@ -1160,6 +1160,137 @@ func TestRelayCodexOwnerHelperWakeRoutes(t *testing.T) {
 	}
 }
 
+// A Codex wake whose codex queue printed its confirmation and then failed,
+// killed at the pass deadline or exiting non-zero, is queued: the broker job is
+// reported accepted on a fresh context, the inbox cursor advances, and neither
+// path queues it again. Without the confirmation the wake still fails.
+func TestRelayCodexQueueConfirmedBeforeErrorCountsQueued(t *testing.T) {
+	for _, tc := range []struct {
+		name, script, exit string
+		deadline, queued   bool
+	}{
+		{"confirmed-then-killed", "printf 'Queued message m1 for thread t1.\\n'\nexec sleep 30\n", "signal: killed", true, true},
+		{"confirmed-then-exit-1", "printf 'Queued message m1 for thread t1.\\n'\nexit 1\n", "exit status 1", false, true},
+		{"silent-killed", "exec sleep 30\n", "signal: killed", true, false},
+		{"silent-exit-1", "exit 1\n", "exit status 1", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			calls := filepath.Join(dir, "calls")
+			fake := filepath.Join(dir, "fake-codex")
+			// exec, so a deadline kill reaches the process holding the output pipe.
+			if err := os.WriteFile(fake, []byte("#!/bin/sh\nprintf 'queued\\n' >> '"+calls+"'\n"+tc.script), 0700); err != nil {
+				t.Fatal(err)
+			}
+			queueCalls := func() int {
+				data, _ := os.ReadFile(calls)
+				return strings.Count(string(data), "queued\n")
+			}
+			pass := func(run func(context.Context) error) string {
+				ctx, cancel := context.WithCancel(context.Background())
+				if tc.deadline {
+					ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+				}
+				defer cancel()
+				out, err := captureRelayOutput(t, true, func() error { return run(ctx) })
+				if err != nil {
+					t.Fatal(err)
+				}
+				return out
+			}
+			checkLog := func(out string) {
+				t.Helper()
+				want := 0
+				if tc.queued {
+					want = 1
+				}
+				if got := strings.Count(out, "[tt relay] agt_0123456789abcdef Codex queued"); got != want || (tc.queued && !strings.Contains(out, tc.exit)) {
+					t.Fatalf("relay log has %d confirmed-failure lines, want %d naming %q:\n%s", got, want, tc.exit, out)
+				}
+			}
+			agent := api.Agent{ID: "agt_0123456789abcdef", RunID: "run_0123456789abcdef", Runtime: "codex", Status: api.AgentDone, Online: true, Unread: 1}
+			b := runtimeBinding{Task: "tsk_0123456789abcdef", Agent: agent.ID, Run: agent.RunID, Thread: "00000000-0000-4000-8000-000000000001", Runtime: "codex", Codex: fake}
+
+			// Broker path. The fixture re-serves an unreported job, as the hub
+			// does once its lease expires.
+			job := api.WakeJob{ID: "wake_0123456789abcdef", LeaseToken: "lease", MessageSeq: 42, AgentID: agent.ID, RunID: agent.RunID, Prompt: "Tailterm broker: #42 request. Run tt obligations."}
+			h := &needsInputHub{t: t, agent: agent, jobs: []api.WakeJob{job}}
+			hub := httptest.NewServer(h)
+			defer hub.Close()
+			c, _ := api.NewClient(hub.URL, time.Second)
+			b.Hub = hub.URL
+			var p relayProgress
+			now := time.Now()
+			var handled bool
+			var brokerErr error
+			checkLog(pass(func(ctx context.Context) error {
+				handled, brokerErr = relayWakeJob(ctx, b, &p, c, now, nativeQueue)
+				return nil
+			}))
+			h.mu.Lock()
+			reports := append([]api.WakeJobReport(nil), h.reports...)
+			if len(reports) == 0 {
+				h.jobs = append(h.jobs, job)
+			}
+			h.mu.Unlock()
+			if tc.queued {
+				if !handled || brokerErr != nil || len(reports) != 1 || reports[0].Status != "accepted" {
+					t.Fatalf("broker handled=%v err=%v reports=%+v, want one accepted", handled, brokerErr, reports)
+				}
+			} else if handled || brokerErr == nil || len(reports) != 1 || reports[0].Status != "failed" || !strings.Contains(reports[0].Detail, "Codex queue failed: "+tc.exit) {
+				t.Fatalf("broker handled=%v err=%v reports=%+v, want one failed", handled, brokerErr, reports)
+			}
+			pass(func(ctx context.Context) error {
+				_, err := relayWakeJob(ctx, b, &p, c, now.Add(time.Minute), nativeQueue)
+				return err
+			})
+			if got := queueCalls(); got != 1 {
+				t.Fatalf("broker path queued %d times, want 1", got)
+			}
+
+			// Inbox path.
+			ih := &needsInputHub{t: t, agent: agent}
+			ih.messages = []api.Message{{Seq: 41, To: agent.ID, From: api.Sender{Node: "workspace", User: "owner"}, Text: "owner input"}}
+			inbox := httptest.NewServer(ih)
+			defer inbox.Close()
+			ic, _ := api.NewClient(inbox.URL, time.Second)
+			b.Hub = inbox.URL
+			var ip relayProgress
+			var inboxErr error
+			checkLog(pass(func(ctx context.Context) error {
+				inboxErr = relayOne(ctx, b, &ip, ic, now, nativeQueue)
+				return nil
+			}))
+			if tc.queued && (inboxErr != nil || ip.Through != 41) {
+				t.Fatalf("inbox err=%v through=%d, want queued through 41", inboxErr, ip.Through)
+			}
+			if !tc.queued && (inboxErr == nil || !strings.Contains(inboxErr.Error(), "Codex queue failed: "+tc.exit) || ip.Through != 0) {
+				t.Fatalf("inbox err=%v through=%d, want failed", inboxErr, ip.Through)
+			}
+			pass(func(ctx context.Context) error {
+				_ = relayOne(ctx, b, &ip, ic, now.Add(time.Minute), nativeQueue)
+				return nil
+			})
+			// A failed wake is retried; a queued one is not.
+			want := 3
+			if tc.queued {
+				want = 2
+			}
+			if got := queueCalls(); got != want {
+				t.Fatalf("queued %d times in all, want %d", got, want)
+			}
+		})
+	}
+	// A clean exit without the confirmation is still unconfirmed.
+	fake := filepath.Join(t.TempDir(), "fake-codex")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\nprintf 'queued\\n'\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := nativeQueue(context.Background(), runtimeBinding{Agent: "agt_0123456789abcdef", Thread: "00000000-0000-4000-8000-000000000001", Codex: fake}, "wake"); err == nil || !strings.Contains(err.Error(), "Codex did not confirm a queued message") {
+		t.Fatalf("clean exit without confirmation: %v", err)
+	}
+}
+
 // rotationLoopFixture runs the relay loop against a local hub with one bound
 // agent, away from the live hub, relay state, config and tmux socket. It
 // counts the team queue polls and the bound agent's wake-pass reads.
