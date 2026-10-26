@@ -250,6 +250,9 @@ a person. Online is therefore not readiness.
 A prepared rotation can therefore last about 13 minutes: the two minute online
 wait, the 10 minute readiness bound and three counted resumes a minute apart.
 Queue dispatch leases neither handler meanwhile, as for any prepared rotation.
+After that it is stuck, and the runner aborts it when the old handler recovers
+or after 60 minutes; see
+[Automatic abort of a stuck rotation](#automatic-abort-of-a-stuck-rotation).
 
 ## Refusals
 
@@ -615,6 +618,9 @@ otherwise). The commit uses the ordinary idle check and
 [successor readiness](#successor-readiness). A successor on the same account
 that is rate limited too never becomes ready: the rotation ends in the stuck
 notice and the old handler keeps its obligations, while its retry wakes go on.
+When a retry wake lets the old handler complete a turn again, the runner aborts
+the stuck rotation at its next tick, which lifts the dispatch hold; see
+[Automatic abort of a stuck rotation](#automatic-abort-of-a-stuck-rotation).
 If the old handler recovers before the commit, the rotation still completes as
 an ordinary one once the successor is ready.
 
@@ -699,7 +705,8 @@ while a listed policy is enabled, and an empty answer is cached for 5 minutes.
 For each listed project:
 
 - A local journal for the project: resume that rotation, unless it has
-  reached the resume ceiling below.
+  reached the resume ceiling below. A stuck one is aborted automatically when
+  its old handler recovers or after 60 minutes (below).
 - Due and idle with a saved spec: rotate, with trigger `runner` and the first
   due reason.
 - Due but busy: nothing this tick. It rotates on the first idle tick.
@@ -729,7 +736,9 @@ reset it.
 
 After 3 failed resumes of one rotation the runner stops resuming it:
 
-- The rotation stays prepared. The runner does not abort it.
+- The rotation stays prepared, until the runner
+  [aborts it automatically](#automatic-abort-of-a-stuck-rotation) or a person
+  resumes or aborts it.
 - The same successor identity is used for every attempt, and no other
   successor is launched.
 - The old handler stays the primary, with its leases and obligations.
@@ -737,7 +746,8 @@ After 3 failed resumes of one rotation the runner stops resuming it:
   handler being replaced, once per rotation and not per tick. With no owner
   helper registered, that copy goes to the Board. Each names the project, the
   handler, the successor, the host, the number of failed resumes and the last
-  error, with the recovery advice for the rotation's state (below).
+  error, the automatic abort rule for the rotation's reason, and the recovery
+  advice for the rotation's state (below).
 - Each notice's request identity names the rotation and its recipient: the
   owner helper's agent, the handler's agent, or the Board. While the
   rotation stays stuck, every tick reads the project's agents and tells only
@@ -786,8 +796,50 @@ state:
 
 Both commands are accepted after the ceiling. A manual resume that fails again
 leaves the runner stopped and posts nothing more. After an abort, a rotation
-that is still due starts fresh with its own count. While a rotation is stuck,
-queue dispatch still leases neither handler, as for any prepared rotation.
+that is still due starts fresh with its own count.
+
+### Automatic abort of a stuck rotation
+
+Bug `wi_63793d7e551231f6`, order #46928. Queue dispatch leases neither handler
+while a rotation is prepared. A stuck rotation therefore held a project's
+dispatch until a person aborted it, even after the old handler had recovered,
+for example a `provider_blocked` handler whose retry wake succeeded while its
+same-account successor stayed rate limited.
+
+The runner now aborts a stuck rotation itself, at the first tick that finds
+either:
+
+- **The old handler recovered** (`provider_blocked` rotations only). The due
+  list's primary is the rotation's exact old agent and run, and its current
+  activity shows a completed turn with a model reply (the same test as
+  [successor readiness](#successor-readiness)) whose last event is after the
+  rotation went stuck. A turn from before that time, another run of the old
+  agent, or a report that is still provider blocked does not count. Other
+  reasons do not use this trigger: their old handler never stopped, so its next
+  ordinary turn would abort a rotation that is still due, and the runner would
+  launch a new successor at once.
+- **The stuck ceiling.** 60 minutes after the rotation went stuck, for any
+  reason. The time it went stuck is saved in the host journal (`stuckAt`) when
+  the resume ceiling is reached, so a relay restart keeps it. A journal stuck
+  before this release has none, and its 60 minutes start when the runner first
+  sees it stuck.
+
+The abort is the one `tt handler rotate --abort` makes, keyed
+`rotation-abort-<rotation id>`. It makes no commit and leaves the old handler
+the primary with its leases and obligations; none moves to the successor and
+none is created for it. It closes the successor and cleans up its session, and
+removes the journal. With no rotation prepared, queue dispatch leases the old
+handler again. A rotation that is still due starts fresh at a later tick, with
+its own count and its own stuck notice.
+
+The stuck notice goes first: the runner aborts only at a tick where every
+recipient has been told, and posts nothing about the rotation after the abort.
+The notice states this rule. Before either trigger the rotation stays prepared
+and the runner posts nothing more. A failed abort or cleanup keeps the journal,
+and the next tick tries again with the same key. The runner sees the project
+only while the hub lists it on the due list: always while its limit policy is
+enabled, and otherwise while a `provider_blocked` rotation is prepared or its
+primary is a dead candidate or provider blocked.
 
 ## API
 

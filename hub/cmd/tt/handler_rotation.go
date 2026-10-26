@@ -157,6 +157,9 @@ type handlerRotationJournal struct {
 	// with no successor online; it is kept here so a relay restart keeps it.
 	ResumeFailures  int    `json:"resumeFailures,omitempty"`
 	LastResumeError string `json:"lastResumeError,omitempty"`
+	// StuckAt is when the runner found the rotation at the resume ceiling;
+	// rotationStuckAbortAfter counts from it (bug wi_63793d7e551231f6).
+	StuckAt time.Time `json:"stuckAt,omitempty"`
 	// SpawnedAt is when the successor's launch was recorded: its first
 	// completed turn is awaited until api.HandlerSuccessorReadyWait after it.
 	SpawnedAt time.Time `json:"spawnedAt,omitempty"`
@@ -827,9 +830,10 @@ func noticeSafeError(text string) string {
 }
 
 // recordResumeFailure adds one failed resume to the journal the runner just
-// resumed and returns it as saved. It returns nil when that journal is gone
-// or now records a different rotation.
-func recordResumeFailure(ctx context.Context, hub, task string, resumed *handlerRotationJournal, cause error) (*handlerRotationJournal, error) {
+// resumed and returns it as saved, with the time it went stuck once the
+// count reaches the ceiling. It returns nil when that journal is gone or now
+// records a different rotation.
+func recordResumeFailure(ctx context.Context, hub, task string, resumed *handlerRotationJournal, cause error, now time.Time) (*handlerRotationJournal, error) {
 	path := handlerRotationJournalPath(hub, task)
 	unlock, err := handlerLock(ctx, path)
 	if err != nil {
@@ -842,7 +846,70 @@ func recordResumeFailure(ctx context.Context, hub, task string, resumed *handler
 	}
 	j.ResumeFailures++
 	j.LastResumeError = noticeSafeError(cause.Error())
+	if j.ResumeFailures >= rotationResumeCeiling && j.StuckAt.IsZero() {
+		j.StuckAt = now.UTC()
+	}
 	return j, writePrivateJSON(path, *j)
+}
+
+// markStuck saves the time a stuck rotation was first seen in a journal that
+// has none, as one saved before StuckAt existed, and returns the journal as
+// saved. It returns nil when that journal is gone or now records a different
+// rotation.
+func markStuck(ctx context.Context, hub, task string, stuck *handlerRotationJournal, now time.Time) (*handlerRotationJournal, error) {
+	path := handlerRotationJournalPath(hub, task)
+	unlock, err := handlerLock(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	j, err := loadRotationJournal(hub, task)
+	if err != nil || j == nil || j.PrepareRequestID != stuck.PrepareRequestID {
+		return nil, err
+	}
+	if j.StuckAt.IsZero() {
+		j.StuckAt = now.UTC()
+		if err = writePrivateJSON(path, *j); err != nil {
+			return nil, err
+		}
+	}
+	return j, nil
+}
+
+// oldHandlerRecovered reports whether the due entry shows the stuck
+// rotation's exact old run completing a turn after the rotation went stuck.
+// Only a provider_blocked rotation counts it: any other old handler never
+// stopped, so its next ordinary turn would abort a rotation that is still due
+// and the runner would launch another at once.
+func oldHandlerRecovered(d api.HandlerRotationDue, j *handlerRotationJournal) bool {
+	a := d.Agent
+	return j.Reason == api.HandlerRotationReasonProviderBlocked && a.ID == j.OldAgentID && a.RunID == j.OldRunID &&
+		a.Activity != nil && api.HandlerSuccessorReady(*a.Activity) && a.Activity.LastEventAt.After(j.StuckAt)
+}
+
+// abortStuckRotation aborts this host's stuck rotation, as tt handler rotate
+// --abort does, once its old handler has recovered or rotationStuckAbortAfter
+// has passed since it went stuck. The caller has settled the stuck notice to
+// every recipient first. Before either trigger, or when the journal changed
+// since the caller read it, it does nothing; a failed abort keeps the journal,
+// so the next tick tries again.
+func (r *rotationRunner) abortStuckRotation(ctx context.Context, e env, c *api.Client, d api.HandlerRotationDue, stuck *handlerRotationJournal) error {
+	if !oldHandlerRecovered(d, stuck) && r.deps.now().Before(stuck.StuckAt.Add(rotationStuckAbortAfter)) {
+		return nil
+	}
+	hub := strings.TrimRight(c.Base, "/")
+	path := handlerRotationJournalPath(hub, d.TaskID)
+	unlock, err := handlerLock(ctx, path)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	j, err := loadRotationJournal(hub, d.TaskID)
+	if err != nil || j == nil || j.PrepareRequestID != stuck.PrepareRequestID || j.RotationID == "" ||
+		(j.Phase != rotationPhasePrepared && j.Phase != rotationPhaseSpawned) {
+		return err
+	}
+	return abortJournaledRotation(ctx, r.deps, e, c, d.TaskID, path, j.RotationID)
 }
 
 // errDeathNotConfirmed marks a dead primary rotation the runner aborted
@@ -1343,6 +1410,12 @@ const rotationQuietCache = 5 * time.Minute
 // the runner makes before it stops and tells the owner helper and the handler.
 const rotationResumeCeiling = 3
 
+// rotationStuckAbortAfter is how long after it went stuck the runner aborts a
+// stuck rotation whose old handler has not recovered, so a prepared rotation
+// does not hold the project's queue dispatch until a person aborts it (bug
+// wi_63793d7e551231f6).
+const rotationStuckAbortAfter = 60 * time.Minute
+
 const rotationStuckSubject = "A handler rotation is stuck because its successor never came online or never completed a turn"
 
 var hostRotationRunner = &rotationRunner{deps: productionRotationDeps(), now: time.Now, interval: time.Minute, notified: map[string]bool{}}
@@ -1473,10 +1546,25 @@ func (r *rotationRunner) tick(ctx context.Context, e env, c *api.Client, host st
 				continue
 			}
 			// A rotation whose successor failed to start at every resume up to
-			// the ceiling stays prepared for a person to resume or abort.
+			// the ceiling is not resumed again. Once its stuck notice has
+			// reached every recipient, it is aborted when the old handler
+			// recovers or at rotationStuckAbortAfter; until then it stays
+			// prepared for a person to resume or abort.
 			if journal.ResumeFailures >= rotationResumeCeiling {
+				if journal.StuckAt.IsZero() {
+					if journal, err = markStuck(ctx, hub, d.TaskID, journal, r.deps.now()); err != nil || journal == nil {
+						if err != nil {
+							errs = append(errs, fmt.Errorf("handler rotation %s: %w", d.TaskID, err))
+						}
+						continue
+					}
+				}
 				if err := r.notifyStuckRotation(ctx, c, host, d, journal); err != nil {
 					errs = append(errs, err)
+					continue
+				}
+				if err := r.abortStuckRotation(ctx, e, c, d, journal); err != nil {
+					errs = append(errs, fmt.Errorf("handler rotation %s: automatic abort of the stuck rotation: %w", d.TaskID, err))
 				}
 				continue
 			}
@@ -1485,7 +1573,7 @@ func (r *rotationRunner) tick(ctx context.Context, e env, c *api.Client, host st
 				errs = append(errs, fmt.Errorf("handler rotation %s: %w", d.TaskID, err))
 			}
 			if errors.As(err, &successorStartError{}) {
-				saved, err := recordResumeFailure(ctx, hub, d.TaskID, journal, err)
+				saved, err := recordResumeFailure(ctx, hub, d.TaskID, journal, err, r.deps.now())
 				if err != nil {
 					errs = append(errs, fmt.Errorf("handler rotation %s: %w", d.TaskID, err))
 				} else if saved != nil && saved.ResumeFailures >= rotationResumeCeiling {
@@ -1630,8 +1718,8 @@ func (r *rotationRunner) notifyStuckRotation(ctx context.Context, c *api.Client,
 			old = a.Name + " (" + a.ID + ")"
 		}
 	}
-	text := fmt.Sprintf("The rotation of database handler %s in project %s (%s) on host %s is stuck: its successor %s (%s) was not online, or did not complete a turn, after %d failed resume attempts by the runner. Last error: %s. The runner has stopped resuming it. The rotation stays prepared, no other successor is launched, and the old handler stays the primary with its leases and obligations. %s",
-		old, detail.Task.Name, d.TaskID, host, j.SuccessorName, j.SuccessorAgentID, j.ResumeFailures, noticeSafeError(j.LastResumeError), stuckRotationRecovery(j.Phase, d.TaskID))
+	text := fmt.Sprintf("The rotation of database handler %s in project %s (%s) on host %s is stuck: its successor %s (%s) was not online, or did not complete a turn, after %d failed resume attempts by the runner. Last error: %s. The runner has stopped resuming it. The rotation stays prepared, no other successor is launched, and the old handler stays the primary with its leases and obligations. %s %s",
+		old, detail.Task.Name, d.TaskID, host, j.SuccessorName, j.SuccessorAgentID, j.ResumeFailures, noticeSafeError(j.LastResumeError), stuckRotationAutoAbort(j.Reason), stuckRotationRecovery(j.Phase, d.TaskID))
 	for _, to := range recipients {
 		requestID := key + "-board"
 		if to.ID != "" {
@@ -1660,6 +1748,17 @@ func (r *rotationRunner) notifyStuckRotation(ctx context.Context, c *api.Client,
 func requestIdentityConflict(err error) bool {
 	var httpErr *api.HTTPError
 	return errors.As(err, &httpErr) && httpErr.Status == http.StatusConflict && strings.Contains(httpErr.Msg, "request ID was already used")
+}
+
+// stuckRotationAutoAbort is the stuck notice's statement of when the runner
+// aborts the rotation itself. It names no time, so the notice reads the same
+// at every tick and after a restart.
+func stuckRotationAutoAbort(reason string) string {
+	when := fmt.Sprintf("%d minutes after it went stuck", int(rotationStuckAbortAfter/time.Minute))
+	if reason == api.HandlerRotationReasonProviderBlocked {
+		when = "when the old handler completes a turn again, or " + when + ", whichever comes first"
+	}
+	return "The runner aborts the rotation automatically " + when + ": the old handler then stays the primary with its leases and obligations, queue dispatch, which leases neither handler while the rotation is prepared, resumes, and a rotation that is still due starts fresh."
 }
 
 // stuckRotationRecovery is the stuck notice's advice for the journal's

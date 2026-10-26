@@ -2398,6 +2398,299 @@ func TestHandlerRotationRunnerStopsResumingStuckRotation(t *testing.T) {
 	}
 }
 
+// assertAutoAborted checks what an automatic abort of a stuck rotation must
+// leave: the rotation aborted with no journal, its successor closed with
+// nothing addressed to it, the old handler the primary with its obligations
+// where they were, and only the two stuck notices.
+func (f *stuckRotation) assertAutoAborted(t *testing.T, stuck api.HandlerRotation) {
+	t.Helper()
+	rotations := f.rotations(t)
+	if len(rotations) != 1 || rotations[0].ID != stuck.ID || rotations[0].State != api.HandlerRotationAborted || f.journalExists() {
+		t.Fatalf("rotations %+v journal=%v", rotations, f.journalExists())
+	}
+	detail, err := f.c.GetTask(context.Background(), f.task.ID)
+	if err != nil || detail.Task.HandlerRevision != 1 {
+		t.Fatalf("task: %+v %v", detail.Task, err)
+	}
+	if primary, ok := currentPrimaryHandler(detail); !ok || primary.ID != f.old.ID || primary.RunID != f.old.RunID {
+		t.Fatalf("primary: %+v", primary)
+	}
+	if owed := f.owedByOld(t); !reflect.DeepEqual(owed, f.owed) {
+		t.Fatalf("obligations moved: %v, want %v", owed, f.owed)
+	}
+	successor, err := f.c.GetAgent(context.Background(), f.task.ID, stuck.SuccessorAgentID)
+	if err != nil || successor.Status != api.AgentClosed {
+		t.Fatalf("successor %+v %v", successor, err)
+	}
+	var obligations, messages int
+	if err := f.db(t).QueryRow(`SELECT (SELECT count(*) FROM obligations WHERE agent_id=?),(SELECT count(*) FROM messages WHERE to_agent=?)`,
+		stuck.SuccessorAgentID, stuck.SuccessorAgentID).Scan(&obligations, &messages); err != nil || obligations+messages != 0 {
+		t.Fatalf("successor got obligations=%d messages=%d %v", obligations, messages, err)
+	}
+	if to := f.noticesTo(t); len(to) != 2 || to[f.helper.ID] != 1 || to[f.old.ID] != 1 {
+		t.Fatalf("stuck notices %v", to)
+	}
+}
+
+func (f *stuckRotation) journal(t *testing.T) handlerRotationJournal {
+	t.Helper()
+	j, err := loadRotationJournal(f.c.Base, f.task.ID)
+	if err != nil || j == nil {
+		t.Fatalf("journal %+v %v", j, err)
+	}
+	return *j
+}
+
+// wi_63793d7e551231f6: a stuck rotation stayed prepared until a person
+// aborted it, and queue dispatch leases neither handler while a rotation is
+// prepared. With neither handler recovering, the runner now aborts it
+// rotationStuckAbortAfter after it went stuck, and not a second before, after
+// its one stuck notice to each recipient; a failed abort is tried again.
+func TestHandlerRotationRunnerAbortsStuckRotationAtTheCeiling(t *testing.T) {
+	f := newStuckRotation(t)
+	clock := time.Now().UTC()
+	f.deps.clock = func() time.Time { return clock }
+	r := f.runner()
+	f.toCeiling(t, r)
+	stuck := f.assertHeld(t)
+	if j := f.journal(t); !j.StuckAt.Equal(clock) {
+		t.Fatalf("stuckAt %s, want %s", j.StuckAt, clock)
+	}
+	text := f.stuckNotices(t)[0].Envelope.Body.Text
+	if !strings.Contains(text, "aborts the rotation automatically 60 minutes after it went stuck") || strings.Contains(text, "completes a turn again") {
+		t.Fatalf("notice does not state the template rotation's rule: %s", text)
+	}
+	actions := f.actions.Load()
+	// Neither handler recovers: up to a second before the ceiling, the
+	// rotation stays prepared, for this runner and a restarted one.
+	clock = clock.Add(rotationStuckAbortAfter - time.Second)
+	for i := 0; i < 2; i++ {
+		if err := f.try(r); err != nil {
+			t.Fatalf("tick %d before the ceiling: %v", i+1, err)
+		}
+	}
+	f.restarts(t, 1)
+	f.assertHeld(t)
+	if f.actions.Load() != actions || len(f.stuckNotices(t)) != 2 {
+		t.Fatalf("before the ceiling: actions %d (was %d) notices %d", f.actions.Load(), actions, len(f.stuckNotices(t)))
+	}
+	// At the ceiling the abort is refused nothing, but the successor's
+	// cleanup fails: the journal stays and the next tick finishes it.
+	clock = clock.Add(time.Second)
+	cleanup := r.deps.cleanup
+	r.deps.cleanup = func(context.Context, env, string, string) error { return errors.New("fixture cleanup failed") }
+	if err := f.try(r); err == nil || !strings.Contains(err.Error(), "automatic abort") || !f.journalExists() {
+		t.Fatalf("failed cleanup at the ceiling: %v journal=%v", err, f.journalExists())
+	}
+	r.deps.cleanup = cleanup
+	if err := f.try(r); err != nil {
+		t.Fatalf("retry of the abort: %v", err)
+	}
+	f.assertAutoAborted(t, stuck)
+	if f.spawns != 1 {
+		t.Fatalf("spawns %d", f.spawns)
+	}
+}
+
+// A stuck journal saved before StuckAt existed starts its ceiling when the
+// runner first sees it stuck.
+func TestHandlerRotationRunnerStartsTheCeilingOfAnOlderStuckJournal(t *testing.T) {
+	f := newStuckRotation(t)
+	clock := time.Now().UTC()
+	f.deps.clock = func() time.Time { return clock }
+	f.toCeiling(t, f.runner())
+	stuck := f.assertHeld(t)
+	j := f.journal(t)
+	j.StuckAt = time.Time{}
+	if err := writePrivateJSON(handlerRotationJournalPath(f.c.Base, f.task.ID), j); err != nil {
+		t.Fatal(err)
+	}
+	clock = clock.Add(2 * rotationStuckAbortAfter)
+	seen := clock
+	r := f.runner()
+	if err := f.try(r); err != nil {
+		t.Fatalf("first tick of the older journal: %v", err)
+	}
+	if j := f.journal(t); !j.StuckAt.Equal(seen) {
+		t.Fatalf("stuckAt %s, want %s", j.StuckAt, seen)
+	}
+	clock = seen.Add(rotationStuckAbortAfter - time.Second)
+	if err := f.try(r); err != nil {
+		t.Fatalf("tick before the ceiling: %v", err)
+	}
+	f.assertHeld(t)
+	clock = seen.Add(rotationStuckAbortAfter)
+	if err := f.try(r); err != nil {
+		t.Fatalf("tick at the ceiling: %v", err)
+	}
+	f.assertAutoAborted(t, stuck)
+}
+
+// newBlockedStuckRotation is a provider_blocked rotation at the resume
+// ceiling: the old handler has been rate limited for 20 minutes while it owes
+// a request, and its successor never comes online. clock sets the runner's
+// clock; the hub's clock stays at the 20-minute bound.
+func newBlockedStuckRotation(t *testing.T) (f *stuckRotation, r *rotationRunner, clock *time.Time) {
+	t.Helper()
+	f = &stuckRotation{rotationCLI: newRotationCLI(t, handlerTemplateDigest("handler assignment"))}
+	if err := saveHandlerSpec(f.spec); err != nil {
+		t.Fatal(err)
+	}
+	setRotationPolicy(t, f.rotationCLI, api.HandlerRotationPolicyRequest{Enabled: false})
+	f.registerHelper(t)
+	f.request(t, f.old.Name, "Record the blocked stuck fixture item")
+	f.owed = f.owedByOld(t)
+	start := time.Now().UTC().Add(-api.HandlerProviderBlockedAfter - 10*time.Second)
+	hub := start
+	f.st.SetClockForTest(func() time.Time { return hub })
+	block := api.ProviderBlock{Provider: "openai", Runtime: "codex", Model: "gpt-6-astra", Class: api.ProviderBlockRateLimited, Code: "response_too_many_failed_attempts", Status: 429, Since: start}
+	if _, err := f.c.ReportActivity(context.Background(), f.task.ID, f.old.ID, api.ActivityReport{RequestID: api.NewID("act"), RunID: f.old.RunID, Activity: api.AgentActivity{State: "provider_blocked", ObservedAt: start, Provider: &block}}); err != nil {
+		t.Fatal(err)
+	}
+	hub = start.Add(api.HandlerProviderBlockedAfter)
+	if _, err := f.db(t).Exec(`UPDATE agents SET last_seen_at=? WHERE id=?`, hub.Format(time.RFC3339Nano), f.old.ID); err != nil {
+		t.Fatal(err)
+	}
+	f.online = false
+	f.deps.online = 100 * time.Millisecond
+	now := time.Now().UTC()
+	clock = &now
+	f.deps.clock = func() time.Time { return *clock }
+	r = f.runner()
+	f.toCeiling(t, r)
+	rotations := f.rotations(t)
+	if len(rotations) != 1 || rotations[0].Reason != api.HandlerRotationReasonProviderBlocked {
+		t.Fatalf("rotations %+v", rotations)
+	}
+	return f, r, clock
+}
+
+// The old handler's report, as at its retry wake: LastEventAt is at, and a
+// non-nil block keeps it blocked.
+func (f *stuckRotation) oldReports(t *testing.T, at time.Time, block *api.ProviderBlock) {
+	t.Helper()
+	activity := api.AgentActivity{State: "idle", ObservedAt: at, LastEventAt: at, Tokens: api.TokenTotals{Output: 1, Total: 1}}
+	if block != nil {
+		activity.State, activity.Provider, activity.Tokens = "provider_blocked", block, api.TokenTotals{}
+	}
+	if _, err := f.c.ReportActivity(context.Background(), f.task.ID, f.old.ID, api.ActivityReport{RequestID: api.NewID("act"), RunID: f.old.RunID, Activity: activity}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The old handler of a stuck provider_blocked rotation completes a turn
+// again, for example at its retry wake: the runner aborts the rotation at that
+// tick, long before the ceiling. A completed turn from before it went stuck
+// and a report that is still blocked do not count.
+func TestHandlerRotationRunnerAbortsStuckRotationWhenTheOldHandlerRecovers(t *testing.T) {
+	f, r, clock := newBlockedStuckRotation(t)
+	// The hub's clock lags real time here, so the held check reads the hub's
+	// own primary from the due list rather than the roster's order.
+	held := func() api.HandlerRotation {
+		t.Helper()
+		rotations := f.rotations(t)
+		if len(rotations) != 1 || rotations[0].State != api.HandlerRotationPrepared || !f.journalExists() {
+			t.Fatalf("the rotation must stay prepared with its journal: %+v journal=%v", rotations, f.journalExists())
+		}
+		due, err := f.c.HandlerRotationsDue(context.Background(), "fixture", handlerTemplateDigest(""))
+		if err != nil || len(due.Entries) != 1 || due.Entries[0].Agent.ID != f.old.ID || due.Entries[0].Agent.RunID != f.old.RunID {
+			t.Fatalf("due %+v %v", due, err)
+		}
+		if owed := f.owedByOld(t); !reflect.DeepEqual(owed, f.owed) {
+			t.Fatalf("obligations moved: %v, want %v", owed, f.owed)
+		}
+		return rotations[0]
+	}
+	stuck := held()
+	stuckAt := f.journal(t).StuckAt
+	if !stuckAt.Equal(*clock) {
+		t.Fatalf("stuckAt %s, want %s", stuckAt, *clock)
+	}
+	text := f.stuckNotices(t)[0].Envelope.Body.Text
+	if !strings.Contains(text, "aborts the rotation automatically when the old handler completes a turn again, or 60 minutes after it went stuck") {
+		t.Fatalf("notice does not state the provider-blocked rule: %s", text)
+	}
+	actions := f.actions.Load()
+	still := func(what string) {
+		t.Helper()
+		*clock = clock.Add(time.Minute)
+		if err := f.try(r); err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+		held()
+		if f.actions.Load() != actions || len(f.stuckNotices(t)) != 2 {
+			t.Fatalf("%s: actions %d (was %d) notices %d", what, f.actions.Load(), actions, len(f.stuckNotices(t)))
+		}
+	}
+	still("still blocked with no new report")
+	f.oldReports(t, stuckAt.Add(-time.Second), nil)
+	still("a completed turn from before it went stuck")
+	f.oldReports(t, stuckAt.Add(time.Minute), &api.ProviderBlock{Provider: "openai", Runtime: "codex", Model: "gpt-6-astra", Class: api.ProviderBlockRateLimited, Status: 429, Since: stuckAt})
+	still("a report after it went stuck that is still blocked")
+	// The retry wake succeeds: the old handler completes a turn.
+	f.oldReports(t, clock.Add(time.Second), nil)
+	*clock = clock.Add(time.Minute)
+	if err := f.try(r); err != nil {
+		t.Fatalf("tick after the old handler recovered: %v", err)
+	}
+	if clock.Sub(stuckAt) >= rotationStuckAbortAfter {
+		t.Fatalf("the test reached the ceiling")
+	}
+	f.assertAutoAborted(t, stuck)
+	// Recovered, the old handler is no longer due: later ticks start nothing.
+	for i := 0; i < 2; i++ {
+		*clock = clock.Add(time.Minute)
+		f.tick(t, f.runner())
+	}
+	if n := len(f.rotations(t)); n != 1 || f.spawns != 1 {
+		t.Fatalf("rotations %d spawns %d after the abort", n, f.spawns)
+	}
+}
+
+// Recovery counts only the stuck rotation's exact old run completing a turn
+// after it went stuck, and only for a provider_blocked rotation.
+func TestHandlerRotationOldHandlerRecovered(t *testing.T) {
+	stuckAt := time.Date(2026, 10, 26, 18, 0, 0, 0, time.UTC)
+	j := &handlerRotationJournal{Reason: api.HandlerRotationReasonProviderBlocked, OldAgentID: "agt_old", OldRunID: "run_old", StuckAt: stuckAt}
+	ready := func(at time.Time) *api.AgentActivity {
+		return &api.AgentActivity{State: "idle", ObservedAt: at, LastEventAt: at, Tokens: api.TokenTotals{Output: 5, Total: 5}}
+	}
+	due := func(id, run string, a *api.AgentActivity) api.HandlerRotationDue {
+		return api.HandlerRotationDue{Agent: api.Agent{ID: id, RunID: run, Activity: a}}
+	}
+	after := stuckAt.Add(time.Second)
+	blocked := ready(after)
+	blocked.State, blocked.Provider = "provider_blocked", &api.ProviderBlock{Class: api.ProviderBlockRateLimited}
+	providerError := ready(after)
+	providerError.Reason = api.ProviderErrorTurnReasonPrefix + " 429"
+	silent := ready(after)
+	silent.Tokens.Output = 0
+	finished := ready(after)
+	finished.State = "finished_silent"
+	for _, c := range []struct {
+		name string
+		due  api.HandlerRotationDue
+		j    *handlerRotationJournal
+		want bool
+	}{
+		{"a completed turn after it went stuck", due("agt_old", "run_old", ready(after)), j, true},
+		{"finished silent with a reply", due("agt_old", "run_old", finished), j, true},
+		{"a turn at the moment it went stuck", due("agt_old", "run_old", ready(stuckAt)), j, false},
+		{"a turn before it went stuck", due("agt_old", "run_old", ready(stuckAt.Add(-time.Minute))), j, false},
+		{"another run of the old handler", due("agt_old", "run_new", ready(after)), j, false},
+		{"another agent", due("agt_other", "run_old", ready(after)), j, false},
+		{"still blocked", due("agt_old", "run_old", blocked), j, false},
+		{"a provider error turn end", due("agt_old", "run_old", providerError), j, false},
+		{"no reply", due("agt_old", "run_old", silent), j, false},
+		{"no activity", due("agt_old", "run_old", nil), j, false},
+		{"a template rotation", due("agt_old", "run_old", ready(after)), &handlerRotationJournal{Reason: api.HandlerRotationReasonTemplate, OldAgentID: "agt_old", OldRunID: "run_old", StuckAt: stuckAt}, false},
+	} {
+		if got := oldHandlerRecovered(c.due, c.j); got != c.want {
+			t.Errorf("%s: %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
 // A launch the host cannot confirm counts like a successor that stays
 // offline, and every attempt names the one successor the journal records.
 func TestHandlerRotationRunnerCountsUnconfirmedLaunches(t *testing.T) {
