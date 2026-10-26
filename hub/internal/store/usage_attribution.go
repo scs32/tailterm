@@ -213,7 +213,9 @@ func resolveUsage(ctx context.Context, tx *sql.Tx, task, agent, run string, t ap
 		}
 	}
 	persistent := p.Role == "database_handler" || p.Role == "project_lead" || p.Role == "deployment_agent" || p.Role == "backlog_steward"
-	if len(items) == 0 && !persistent && p.Binding != nil {
+	// The exact binding counts only for an item of the turn's own project; a
+	// cross-project binding leaves the request to this project's overhead.
+	if len(items) == 0 && !persistent && p.Binding != nil && p.Binding.ItemTaskID == task {
 		b := p.Binding
 		items[b.ItemTaskID+"/"+b.ItemID] = api.UsageAttribution{TaskID: b.ItemTaskID, ItemID: b.ItemID, Reason: "exact admitted binding " + b.ContextDigest}
 		if err := visit(b.WorkOrderMessage, 0, false); err != nil {

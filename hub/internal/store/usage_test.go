@@ -3324,6 +3324,50 @@ func TestUsageCrossProjectLinksAreIgnored(t *testing.T) {
 	}
 }
 
+// A worker bound to an item in another project, with no same-project handled
+// evidence, is not credited to that item: the request goes to its own
+// project's overhead (review #47040 b1).
+func TestUsageCrossProjectBindingGoesToOverhead(t *testing.T) {
+	s, task, _, _, _ := usageFixture(t)
+	ctx := context.Background()
+	by := api.Caller{Node: "fixture", User: "owner"}
+	other, err := s.CreateTask(ctx, api.CreateTaskRequest{Name: "Other synthetic project"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreign, err := s.CreateWorkItem(ctx, other.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Other project item", RequestID: "foreign-bound-item"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	order, err := s.PostMessage(ctx, other.ID, api.PostMessageRequest{RequestID: "foreign-order", Text: "Synthetic work order", WorkItems: []api.MessageWorkItem{{ItemTaskID: other.ID, ItemID: foreign.ID, ItemRevision: foreign.Revision, Relationship: "primary"}}}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "cross-project-builder", Host: "fixture", Session: "fixture", Runtime: "codex"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.db.Exec(`INSERT INTO agent_work_item_bindings(agent_id,run_id,item_task_id,item_id,item_revision,work_order_task_id,work_order_message_seq,context_through_message_seq,context_digest,context_json,created_at) VALUES(?,?,?,?,1,?,?,0,'synthetic-binding','{}',?)`, worker.ID, worker.RunID, other.ID, foreign.ID, other.ID, order.Seq, ts(s.now())); err != nil {
+		t.Fatal(err)
+	}
+	turn := syntheticUsageTurn("cross-bound")
+	if _, err = s.ReportUsage(ctx, task.ID, worker.ID, usageBatch(worker, "cross-bound", turn)); err != nil {
+		t.Fatal(err)
+	}
+	p := usageStoredProjection(t, s, "cross-bound")
+	if len(p.Shares) != 1 || p.Shares[0].TaskID != task.ID || p.Shares[0].ItemID != "" || p.Shares[0].Denominator != 1 {
+		t.Fatalf("cross-project binding credited: %+v", p.Shares)
+	}
+	var rows int
+	if err = s.db.QueryRow(`SELECT count(*) FROM usage_item_shares WHERE item_task_id=?`, other.ID).Scan(&rows); err != nil || rows != 0 {
+		t.Fatalf("cross-project share rows: %d %v", rows, err)
+	}
+	report, err := s.Usage(ctx, task.ID, api.UsageQuery{})
+	if err != nil || report.Summary.Requests != 1 || report.Overhead.Summary.Requests != 1 {
+		t.Fatalf("request not counted in its own project's overhead: %+v %v", report.Summary, err)
+	}
+}
+
 // The plan reviewer's role text maps to a slug, and a stored projection that
 // kept the raw text still reads as intake and planning (wi_21f7dd24b4f5743f).
 func TestUsagePlanReviewRoleSelectsPlanning(t *testing.T) {
