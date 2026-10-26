@@ -544,9 +544,12 @@ An ASSIGN may also freeze `body.verificationCriteria` (CLI:
 `--verification-criterion aN`) for IDs designated by the order or plan as
 independently verified. REVIEW repeats those exact IDs. Each general RESULT must
 mark them `pending-verification`; it is distinct from pass and partial. The
-handler-imported eligible receipt for the exact candidate, scope and assignment
-judges those IDs, including on items without mandatory enrollment. All other
-criteria still need reviewer pass. A failed verdict blocks until its blocker is
+hub-saved eligible receipt for the exact candidate, scope and assignment judges
+those IDs, including on items without mandatory enrollment. The database
+handler, the plan's verifier or the item lead imports it, as
+[Validated team operations](project-queue.md#validated-team-operations) allows.
+All other criteria still need reviewer pass.
+A failed verdict blocks until its blocker is
 verified by ID. A round-two `partial` with no blocker blocks until a focused
 check settles it (see below). Completed verdicts stay frozen: settlement is a
 separate record, and the owner-accept route remains.
@@ -655,8 +658,11 @@ round two left it `partial`.
 
 Exact receipt rule for both routes: a request with `criterionIds`, a RESULT that
 passes them, and any accept that relies on a passed `treeDiffers` or
-`criterionIds` record need the handler-imported eligible passing receipt for
-the current scope and that exact commit. This holds also on items without
+`criterionIds` record need the hub-saved eligible passing receipt for the
+current scope and that exact commit, imported by the database handler, the
+plan's verifier or the item lead as
+[Validated team operations](project-queue.md#validated-team-operations) allows.
+This holds also on items without
 enrollment or verification-owned criteria. A receipt for another commit, or a
 newer plan with no receipt yet, refuses the step.
 
