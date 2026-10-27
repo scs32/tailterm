@@ -514,8 +514,10 @@ func (s *Store) ExtendObligation(ctx context.Context, taskID, obligationID strin
 // the recipient's behalf: the answer goes to whoever asked (or is blocked),
 // and the recipient's obligation closes as answered.
 func (s *Store) AnswerObligation(ctx context.Context, taskID, obligationID string, req api.ObligationAnswerRequest, by api.Caller) (api.OwnerActionResult, error) {
-	text := req.Text
-	if (!req.Approve && strings.TrimSpace(text) == "") || !api.ValidText(text, 4000) || (req.Source != nil && !api.ValidMessageSource(*req.Source)) {
+	// A free-text answer is stored trimmed; an approval keeps the request's
+	// exact expected-answer bytes, read below.
+	text := strings.TrimSpace(req.Text)
+	if (!req.Approve && text == "") || !api.ValidText(text, 4000) || (req.Source != nil && !api.ValidMessageSource(*req.Source)) {
 		return api.OwnerActionResult{}, api.ErrInvalid
 	}
 	// An agent answering without a per-request session grant answers under an

@@ -653,3 +653,77 @@ func TestExitedOutgoingLeadHandsOff(t *testing.T) {
 		t.Fatalf("the new lead holds %d obligations", len(moved))
 	}
 }
+
+// wi_656ea192498c3dd5: a free-text answer is stored trimmed, while an
+// approval keeps the request's exact expected-answer bytes.
+func TestOwnerAnswerTrimsFreeTextAndKeepsApprovalBytes(t *testing.T) {
+	f := newDeliveryFixture(t)
+	ctx := context.Background()
+	links := []api.MessageWorkItem{{ItemTaskID: f.item.TaskID, ItemID: f.item.ID, ItemRevision: f.item.Revision, Relationship: "primary"}}
+	toLead := func(key string, env *api.Envelope) int64 {
+		t.Helper()
+		m, err := f.s.PostMessage(ctx, f.task.ID, api.PostMessageRequest{AgentID: f.worker.ID, RunID: f.worker.RunID, To: f.lead.ID, RequestID: key, WorkItems: links, Envelope: env}, f.by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return m.Seq
+	}
+	question := toLead("trim-question", &api.Envelope{Kind: api.EnvelopeKindQuestion, To: "lead", Subject: "Which fixture should the test use", Body: api.EnvelopeBody{Question: "Static or live?"}})
+	block := toLead("trim-block", &api.Envelope{Kind: api.EnvelopeKindBlock, To: "lead", Subject: "Blocked on the fixture choice",
+		Body: api.EnvelopeBody{Reason: "two fixtures", Needs: "a choice", ResumeWhen: "the lead picks one"}})
+	free := ownerFixtureRequest(t, f, "owner", "trim-owner-free", "", "").Seq
+	exact := " APPROVE 矩阵\nsha256:abc\n "
+	approval := ownerFixtureRequest(t, f, "owner", "trim-owner-approval", "", exact).Seq
+	obligation := func(seq int64) string {
+		t.Helper()
+		all, err := f.s.ListObligations(ctx, f.task.ID, ObligationFilter{OpenOnly: true}, f.s.now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, o := range all {
+			if o.MessageSeq == seq {
+				return o.ID
+			}
+		}
+		t.Fatalf("no open obligation for #%d", seq)
+		return ""
+	}
+	stored := func(seq int64) string {
+		t.Helper()
+		msgs, err := f.s.ListMessages(ctx, f.task.ID, 0, "", 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, m := range msgs {
+			if m.Seq == seq && m.Envelope != nil {
+				return m.Envelope.Body.Answer
+			}
+		}
+		t.Fatalf("answer #%d is not stored", seq)
+		return ""
+	}
+	for _, c := range []struct {
+		name string
+		seq  int64
+		req  api.ObligationAnswerRequest
+		want string
+	}{
+		{"question", question, api.ObligationAnswerRequest{Text: "  Static.\n\t", RequestID: "trim-answer-question"}, "Static."},
+		{"block", block, api.ObligationAnswerRequest{Text: "\n Use the static fixture. \n", RequestID: "trim-answer-block"}, "Use the static fixture."},
+		{"owner free text", free, api.ObligationAnswerRequest{Text: " Not yet, rerun the matrix. ", RequestID: "trim-answer-free"}, "Not yet, rerun the matrix."},
+		{"approval", approval, api.ObligationAnswerRequest{Approve: true, RequestID: "trim-answer-approval"}, exact},
+	} {
+		out, err := f.s.AnswerObligation(ctx, f.task.ID, obligation(c.seq), c.req, f.by)
+		if err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		if got := stored(out.Message.Seq); got != c.want {
+			t.Fatalf("%s: stored answer %q, want %q", c.name, got, c.want)
+		}
+	}
+	// An answer that is only whitespace is still refused.
+	again := toLead("trim-blank", &api.Envelope{Kind: api.EnvelopeKindQuestion, To: "lead", Subject: "Is the fixture ready", Body: api.EnvelopeBody{Question: "Ready?"}})
+	if _, err := f.s.AnswerObligation(ctx, f.task.ID, obligation(again), api.ObligationAnswerRequest{Text: " \n\t ", RequestID: "trim-answer-blank"}, f.by); !errors.Is(err, api.ErrInvalid) {
+		t.Fatalf("blank answer = %v, want invalid", err)
+	}
+}
