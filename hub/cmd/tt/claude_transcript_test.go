@@ -56,6 +56,9 @@ func resetClaudeRecordLog() {
 	claudeRecordLog.Lock()
 	claudeRecordLog.seen = nil
 	claudeRecordLog.Unlock()
+	claudeQueueDriftLog.Lock()
+	claudeQueueDriftLog.seen = nil
+	claudeQueueDriftLog.Unlock()
 }
 
 // Times from the fixtures' real records.
@@ -244,16 +247,23 @@ func TestClaudeTranscriptStrictWhereItMatters(t *testing.T) {
 }
 
 // a5: queued input blocks only while fresh; an older unmatched enqueue after a
-// completed turn is logged once and the pane decides.
+// completed turn is logged once and the pane decides. Freshness counts from
+// the turn end, which is later than the enqueue here (bug wi_efe0822641feba60).
 func TestClaudeTranscriptQueuedInputStaleBound(t *testing.T) {
 	resetClaudeRecordLog()
 	b, _ := claudeTranscriptFixture(t, "queue-queued")
-	if _, err := claudeTranscriptSnapshot(b, queueQueuedEnqueue.Add(claudeQueueStaleAfter-time.Second)); err == nil || !strings.HasSuffix(err.Error(), ": queued input pending (1)") {
-		t.Fatalf("fresh queued input: %v", err)
+	for _, age := range []time.Duration{0, claudeQueueStaleAfter - time.Second} {
+		if _, err := claudeTranscriptSnapshot(b, queueQueuedEnd.Add(age)); err == nil || !strings.HasSuffix(err.Error(), ": queued input pending (1)") {
+			t.Fatalf("queued input %s after the turn end: %v", age, err)
+		}
+	}
+	// The old rule called this stale: 31 s after the enqueue, 27.7 s after the turn end.
+	if _, err := claudeTranscriptSnapshot(b, queueQueuedEnqueue.Add(claudeQueueStaleAfter+time.Second)); err == nil || !strings.HasSuffix(err.Error(), ": queued input pending (1)") {
+		t.Fatalf("queued input stale from the enqueue: %v", err)
 	}
 	out, err := captureRelayOutput(t, true, func() error {
 		for _, age := range []time.Duration{claudeQueueStaleAfter + time.Second, 5 * time.Minute} {
-			if _, err := claudeTranscriptSnapshot(b, queueQueuedEnqueue.Add(age)); err != nil {
+			if _, err := claudeTranscriptSnapshot(b, queueQueuedEnd.Add(age)); err != nil {
 				return err
 			}
 		}
@@ -293,5 +303,115 @@ func TestClaudeQueueCursorCompatible(t *testing.T) {
 	var old activityCursor
 	if err := json.Unmarshal([]byte(`{"run":"run_1","turnComplete":true,"seenTurn":true}`), &old); err != nil || old.ClaudeQueued != 0 || !old.ClaudeQueuedAt.IsZero() {
 		t.Fatalf("empty cursor %s %v", data, err)
+	}
+}
+
+// queuedLongTurnTranscript is a turn that queued input 357 s before it ended,
+// with no dequeue yet: what the relay reads in the instant between Claude
+// Code's end_turn and its dequeue.
+func queuedLongTurnTranscript(t *testing.T, end time.Time) runtimeBinding {
+	t.Helper()
+	stamp := func(at time.Time) string { return at.UTC().Format("2006-01-02T15:04:05.000Z") }
+	b, _ := claudeTranscriptFixture(t, "queue-idle",
+		`{"type":"user","uuid":"00000000-0000-4000-8000-0000000000a1","timestamp":"`+stamp(end.Add(-360*time.Second))+`","message":{"role":"user","content":"Fixture long turn."}}`,
+		`{"type":"queue-operation","operation":"enqueue","timestamp":"`+stamp(end.Add(-357*time.Second))+`","content":"Fixture queued input."}`,
+		`{"type":"assistant","uuid":"00000000-0000-4000-8000-0000000000a2","timestamp":"`+stamp(end)+`","message":{"id":"msg_fixture_a2","role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"Done."}]}}`,
+	)
+	return b
+}
+
+// claim 5 (a4): queued input stays fresh for 30 s from the turn end, not from
+// the enqueue, and a restarted relay (an empty cache) reads the same bound.
+func TestClaudeWakeQueuedInputFreshAfterTurnEnd(t *testing.T) {
+	resetClaudeRecordLog()
+	end := time.Date(2026, 10, 26, 18, 30, 0, 0, time.UTC)
+	b := queuedLongTurnTranscript(t, end)
+	for _, restarted := range []bool{false, true} {
+		if restarted {
+			claudeTranscriptCache.Lock()
+			claudeTranscriptCache.runs = nil
+			claudeTranscriptCache.Unlock()
+		}
+		if _, err := claudeTranscriptSnapshot(b, end.Add(50*time.Millisecond)); err == nil || !strings.HasSuffix(err.Error(), ": queued input pending (1)") {
+			t.Fatalf("restarted=%v: 50 ms after the turn end: %v", restarted, err)
+		}
+		if restarted {
+			claudeTranscriptCache.Lock()
+			claudeTranscriptCache.runs = nil
+			claudeTranscriptCache.Unlock()
+		}
+		snap, err := claudeTranscriptSnapshot(b, end.Add(31*time.Second))
+		if err != nil || !snap.TurnEndAt.Equal(end) {
+			t.Fatalf("restarted=%v: 31 s after the turn end: %v, turn end %s", restarted, err, snap.TurnEndAt)
+		}
+	}
+
+	// The wake gate refuses on the snapshot's turn end too.
+	t.Setenv("TAILTERM_RELAY_STATE", t.TempDir())
+	now := time.Date(2026, 10, 26, 18, 30, 1, 0, time.UTC)
+	stub := claudeWakeSnapshot{Pane: "%1", Screen: "Answer\n❯ \n? for shortcuts\n", TurnEndAt: now.Add(-time.Second), Cursor: activityCursor{Ready: true, SeenTurn: true, TurnComplete: true, ClaudeQueued: 1, ClaudeQueuedAt: now.Add(-10 * time.Minute)}}
+	if claudeWakeIdle(stub, now) {
+		t.Fatal("old enqueue with a turn end 1 s ago read as idle")
+	}
+	var sent []string
+	ops := claudeWakeOps{inspect: func(context.Context, runtimeBinding, string) (claudeWakeSnapshot, error) {
+		return stub, nil
+	}, send: func(_ context.Context, _ string, value string, _ bool) error {
+		sent = append(sent, value)
+		return nil
+	}, sleep: func(time.Duration) {}, now: func() time.Time { return now }}
+	if err := claudeWakeWith(context.Background(), testClaudeBinding(), "Tailterm messages #1. Run tt inbox --unread --mark-read.", ops); !errors.Is(err, errClaudeWakeUnsafe) || len(sent) != 0 {
+		t.Fatalf("queued input fresh from the turn end woke: %v sent=%q", err, sent)
+	}
+	// With no known turn end the bound counts from the enqueue, as before.
+	stub.TurnEndAt = time.Time{}
+	if !claudeWakeIdle(stub, now) {
+		t.Fatal("old enqueue with no turn end refused")
+	}
+}
+
+// claim 7 (a5): stale queued input is logged once per run, and drift lines
+// never use up the record-type log.
+func TestClaudeWakeQueueDriftLogsPerRun(t *testing.T) {
+	resetClaudeRecordLog()
+	first, _ := claudeTranscriptFixture(t, "queue-queued")
+	second := first
+	second.Agent, second.Run = "agt_0000000000000002", "run_0000000000000002"
+	stale := queueQueuedEnd.Add(claudeQueueStaleAfter + time.Second)
+	out, err := captureRelayOutput(t, true, func() error {
+		for _, b := range []runtimeBinding{first, second, first} {
+			if _, err := claudeTranscriptSnapshot(b, stale); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(out, "\n") != 2 || strings.Count(out, first.Agent+" Claude transcript has 1 queued input") != 1 || strings.Count(out, second.Agent+" Claude transcript has 1 queued input") != 1 {
+		t.Fatalf("drift log %q, want one line per run", out)
+	}
+	out, err = captureRelayOutput(t, true, func() error {
+		for i := 0; i <= claudeRecordLogCap; i++ {
+			logClaudeQueueDriftOnce(fmt.Sprintf("run_drift_%d", i), "drift %d\n", i)
+		}
+		return nil
+	})
+	if err != nil || strings.Count(out, "\n") != claudeRecordLogCap+1 {
+		t.Fatalf("drift lines for %d runs: %d lines, %v", claudeRecordLogCap+1, strings.Count(out, "\n"), err)
+	}
+	b, _ := claudeTranscriptFixture(t, "queue-idle", `{"type":"tt-fixture-future-drift","timestamp":"2026-09-25T18:57:31.500Z"}`)
+	b.Run = "run_0000000000000003"
+	out, err = captureRelayOutput(t, true, func() error {
+		for i := 0; i < 2; i++ {
+			if _, err := claudeTranscriptSnapshot(b, queueIdleEnd); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil || strings.Count(out, "\n") != 1 || !strings.Contains(out, `record type "tt-fixture-future-drift" not recognized`) {
+		t.Fatalf("unknown type after drift lines: %q %v", out, err)
 	}
 }

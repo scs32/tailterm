@@ -88,6 +88,9 @@ type claudeWakeSnapshot struct {
 	// clear sends its Backspaces only while the cursor is still there.
 	CaretX, CaretY int
 	Cursor         activityCursor
+	// TurnEndAt is when the transcript's last turn ended (see
+	// claudeTranscriptState.turnEndAt); zero when unknown.
+	TurnEndAt time.Time
 	// UnknownTypes lists transcript record types the idle check ignored.
 	UnknownTypes []string
 	// Safe says why the transcript allows input (see claudeWakeIntent.Safe).
@@ -207,12 +210,21 @@ func emptyClaudeInput(screen string) bool {
 	}
 	for _, line := range lines[input+1:] {
 		trimmed := strings.TrimSpace(line)
-		if trimmed == "" || strings.HasPrefix(trimmed, "? for shortcuts") || strings.HasPrefix(trimmed, "⏵⏵") || strings.HasPrefix(trimmed, "──") {
+		if trimmed == "" || claudeFooterRow(trimmed) || strings.HasPrefix(trimmed, "──") {
 			continue
 		}
 		return false
 	}
 	return true
+}
+
+// claudeFooterRow reports a known idle footer row below Claude's input box:
+// the shortcuts hint, the accept-edits and bypass modes (⏵⏵ …) and the
+// default permission mode (⏸ manual mode on …, captured from Claude Code
+// 2.1.311 on 2026-10-26; bug wi_efe0822641feba60). Any other footer, plan mode
+// for example, is unknown and fails closed.
+func claudeFooterRow(trimmed string) bool {
+	return strings.HasPrefix(trimmed, "? for shortcuts") || strings.HasPrefix(trimmed, "⏵⏵") || strings.HasPrefix(trimmed, "⏸ manual mode on")
 }
 
 // claudeBlockedScreen reports a dialog phrase in the active prompt area.
@@ -247,10 +259,10 @@ func exactClaudeInput(screen, expected string) bool {
 			border = true
 			continue
 		}
-		if border && (trimmed == "" || strings.HasPrefix(trimmed, "⏵⏵") || strings.HasPrefix(trimmed, "? for shortcuts")) {
+		if border && (trimmed == "" || claudeFooterRow(trimmed)) {
 			continue
 		}
-		if !border && trimmed != "" && strings.HasPrefix(line, "  ") && !strings.HasPrefix(trimmed, "⏵⏵") {
+		if !border && trimmed != "" && strings.HasPrefix(line, "  ") && !claudeFooterRow(trimmed) {
 			parts = append(parts, trimmed) // Claude wraps editor text at words.
 			continue
 		}
@@ -290,7 +302,9 @@ func claudeInputText(screen string) (string, bool) {
 		switch {
 		case claudeRuleLine(line):
 			border = true
-		case trimmed == "" || (border && (strings.HasPrefix(trimmed, "⏵⏵") || strings.HasPrefix(trimmed, "? for shortcuts"))):
+		case trimmed == "" || (border && claudeFooterRow(trimmed)):
+		case !border && claudeFooterRow(trimmed):
+			return "", false // a footer above the lower rule is no known layout
 		case !border && strings.HasPrefix(line, "  "):
 			parts = append(parts, trimmed)
 		default:
@@ -359,15 +373,25 @@ func claudeEarlierWake(text, own string) (stray string, ok bool) {
 }
 
 // claudeQueueStaleAfter bounds how long queued input can hold a wake after a
-// completed turn. Claude Code dequeues queued input within about 50 ms of a
-// turn ending, so an older unmatched enqueue is drift (an unrecorded removal,
-// for example) and the pane check decides instead.
+// completed turn. Claude Code dequeues queued input 0.1-0.2 s after a turn
+// ends (measured over 27 turn ends, one 10 s outlier), so an unmatched enqueue
+// still there this long after both the enqueue and the turn end is drift (an
+// unrecorded removal, for example) and the pane check decides instead.
 const claudeQueueStaleAfter = 30 * time.Second
 
 // claudeQueueFresh reports input Claude Code queued recently enough that a new
-// turn is about to start from it.
-func claudeQueueFresh(c activityCursor, now time.Time) bool {
-	return c.ClaudeQueued > 0 && now.Sub(c.ClaudeQueuedAt) < claudeQueueStaleAfter
+// turn is about to start from it. The bound counts from the later of the
+// enqueue and turnEnd, the end of the last turn: input queued early in a long
+// turn is dequeued only when that turn ends. Before bug wi_efe0822641feba60 it
+// counted from the enqueue alone, so input queued more than 30 s before the
+// turn ended read as stale in the instant before its dequeue. A zero turnEnd
+// counts from the enqueue.
+func claudeQueueFresh(c activityCursor, turnEnd, now time.Time) bool {
+	since := c.ClaudeQueuedAt
+	if turnEnd.After(since) {
+		since = turnEnd
+	}
+	return c.ClaudeQueued > 0 && now.Sub(since) < claudeQueueStaleAfter
 }
 
 // claudeRecordLog remembers which unrecognized transcript record types this
@@ -392,6 +416,34 @@ func logClaudeRecordOnce(key, format string, args ...any) {
 	}
 	claudeRecordLog.seen[key] = true
 	claudeRecordLog.Unlock()
+	fmt.Fprintf(os.Stderr, format, args...)
+}
+
+// claudeQueueDriftLog remembers the runs whose stale queued input this relay
+// process has logged. It is kept apart from claudeRecordLog so drift lines
+// never use up the record-type cap, and it starts over when full, as
+// claudeTranscriptCache does, so a long-lived relay keeps logging new runs.
+// Before bug wi_efe0822641feba60 one key served every agent, so only the
+// first agent's drift was ever logged.
+var claudeQueueDriftLog struct {
+	sync.Mutex
+	seen map[string]bool
+}
+
+const claudeQueueDriftLogCap = 64
+
+// logClaudeQueueDriftOnce writes one relay log line per run per process.
+func logClaudeQueueDriftOnce(run, format string, args ...any) {
+	claudeQueueDriftLog.Lock()
+	if claudeQueueDriftLog.seen[run] {
+		claudeQueueDriftLog.Unlock()
+		return
+	}
+	if claudeQueueDriftLog.seen == nil || len(claudeQueueDriftLog.seen) >= claudeQueueDriftLogCap {
+		claudeQueueDriftLog.seen = map[string]bool{}
+	}
+	claudeQueueDriftLog.seen[run] = true
+	claudeQueueDriftLog.Unlock()
 	fmt.Fprintf(os.Stderr, format, args...)
 }
 
@@ -461,6 +513,11 @@ type claudeTranscriptState struct {
 	// first assistant record of a turn no prompt began (a scheduled wake, a
 	// stop-hook continuation). Later records of that turn never move it.
 	turnStartAt time.Time
+	// turnEndAt is when the turn state last moved to complete: the timestamp
+	// of the record that ended the turn, or the check's time when that record
+	// has none. A restarted relay re-reads the record, so the queued-input
+	// bound does not restart with it (claudeQueueFresh).
+	turnEndAt time.Time
 }
 
 // claudeRecordTime returns a record's own top-level timestamp, or the zero
@@ -553,6 +610,7 @@ func claudeTranscriptSnapshotContext(ctx context.Context, b runtimeBinding, now 
 		if err := readActivityAppend(path, cursor, func(line []byte, cursor *activityCursor) error {
 			st.records++
 			wasOpen := cursor.SeenTurn && !cursor.TurnComplete
+			wasComplete := cursor.SeenTurn && cursor.TurnComplete
 			err := parseClaudeActivity(line, cursor)
 			var unknown unknownClaudeRecordError
 			if err == nil || errors.As(err, &unknown) {
@@ -562,6 +620,12 @@ func claudeTranscriptSnapshotContext(ctx context.Context, b runtimeBinding, now 
 				}
 				if !wasOpen && cursor.SeenTurn && !cursor.TurnComplete {
 					st.turnStartAt = at
+				}
+				if !wasComplete && cursor.SeenTurn && cursor.TurnComplete {
+					st.turnEndAt = at
+					if at.IsZero() {
+						st.turnEndAt = now
+					}
 				}
 			}
 			if errors.As(err, &unknown) {
@@ -626,7 +690,7 @@ func claudeTranscriptSnapshotContext(ctx context.Context, b runtimeBinding, now 
 	case len(cursor.Pending) != 0:
 		ids := slices.Sorted(maps.Keys(cursor.Pending))
 		reason = "tool call pending: " + cursor.Pending[ids[0]].Name
-	case claudeQueueFresh(*cursor, now):
+	case claudeQueueFresh(*cursor, st.turnEndAt, now):
 		reason = fmt.Sprintf("queued input pending (%d)", cursor.ClaudeQueued)
 	case strictUnknown:
 		reason = unknownReason
@@ -644,7 +708,7 @@ func claudeTranscriptSnapshotContext(ctx context.Context, b runtimeBinding, now 
 		return claudeWakeSnapshot{}, fmt.Errorf("Claude transcript busy, incomplete, or unknown: %s", reason)
 	}
 	if cursor.ClaudeQueued > 0 {
-		logClaudeRecordOnce("queue-operation/stale", "[tt relay] %s %s Claude transcript has %d queued input older than %s after a completed turn; idle from turn state and pane check\n", now.UTC().Format(time.RFC3339), b.Agent, cursor.ClaudeQueued, claudeQueueStaleAfter)
+		logClaudeQueueDriftOnce(b.Run, "[tt relay] %s %s Claude transcript has %d queued input older than %s after a completed turn; idle from turn state and pane check\n", now.UTC().Format(time.RFC3339), b.Agent, cursor.ClaudeQueued, claudeQueueStaleAfter)
 	}
 	safe := fmt.Sprintf("turn complete, no pending tool call, no fresh queued input; transcript read to its end (%d records, %d bytes)", st.records, cursor.Offset)
 	// The caller gets a copy that shares nothing the next check will change.
@@ -654,7 +718,7 @@ func claudeTranscriptSnapshotContext(ctx context.Context, b runtimeBinding, now 
 		block := *cursor.ProviderBlock
 		snapshot.ProviderBlock = &block
 	}
-	return claudeWakeSnapshot{Path: path, FileID: cursor.FileID, Offset: cursor.Offset, Cursor: snapshot, UnknownTypes: slices.Clone(st.unknownTypes), Safe: safe, ReadBytes: cursor.Offset - start}, nil
+	return claudeWakeSnapshot{Path: path, FileID: cursor.FileID, Offset: cursor.Offset, Cursor: snapshot, TurnEndAt: st.turnEndAt, UnknownTypes: slices.Clone(st.unknownTypes), Safe: safe, ReadBytes: cursor.Offset - start}, nil
 }
 
 // claudeCompletedRecord reports a record that ends a turn, including an
@@ -1067,7 +1131,7 @@ const (
 
 // claudeWakeIdle reports a snapshot that may safely receive input.
 func claudeWakeIdle(s claudeWakeSnapshot, now time.Time) bool {
-	return s.Cursor.TurnComplete && s.Cursor.Ready && !s.Cursor.Unknown && len(s.Cursor.Pending) == 0 && !claudeQueueFresh(s.Cursor, now)
+	return s.Cursor.TurnComplete && s.Cursor.Ready && !s.Cursor.Unknown && len(s.Cursor.Pending) == 0 && !claudeQueueFresh(s.Cursor, s.TurnEndAt, now)
 }
 
 func claudeWakeSaveReason(intent *claudeWakeIntent, reason string) {

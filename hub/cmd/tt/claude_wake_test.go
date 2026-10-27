@@ -904,9 +904,10 @@ func startLiveClaude(t *testing.T, suggestions bool, flags ...string) *liveClaud
 			if _, plain, err := claudePlainScreen(raw); err == nil && emptyClaudeInput(plain) {
 				break
 			} else if err == nil && len(flags) > 0 {
-				// Outside bypass mode the footer (for example "⏸ manual mode
-				// on") is not on the wake allowlist; typing only needs an empty
-				// input box.
+				// A footer outside the wake allowlist (plan mode, for
+				// example; default mode's "⏸ manual mode on" is on it since
+				// bug wi_efe0822641feba60) still leaves an empty input box,
+				// and typing only needs that.
 				if area, boxed := claudePromptArea(strings.Split(plain, "\n")); boxed && strings.TrimSpace(area[1]) == "❯" {
 					break
 				}
@@ -4200,4 +4201,155 @@ func TestClaudeWakeRetryWatchHoldsARefusedRetry(t *testing.T) {
 			t.Fatalf("hub reads in the %v after the changed intent's refusal: %q, want one gate at %v", claudeWakeBackoff[0]+claudeWakeDueEvery, calls, claudeWakeBackoff[0])
 		}
 	})
+}
+
+// manualModeWake is the wake prompt typed into the manual-mode capture.
+const manualModeWake = "Tailterm messages #47578. Run tt inbox --unread --mark-read."
+
+// manualModeCapture rebuilds a live `capture-pane -p -e` of an idle Claude
+// Code 2.1.311 session in default permission mode (`claude --permission-mode
+// default`, 100x30, private tmux socket, captured 2026-10-26 on Stephens-Mini
+// for bug wi_efe0822641feba60). input is what follows "❯" and a no-break
+// space; footer replaces the captured "⏸ manual mode on" row. The cursor was
+// at x=2 (idle) or x=62 (manualModeWake typed), y=26.
+func manualModeCapture(input, footer string) string {
+	rule := "\x1b[38;5;244m" + strings.Repeat("─", 100)
+	rows := []string{
+		"",
+		"\x1b[38;5;174m ▐\x1b[48;5;16m▛███▛█\x1b[39m\x1b[49m   \x1b[1mClaude Code\x1b[0m \x1b[38;5;246mv2.1.311\x1b[39m",
+		"\x1b[38;5;174m▝▜\x1b[48;5;16m█████\x1b[49m█▀\x1b[39m  \x1b[38;5;246mOpus 5.5 with high effort · Claude Max\x1b[39m",
+		"\x1b[38;5;174m ▝▝   ▝▝ \x1b[39m  \x1b[38;5;246m/…/scratchpad/work-efe0\x1b[39m",
+	}
+	for len(rows) < 25 {
+		rows = append(rows, "")
+	}
+	rows = append(rows, rule, "\x1b[39m❯ "+input, rule, "", "\x1b[39m  \x1b[38;5;246m"+footer+"\x1b[39m", "")
+	return strings.Join(rows, "\n")
+}
+
+// w1 (a1): the default-mode idle footer is idle, on the empty check, on the
+// typed-text checks and through a whole wake.
+func TestClaudeWakeManualModeFooter(t *testing.T) {
+	idle := manualModeCapture("", "⏸ manual mode on")
+	screen, err := claudeInputScreen(idle, 2, 26, "")
+	if err != nil || !emptyClaudeInput(screen) {
+		t.Fatalf("idle default-mode pane refused: %q %v", screen, err)
+	}
+	// Claude Code rotates a hint after the mode: 2.1.311 showed "← for
+	// agents" first, and 2.1.284 showed "? for shortcuts".
+	for _, footer := range []string{"⏸ manual mode on", "⏸ manual mode on · ← for agents", "⏸ manual mode on · ? for shortcuts"} {
+		_, plain, err := claudePlainScreen(manualModeCapture("", footer))
+		if err != nil || !emptyClaudeInput(plain) {
+			t.Fatalf("footer %q: emptyClaudeInput refused (%v)", footer, err)
+		}
+	}
+	typed := manualModeCapture(manualModeWake, "⏸ manual mode on")
+	if _, err := claudeInputScreen(typed, 62, 26, manualModeWake); err != nil {
+		t.Fatalf("pre-Enter check refused the typed wake: %v", err)
+	}
+	_, plain, err := claudePlainScreen(typed)
+	if err != nil || !exactClaudeInput(plain, manualModeWake) {
+		t.Fatalf("exactClaudeInput refused the typed wake: %v", err)
+	}
+	if text, ok := claudeInputText(plain); !ok || text != manualModeWake {
+		t.Fatalf("claudeInputText = %q, %v", text, ok)
+	}
+	if _, err := claudeInputScreen(typed, 62, 26, ""); err == nil {
+		t.Fatal("typed wake passed the empty check")
+	}
+
+	t.Setenv("TAILTERM_RELAY_STATE", t.TempDir())
+	b := testClaudeBinding()
+	transcript := filepath.Join(t.TempDir(), b.Thread+".jsonl")
+	if err := os.WriteFile(transcript, []byte(`{"type":"assistant","message":{"stop_reason":"end_turn","content":[]}}`+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	clock := time.Now()
+	var sent []string
+	inspect := func(_ context.Context, _ runtimeBinding, expected string) (claudeWakeSnapshot, error) {
+		info, err := os.Stat(transcript)
+		if err != nil {
+			return claudeWakeSnapshot{}, err
+		}
+		raw, x := idle, 2
+		if expected != "" {
+			raw, x = manualModeCapture(expected, "⏸ manual mode on"), 2+len([]rune(expected))
+		}
+		visible, err := claudeInputScreen(raw, x, 26, expected)
+		if err != nil {
+			return claudeWakeSnapshot{}, err
+		}
+		return claudeWakeSnapshot{Pane: "%1", SessionID: "$1", Created: "100", PanePID: 1001, Path: transcript, FileID: fileIdentity(info), Offset: info.Size(), Screen: visible, CaretX: x, CaretY: 26, Cursor: activityCursor{Ready: true, SeenTurn: true, TurnComplete: true}}, nil
+	}
+	ops := claudeWakeOps{inspect: inspect, send: func(_ context.Context, pane, value string, literal bool) error {
+		if literal {
+			sent = append(sent, "text:"+value)
+			return nil
+		}
+		sent = append(sent, "Enter")
+		line, _ := json.Marshal(map[string]any{"type": "user", "message": map[string]any{"content": manualModeWake}})
+		f, err := os.OpenFile(transcript, os.O_APPEND|os.O_WRONLY, 0600)
+		if err != nil {
+			return err
+		}
+		_, err = f.Write(append(line, '\n'))
+		f.Close()
+		return err
+	}, sleep: func(d time.Duration) { clock = clock.Add(d) }, now: func() time.Time { return clock }}
+	if err := claudeWakeWith(context.Background(), b, manualModeWake, ops); err != nil {
+		t.Fatal(err)
+	}
+	if len(sent) != 2 || sent[0] != "text:"+manualModeWake || sent[1] != "Enter" {
+		t.Fatalf("send order %v", sent)
+	}
+}
+
+// w1 (a2): the new footer hides no dialog, admits no other mode, and counts
+// only below the lower rule.
+func TestClaudeWakeManualModeFooterKeepsDialogsRefused(t *testing.T) {
+	// Default-mode dialogs: the 2.1.284 captures in testdata/claude-pane, and
+	// the 2.1.311 folder trust prompt captured with the footer above.
+	for _, fixture := range []string{"permission-dialog", "selection-dialog", "trust-dialog"} {
+		raw, x, y := readClaudePaneFixture(t, fixture)
+		for _, expected := range []string{"", manualModeWake} {
+			if _, err := claudeInputScreen(raw, x, y, expected); err == nil || !strings.Contains(err.Error(), "Claude pane has a permission or selection prompt: ") {
+				t.Fatalf("%s %q: dialog not refused: %v", fixture, expected, err)
+			}
+		}
+	}
+	trust311 := strings.Join([]string{"", "\x1b[38;5;220m" + strings.Repeat("─", 100), "\x1b[39m \x1b[1m\x1b[38;5;220mAccessing\x1b[0m \x1b[1m\x1b[38;5;220mworkspace:\x1b[0m", "",
+		" Quick safety check: Is this a project you created or one you trust? (Like your own code, a", "",
+		" \x1b[38;5;153m❯\x1b[39m \x1b[38;5;153mNo,\x1b[39m \x1b[38;5;153mexit\x1b[39m", "   Yes, I trust this folder", "",
+		" \x1b[38;5;246mEnter\x1b[39m \x1b[38;5;246mto\x1b[39m \x1b[38;5;246mconfirm\x1b[39m \x1b[38;5;246m·\x1b[39m \x1b[38;5;246mEsc\x1b[39m \x1b[38;5;246mto\x1b[39m \x1b[38;5;246mcancel\x1b[39m", ""}, "\n")
+	if _, err := claudeInputScreen(trust311, 1, 15, ""); err == nil || !strings.Contains(err.Error(), `"esc to cancel"`) {
+		t.Fatalf("2.1.311 trust prompt not refused: %v", err)
+	}
+	// A dialog phrase inside the box, beside or above the manual footer.
+	for _, raw := range []string{
+		manualModeCapture("", "⏸ manual mode on · Esc to cancel"),
+		strings.Replace(manualModeCapture("", "⏸ manual mode on"), "\n\n\x1b[39m  ", "\n  Do you want to proceed?\n\x1b[39m  ", 1),
+	} {
+		if _, err := claudeInputScreen(raw, 2, 26, ""); err == nil || !strings.Contains(err.Error(), "Claude pane has a permission or selection prompt: ") {
+			t.Fatalf("dialog phrase in the prompt area not refused: %v", err)
+		}
+	}
+	// Any other mode fails closed.
+	for _, footer := range []string{"⏸ plan mode on · ? for shortcuts", "⏸ manual", "manual mode on"} {
+		raw := manualModeCapture("", footer)
+		if _, err := claudeInputScreen(raw, 2, 26, ""); err == nil {
+			t.Fatalf("unlisted footer %q accepted", footer)
+		}
+		if _, plain, _ := claudePlainScreen(raw); emptyClaudeInput(plain) {
+			t.Fatalf("unlisted footer %q accepted by emptyClaudeInput", footer)
+		}
+	}
+	// Above the lower rule the footer is not footer, and not input either.
+	rule := strings.Repeat("─", 100)
+	above := rule + "\n❯ " + manualModeWake + "\n  ⏸ manual mode on\n" + rule + "\n\n  ⏸ manual mode on\n"
+	if exactClaudeInput(above, manualModeWake) {
+		t.Fatal("exactClaudeInput accepted a footer above the lower rule")
+	}
+	if text, ok := claudeInputText(above); ok {
+		t.Fatalf("claudeInputText read a footer above the lower rule as %q", text)
+	}
 }
