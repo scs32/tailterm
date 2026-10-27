@@ -571,3 +571,110 @@ func TestWorkOrderScopeTriggerRefusalOmitsEmptyReason(t *testing.T) {
 	}
 	requireNoScopeConfirmation(t, f, item, req.OrderMessageSeq)
 }
+
+// scopeSaveTriggerFixture confirms the uncited scope of scopeTriggerFixture
+// and links one source message to the item, so an uncited decision save
+// would succeed (bug wi_fa80fcbfc4430606).
+func scopeSaveTriggerFixture(t *testing.T) (phase3Fixture, api.WorkItem, api.WorkOrderBookkeepingRequest) {
+	t.Helper()
+	f, item, confirm := scopeTriggerFixture(t)
+	confirm.RequestID = "confirm-uncited"
+	if _, err := f.s.ConfirmWorkOrderScope(f.ctx, f.task.ID, item.ID, confirm); err != nil {
+		t.Fatal(err)
+	}
+	source, err := f.post(t, api.PostMessageRequest{Text: "decision", RequestID: "trigger-decision", WorkItems: []api.MessageWorkItem{{ItemTaskID: f.task.ID, ItemID: item.ID, ItemRevision: item.Revision, Relationship: "primary"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return f, item, api.WorkOrderBookkeepingRequest{AgentID: f.handler.ID, RunID: f.handler.RunID, ExpectedRevision: item.Revision, OrderMessageSeq: confirm.OrderMessageSeq, SourceMessageSeq: source.Seq, Kind: "decision"}
+}
+
+func requireNoBookkeeping(t *testing.T, f phase3Fixture, item api.WorkItem, requestIDs ...string) {
+	t.Helper()
+	for _, id := range requestIDs {
+		if got, err := f.s.GetWorkOrderBookkeepingReceipt(f.ctx, f.task.ID, item.ID, id); !errors.Is(err, api.ErrNotFound) {
+			t.Fatalf("a refused save %s was recorded: %+v %v", id, got, err)
+		}
+	}
+}
+
+// g2/g3: a scope save citing a withdrawn, answered or foreign request is
+// refused, naming the request, and saves nothing.
+func TestWorkOrderScopeSaveRefusesClosedTrigger(t *testing.T) {
+	f, item, req := scopeSaveTriggerFixture(t)
+	withdrawn := triggerToHandler(t, f.s, f.ctx, f.by, f.task.ID, f.lead, f.handler)
+	withdrawTrigger(t, f.s, f.ctx, f.task.ID, f.lead, withdrawn, "Do not record generation 1")
+	cited := req
+	cited.RequestID, cited.TriggerSeq = "withdrawn", withdrawn
+	_, err := f.s.SaveWorkOrderBookkeeping(f.ctx, f.task.ID, item.ID, cited)
+	refusedNaming(t, "withdrawn", err, fmt.Sprintf("#%d", withdrawn), "withdrawn", "Do not record generation 1")
+	answered := triggerToHandler(t, f.s, f.ctx, f.by, f.task.ID, f.lead, f.handler)
+	result := answerTrigger(t, f.s, f.ctx, f.by, f.task.ID, f.lead, f.handler, answered)
+	cited.RequestID, cited.TriggerSeq = "answered", answered
+	_, err = f.s.SaveWorkOrderBookkeeping(f.ctx, f.task.ID, item.ID, cited)
+	refusedNaming(t, "answered", err, fmt.Sprintf("#%d", answered), "already answered", fmt.Sprintf("#%d", result))
+	foreign, err := f.post(t, withdrawSource(api.EnvelopeKindRequest, f.lead, f.builder))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cited.RequestID, cited.TriggerSeq = "foreign", foreign.Seq
+	_, err = f.s.SaveWorkOrderBookkeeping(f.ctx, f.task.ID, item.ID, cited)
+	refusedNaming(t, "foreign", err, fmt.Sprintf("#%d", foreign.Seq), "not a request addressed to you")
+	requireNoBookkeeping(t, f, item, "withdrawn", "answered", "foreign")
+	cited.RequestID, cited.TriggerSeq = "negative", -1
+	if _, err = f.s.SaveWorkOrderBookkeeping(f.ctx, f.task.ID, item.ID, cited); !errors.Is(err, api.ErrInvalid) {
+		t.Fatalf("negative trigger = %v", err)
+	}
+}
+
+// g2/g3: a scope save made while its trigger was open replays after the
+// withdrawal; a changed retry or a new request citing it is refused.
+func TestWorkOrderScopeSaveTriggerRetryReplaysAfterWithdrawal(t *testing.T) {
+	f, item, req := scopeSaveTriggerFixture(t)
+	trigger := triggerToHandler(t, f.s, f.ctx, f.by, f.task.ID, f.lead, f.handler)
+	req.RequestID, req.TriggerSeq = "save-1", trigger
+	saved, err := f.s.SaveWorkOrderBookkeeping(f.ctx, f.task.ID, item.ID, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withdrawTrigger(t, f.s, f.ctx, f.task.ID, f.lead, trigger, "withdrawn after the save")
+	if again, err := f.s.SaveWorkOrderBookkeeping(f.ctx, f.task.ID, item.ID, req); err != nil || !reflect.DeepEqual(again, saved) {
+		t.Fatalf("replay: %+v %v", again, err)
+	}
+	changed := req
+	changed.TriggerSeq = trigger + 1000
+	if _, err = f.s.SaveWorkOrderBookkeeping(f.ctx, f.task.ID, item.ID, changed); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "bookkeeping retry payload changed") {
+		t.Fatalf("changed retry = %v", err)
+	}
+	fresh := req
+	fresh.RequestID = "save-2"
+	_, err = f.s.SaveWorkOrderBookkeeping(f.ctx, f.task.ID, item.ID, fresh)
+	refusedNaming(t, "new request ID", err, fmt.Sprintf("#%d", trigger), "withdrawn")
+	requireNoBookkeeping(t, f, item, "save-2")
+}
+
+// g2/g3: an uncited scope save succeeds beside a withdrawn request, and its
+// payload hash is the one the previous hub computed.
+func TestWorkOrderScopeSaveUntriggeredUnchanged(t *testing.T) {
+	f, item, req := scopeSaveTriggerFixture(t)
+	trigger := triggerToHandler(t, f.s, f.ctx, f.by, f.task.ID, f.lead, f.handler)
+	withdrawTrigger(t, f.s, f.ctx, f.task.ID, f.lead, trigger, "not needed")
+	req.RequestID = "uncited"
+	if _, err := f.s.SaveWorkOrderBookkeeping(f.ctx, f.task.ID, item.ID, req); err != nil {
+		t.Fatalf("uncited save: %v", err)
+	}
+	b, _ := json.Marshal(req)
+	if strings.Contains(string(b), "triggerSeq") {
+		t.Fatalf("an uncited request marshals a trigger: %s", b)
+	}
+	// The golden hash is the one hub 8bb2cf70, which had no trigger field on
+	// a bookkeeping save, computed for this request, so its saved receipts
+	// still replay.
+	golden := api.WorkOrderBookkeepingRequest{RequestID: "golden", AgentID: "agt_0123456789abcdef", RunID: "run_0123456789abcdef", ExpectedRevision: 3, OrderMessageSeq: 7, SourceMessageSeq: 8, Kind: "decision"}
+	if got := requestHash(struct {
+		Task, Item string
+		Request    api.WorkOrderBookkeepingRequest
+	}{"tsk_0123456789abcdef", "wi_0123456789abcdef", golden}); got != "70aab540c9bf87b9c0b68e03d6bd4276b5b7619e49786b8751f45502f60c38d8" {
+		t.Fatalf("the uncited payload hash changed: %s", got)
+	}
+}

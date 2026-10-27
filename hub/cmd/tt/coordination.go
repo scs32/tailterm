@@ -229,10 +229,12 @@ const handlerAuditRule = "Retain assignment/result message links and verificatio
 
 // handlerTriggerRule tells every handler to cite the request behind each
 // write with --trigger, so the hub refuses a write whose request its sender
-// withdrew or the handler already answered (bug wi_75d75d0b9693a9e9; the
-// guard is wi_60fda3c3fefa60c4). Only a message that leaves the handler an
-// obligation can be cited, so the rule also says when to omit it.
-const handlerTriggerRule = "Cite the request behind each write: pass --trigger SEQ, the seq of the REQUEST (or other message tt obligations lists for you) that asked for it, on tt work-items update, tt work-items scope confirm and tt verification plan|receipt|carry-over. The hub refuses the write, naming the request, once its sender withdrew it or it was already answered, so make every cited write before your RESULT, and on that refusal reread your inbox rather than retry. Omit --trigger for a write no message addressed to you asked for, such as an owner work order posted to the board or your own readiness pass: the hub refuses a seq that is not a request addressed to you. An unchanged retry of a saved write still replays."
+// withdrew or the handler already answered (bugs wi_75d75d0b9693a9e9 and
+// wi_fa80fcbfc4430606, which added create, note and scope save; the guard is
+// wi_60fda3c3fefa60c4). Only a message that leaves the handler an obligation
+// can be cited, so the rule also says when to omit it. The browser handler
+// prompt in client/project-handler.js carries the same sentences.
+const handlerTriggerRule = "Cite the request behind each write: pass --trigger SEQ, the seq of the REQUEST (or other message tt obligations lists for you) that asked for it, on tt work-items update|create|note, tt work-items scope confirm|save and tt verification plan|receipt|carry-over. The hub refuses the write, naming the request, once its sender withdrew it or it was already answered, so make every cited write before your RESULT, and on that refusal reread your inbox rather than retry. Omit --trigger for a write no message addressed to you asked for, such as an owner work order posted to the board or your own readiness pass: the hub refuses a seq that is not a request addressed to you. An unchanged retry of a saved write still replays."
 
 const handlerStartEvidenceRule = "Preserve deliberate selection, bounded order, admission and separate exact Start evidence with item/revision/agent/run/context digest; Send or notification is review only, never automatic claim, launch, reassignment or closure. " + queueTeamStartRule + " " + queueTeamStartHandlerRule + " " + queueTeamStartAmendmentRule
 

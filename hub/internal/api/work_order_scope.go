@@ -66,6 +66,11 @@ type WorkOrderBookkeepingRequest struct {
 	Kind             string               `json:"kind"` // order, sequencing_note, decision
 	QueueEntryID     string               `json:"queueEntryId,omitempty"`
 	Admissions       []WorkOrderAdmission `json:"admissions,omitempty"`
+	// TriggerSeq cites the request that triggered this save, as on
+	// CreateWorkItemUpdate. The hub refuses it, naming the request, once the
+	// handler's obligation on it is closed. 0 cites nothing (bug
+	// wi_fa80fcbfc4430606).
+	TriggerSeq int64 `json:"triggerSeq,omitempty"`
 }
 
 type WorkOrderAdmission struct {

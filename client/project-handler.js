@@ -31,6 +31,12 @@ const handlerCheckRule =
 // (handlerAmendedScopeRule) carries the same sentences.
 const handlerAmendedScopeRule =
   "When an owner edit amends a queued item's scope, confirm the amended revision with its owned paths and amended criteria: tt work-items scope confirm --complete --request-id KEY --revision N --scope-revision S --order SEQ --owns PATH (once per owned path) --criteria-file FILE ITEM, where FILE is a JSON object of each criterion ID that stays, the frozen ASSIGN's a1..aN, to its exact text as the owner amended it, without the moved ones. Read it back with tt work-items scope get. Without the criteria and owned paths the hub refuses any receipt carry-over to that revision, and the item needs a new plan and a full matrix run.";
+// A handler cites the request behind each write with --trigger, so the hub
+// refuses a write whose request was withdrawn or answered
+// (wi_75d75d0b9693a9e9, wi_fa80fcbfc4430606). hub/cmd/tt/coordination.go
+// (handlerTriggerRule) carries the same sentences.
+const handlerTriggerRule =
+  "Cite the request behind each write: pass --trigger SEQ, the seq of the REQUEST (or other message tt obligations lists for you) that asked for it, on tt work-items update|create|note, tt work-items scope confirm|save and tt verification plan|receipt|carry-over. The hub refuses the write, naming the request, once its sender withdrew it or it was already answered, so make every cited write before your RESULT, and on that refusal reread your inbox rather than retry. Omit --trigger for a write no message addressed to you asked for, such as an owner work order posted to the board or your own readiness pass: the hub refuses a seq that is not a request addressed to you. An unchanged retry of a saved write still replays.";
 const handlerPrompt =
   "You are this project's database handler, the sole agent owner of all work-item " +
   "database reads/writes (list/get/create/update/dispatch). All agent work must " +
@@ -109,6 +115,8 @@ const handlerPrompt =
   "capacity. After accepted completion and saved result/receipt readback, " +
   "perform the next readiness pass while lead and handler remain available. " +
   handlerEvidenceRule +
+  " " +
+  handlerTriggerRule +
   " " +
   handlerWaitRule +
   " These are auditable instructions, not a persisted scheduler or a guarantee " +

@@ -1158,11 +1158,11 @@ func TestAuxiliaryHandlerBriefingCarriesSharedGuidance(t *testing.T) {
 // successor and auxiliary, tells the handler once to cite the request behind
 // each write with --trigger, on every write that takes it, and when to omit it.
 func TestPrimaryHandlerGuidanceCitesTriggeringRequest(t *testing.T) {
-	const rule = "Cite the request behind each write: pass --trigger SEQ, the seq of the REQUEST (or other message tt obligations lists for you) that asked for it, on tt work-items update, tt work-items scope confirm and tt verification plan|receipt|carry-over. The hub refuses the write, naming the request, once its sender withdrew it or it was already answered, so make every cited write before your RESULT, and on that refusal reread your inbox rather than retry. Omit --trigger for a write no message addressed to you asked for, such as an owner work order posted to the board or your own readiness pass: the hub refuses a seq that is not a request addressed to you. An unchanged retry of a saved write still replays."
+	const rule = "Cite the request behind each write: pass --trigger SEQ, the seq of the REQUEST (or other message tt obligations lists for you) that asked for it, on tt work-items update|create|note, tt work-items scope confirm|save and tt verification plan|receipt|carry-over. The hub refuses the write, naming the request, once its sender withdrew it or it was already answered, so make every cited write before your RESULT, and on that refusal reread your inbox rather than retry. Omit --trigger for a write no message addressed to you asked for, such as an owner work order posted to the board or your own readiness pass: the hub refuses a seq that is not a request addressed to you. An unchanged retry of a saved write still replays."
 	if handlerTriggerRule != rule {
 		t.Fatalf("trigger rule changed: %q", handlerTriggerRule)
 	}
-	for _, want := range []string{"--trigger SEQ", "tt work-items update", "tt work-items scope confirm", "tt verification plan|receipt|carry-over", "Omit --trigger"} {
+	for _, want := range []string{"--trigger SEQ", "tt work-items update", "tt work-items update|create|note", "tt work-items scope confirm", "tt work-items scope confirm|save", "tt verification plan|receipt|carry-over", "Omit --trigger"} {
 		if !strings.Contains(rule, want) {
 			t.Fatalf("trigger rule does not name %q", want)
 		}

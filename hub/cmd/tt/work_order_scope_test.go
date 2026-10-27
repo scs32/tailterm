@@ -196,3 +196,70 @@ func TestWorkOrderScopeCLIConfirmCitesTrigger(t *testing.T) {
 		t.Fatalf("uncited confirm %q %v, wire %v", out, err, bodies)
 	}
 }
+
+// g2 through tt work-items scope save --trigger against the real route (bug
+// wi_fa80fcbfc4430606).
+func TestWorkOrderScopeCLISaveCitesTrigger(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "hub.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	by := api.Caller{Node: "cli-test", User: "owner"}
+	ctx := context.Background()
+	task, err := st.CreateTask(ctx, api.CreateTaskRequest{Name: "CLI project"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lead, err := st.AddAgent(ctx, task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "lead", Host: "h", Session: "lead", Runtime: "codex"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := st.AddAgent(ctx, task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "db-handler", Host: "h", Session: "db-handler", Runtime: "codex", Role: api.AgentRoleDatabaseHandler}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, err := st.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Scope save trigger flag", RequestID: "item"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	link := []api.MessageWorkItem{{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, Relationship: "primary"}}
+	order, err := st.PostMessage(ctx, task.ID, api.PostMessageRequest{Text: "bounded owner order", RequestID: "order", WorkItems: link}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.ConfirmWorkOrderScope(ctx, task.ID, item.ID, api.ConfirmWorkOrderScopeRequest{RequestID: "confirm", AgentID: handler.ID, RunID: handler.RunID, ExpectedRevision: item.Revision, ScopeRevision: item.ScopeRevision, OrderMessageSeq: order.Seq, Complete: true}); err != nil {
+		t.Fatal(err)
+	}
+	source, err := st.PostMessage(ctx, task.ID, api.PostMessageRequest{Text: "decision", RequestID: "decision", WorkItems: link}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bodies []string
+	srv := recordTriggerWire(t, server.New(st, func(*http.Request) (api.Caller, error) { return by, nil }), "/order-bookkeeping", &bodies)
+	e := env{hub: srv.URL, task: task.ID, agent: handler.ID, runID: handler.RunID}
+	save := func(key string, extra ...string) (string, error) {
+		args := append([]string{"save", "--revision", fmt.Sprint(item.Revision), "--order", fmt.Sprint(order.Seq), "--source", fmt.Sprint(source.Seq), "--kind", "decision", "--request-id", key}, extra...)
+		return captureCLIOutput(t, func() error { return cmdWorkOrderScope(e, append(args, item.ID)) })
+	}
+	trigger := triggerCLIRequest(t, st, task.ID, lead, handler)
+	cited := []string{"--trigger", fmt.Sprint(trigger)}
+	first, err := save("cited", cited...)
+	if err != nil || len(bodies) != 1 || !strings.Contains(bodies[0], fmt.Sprintf(`"triggerSeq":%d`, trigger)) {
+		t.Fatalf("cited save %q %v, wire %v", first, err, bodies)
+	}
+	withdrawCLITrigger(t, st, task.ID, lead, trigger)
+	if again, err := save("cited", cited...); err != nil || again != first {
+		t.Fatalf("retry after the withdrawal %q vs %q: %v", again, first, err)
+	}
+	if _, err = save("cited-2", cited...); err == nil || !strings.Contains(err.Error(), fmt.Sprintf("triggering request #%d was withdrawn", trigger)) {
+		t.Fatalf("new save citing the withdrawn request: %v", err)
+	}
+	if _, err = save("negative", "--trigger", "-1"); err == nil || !strings.Contains(err.Error(), "--trigger SEQ") {
+		t.Fatalf("negative trigger: %v", err)
+	}
+	bodies = nil
+	if out, err := save("uncited"); err != nil || !strings.Contains(out, item.ID) || len(bodies) != 1 || strings.Contains(bodies[0], "triggerSeq") {
+		t.Fatalf("uncited save %q %v, wire %v", out, err, bodies)
+	}
+}

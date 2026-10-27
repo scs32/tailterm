@@ -364,6 +364,9 @@ func validateArtifactRequest(req api.PutNarrativeArtifactRequest) error {
 	if req.ArtifactID != "" && !validNarrativeID(req.ArtifactID, "nart") {
 		return api.ErrInvalid
 	}
+	if req.TriggerSeq < 0 || (req.TriggerSeq > 0 && req.AgentID == "") {
+		return api.ErrInvalid
+	}
 	if !api.ValidText(req.Content, api.MaxNarrativeContentBytes) {
 		return api.ErrInvalid
 	}
@@ -398,6 +401,12 @@ func (s *Store) PutNarrativeArtifact(ctx context.Context, taskID, itemID string,
 	defer tx.Rollback()
 	if prior, ok, err := replayNarrativeReceipt[api.NarrativeArtifactVersion](tx, ctx, taskID, itemID, "artifact", req.RequestID, req.AgentID, payload, by); ok || err != nil {
 		return prior, ok, err
+	}
+	// After the replay, so a note saved before a withdrawal still replays,
+	// and before the item and actor checks, so the trigger reason wins over
+	// them (bug wi_fa80fcbfc4430606).
+	if err = refuseClosedTrigger(ctx, tx, req.AgentID, req.TriggerSeq); err != nil {
+		return api.NarrativeArtifactVersion{}, false, err
 	}
 	if _, err = loadWritableItem(tx, ctx, taskID, itemID); err != nil {
 		return api.NarrativeArtifactVersion{}, false, err

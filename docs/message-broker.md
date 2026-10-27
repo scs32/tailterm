@@ -541,21 +541,26 @@ count or attach to a round. A round with a RESULT is never removed, and an
 unanswered round that was not withdrawn still refuses a new REVIEW (bug
 `wi_042fe7cb76b34bf0`).
 
-A handler write may cite the request that triggered it: `tt work-items update
---trigger SEQ` (field, scope, done and estimate saves), `tt work-items scope
-confirm --trigger SEQ` and `tt verification plan|receipt|carry-over --trigger
-SEQ`. The hub refuses the write, naming the request, once the writer's own
-obligation on it is closed: withdrawn by its sender, already answered (RESULT,
-ANSWER or DECLINE), or otherwise closed. A sequence that is not a request
-addressed to the writer is refused too. The check runs in the write's
-transaction, so a withdrawal committed first always wins. An unchanged retry
-of a write saved before the withdrawal still replays its saved receipt, and a
-write that cites no request behaves as before (bug `wi_60fda3c3fefa60c4`).
+A handler write may cite the request that triggered it with `--trigger SEQ`.
+These handler writes take it: `tt work-items update` (field, scope, done and
+estimate saves), `tt work-items create`, `tt work-items note`,
+`tt work-items scope confirm|save` and
+`tt verification plan|receipt|carry-over` (create, note and scope save since
+bug `wi_fa80fcbfc4430606`). The hub refuses the write, naming the request,
+once the writer's own obligation on it is closed: withdrawn by its sender,
+already answered (RESULT, ANSWER or DECLINE), or otherwise closed. A
+sequence that is not a request addressed to the writer is refused too. The
+check runs in the write's transaction, so a withdrawal committed first always
+wins. An unchanged retry of a write saved before the withdrawal still replays
+its saved receipt, and a write that cites no request behaves as before (bug
+`wi_60fda3c3fefa60c4`).
 Database handler briefings tell each handler to cite the trigger: pass
 `--trigger` with the seq of the request that asked for the write, make the
 write before its RESULT, and omit `--trigger` when no message addressed to the
 handler asked for it, such as an owner work order posted to the board (bug
-`wi_75d75d0b9693a9e9`).
+`wi_75d75d0b9693a9e9`). The browser handler prompt
+(`client/project-handler.js`) carries the same rule text (bug
+`wi_fa80fcbfc4430606`).
 
 An ASSIGN may also freeze `body.verificationCriteria` (CLI:
 `--verification-criterion aN`) for IDs designated by the order or plan as

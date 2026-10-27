@@ -1602,3 +1602,195 @@ func TestWorkItemUntriggeredWriteUnchanged(t *testing.T) {
 		t.Fatalf("the uncited payload hash changed: %s", got)
 	}
 }
+
+// triggerCreate is the handler's create request for one cited filing (bug
+// wi_fa80fcbfc4430606).
+func triggerCreate(f phase3Fixture, requestID string, trigger int64) api.CreateWorkItemRequest {
+	return api.CreateWorkItemRequest{Kind: "bug", Title: "Cited filing", Description: "filed for a request", AgentID: f.handler.ID, RequestID: requestID, TriggerSeq: trigger}
+}
+
+func requireWorkItemCount(t *testing.T, f phase3Fixture, want int) {
+	t.Helper()
+	list, err := f.s.ListWorkItems(f.ctx, f.task.ID, "", "", 0, 100)
+	if err != nil || len(list.Items) != want {
+		t.Fatalf("work items = %d, want %d (%v)", len(list.Items), want, err)
+	}
+}
+
+// g2/g3: a create citing a withdrawn, answered or foreign request is refused,
+// naming the request, and saves no item.
+func TestWorkItemCreateRefusesClosedTrigger(t *testing.T) {
+	f := newPhase3Fixture(t)
+	triggerItem(t, f)
+	withdrawn := triggerToHandler(t, f.s, f.ctx, f.by, f.task.ID, f.lead, f.handler)
+	withdrawTrigger(t, f.s, f.ctx, f.task.ID, f.lead, withdrawn, "Do not file generation 1")
+	_, err := f.s.CreateWorkItem(f.ctx, f.task.ID, triggerCreate(f, "withdrawn", withdrawn), f.by)
+	refusedNaming(t, "withdrawn", err, fmt.Sprintf("#%d", withdrawn), "withdrawn", "Do not file generation 1")
+	answered := triggerToHandler(t, f.s, f.ctx, f.by, f.task.ID, f.lead, f.handler)
+	result := answerTrigger(t, f.s, f.ctx, f.by, f.task.ID, f.lead, f.handler, answered)
+	_, err = f.s.CreateWorkItem(f.ctx, f.task.ID, triggerCreate(f, "answered", answered), f.by)
+	refusedNaming(t, "answered", err, fmt.Sprintf("#%d", answered), "already answered", fmt.Sprintf("#%d", result))
+	foreign, err := f.post(t, withdrawSource(api.EnvelopeKindRequest, f.lead, f.builder))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = f.s.CreateWorkItem(f.ctx, f.task.ID, triggerCreate(f, "foreign", foreign.Seq), f.by)
+	refusedNaming(t, "foreign", err, fmt.Sprintf("#%d", foreign.Seq), "not a request addressed to you")
+	requireWorkItemCount(t, f, 1)
+	if _, err = f.s.CreateWorkItem(f.ctx, f.task.ID, triggerCreate(f, "negative", -1), f.by); !errors.Is(err, api.ErrInvalid) {
+		t.Fatalf("negative trigger = %v", err)
+	}
+	noAgent := triggerCreate(f, "no-agent", withdrawn)
+	noAgent.AgentID = ""
+	if _, err = f.s.CreateWorkItem(f.ctx, f.task.ID, noAgent, f.by); !errors.Is(err, api.ErrInvalid) {
+		t.Fatalf("trigger without an agent = %v", err)
+	}
+}
+
+// g2/g3: a create saved while its trigger was open replays after the
+// withdrawal; a changed retry or a new request citing it is refused.
+func TestWorkItemCreateTriggerRetryReplaysAfterWithdrawal(t *testing.T) {
+	f := newPhase3Fixture(t)
+	trigger := triggerToHandler(t, f.s, f.ctx, f.by, f.task.ID, f.lead, f.handler)
+	req := triggerCreate(f, "file-1", trigger)
+	saved, err := f.s.CreateWorkItem(f.ctx, f.task.ID, req, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withdrawTrigger(t, f.s, f.ctx, f.task.ID, f.lead, trigger, "withdrawn after the save")
+	if again, err := f.s.CreateWorkItem(f.ctx, f.task.ID, req, f.by); err != nil || again.ID != saved.ID || again.Revision != saved.Revision {
+		t.Fatalf("replay: %+v %v", again, err)
+	}
+	requireWorkItemCount(t, f, 1)
+	changed := req
+	changed.TriggerSeq = trigger + 1000
+	if _, err = f.s.CreateWorkItem(f.ctx, f.task.ID, changed, f.by); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "different create data") {
+		t.Fatalf("changed retry = %v", err)
+	}
+	_, err = f.s.CreateWorkItem(f.ctx, f.task.ID, triggerCreate(f, "file-2", trigger), f.by)
+	refusedNaming(t, "new request ID", err, fmt.Sprintf("#%d", trigger), "withdrawn")
+	requireWorkItemCount(t, f, 1)
+}
+
+// g2/g3: an uncited create saves beside a withdrawn request, and its payload
+// hash is the one the previous hub computed.
+func TestWorkItemCreateUntriggeredUnchanged(t *testing.T) {
+	f := newPhase3Fixture(t)
+	trigger := triggerToHandler(t, f.s, f.ctx, f.by, f.task.ID, f.lead, f.handler)
+	withdrawTrigger(t, f.s, f.ctx, f.task.ID, f.lead, trigger, "not needed")
+	req := triggerCreate(f, "uncited", 0)
+	if _, err := f.s.CreateWorkItem(f.ctx, f.task.ID, req, f.by); err != nil {
+		t.Fatalf("uncited create: %v", err)
+	}
+	b, _ := json.Marshal(req)
+	if strings.Contains(string(b), "triggerSeq") {
+		t.Fatalf("an uncited request marshals a trigger: %s", b)
+	}
+	// The golden hash is the one hub 8bb2cf70, which had no trigger field on
+	// create, computed for this request, so its saved receipts still replay.
+	golden := api.CreateWorkItemRequest{Kind: "bug", Title: "Golden", Description: "fixture", Priority: "normal", AgentID: "agt_0123456789abcdef", SourceMessageSeq: 7, RequestID: "golden"}
+	if got := requestHash(golden); got != "eec71689cb0665d0b4b399c6125f5934e037cc453d0978506dc6c1f4d76e09f4" {
+		t.Fatalf("the uncited payload hash changed: %s", got)
+	}
+}
+
+// triggerNote is the request tt work-items note sends for one cited note
+// (bug wi_fa80fcbfc4430606).
+func triggerNote(f phase3Fixture, requestID string, trigger int64) api.PutNarrativeArtifactRequest {
+	return api.PutNarrativeArtifactRequest{
+		RequestID: requestID, Namespace: "note", SourceID: requestID, SourceVersion: "1", Kind: "note", Title: "Cited note",
+		AgentID: f.handler.ID, RunID: f.handler.RunID, Provenance: "agent-note", CaptureState: "stored-content", Availability: "available", Content: "noted for a request",
+		TriggerSeq: trigger,
+	}
+}
+
+func requireNoteCount(t *testing.T, f phase3Fixture, item api.WorkItem, want int) {
+	t.Helper()
+	list, err := f.s.ListNarrativeArtifacts(f.ctx, f.task.ID, item.ID, "", api.MaxNarrativePage)
+	if err != nil || len(list.Artifacts) != want {
+		t.Fatalf("notes = %d, want %d (%v)", len(list.Artifacts), want, err)
+	}
+}
+
+// g2/g3: a note citing a withdrawn, answered or foreign request is refused,
+// naming the request, and saves nothing.
+func TestWorkItemNoteRefusesClosedTrigger(t *testing.T) {
+	f := newPhase3Fixture(t)
+	item := triggerItem(t, f)
+	withdrawn := triggerToHandler(t, f.s, f.ctx, f.by, f.task.ID, f.lead, f.handler)
+	withdrawTrigger(t, f.s, f.ctx, f.task.ID, f.lead, withdrawn, "Do not note generation 1")
+	_, _, err := f.s.PutNarrativeArtifact(f.ctx, f.task.ID, item.ID, triggerNote(f, "withdrawn", withdrawn), f.by)
+	refusedNaming(t, "withdrawn", err, fmt.Sprintf("#%d", withdrawn), "withdrawn", "Do not note generation 1")
+	answered := triggerToHandler(t, f.s, f.ctx, f.by, f.task.ID, f.lead, f.handler)
+	result := answerTrigger(t, f.s, f.ctx, f.by, f.task.ID, f.lead, f.handler, answered)
+	_, _, err = f.s.PutNarrativeArtifact(f.ctx, f.task.ID, item.ID, triggerNote(f, "answered", answered), f.by)
+	refusedNaming(t, "answered", err, fmt.Sprintf("#%d", answered), "already answered", fmt.Sprintf("#%d", result))
+	foreign, err := f.post(t, withdrawSource(api.EnvelopeKindRequest, f.lead, f.builder))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = f.s.PutNarrativeArtifact(f.ctx, f.task.ID, item.ID, triggerNote(f, "foreign", foreign.Seq), f.by)
+	refusedNaming(t, "foreign", err, fmt.Sprintf("#%d", foreign.Seq), "not a request addressed to you")
+	requireNoteCount(t, f, item, 0)
+	if _, _, err = f.s.PutNarrativeArtifact(f.ctx, f.task.ID, item.ID, triggerNote(f, "negative", -1), f.by); !errors.Is(err, api.ErrInvalid) {
+		t.Fatalf("negative trigger = %v", err)
+	}
+	noAgent := triggerNote(f, "no-agent", withdrawn)
+	noAgent.AgentID, noAgent.RunID = "", ""
+	if _, _, err = f.s.PutNarrativeArtifact(f.ctx, f.task.ID, item.ID, noAgent, f.by); !errors.Is(err, api.ErrInvalid) {
+		t.Fatalf("trigger without an agent = %v", err)
+	}
+}
+
+// g2/g3: a note saved while its trigger was open replays after the
+// withdrawal; a changed retry or a new request citing it is refused.
+func TestWorkItemNoteTriggerRetryReplaysAfterWithdrawal(t *testing.T) {
+	f := newPhase3Fixture(t)
+	item := triggerItem(t, f)
+	trigger := triggerToHandler(t, f.s, f.ctx, f.by, f.task.ID, f.lead, f.handler)
+	req := triggerNote(f, "note-1", trigger)
+	saved, replay, err := f.s.PutNarrativeArtifact(f.ctx, f.task.ID, item.ID, req, f.by)
+	if err != nil || replay {
+		t.Fatalf("first save: %+v %v %v", saved, replay, err)
+	}
+	withdrawTrigger(t, f.s, f.ctx, f.task.ID, f.lead, trigger, "withdrawn after the save")
+	if again, replay, err := f.s.PutNarrativeArtifact(f.ctx, f.task.ID, item.ID, req, f.by); err != nil || !replay || !reflect.DeepEqual(again, saved) {
+		t.Fatalf("replay: %+v %v %v", again, replay, err)
+	}
+	requireNoteCount(t, f, item, 1)
+	changed := req
+	changed.TriggerSeq = trigger + 1000
+	if _, _, err = f.s.PutNarrativeArtifact(f.ctx, f.task.ID, item.ID, changed, f.by); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "different narrative data") {
+		t.Fatalf("changed retry = %v", err)
+	}
+	_, _, err = f.s.PutNarrativeArtifact(f.ctx, f.task.ID, item.ID, triggerNote(f, "note-2", trigger), f.by)
+	refusedNaming(t, "new request ID", err, fmt.Sprintf("#%d", trigger), "withdrawn")
+	requireNoteCount(t, f, item, 1)
+}
+
+// g2/g3: an uncited note saves beside a withdrawn request, and its payload
+// hash is the one the previous hub computed.
+func TestWorkItemNoteUntriggeredUnchanged(t *testing.T) {
+	f := newPhase3Fixture(t)
+	item := triggerItem(t, f)
+	trigger := triggerToHandler(t, f.s, f.ctx, f.by, f.task.ID, f.lead, f.handler)
+	withdrawTrigger(t, f.s, f.ctx, f.task.ID, f.lead, trigger, "not needed")
+	req := triggerNote(f, "uncited", 0)
+	if _, _, err := f.s.PutNarrativeArtifact(f.ctx, f.task.ID, item.ID, req, f.by); err != nil {
+		t.Fatalf("uncited note: %v", err)
+	}
+	b, _ := json.Marshal(req)
+	if strings.Contains(string(b), "triggerSeq") {
+		t.Fatalf("an uncited request marshals a trigger: %s", b)
+	}
+	// The golden hash is the one hub 8bb2cf70, which had no trigger field on
+	// a narrative write, computed for this note, so its saved receipts still
+	// replay.
+	golden := api.PutNarrativeArtifactRequest{
+		RequestID: "golden", Namespace: "note", SourceID: "golden", SourceVersion: "1", Kind: "note", Title: "Golden",
+		AgentID: "agt_0123456789abcdef", RunID: "run_0123456789abcdef", Provenance: "agent-note", CaptureState: "stored-content", Availability: "available", Content: "fixture",
+	}
+	if got := narrativePayloadHash(golden); got != "9ed0af3d5e999a5920ce872630f796f7c7c0a7179a95f1a387872eb9aebe150e" {
+		t.Fatalf("the uncited payload hash changed: %s", got)
+	}
+}

@@ -924,3 +924,77 @@ func TestWorkItemsCLITriggerFlag(t *testing.T) {
 		t.Fatalf("uncited update %q %v, wire %v", out, err, bodies)
 	}
 }
+
+// g2 through tt work-items create --trigger and note --trigger against the
+// real routes (bug wi_fa80fcbfc4430606).
+func TestWorkItemsCLICreateAndNoteTriggerFlag(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "hub.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	by := api.Caller{Node: "cli-test", User: "owner"}
+	ctx := context.Background()
+	task, err := st.CreateTask(ctx, api.CreateTaskRequest{Name: "CLI project"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lead, err := st.AddAgent(ctx, task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "lead", Host: "h", Session: "lead", Runtime: "codex"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := st.AddAgent(ctx, task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "db-handler", Host: "h", Session: "db-handler", Runtime: "codex", Role: api.AgentRoleDatabaseHandler}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, err := st.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Note trigger flag", RequestID: "item"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bodyPath := filepath.Join(t.TempDir(), "body.txt")
+	if err = os.WriteFile(bodyPath, []byte("cited text\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	hub := server.New(st, func(*http.Request) (api.Caller, error) { return by, nil })
+	for _, c := range []struct {
+		name, suffix string
+		args         func(key string) []string
+	}{
+		{"create", "/work-items", func(key string) []string {
+			return []string{"create", "--kind", "bug", "--title", "Cited filing", "--body-file", bodyPath, "--request-id", key}
+		}},
+		{"note", "/artifacts", func(key string) []string {
+			return []string{"note", "--request-id", key, "--title", "Cited note", "--body-file", bodyPath, item.ID}
+		}},
+	} {
+		var bodies []string
+		srv := recordTriggerWire(t, hub, c.suffix, &bodies)
+		e := env{hub: srv.URL, task: task.ID, agent: handler.ID, runID: handler.RunID}
+		run := func(key string, extra ...string) (string, error) {
+			args := c.args(key)
+			// Flags go before the note's WI_ID operand.
+			args = append(args[:1], append(append([]string{}, extra...), args[1:]...)...)
+			return captureCLIOutput(t, func() error { return cmdWorkItems(e, args) })
+		}
+		trigger := triggerCLIRequest(t, st, task.ID, lead, handler)
+		cited := []string{"--trigger", fmt.Sprint(trigger)}
+		first, err := run(c.name+"-cited", cited...)
+		if err != nil || len(bodies) != 1 || !strings.Contains(bodies[0], fmt.Sprintf(`"triggerSeq":%d`, trigger)) {
+			t.Fatalf("%s: cited write %q %v, wire %v", c.name, first, err, bodies)
+		}
+		withdrawCLITrigger(t, st, task.ID, lead, trigger)
+		if again, err := run(c.name+"-cited", cited...); err != nil || again != first {
+			t.Fatalf("%s: retry after the withdrawal %q vs %q: %v", c.name, again, first, err)
+		}
+		if _, err = run(c.name+"-cited-2", cited...); err == nil || !strings.Contains(err.Error(), fmt.Sprintf("triggering request #%d was withdrawn", trigger)) {
+			t.Fatalf("%s: new write citing the withdrawn request: %v", c.name, err)
+		}
+		if _, err = run(c.name+"-negative", "--trigger", "-1"); err == nil || !strings.Contains(err.Error(), "--trigger SEQ") {
+			t.Fatalf("%s: negative trigger: %v", c.name, err)
+		}
+		bodies = nil
+		if out, err := run(c.name + "-uncited"); err != nil || out == "" || len(bodies) != 1 || strings.Contains(bodies[0], "triggerSeq") {
+			t.Fatalf("%s: uncited write %q %v, wire %v", c.name, out, err, bodies)
+		}
+	}
+}

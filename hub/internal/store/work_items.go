@@ -308,7 +308,8 @@ func (s *Store) CreateWorkItem(ctx context.Context, taskID string, req api.Creat
 	if req.Priority == "" {
 		req.Priority = "normal"
 	}
-	if !api.ValidID(taskID, "tsk") || !validWorkItemKind(req.Kind) || !validWorkItemTitle(req.Title) || !api.ValidText(req.Description, api.MaxTextLen) || !validWorkItemPriority(req.Priority) || !validRequestID(req.RequestID) || req.SourceMessageSeq < 0 {
+	if !api.ValidID(taskID, "tsk") || !validWorkItemKind(req.Kind) || !validWorkItemTitle(req.Title) || !api.ValidText(req.Description, api.MaxTextLen) || !validWorkItemPriority(req.Priority) || !validRequestID(req.RequestID) || req.SourceMessageSeq < 0 ||
+		req.TriggerSeq < 0 || (req.TriggerSeq > 0 && req.AgentID == "") {
 		return api.WorkItem{}, api.ErrInvalid
 	}
 	payload := requestHash(req)
@@ -342,6 +343,12 @@ func (s *Store) CreateWorkItem(ctx context.Context, taskID string, req api.Creat
 	// Broker phase 3.1: an agent holding unacknowledged work is refused; a
 	// retried request that already committed replays above.
 	if err := ackGate(ctx, tx, req.AgentID, "", 0, s.now()); err != nil {
+		return api.WorkItem{}, err
+	}
+	// After the replay, so a create saved before a withdrawal still replays,
+	// and the ack gate, and before the task and agent checks, so the trigger
+	// reason wins over them (bug wi_fa80fcbfc4430606).
+	if err := refuseClosedTrigger(ctx, tx, req.AgentID, req.TriggerSeq); err != nil {
 		return api.WorkItem{}, err
 	}
 	if task.Status != api.TaskOpen {

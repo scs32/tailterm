@@ -410,7 +410,7 @@ func sameAdmissions(a, b []api.WorkOrderAdmission) bool {
 }
 
 func (s *Store) SaveWorkOrderBookkeeping(ctx context.Context, task, itemID string, req api.WorkOrderBookkeepingRequest) (api.WorkOrderBookkeepingReceipt, error) {
-	if !api.ValidID(task, "tsk") || !api.ValidID(itemID, "wi") || !validRequestID(req.RequestID) || req.ExpectedRevision < 1 || req.OrderMessageSeq < 1 || req.SourceMessageSeq < 1 ||
+	if !api.ValidID(task, "tsk") || !api.ValidID(itemID, "wi") || !validRequestID(req.RequestID) || req.ExpectedRevision < 1 || req.OrderMessageSeq < 1 || req.SourceMessageSeq < 1 || req.TriggerSeq < 0 ||
 		(req.Kind != "order" && req.Kind != "sequencing_note" && req.Kind != "decision") {
 		return api.WorkOrderBookkeepingReceipt{}, api.ErrInvalid
 	}
@@ -439,6 +439,12 @@ func (s *Store) SaveWorkOrderBookkeeping(ctx context.Context, task, itemID strin
 		return api.WorkOrderBookkeepingReceipt{}, err
 	}
 	if err := requireScopeHandler(tx, ctx, task, req.AgentID, req.RunID); err != nil {
+		return api.WorkOrderBookkeepingReceipt{}, err
+	}
+	// After the replay, so a save made before a withdrawal still replays,
+	// and the handler check, and before the item and order checks, so the
+	// trigger reason wins over them (bug wi_fa80fcbfc4430606).
+	if err := refuseClosedTrigger(ctx, tx, req.AgentID, req.TriggerSeq); err != nil {
 		return api.WorkOrderBookkeepingReceipt{}, err
 	}
 	item, err := getWorkItem(tx, ctx, task, itemID)

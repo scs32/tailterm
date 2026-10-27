@@ -250,3 +250,25 @@ test("handler prompt records evidence as a note and never as a description appen
   const go = readFileSync(new URL("../hub/cmd/tt/coordination.go", import.meta.url), "utf8");
   assert.equal(count(go, rule), 1);
 });
+
+// wi_fa80fcbfc4430606: the browser handler cites the request behind each
+// handler write with --trigger, like the tt handler guidance. The sentences
+// are pinned whole, and hub/cmd/tt/coordination.go (handlerTriggerRule)
+// carries the same text.
+test("handler prompt cites the triggering request on each handler write", () => {
+  const evidence =
+    "pass --scope-change only for a recorded scope amendment, because it invalidates that release.";
+  const rule =
+    "Cite the request behind each write: pass --trigger SEQ, the seq of the REQUEST (or other message tt obligations lists for you) that asked for it, on tt work-items update|create|note, tt work-items scope confirm|save and tt verification plan|receipt|carry-over. The hub refuses the write, naming the request, once its sender withdrew it or it was already answered, so make every cited write before your RESULT, and on that refusal reread your inbox rather than retry. Omit --trigger for a write no message addressed to you asked for, such as an owner work order posted to the board or your own readiness pass: the hub refuses a seq that is not a request addressed to you. An unchanged retry of a saved write still replays.";
+  const count = (text, clause) => text.split(clause).length - 1;
+  const prompt = withDatabaseHandler(plan())[1].fields.prompt;
+  assert.equal(count(prompt, rule), 1);
+  assert.ok(
+    prompt.includes(`${evidence} ${rule} Shared-path sequencing:`),
+    "the trigger rule does not sit between the evidence and wait rules",
+  );
+  assert.equal(count(prompt, "tt work-items note"), 1);
+  assert.ok(prompt.length <= 8192, `handler prompt is ${prompt.length} characters`);
+  const go = readFileSync(new URL("../hub/cmd/tt/coordination.go", import.meta.url), "utf8");
+  assert.equal(count(go, rule), 1);
+});

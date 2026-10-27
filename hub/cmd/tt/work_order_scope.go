@@ -28,7 +28,7 @@ func cmdWorkOrderScope(e env, args []string) error {
 	requestID := fs.String("request-id", "", "stable retry id")
 	complete := fs.Bool("complete", false, "handler verified complete owner-filed scope")
 	criteriaFile := fs.String("criteria-file", "", "confirm: JSON object of each amended criterion ID to its exact text, as read from the owner filing; needs --owns. A receipt carry-over to this revision requires them")
-	trigger := fs.Int64("trigger", 0, "confirm: seq of the request that triggered this write; the hub refuses it once that request is withdrawn or answered")
+	trigger := fs.Int64("trigger", 0, "confirm, save: seq of the request that triggered this write; the hub refuses it once that request is withdrawn or answered")
 	var owns ownershipFlags
 	fs.Var(&owns, "owns", "confirm: repository-relative file or directory the plan or intake will change (repeatable); a queue add without --owns uses it")
 	if err := fs.Parse(args[1:]); err != nil {
@@ -81,8 +81,8 @@ func cmdWorkOrderScope(e env, args []string) error {
 		}
 		printJSON(out)
 	case "save":
-		if e.agent == "" || e.runID == "" || !validScopeArgs(*requestID, *revision, *order) || *source < 1 || *kind == "" {
-			return errors.New("save requires handler agent, --request-id, --revision, --order, --source and --kind")
+		if e.agent == "" || e.runID == "" || !validScopeArgs(*requestID, *revision, *order) || *source < 1 || *kind == "" || *trigger < 0 {
+			return errors.New("save requires handler agent, --request-id, --revision, --order, --source and --kind; --trigger SEQ is optional")
 		}
 		admissions := []api.WorkOrderAdmission{}
 		if *admissionsFile != "" {
@@ -94,7 +94,7 @@ func cmdWorkOrderScope(e env, args []string) error {
 				return fmt.Errorf("admissions file: %w", err)
 			}
 		}
-		out, err := c.SaveWorkOrderBookkeeping(ctx, task, item, api.WorkOrderBookkeepingRequest{RequestID: *requestID, AgentID: e.agent, RunID: e.runID, ExpectedRevision: *revision, OrderMessageSeq: *order, SourceMessageSeq: *source, Kind: *kind, QueueEntryID: *entry, Admissions: admissions})
+		out, err := c.SaveWorkOrderBookkeeping(ctx, task, item, api.WorkOrderBookkeepingRequest{RequestID: *requestID, AgentID: e.agent, RunID: e.runID, ExpectedRevision: *revision, OrderMessageSeq: *order, SourceMessageSeq: *source, Kind: *kind, QueueEntryID: *entry, Admissions: admissions, TriggerSeq: *trigger})
 		if err != nil {
 			return err
 		}

@@ -101,6 +101,11 @@ type CreateWorkItemRequest struct {
 	AgentID          string `json:"agentId"`
 	SourceMessageSeq int64  `json:"sourceMessageSeq,omitempty"`
 	RequestID        string `json:"requestId"`
+	// TriggerSeq cites the request that triggered this create, as on
+	// CreateWorkItemUpdate. The hub refuses it, naming the request, once the
+	// handler's obligation on it is closed. 0 cites nothing (bug
+	// wi_fa80fcbfc4430606).
+	TriggerSeq int64 `json:"triggerSeq,omitempty"`
 }
 
 type UpdateWorkItemRequest struct {
@@ -246,6 +251,11 @@ type PutNarrativeArtifactRequest struct {
 	SuppliedDigest  string     `json:"suppliedDigest,omitempty"`
 	Locator         string     `json:"locator,omitempty"`
 	Size            int64      `json:"size,omitempty"`
+	// TriggerSeq cites the request that triggered this write, as on
+	// CreateWorkItemUpdate. The hub refuses it, naming the request, once the
+	// handler's obligation on it is closed. 0 cites nothing (bug
+	// wi_fa80fcbfc4430606).
+	TriggerSeq int64 `json:"triggerSeq,omitempty"`
 }
 
 type NarrativeArtifactList struct {

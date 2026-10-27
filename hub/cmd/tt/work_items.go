@@ -99,18 +99,19 @@ func cmdWorkItems(e env, args []string) error {
 // moves neither the item revision nor the scope revision, so an accepted
 // candidate stays releasable.
 func cmdWorkItemNote(e env, args []string) error {
-	const usage = "usage: tt work-items note --request-id KEY --title T --body-file F [--kind recurrence|log|note] WI_ID"
+	const usage = "usage: tt work-items note --request-id KEY --title T --body-file F [--kind recurrence|log|note] [--trigger SEQ] WI_ID"
 	fs := flag.NewFlagSet("work-items note", flag.ContinueOnError)
 	projectFlag := fs.String("project", e.task, "owning project id")
 	requestID := fs.String("request-id", "", "stable retry key (required)")
 	title := fs.String("title", "", "one-line title of the note (required)")
 	body := fs.String("body-file", "", "note text file, or - for stdin (required)")
 	kind := fs.String("kind", "note", "recurrence, log or note")
+	trigger := fs.Int64("trigger", 0, "seq of the request that triggered this write; the hub refuses it once that request is withdrawn or answered")
 	asJSON := fs.Bool("json", false, "JSON output")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if fs.NArg() != 1 || !api.ValidID(fs.Arg(0), "wi") || *requestID == "" || *title == "" || *body == "" {
+	if fs.NArg() != 1 || !api.ValidID(fs.Arg(0), "wi") || *requestID == "" || *title == "" || *body == "" || *trigger < 0 {
 		return errors.New(usage)
 	}
 	if *kind != "recurrence" && *kind != "log" && *kind != "note" {
@@ -136,6 +137,7 @@ func cmdWorkItemNote(e env, args []string) error {
 	out, err := c.PutNarrativeArtifact(ctx, project, fs.Arg(0), api.PutNarrativeArtifactRequest{
 		RequestID: *requestID, Namespace: "note", SourceID: *requestID, SourceVersion: "1", Kind: *kind, Title: *title,
 		AgentID: e.agent, RunID: e.runID, Provenance: "agent-note", CaptureState: "stored-content", Availability: "available", Content: content,
+		TriggerSeq: *trigger,
 	})
 	if err != nil {
 		return err
@@ -250,6 +252,7 @@ func workItemBudgetLines(b *api.TokenBudget) []string {
 }
 
 func cmdWorkItemCreate(e env, args []string) error {
+	const usage = "usage: tt work-items create --kind bug|feature --title T --request-id KEY [--body-file F] [--priority P] [--source-seq SEQ] [--trigger SEQ]"
 	fs := flag.NewFlagSet("work-items create", flag.ContinueOnError)
 	projectFlag := fs.String("project", e.task, "owning project id")
 	kind := fs.String("kind", "", "bug or feature (required)")
@@ -258,9 +261,13 @@ func cmdWorkItemCreate(e env, args []string) error {
 	priority := fs.String("priority", "", "low, normal, high or urgent")
 	source := fs.Int64("source-seq", 0, "source board message sequence")
 	requestID := fs.String("request-id", "", "stable retry key (required)")
+	trigger := fs.Int64("trigger", 0, "seq of the request that triggered this write; the hub refuses it once that request is withdrawn or answered")
 	asJSON := fs.Bool("json", false, "JSON output")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *trigger < 0 {
+		return errors.New(usage)
 	}
 	project, err := workItemProject(e, *projectFlag)
 	if err != nil {
@@ -276,7 +283,7 @@ func cmdWorkItemCreate(e env, args []string) error {
 	}
 	ctx, cancel := ctxTimeout(10 * time.Second)
 	defer cancel()
-	item, err := c.CreateWorkItem(ctx, project, api.CreateWorkItemRequest{Kind: *kind, Title: *title, Description: description, Priority: *priority, AgentID: e.agent, SourceMessageSeq: *source, RequestID: *requestID})
+	item, err := c.CreateWorkItem(ctx, project, api.CreateWorkItemRequest{Kind: *kind, Title: *title, Description: description, Priority: *priority, AgentID: e.agent, SourceMessageSeq: *source, RequestID: *requestID, TriggerSeq: *trigger})
 	if err != nil {
 		return err
 	}
