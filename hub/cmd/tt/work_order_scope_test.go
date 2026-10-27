@@ -4,10 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/scs32/tailterm/hub/internal/api"
+	"github.com/scs32/tailterm/hub/internal/server"
+	"github.com/scs32/tailterm/hub/internal/store"
 )
 
 func confirmCLIFixtureOrder(t *testing.T, c *api.Client, task, item string, order int64, handler api.Agent) {
@@ -122,5 +126,73 @@ func TestWorkOrderScopeCLIConfirmOwnershipFeedsQueueAdd(t *testing.T) {
 	list, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"list"}) })
 	if err != nil || !strings.Contains(list, "owns=hub/x.go,docs/y.md ") {
 		t.Fatalf("list %q %v", list, err)
+	}
+}
+
+// t4 through tt work-items scope confirm --trigger against the real route
+// (bug wi_75d75d0b9693a9e9).
+func TestWorkOrderScopeCLIConfirmCitesTrigger(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "hub.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	by := api.Caller{Node: "cli-test", User: "owner"}
+	ctx := context.Background()
+	task, err := st.CreateTask(ctx, api.CreateTaskRequest{Name: "CLI project"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lead, err := st.AddAgent(ctx, task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "lead", Host: "h", Session: "lead", Runtime: "codex"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := st.AddAgent(ctx, task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "db-handler", Host: "h", Session: "db-handler", Runtime: "codex", Role: api.AgentRoleDatabaseHandler}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, err := st.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Scope trigger flag", RequestID: "item"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	order, err := st.PostMessage(ctx, task.ID, api.PostMessageRequest{Text: "bounded owner order", RequestID: "order", WorkItems: []api.MessageWorkItem{{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, Relationship: "primary"}}}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := st.PostMessage(ctx, task.ID, api.PostMessageRequest{Text: "second bounded owner order", RequestID: "order-2", WorkItems: []api.MessageWorkItem{{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, Relationship: "primary"}}}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bodies []string
+	srv := recordTriggerWire(t, server.New(st, func(*http.Request) (api.Caller, error) { return by, nil }), "/order-scope/confirm", &bodies)
+	var confirmOrder func(seq int64, key string, extra ...string) (string, error)
+	e := env{hub: srv.URL, task: task.ID, agent: handler.ID, runID: handler.RunID}
+	confirm := func(key string, extra ...string) (string, error) {
+		return confirmOrder(order.Seq, key, extra...)
+	}
+	confirmOrder = func(seq int64, key string, extra ...string) (string, error) {
+		args := append([]string{"confirm", "--revision", fmt.Sprint(item.Revision), "--scope-revision", fmt.Sprint(item.ScopeRevision), "--order", fmt.Sprint(seq), "--request-id", key, "--complete"}, extra...)
+		return captureCLIOutput(t, func() error { return cmdWorkOrderScope(e, append(args, item.ID)) })
+	}
+	trigger := triggerCLIRequest(t, st, task.ID, lead, handler)
+	cited := []string{"--trigger", fmt.Sprint(trigger)}
+	first, err := confirm("cited", cited...)
+	if err != nil || len(bodies) != 1 || !strings.Contains(bodies[0], fmt.Sprintf(`"triggerSeq":%d`, trigger)) {
+		t.Fatalf("cited confirm %q %v, wire %v", first, err, bodies)
+	}
+	withdrawCLITrigger(t, st, task.ID, lead, trigger)
+	if again, err := confirm("cited", cited...); err != nil || again != first {
+		t.Fatalf("retry after the withdrawal %q vs %q: %v", again, first, err)
+	}
+	if _, err = confirm("cited-2", cited...); err == nil || !strings.Contains(err.Error(), fmt.Sprintf("triggering request #%d was withdrawn", trigger)) {
+		t.Fatalf("new confirm citing the withdrawn request: %v", err)
+	}
+	if _, err = confirm("negative", "--trigger", "-1"); err == nil || !strings.Contains(err.Error(), "--trigger SEQ") {
+		t.Fatalf("negative trigger: %v", err)
+	}
+	bodies = nil
+	// An uncited confirm of the second order saves beside the withdrawn request.
+	if out, err := confirmOrder(second.Seq, "uncited"); err != nil || !strings.Contains(out, item.ID) || len(bodies) != 1 || strings.Contains(bodies[0], "triggerSeq") {
+		t.Fatalf("uncited confirm %q %v, wire %v", out, err, bodies)
 	}
 }

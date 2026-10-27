@@ -1123,7 +1123,7 @@ func TestAuxiliaryHandlerBriefingCarriesSharedGuidance(t *testing.T) {
 	if !strings.HasSuffix(auxiliary, "These handler rules apply to your leased item:"+leasedHandlerGuidance) {
 		t.Fatalf("auxiliary briefing does not end with the leased guidance: %s", auxiliary)
 	}
-	for _, rule := range []string{handlerGateRule, handlerReadBackRule, handlerEvidenceReadRule, handlerAuditRule, handlerStartEvidenceRule, handlerEvidenceRule} {
+	for _, rule := range []string{handlerGateRule, handlerReadBackRule, handlerEvidenceReadRule, handlerAuditRule, handlerStartEvidenceRule, handlerEvidenceRule, handlerTriggerRule} {
 		if n := strings.Count(primaryHandlerGuidance, rule); n != 1 {
 			t.Fatalf("primary guidance states a shared rule %d times: %q", n, rule)
 		}
@@ -1150,6 +1150,44 @@ func TestAuxiliaryHandlerBriefingCarriesSharedGuidance(t *testing.T) {
 		}
 		if strings.Contains(auxiliary, primaryOnly) {
 			t.Fatalf("auxiliary briefing carries primary-only duty %q", primaryOnly)
+		}
+	}
+}
+
+// wi_75d75d0b9693a9e9 t1/t2: every handler briefing, primary, rotation
+// successor and auxiliary, tells the handler once to cite the request behind
+// each write with --trigger, on every write that takes it, and when to omit it.
+func TestPrimaryHandlerGuidanceCitesTriggeringRequest(t *testing.T) {
+	const rule = "Cite the request behind each write: pass --trigger SEQ, the seq of the REQUEST (or other message tt obligations lists for you) that asked for it, on tt work-items update, tt work-items scope confirm and tt verification plan|receipt|carry-over. The hub refuses the write, naming the request, once its sender withdrew it or it was already answered, so make every cited write before your RESULT, and on that refusal reread your inbox rather than retry. Omit --trigger for a write no message addressed to you asked for, such as an owner work order posted to the board or your own readiness pass: the hub refuses a seq that is not a request addressed to you. An unchanged retry of a saved write still replays."
+	if handlerTriggerRule != rule {
+		t.Fatalf("trigger rule changed: %q", handlerTriggerRule)
+	}
+	for _, want := range []string{"--trigger SEQ", "tt work-items update", "tt work-items scope confirm", "tt verification plan|receipt|carry-over", "Omit --trigger"} {
+		if !strings.Contains(rule, want) {
+			t.Fatalf("trigger rule does not name %q", want)
+		}
+	}
+	task := api.Task{Name: "Project", Orchestrator: "lead"}
+	roster := []api.Agent{{Name: "lead", Status: api.AgentRunning}, {Name: "handler", Role: api.AgentRoleDatabaseHandler, Status: api.AgentRunning}, {Name: "handler-aux", Role: api.AgentRoleDatabaseHandler, Status: api.AgentRunning}}
+	steward := stewardBriefing{Active: "backlog-steward"}
+	successor := agentTaskBriefingWithSteward(task, "handler", api.AgentRoleDatabaseHandler, "", roster, 0, true, steward)
+	if !strings.Contains(successor, handlerSuccessorBriefing) {
+		t.Fatal("successor briefing lacks the rotation text")
+	}
+	for name, text := range map[string]string{
+		"primary guidance":   primaryHandlerGuidance,
+		"leased guidance":    leasedHandlerGuidance,
+		"primary briefing":   agentTaskBriefingWithSteward(task, "handler", api.AgentRoleDatabaseHandler, "", roster, 0, false, steward),
+		"successor briefing": successor,
+		"auxiliary briefing": agentTaskBriefingWithSteward(task, "handler-aux", api.AgentRoleDatabaseHandler, "", roster, 0, false, steward),
+	} {
+		if n := strings.Count(text, rule); n != 1 {
+			t.Fatalf("%s states the trigger rule %d times", name, n)
+		}
+	}
+	for _, name := range []string{"lead", "builder"} {
+		if got := agentTaskBriefing(task, name, "", "", roster); strings.Contains(got, rule) {
+			t.Fatalf("%s briefing carries the handler trigger rule", name)
 		}
 	}
 }

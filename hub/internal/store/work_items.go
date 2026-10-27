@@ -85,12 +85,18 @@ func closedTriggerReason(ctx context.Context, q queryRower, agentID string, seq 
 	}
 	switch outcome {
 	case api.OutcomeWithdrawn:
+		if reason == "" {
+			return fmt.Sprintf("triggering request #%d was withdrawn by its sender; reread your inbox before writing", seq), nil
+		}
 		return fmt.Sprintf("triggering request #%d was withdrawn by its sender: %s; reread your inbox before writing", seq, reason), nil
 	case api.OutcomeResult, api.OutcomeAnswered, api.OutcomeDeclined:
 		if outcomeSeq > 0 {
 			return fmt.Sprintf("triggering request #%d was already answered (outcome %s, #%d)", seq, outcome, outcomeSeq), nil
 		}
 		return fmt.Sprintf("triggering request #%d was already answered (outcome %s)", seq, outcome), nil
+	}
+	if reason == "" {
+		return fmt.Sprintf("triggering request #%d is closed (%s)", seq, outcome), nil
 	}
 	return fmt.Sprintf("triggering request #%d is closed (%s: %s)", seq, outcome, reason), nil
 }
@@ -749,7 +755,8 @@ func (s *Store) CreateWorkItemUpdate(ctx context.Context, taskID, itemID string,
 		return api.WorkItemUpdateResult{}, false, err
 	}
 	// After the replay, so a write saved before a withdrawal still replays,
-	// and before every other check, so the trigger reason wins.
+	// and the ack gate, and before the item checks, so the trigger reason
+	// wins over them.
 	if err := refuseClosedTrigger(ctx, tx, req.AgentID, req.TriggerSeq); err != nil {
 		return api.WorkItemUpdateResult{}, false, err
 	}

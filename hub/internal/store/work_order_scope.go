@@ -218,7 +218,7 @@ func amendedEntryScopeRefusal(e api.TeamQueueEntry, current int64) error {
 }
 
 func (s *Store) ConfirmWorkOrderScope(ctx context.Context, task, itemID string, req api.ConfirmWorkOrderScopeRequest) (api.WorkOrderScopeConfirmation, error) {
-	if !api.ValidID(task, "tsk") || !api.ValidID(itemID, "wi") || !validRequestID(req.RequestID) || req.ExpectedRevision < 1 || req.ScopeRevision < 1 || req.OrderMessageSeq < 1 {
+	if !api.ValidID(task, "tsk") || !api.ValidID(itemID, "wi") || !validRequestID(req.RequestID) || req.ExpectedRevision < 1 || req.ScopeRevision < 1 || req.OrderMessageSeq < 1 || req.TriggerSeq < 0 {
 		return api.WorkOrderScopeConfirmation{}, api.ErrInvalid
 	}
 	if !req.Complete {
@@ -265,6 +265,12 @@ func (s *Store) ConfirmWorkOrderScope(ctx context.Context, task, itemID string, 
 		return api.WorkOrderScopeConfirmation{}, err
 	}
 	if err := requireScopeHandler(tx, ctx, task, req.AgentID, req.RunID); err != nil {
+		return api.WorkOrderScopeConfirmation{}, err
+	}
+	// After the replay, so a confirmation saved before a withdrawal still
+	// replays, and the handler check, and before the item, order and
+	// duplicate checks, so the trigger reason wins over them.
+	if err := refuseClosedTrigger(ctx, tx, req.AgentID, req.TriggerSeq); err != nil {
 		return api.WorkOrderScopeConfirmation{}, err
 	}
 	item, err := getWorkItem(tx, ctx, task, itemID)

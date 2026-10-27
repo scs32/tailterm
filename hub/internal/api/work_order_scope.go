@@ -43,6 +43,11 @@ type ConfirmWorkOrderScopeRequest struct {
 	// Criteria are optional and need Ownership; they are part of the retry
 	// identity.
 	Criteria map[string]string `json:"criteria,omitempty"`
+	// TriggerSeq cites the request that triggered this confirmation, as on
+	// CreateWorkItemUpdate. The hub refuses it, naming the request, once the
+	// handler's obligation on it is closed. 0 cites nothing (bug
+	// wi_75d75d0b9693a9e9).
+	TriggerSeq int64 `json:"triggerSeq,omitempty"`
 }
 
 // MaxConfirmedCriteria bounds the amended criteria one confirmation records.

@@ -1119,9 +1119,10 @@ func TestQueueHandlerBriefingIntakeOwnershipAndPlainDone(t *testing.T) {
 	}
 	// The amended scope confirmation rule (wi_8a98bbcb8cd81a96), with the item
 	// ID after the flags, changes the template again, and so does the pathless
-	// wait sentence in the shared-path wait rule (wi_8237a5d578808c82).
-	const before = "d15c04366ae5ad19a58b7ebe59970d3f935d268c094a3983e3eedbef249e207a" // e0b58267
-	const current = "3d18b15618973afbab57dca450b149f6ebc6ddf98fb578c9a002799174e32aa9"
+	// wait sentence in the shared-path wait rule (wi_8237a5d578808c82), and
+	// the trigger citation rule (wi_75d75d0b9693a9e9).
+	const before = "3d18b15618973afbab57dca450b149f6ebc6ddf98fb578c9a002799174e32aa9" // 25317c54
+	const current = "7866257220c231cc2b2d1db56cb3a307054097dbc49426929486100356874bc7"
 	if got := handlerTemplateDigest("handler assignment"); got != current || got == before {
 		t.Fatalf("handler template digest %s, want %s", got, current)
 	}

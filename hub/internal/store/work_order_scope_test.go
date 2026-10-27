@@ -447,3 +447,127 @@ func TestWorkOrderScopeConfirmationRecordsAmendedCriteria(t *testing.T) {
 		t.Fatalf("readback after reopen %+v %v", got, err)
 	}
 }
+
+// scopeTriggerFixture is a phase-3 fixture with an item, its recorded order
+// and an uncited confirmation request for them (bug wi_75d75d0b9693a9e9).
+func scopeTriggerFixture(t *testing.T) (phase3Fixture, api.WorkItem, api.ConfirmWorkOrderScopeRequest) {
+	t.Helper()
+	f := newPhase3Fixture(t)
+	item := triggerItem(t, f)
+	order, err := f.post(t, api.PostMessageRequest{Text: "bounded owner order", RequestID: "trigger-order", WorkItems: []api.MessageWorkItem{{ItemTaskID: f.task.ID, ItemID: item.ID, ItemRevision: item.Revision, Relationship: "primary"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return f, item, api.ConfirmWorkOrderScopeRequest{AgentID: f.handler.ID, RunID: f.handler.RunID, ExpectedRevision: item.Revision, ScopeRevision: item.ScopeRevision, OrderMessageSeq: order.Seq, Complete: true, Ownership: []string{"hub/internal/store"}}
+}
+
+func requireNoScopeConfirmation(t *testing.T, f phase3Fixture, item api.WorkItem, order int64) {
+	t.Helper()
+	if got, err := f.s.GetWorkOrderScopeConfirmation(f.ctx, f.task.ID, item.ID, item.Revision, order); !errors.Is(err, api.ErrNotFound) {
+		t.Fatalf("a refused confirmation was saved: %+v %v", got, err)
+	}
+}
+
+// t4: a confirmation citing a withdrawn, answered or foreign request is
+// refused, naming the request, and saves nothing.
+func TestWorkOrderScopeConfirmRefusesClosedTrigger(t *testing.T) {
+	f, item, req := scopeTriggerFixture(t)
+	withdrawn := triggerToHandler(t, f.s, f.ctx, f.by, f.task.ID, f.lead, f.handler)
+	withdrawTrigger(t, f.s, f.ctx, f.task.ID, f.lead, withdrawn, "Do not confirm generation 1")
+	cited := req
+	cited.RequestID, cited.TriggerSeq = "withdrawn", withdrawn
+	_, err := f.s.ConfirmWorkOrderScope(f.ctx, f.task.ID, item.ID, cited)
+	refusedNaming(t, "withdrawn", err, fmt.Sprintf("#%d", withdrawn), "withdrawn", "Do not confirm generation 1")
+	answered := triggerToHandler(t, f.s, f.ctx, f.by, f.task.ID, f.lead, f.handler)
+	result := answerTrigger(t, f.s, f.ctx, f.by, f.task.ID, f.lead, f.handler, answered)
+	cited.RequestID, cited.TriggerSeq = "answered", answered
+	_, err = f.s.ConfirmWorkOrderScope(f.ctx, f.task.ID, item.ID, cited)
+	refusedNaming(t, "answered", err, fmt.Sprintf("#%d", answered), "already answered", fmt.Sprintf("#%d", result))
+	foreign, err := f.post(t, withdrawSource(api.EnvelopeKindRequest, f.lead, f.builder))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cited.RequestID, cited.TriggerSeq = "foreign", foreign.Seq
+	_, err = f.s.ConfirmWorkOrderScope(f.ctx, f.task.ID, item.ID, cited)
+	refusedNaming(t, "foreign", err, fmt.Sprintf("#%d", foreign.Seq), "not a request addressed to you")
+	requireNoScopeConfirmation(t, f, item, req.OrderMessageSeq)
+	cited.RequestID, cited.TriggerSeq = "negative", -1
+	if _, err = f.s.ConfirmWorkOrderScope(f.ctx, f.task.ID, item.ID, cited); !errors.Is(err, api.ErrInvalid) {
+		t.Fatalf("negative trigger = %v", err)
+	}
+}
+
+// t4: a confirmation saved while its trigger was open replays after the
+// withdrawal; a changed retry or a new request citing it is refused.
+func TestWorkOrderScopeConfirmTriggerRetryReplaysAfterWithdrawal(t *testing.T) {
+	f, item, req := scopeTriggerFixture(t)
+	trigger := triggerToHandler(t, f.s, f.ctx, f.by, f.task.ID, f.lead, f.handler)
+	req.RequestID, req.TriggerSeq = "confirm-1", trigger
+	saved, err := f.s.ConfirmWorkOrderScope(f.ctx, f.task.ID, item.ID, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withdrawTrigger(t, f.s, f.ctx, f.task.ID, f.lead, trigger, "withdrawn after the save")
+	if again, err := f.s.ConfirmWorkOrderScope(f.ctx, f.task.ID, item.ID, req); err != nil || !reflect.DeepEqual(again, saved) {
+		t.Fatalf("replay: %+v %v", again, err)
+	}
+	changed := req
+	changed.TriggerSeq = trigger + 1000
+	if _, err = f.s.ConfirmWorkOrderScope(f.ctx, f.task.ID, item.ID, changed); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "confirmation retry payload changed") {
+		t.Fatalf("changed retry = %v", err)
+	}
+	fresh := req
+	fresh.RequestID = "confirm-2"
+	_, err = f.s.ConfirmWorkOrderScope(f.ctx, f.task.ID, item.ID, fresh)
+	refusedNaming(t, "new request ID", err, fmt.Sprintf("#%d", trigger), "withdrawn")
+}
+
+// t4: an uncited confirmation saves beside a withdrawn request, and its
+// payload hash is the one the previous hub computed.
+func TestWorkOrderScopeConfirmUntriggeredUnchanged(t *testing.T) {
+	f, item, req := scopeTriggerFixture(t)
+	trigger := triggerToHandler(t, f.s, f.ctx, f.by, f.task.ID, f.lead, f.handler)
+	withdrawTrigger(t, f.s, f.ctx, f.task.ID, f.lead, trigger, "not needed")
+	req.RequestID = "uncited"
+	saved, err := f.s.ConfirmWorkOrderScope(f.ctx, f.task.ID, item.ID, req)
+	if err != nil || saved.ItemRevision != item.Revision || saved.OrderSeq != req.OrderMessageSeq {
+		t.Fatalf("uncited confirmation: %+v %v", saved, err)
+	}
+	b, _ := json.Marshal(req)
+	if strings.Contains(string(b), "triggerSeq") {
+		t.Fatalf("an uncited request marshals a trigger: %s", b)
+	}
+	// The golden hash is the one hub 25317c54, which had no trigger field on
+	// scope confirm, computed for this request, so its saved confirmations
+	// still replay.
+	golden := api.ConfirmWorkOrderScopeRequest{RequestID: "golden", AgentID: "agt_0123456789abcdef", RunID: "run_0123456789abcdef", ExpectedRevision: 3, ScopeRevision: 3, OrderMessageSeq: 7, Complete: true, Ownership: []string{"hub/internal/store"}}
+	if got := requestHash(struct {
+		Task, Item string
+		Request    api.ConfirmWorkOrderScopeRequest
+	}{"tsk_0123456789abcdef", "wi_0123456789abcdef", golden}); got != "7c28853a1cb1bbec6c437b932931843f2bab1a38e55dfb8126acd52bd99ed6de" {
+		t.Fatalf("the uncited payload hash changed: %s", got)
+	}
+}
+
+// t6: a closed trigger with an empty reason names the close kind alone.
+func TestWorkOrderScopeTriggerRefusalOmitsEmptyReason(t *testing.T) {
+	f, item, req := scopeTriggerFixture(t)
+	for _, tc := range []struct{ outcome, want string }{
+		{api.OutcomeWithdrawn, "was withdrawn by its sender; reread your inbox before writing"},
+		{api.OutcomeSuperseded, "is closed (superseded)"},
+	} {
+		seq := triggerToHandler(t, f.s, f.ctx, f.by, f.task.ID, f.lead, f.handler)
+		if _, err := f.s.db.ExecContext(f.ctx, `UPDATE obligations SET state=?,outcome=?,reason='' WHERE message_seq=? AND agent_id=?`, api.ObligationClosed, tc.outcome, seq, f.handler.ID); err != nil {
+			t.Fatal(err)
+		}
+		cited := req
+		cited.RequestID, cited.TriggerSeq = "empty-"+tc.outcome, seq
+		_, err := f.s.ConfirmWorkOrderScope(f.ctx, f.task.ID, item.ID, cited)
+		want := fmt.Sprintf("triggering request #%d %s", seq, tc.want)
+		refusedNaming(t, tc.outcome, err, want)
+		if msg := err.Error(); !strings.HasSuffix(msg, want) || strings.Contains(msg, ": ;") || strings.Contains(msg, ": )") {
+			t.Fatalf("%s refusal reads %q, want it to end %q", tc.outcome, msg, want)
+		}
+	}
+	requireNoScopeConfirmation(t, f, item, req.OrderMessageSeq)
+}

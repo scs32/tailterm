@@ -652,7 +652,8 @@ func (s *Store) SaveVerification(ctx context.Context, task, itemID string, req a
 	if err = ackGate(ctx, tx, req.AgentID, req.RunID, 0, s.now()); err != nil {
 		return zero, err
 	}
-	// After the replay and before every other check, as in CreateWorkItemUpdate.
+	// After the replay, the author check and the ack gate, and before the
+	// item and plan checks, as in CreateWorkItemUpdate.
 	if reason, err := closedTriggerReason(ctx, tx, req.AgentID, req.TriggerSeq); err != nil || reason != "" {
 		if err == nil {
 			err = verificationConflict(reason)
