@@ -109,19 +109,29 @@ export const HUB_SERVICE={image:"gcr.io/distroless/static-debian12:nonroot",user
 // Journal retention (j1-j3). A rehearsal fixture: an imported backup copy and a
 // migration binary in a private journal directory, with the container run
 // replaced by one that writes the copy and SQLite sidecars as a real one does.
-// status and run are what the runtime check and the run report.
+// status, probe and run are what the runtime check, the probe on an empty
+// /state and the run on the copy report; onProbe runs after the probe.
 export const SIDECARS=["","-wal","-shm","-journal"];
 export function rehearsalFixture(id="rel_rehearse"){
  const home=mkdtempSync(join(tmpdir(),"release-rehearsal-")),backup=join(home,id+"-truenas-backup.sqlite"),binary=join(home,id+"-migration");
  writeFileSync(backup,"imported backup");writeFileSync(binary,"migration binary");
  const adapter=new HostAdapter({cwd:home,journalDirectory:home},{id});let clock=Date.parse("2026-10-01T09:00:00Z");adapter.now=()=>clock+=1000;
  const artifact={backupCopy:backup,backupSHA256:hash("imported backup"),migrationBinary:binary,migrationBinarySHA256:hash("migration binary"),planPath:join(home,"plan.json"),release:"fixture"};
- const base=backup+".rehearsal-"+id,state=base+".state",copy=join(state,"hub.sqlite"),seen=[],calls=[],commands=[];
- const r={home,backup,binary,adapter,artifact,state,copy,marker:base+".json",seen,calls,commands,service:HUB_SERVICE,status:{status:0},run:{status:0},left:()=>existsSync(state)?[".state",...readdirSync(state)]:[]};
+ const base=backup+".rehearsal-"+id,state=base+".state",copy=join(state,"hub.sqlite"),seen=[],probes=[],calls=[],commands=[];
+ const r={home,backup,binary,adapter,artifact,state,copy,marker:base+".json",seen,probes,calls,commands,service:HUB_SERVICE,status:{status:0},probe:{status:0},run:null,onProbe:null,left:()=>existsSync(state)?[".state",...readdirSync(state)]:[]};
  adapter.command=argv=>{commands.push(argv);if(argv[0]==="python3")return JSON.stringify(r.service);throw new Error("unexpected host command");};
  adapter.container=argv=>{calls.push(argv);if(argv[1]==="system")return {stdout:"",stderr:"",...r.status};if(argv[1]!=="run")return {status:0,stdout:"",stderr:""};
-  seen.push({argv,copy:readFileSync(copy,"utf8"),wal:existsSync(copy+"-wal")});for(const s of SIDECARS)writeFileSync(copy+s,"migrated");return {stdout:"",stderr:"",...r.run};};
+  // A run before the copy exists is the probe; it creates a fresh database.
+  if(!existsSync(copy)){probes.push({argv,state:readdirSync(state),marker:existsSync(r.marker)});for(const s of SIDECARS)writeFileSync(copy+s,"fresh");r.onProbe?.();return {stdout:"",stderr:"",...r.probe};}
+  seen.push({argv,copy:readFileSync(copy,"utf8"),wal:existsSync(copy+"-wal")});for(const s of SIDECARS)writeFileSync(copy+s,"migrated");return {stdout:"",stderr:"",...(r.run??readOnlyTemp(argv))};};
  return r;
+}
+// The f3 temp model: this models the measured --read-only behavior (#27380,
+// 5d63fc52), not SQLite itself. Rebuilding a non-empty database needs a
+// writable temp directory, and under a read-only root only /state is one.
+function readOnlyTemp(argv){
+ const tmp=argv.flatMap((x,i)=>x==="-e" && argv[i+1].startsWith("SQLITE_TMPDIR=")?[argv[i+1].slice(14)]:[]);
+ return !argv.includes("--read-only") || tmp.some(t=>t==="/state" || t.startsWith("/state/"))?{status:0}:{status:1,stderr:"2026/10/07 05:12:46 migration rehearsal failed\n"};
 }
 // Container rehearsal (wi_78521ba68a8ad197), criteria c1-c9 of order #27293's plan (its a1, a4-a7, a9).
 export const REPO=resolve(dirname(new URL(import.meta.url).pathname),"..");

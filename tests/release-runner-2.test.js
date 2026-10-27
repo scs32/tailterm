@@ -189,22 +189,23 @@ test("b1 schema rehearsal builds the exact candidate binary for the Linux contai
  const artifact=await adapter.prepare("hub",commit);assert.equal(artifact.schemaChanged,true);assert.equal(buildHeads.length,2);assert.deepEqual(buildHeads,[commit,commit]);assert.notEqual(artifact.migrationBinary,config.targets.hub.migrationBinary);
  // a3: the migration binary only ever runs in the Linux container.
  const migrationBuild=builds.find(b=>b[b.indexOf("-o")+1]===artifact.migrationBinary);assert.deepEqual(migrationBuild.slice(0,4),["env","CGO_ENABLED=0","GOOS=linux",`GOARCH=${process.arch==="arm64"?"arm64":"amd64"}`]);
- await adapter.rehearse(artifact);assert.deepEqual(composed,[[plan,release]],"the compose comes from this job's plan and release");assert.equal(runs.length,1);assert.ok(runs[0].includes(`${artifact.migrationBinary}:/opt/tailterm-hub:ro`));
- assert.deepEqual(hostRuns,[],"nothing runs the migration on the host");assert.ok(!runs[0].some(x=>x.startsWith(backup+":")),"the imported backup itself is never mounted");assert.equal(readFileSync(backup,"utf8"),"backup");
+ await adapter.rehearse(artifact);assert.deepEqual(composed,[[plan,release]],"the compose comes from this job's plan and release");assert.equal(runs.length,2);assert.ok(runs[0][runs[0].indexOf("--name")+1].endsWith("-probe"),"the probe runs first");
+ for(const run of runs)assert.ok(run.includes(`${artifact.migrationBinary}:/opt/tailterm-hub:ro`));
+ assert.deepEqual(hostRuns,[],"nothing runs the migration on the host");assert.ok(!runs.some(run=>run.some(x=>x.startsWith(backup+":"))),"the imported backup itself is never mounted");assert.equal(readFileSync(backup,"utf8"),"backup");
  importInputs(adapter,commit,{hub:{...input,backupJobId:"rel_previous"}});await assert.rejects(adapter.prepare("hub",commit),/backup identity/);
  // A manifest that records its generation needs that generation's backup.
  for(const stale of [join(home,id+"-backup"),join(home,id+"-g7-backup")]){importInputs(adapter,commit,{hub:{...input,backup:stale}});await assert.rejects(adapter.prepare("hub",commit),/backup identity/,stale);}
 });
 test("a1 a passing rehearsal runs one container on a private copy, removes its state directory, marks passed and leaves the imported backup unchanged",async()=>{
  const r=rehearsalFixture();assert.equal(await r.adapter.rehearse(r.artifact),true);
- const argv=rehearsalArgv(HUB_SERVICE,{runtime:"container",name:"tt-rehearsal-rel_rehearse",binary:r.binary,stateDir:r.state});
- assert.deepEqual(r.calls,[["container","system","status"],argv]);assert.equal(r.seen[0].copy,"imported backup");
+ const argv=rehearsalArgv(HUB_SERVICE,{runtime:"container",name:"tt-rehearsal-rel_rehearse",binary:r.binary,stateDir:r.state}),probe=rehearsalArgv(HUB_SERVICE,{runtime:"container",name:"tt-rehearsal-rel_rehearse-probe",binary:r.binary,stateDir:r.state});
+ assert.deepEqual(r.calls,[["container","system","status"],probe,argv]);assert.equal(r.seen[0].copy,"imported backup");
  assert.deepEqual(r.commands.map(c=>[c[0],c[1],...c.slice(3)]),[["python3","-c",r.artifact.planPath,"fixture"]]);
  assert.deepEqual(r.left(),[]);assert.equal(readFileSync(r.backup,"utf8"),"imported backup");
  assert.deepEqual(JSON.parse(readFileSync(r.marker,"utf8")),{version:1,jobId:"rel_rehearse",backupSHA256:hash("imported backup"),startedAt:"2026-10-01T09:00:01.000Z",outcome:"passed",endedAt:"2026-10-01T09:00:02.000Z",copyRemoved:true});
  assert.equal(statSync(r.marker).mode&0o777,0o600);
  // A configured runtime path replaces only the program; no setting selects a host run.
- const p=rehearsalFixture("rel_path");p.adapter.config.rehearsal={runtime:"/opt/homebrew/bin/container"};assert.equal(await p.adapter.rehearse(p.artifact),true);assert.deepEqual(p.calls.map(c=>c.slice(0,2)),[["/opt/homebrew/bin/container","system"],["/opt/homebrew/bin/container","run"]]);
+ const p=rehearsalFixture("rel_path");p.adapter.config.rehearsal={runtime:"/opt/homebrew/bin/container"};assert.equal(await p.adapter.rehearse(p.artifact),true);assert.deepEqual(p.calls.map(c=>c.slice(0,2)),[["/opt/homebrew/bin/container","system"],["/opt/homebrew/bin/container","run"],["/opt/homebrew/bin/container","run"]]);
  const bad=rehearsalFixture("rel_badpath");bad.adapter.config.rehearsal={runtime:"sh -c"};await assert.rejects(bad.adapter.rehearse(bad.artifact),/Invalid rehearsal runtime/);assert.deepEqual(bad.calls,[]);
 });
 test("a2 a failing rehearsal rejects with the container's exit reason, removes its state directory and marks failed",async()=>{
@@ -212,9 +213,10 @@ test("a2 a failing rehearsal rejects with the container's exit reason, removes i
  await assert.rejects(r.adapter.rehearse(r.artifact),error=>failureReason(error)==="Rehearsal container exit 1" && error.rehearsal.exit==="exit 1" && error.rehearsal.lines.length===1);
  assert.equal(r.seen.length,1);assert.deepEqual(r.left(),[]);assert.equal(readFileSync(r.backup,"utf8"),"imported backup");
  const marker=JSON.parse(readFileSync(r.marker,"utf8"));assert.equal(marker.outcome,"failed");assert.equal(marker.copyRemoved,true);assert.ok(!readFileSync(r.marker,"utf8").includes("rehearsal failed"));
- // A migration binary changed after the build fails the same way, before any container runs.
+ // A migration binary changed after the build is refused before any container runs, so no attempt is spent.
  const b=rehearsalFixture("rel_binary");writeFileSync(b.binary,"another binary");
- await assert.rejects(b.adapter.rehearse(b.artifact),/migration binary changed/);assert.equal(b.seen.length,0);assert.deepEqual(b.left(),[]);assert.equal(JSON.parse(readFileSync(b.marker,"utf8")).outcome,"failed");
+ await assert.rejects(b.adapter.rehearse(b.artifact),e=>failureReason(e)==="Candidate migration binary changed");assert.equal(b.seen.length,0);assert.equal(b.probes.length,0);assert.deepEqual(b.calls,[["container","system","status"]]);
+ assert.deepEqual(b.left(),[]);assert.equal(existsSync(b.marker),false);
 });
 test("a3 the marker, not the copy, refuses a second rehearsal",async()=>{
  for(const fail of [false,true]){
@@ -274,15 +276,15 @@ test("c5 a failed container run stops the release before any deploy and journals
  // Nothing the runner hands to its adapter (notices, receipts) or throws carries an output line.
  const out=s.said.join("\n")+String(thrown?.message);for(const text of ["migration rehearsal failed","line 30","no such file",secret,"stdout noise"])assert.ok(!out.includes(text),text);
  assert.deepEqual(s.e.left(),[]);const marker=readFileSync(s.e.marker,"utf8");assert.equal(JSON.parse(marker).outcome,"failed");assert.ok(!marker.includes("rehearsal failed") && !marker.includes("line 30"));
- assert.deepEqual(s.e.calls.map(c=>c[1]),["system","run"]);
+ assert.deepEqual(s.e.calls.map(c=>c[1]),["system","run","run"]);
 });
 test("c6 a signal, a timeout and an out-of-memory kill are named, and a malformed rehearsal record is dropped from the journal",async()=>{
  const name="tt-rehearsal-rel_how",removal=["container","delete","-f",name];
- for(const [run,how,removed] of [[{status:null,signal:"SIGKILL"},"signal SIGKILL",true],[{status:null,signal:"SIGTERM",error:Object.assign(new Error("spawnSync container ETIMEDOUT"),{code:"ETIMEDOUT"})},"timeout",true],[{status:137},"exit 137",false],[{status:null,error:Object.assign(new Error("spawn EACCES"),{code:"EACCES"})},"not started",true]]){
+ for(const [run,how,removed] of [[{status:null,signal:"SIGKILL"},"signal SIGKILL",true],[{status:null,signal:"SIGTERM",error:Object.assign(new Error("spawnSync container ETIMEDOUT"),{code:"ETIMEDOUT"})},"timeout",true],[{status:137},"exit 137",false]]){
   const r=rehearsalFixture("rel_how");r.run=run;
   await assert.rejects(r.adapter.rehearse(r.artifact),e=>failureReason(e)==="Rehearsal container "+how && failureRehearsal(e).exit===how && failureRehearsal(e).lines.length===0,how);
   // Only a run that did not end by itself may have left its container behind.
-  assert.deepEqual(r.calls.slice(2),removed?[removal]:[],how);assert.deepEqual(r.left(),[],how);assert.equal(JSON.parse(readFileSync(r.marker,"utf8")).outcome,"failed");
+  assert.deepEqual(r.calls.slice(3),removed?[removal]:[],how);assert.deepEqual(r.left(),[],how);assert.equal(JSON.parse(readFileSync(r.marker,"utf8")).outcome,"failed");
  }
  const good={runtime:"container",image:"gcr.io/distroless/static-debian12:nonroot",exit:"exit 1",lines:["one"]},tagged=rehearsal=>Object.assign(releaseError("Rehearsal container exit 1"),{rehearsal});
  assert.deepEqual(failureRehearsal(tagged({...good,extra:"dropped",lines:["one"]})),good);
@@ -304,6 +306,64 @@ test("c7 a missing or stopped container runtime stops the release with no host r
   assert.deepEqual(s.journal().failure,{step:"rehearse",target:"hub",reason});assert.ok(!s.a.calls.some(x=>x.startsWith("deploy:")));
   assert.ok(!s.e.calls.some(c=>c[1]==="run") && !s.e.commands.some(c=>c[0]===s.e.binary));assert.equal(existsSync(s.e.marker),false);
  }
+});
+// Rehearsal runtime probe (wi_872919f3ff65bcce), criteria a1-a5, a8 and a9 of order #48215's plan v1.
+const probeName=r=>"tt-rehearsal-"+r.adapter.job.id+"-probe",spawnError=code=>({status:null,error:Object.assign(new Error("spawn "+code),{code})});
+test("probe a1 a failed probe is refused as a runtime failure with no marker, and the job rehearses once the probe passes",async()=>{
+ for(const [probe,how,removed] of [[{status:1,stderr:"Error: path '/x' does not exist\n"},"exit 1",false],[{status:null,signal:"SIGKILL"},"signal SIGKILL",true],[{status:null,signal:"SIGTERM",error:Object.assign(new Error("spawnSync container ETIMEDOUT"),{code:"ETIMEDOUT"})},"timeout",true],[spawnError("EACCES"),"not started",true]]){
+  const r=rehearsalFixture("rel_probe");r.probe=probe;
+  await assert.rejects(r.adapter.rehearse(r.artifact),e=>failureReason(e)==="Rehearsal container runtime probe "+how && failureRehearsal(e).exit===how,how);
+  assert.equal(existsSync(r.marker),false,how);assert.equal(r.seen.length,0,how);assert.deepEqual(r.left(),[],how);assert.equal(r.probes.length,1,how);
+  // Only a probe that did not end by itself may have left its container behind.
+  assert.deepEqual(r.calls.slice(2),removed?[["container","delete","-f",probeName(r)]]:[],how);
+  r.probe={status:0};assert.equal(await r.adapter.rehearse(r.artifact),true,how);assert.equal(JSON.parse(readFileSync(r.marker,"utf8")).outcome,"passed",how);assert.deepEqual(r.left(),[],how);
+ }
+});
+test("probe a2 the probe runs the same container on an empty state directory before the marker",async()=>{
+ const r=rehearsalFixture("rel_order");mkdirSync(r.state);writeFileSync(r.copy,"stale copy");assert.equal(await r.adapter.rehearse(r.artifact),true);
+ assert.equal(r.probes.length,1);assert.deepEqual(r.probes[0].state,[],"the probe sees an empty /state");assert.equal(r.probes[0].marker,false,"no marker exists while the probe runs");
+ const run=r.seen[0].argv,probe=r.probes[0].argv,at=run.indexOf("--name");
+ assert.equal(probe[at+1],"tt-rehearsal-rel_order-probe");assert.deepEqual(probe.toSpliced(at+1,1),run.toSpliced(at+1,1),"only the name differs");
+ assert.equal(r.seen[0].copy,"imported backup","the copy run starts from the backup, not the probe's database");
+});
+test("probe a3 a run on the copy that never spawned is a runtime failure, removes the marker and leaves the attempt unspent",async()=>{
+ const r=rehearsalFixture("rel_spawn");r.run=spawnError("EACCES");
+ await assert.rejects(r.adapter.rehearse(r.artifact),e=>failureReason(e)==="Rehearsal container runtime not started" && failureRehearsal(e).exit==="not started");
+ assert.equal(r.probes.length,1);assert.equal(existsSync(r.marker),false);assert.deepEqual(r.left(),[]);assert.deepEqual(r.calls.at(-1),["container","delete","-f","tt-rehearsal-rel_spawn"]);
+ r.run=null;assert.equal(await r.adapter.rehearse(r.artifact),true);assert.equal(JSON.parse(readFileSync(r.marker,"utf8")).outcome,"passed");
+});
+test("probe a4 after a passing probe, a failed run on the copy spends the attempt with today's reason",async()=>{
+ for(const [run,how] of [[{status:1},"exit 1"],[{status:137},"exit 137"],[{status:null,signal:"SIGKILL"},"signal SIGKILL"],[{status:null,signal:"SIGTERM",error:Object.assign(new Error("spawnSync container ETIMEDOUT"),{code:"ETIMEDOUT"})},"timeout"]]){
+  const r=rehearsalFixture("rel_spent");r.run=run;
+  await assert.rejects(r.adapter.rehearse(r.artifact),e=>failureReason(e)==="Rehearsal container "+how,how);
+  assert.equal(r.probes.length,1,how);assert.equal(r.seen.length,1,how);assert.equal(JSON.parse(readFileSync(r.marker,"utf8")).outcome,"failed",how);assert.deepEqual(r.left(),[],how);
+  r.run=null;await assert.rejects(r.adapter.rehearse(r.artifact),/Rehearsal already attempted; inspect prior attempt/,how);assert.equal(r.seen.length,1,how);
+ }
+});
+test("probe a5 a rehearsal container with no writable temp directory passes the probe and is caught on the copy",async()=>{
+ const {SQLITE_TMPDIR,...environment}=HUB_SERVICE.environment,noTemp={...HUB_SERVICE,environment};
+ const r=rehearsalFixture("rel_notemp");r.service=noTemp;
+ await assert.rejects(r.adapter.rehearse(r.artifact),e=>failureReason(e)==="Rehearsal container exit 1");
+ assert.equal(r.probes.length,1);assert.equal(r.seen.length,1);assert.equal(JSON.parse(readFileSync(r.marker,"utf8")).outcome,"failed");
+ const s=schemaRelease("rel_fixture");s.e.service=noTemp;await assert.rejects(runRelease(s.c,s.a));
+ const failure=s.journal().failure;assert.equal(failure.reason,"Rehearsal container exit 1");assert.ok(failure.rehearsal.lines.some(l=>l.includes("migration rehearsal failed")));assert.ok(!s.a.calls.some(x=>x.startsWith("deploy:")));
+ // The production service, with SQLITE_TMPDIR=/state, passes the same model.
+ const ok=rehearsalFixture("rel_temp");assert.equal(await ok.adapter.rehearse(ok.artifact),true);assert.equal(ok.seen.length,1);
+});
+test("probe a8 a binary changed after a passing probe is refused after the marker and spends the attempt",async()=>{
+ const r=rehearsalFixture("rel_swapped");r.onProbe=()=>writeFileSync(r.binary,"another binary");
+ await assert.rejects(r.adapter.rehearse(r.artifact),e=>failureReason(e)==="Candidate migration binary changed");
+ assert.equal(r.probes.length,1);assert.equal(r.seen.length,0);assert.equal(JSON.parse(readFileSync(r.marker,"utf8")).outcome,"failed");assert.deepEqual(r.left(),[]);
+ await assert.rejects(r.adapter.rehearse(r.artifact),/already attempted/);
+});
+test("probe a9 a candidate that cannot migrate a fresh database is refused as a probe failure with its lines journaled",async()=>{
+ const fatal={status:1,stderr:"2026/10/27 09:00:00 migration rehearsal failed\n"};
+ const r=rehearsalFixture("rel_fatal");r.probe=fatal;
+ await assert.rejects(r.adapter.rehearse(r.artifact),e=>failureReason(e)==="Rehearsal container runtime probe exit 1");
+ assert.equal(existsSync(r.marker),false);assert.equal(r.seen.length,0);assert.deepEqual(r.left(),[]);
+ const s=schemaRelease("rel_fixture");s.e.probe=fatal;await assert.rejects(runRelease(s.c,s.a));
+ assert.deepEqual(s.journal().failure,{step:"rehearse",target:"hub",reason:"Rehearsal container runtime probe exit 1",rehearsal:{runtime:"container",image:"gcr.io/distroless/static-debian12:nonroot",exit:"exit 1",lines:["2026/10/27 09:00:00 migration rehearsal failed"]}});
+ assert.ok(!s.a.calls.some(x=>x.startsWith("deploy:")));assert.equal(existsSync(s.e.marker),false);
 });
 test("c9 retention removes a terminal job's rehearsal state directory and nothing else in it",()=>{
  const jobs=[{id:"rel_done",state:"refused"},{id:"rel_live",state:"blocked"},{id:"rel_link",state:"refused"},{id:"rel_swap",state:"refused"}],state=id=>copyOf(id)+".rehearsal-"+id+".state";

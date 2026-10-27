@@ -1461,12 +1461,13 @@ export function rehearsalArgv(service,{runtime,name,binary,stateDir}){
     ...env.sort(([a],[b])=>a<b?-1:a>b?1:0).flatMap(([k,v])=>["-e",`${k}=${v}`]),"-v",`${binary}:${entry}:ro`,"-v",`${stateDir}:/state`,"--entrypoint",entry,s.image,"--migrate-only","/state/"+REHEARSAL_DB];
 }
 // How a rehearsal run ended, in childReason's vocabulary (exit 137 is the
-// out-of-memory kill), with its last output lines redacted and bounded.
-function rehearsalFailure(run,runtime,service){
+// out-of-memory kill), with its last output lines redacted and bounded. The
+// prefix names a runtime failure apart from the migration's own.
+function rehearsalFailure(run,runtime,service,prefix="Rehearsal container "){
   const how=run?.error?.code==="ETIMEDOUT"?"timeout":/^SIG[A-Z0-9]{1,12}$/.test(run?.signal||"")?`signal ${run.signal}`:Number.isInteger(run?.status) && run.status>=0 && run.status<1000?`exit ${run.status}`:"not started";
   const tail=(text,n)=>n>0?String(text||"").split(/\r?\n/).filter(l=>l.trim()).slice(-n):[];
   const stderr=tail(run?.stderr,REHEARSAL_LINES),lines=[...stderr,...tail(run?.stdout,REHEARSAL_LINES-stderr.length)];
-  const error=releaseError("Rehearsal container "+how);
+  const error=releaseError(prefix+how);
   error.rehearsal={runtime,image:service.image,exit:how,lines:sanitizeCapture({logs:[{service:"hub",lines}]},Object.values(service.environment)).logs[0].lines};
   return error;
 }
@@ -1981,35 +1982,49 @@ export class HostAdapter {
     // saved before the copy exists and holds no path, output or error text.
     const base=a.backupCopy+".rehearsal-"+this.job.id,stateDir=base+".state",marker=base+".json";
     if(existsSync(marker))throw releaseError("Rehearsal already attempted; inspect prior attempt");
-    // Runtime and compose refusals come before the marker, so the same job
-    // can be rehearsed once the host is fixed.
+    // Runtime, compose, binary and probe refusals come before the marker, so
+    // the same job can be rehearsed once the host is fixed.
     const runtime=this.config.rehearsal?.runtime??"container";
     if(typeof runtime!=="string" || !REHEARSAL_NAME.test(runtime))throw releaseError("Invalid rehearsal runtime");
     const up=this.container([runtime,"system","status"],{timeout:30000});
     if(up?.error)throw releaseError("Rehearsal container runtime unavailable");
     if(up?.status!==0)throw releaseError("Rehearsal container runtime not running");
     const service=this.rehearsalSpec(a),name="tt-rehearsal-"+this.job.id,argv=rehearsalArgv(service,{runtime,name,binary:a.migrationBinary,stateDir});
+    if(fileDigest(a.migrationBinary)!==a.migrationBinarySHA256)throw releaseError("Candidate migration binary changed");
+    const clear=()=>{try{rmSync(stateDir,{recursive:true,force:true});return !existsSync(stateDir);}catch{return false;}};
+    // A run that did not end by itself may have left its container; the
+    // removal is best effort and never changes the result.
+    const remove=(run,id)=>{if(!Number.isInteger(run?.status)){try{this.container([runtime,"delete","-f",id],{timeout:30000});}catch{}}};
+    // The probe is the same container on an empty /state: a fresh database
+    // needs no table rebuild, so its failure is the runtime's (image, mount,
+    // entrypoint) or a candidate that cannot migrate at all, never the backup.
+    // A directory an earlier run left behind is replaced, sidecars included.
+    clear();mkdirSync(stateDir,{mode:0o700});
+    const probe=this.container(rehearsalArgv(service,{runtime,name:name+"-probe",binary:a.migrationBinary,stateDir}));
+    if(probe?.status!==0 || probe.signal || probe.error){remove(probe,name+"-probe");clear();throw rehearsalFailure(probe,runtime,service,"Rehearsal container runtime probe ");}
+    clear();
     const record={version:1,jobId:this.job.id,backupSHA256:a.backupSHA256,startedAt:new Date(this.now()).toISOString(),outcome:"started"};
     save(marker,record);
-    const clear=()=>{try{rmSync(stateDir,{recursive:true,force:true});return !existsSync(stateDir);}catch{return false;}};
     let outcome="failed";
     try{
-      // A directory an earlier run left behind is replaced, sidecars included.
-      clear();mkdirSync(stateDir,{mode:0o700});copyFileSync(a.backupCopy,join(stateDir,REHEARSAL_DB));
+      mkdirSync(stateDir,{mode:0o700});copyFileSync(a.backupCopy,join(stateDir,REHEARSAL_DB));
       if(fileDigest(a.migrationBinary)!==a.migrationBinarySHA256)throw releaseError("Candidate migration binary changed");
       const run=this.container(argv);
       if(run?.status!==0 || run.signal || run.error){
-        // A run that did not end by itself may have left its container; the
-        // removal is best effort and never changes the result.
-        if(!Number.isInteger(run?.status)){try{this.container([runtime,"delete","-f",name],{timeout:30000});}catch{}}
+        remove(run,name);
+        // A run that never spawned did not run the migration, so it does not
+        // spend the attempt. Any other failure after a passing probe does.
+        if(run?.error && !Number.isInteger(run.status) && !run.signal && run.error.code!=="ETIMEDOUT"){outcome="unstarted";throw rehearsalFailure(run,runtime,service,"Rehearsal container runtime ");}
         throw rehearsalFailure(run,runtime,service);
       }
       outcome="passed";
     }finally{
       // Cleanup never changes the rehearsal's result; a directory left here
-      // is removed by the retention sweep once the job is terminal.
+      // is removed by the retention sweep once the job is terminal. A marker
+      // that cannot be removed stays started and refuses the next attempt.
       const copyRemoved=clear();
-      try{save(marker,{...record,outcome,endedAt:new Date(this.now()).toISOString(),copyRemoved});}catch{}
+      if(outcome==="unstarted"){try{rmSync(marker,{force:true});}catch{}}
+      else try{save(marker,{...record,outcome,endedAt:new Date(this.now()).toISOString(),copyRemoved});}catch{}
     }
     return true;
   }
