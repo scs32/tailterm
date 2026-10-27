@@ -75,6 +75,13 @@ hub-saved eligible receipt for the exact candidate, scope and assignment judges
 them; the database handler, the plan's verifier or the item lead imports it, as
 [Validated team operations](project-queue.md#validated-team-operations) allows.
 Other criteria retain the reviewer pass/fail/partial gate.
+At least one criterion of each scope stays reviewer-judged (feature
+`wi_46d43d4798b646bf`). The hub refuses an ASSIGN that freezes a new scope whose
+verification-owned IDs cover every criterion, with `at least one criterion must
+stay reviewer-judged; verification-owned criteria cover every criterion`. A REVIEW
+must repeat the ASSIGN's IDs, so it cannot widen them. A verification carry-over
+moves only verification-owned criteria, so reviewer-judged ones stay. Scopes frozen
+before this rule are unchanged.
 An item with verification-owned criteria needs that receipt even if older
 enrollment says verification was optional. Existing completed rounds and verdicts
 remain immutable; their owner-accept route is preserved without a third round.

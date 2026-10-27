@@ -403,6 +403,17 @@ func compatibleVerificationDesignation(state api.ReviewConvergence, ids []string
 	}
 	return nil
 }
+func reviewerJudgedCriterion(criteria map[string]string, owned []string) error {
+	if len(owned) == 0 {
+		return nil
+	}
+	for key := range criteria {
+		if !verificationOwned(owned, key) {
+			return nil
+		}
+	}
+	return reviewConflict("at least one criterion must stay reviewer-judged; verification-owned criteria cover every criterion")
+}
 func completeVerdicts(criteria map[string]string, owned []string, verdicts map[string]string) error {
 	if len(criteria) != len(verdicts) {
 		return reviewConflict("verdicts must cover every frozen criterion")
@@ -803,6 +814,11 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 		owned := normalizedVerificationCriteria(e.Body.VerificationCriteria)
 		if err = compatibleVerificationDesignation(state, owned); err != nil {
 			return err
+		}
+		if sc == nil {
+			if err = reviewerJudgedCriterion(e.Body.Acceptance, owned); err != nil {
+				return err
+			}
 		}
 		if sc != nil && (!reflect.DeepEqual(sc.Criteria, e.Body.Acceptance) || !reflect.DeepEqual(normalizedVerificationCriteria(sc.VerificationCriteria), owned)) {
 			return reviewConflict("criteria frozen; revision-checked scope update required")

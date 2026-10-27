@@ -292,6 +292,48 @@ func TestReviewConvergenceVerificationOwnership(t *testing.T) {
 	}
 }
 
+// wi_46d43d4798b646bf: a new scope keeps at least one reviewer-judged criterion.
+func TestReviewConvergenceVerificationNeedsReviewerCriterion(t *testing.T) {
+	const reason = "at least one criterion must stay reviewer-judged"
+	t.Run("every criterion designated", func(t *testing.T) {
+		f := newConvergenceFixture(t)
+		f.rescope(t, "Designate every criterion")
+		refusedWith(t, "all designated", f.assign(map[string]string{"a1": "builds", "a2": "matrix passes"}, []string{"a1", "a2"}), reason)
+		if scopes := f.state(t).Scopes; len(scopes) != 1 {
+			t.Fatal("refused ASSIGN saved a scope", scopes)
+		}
+	})
+	t.Run("single designated criterion", func(t *testing.T) {
+		f := newConvergenceFixture(t)
+		f.rescope(t, "Designate the only criterion")
+		refusedWith(t, "only criterion designated", f.assign(map[string]string{"a1": "matrix passes"}, []string{"a1"}), reason)
+		if scopes := f.state(t).Scopes; len(scopes) != 1 {
+			t.Fatal("refused ASSIGN saved a scope", scopes)
+		}
+	})
+	t.Run("one reviewer criterion allowed", func(t *testing.T) {
+		f := newConvergenceFixture(t)
+		f.rescope(t, "Designate the matrix criterion")
+		f.criteria = map[string]string{"a1": "builds", "a2": "matrix passes"}
+		f.verificationCriteria = []string{"a2"}
+		if err := f.assign(f.criteria, f.verificationCriteria); err != nil {
+			t.Fatal(err)
+		}
+		// REVIEW repeats the ASSIGN's IDs, so it cannot widen the designation.
+		f.verificationCriteria = []string{"a1", "a2"}
+		refusedWith(t, "widened review", f.reviewErr(candidateA), "review must use frozen assignment criteria")
+		f.verificationCriteria = []string{"a2"}
+		r := f.review(t, candidateA)
+		if _, err := f.post(f.resultEnv(candidateA, map[string]string{"a1": "pass", "a2": "pending-verification"}, api.ReviewMetadata{Mode: "general"}), "", r.Seq, f.reviewer); err != nil {
+			t.Fatal(err)
+		}
+		state := f.state(t)
+		if len(state.Scopes) != 2 || len(state.Rounds) != 1 || state.Rounds[0].Verdicts["a1"] != "pass" || state.Rounds[0].Verdicts["a2"] != "pending-verification" {
+			t.Fatal(state)
+		}
+	})
+}
+
 func TestProbeReclassifiedBlockerWedge(t *testing.T) {
 	f := newConvergenceFixture(t)
 	r1 := f.review(t, candidateA)
