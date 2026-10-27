@@ -62,6 +62,10 @@ const (
 	// A provider_blocked prepare only: the primary's current run is not in
 	// the blocked state the reason needs.
 	HandlerRotationRefusedNotBlocked = "not_blocked"
+	// Prepare only: registering the successor would exceed the project's
+	// agent cap, counting the seats admitted team launches still have to
+	// register (bug wi_caa61d47ad431bf5).
+	HandlerRotationRefusedNoAgentSlot = "no_agent_slot"
 
 	// Owner decision #14233, option A.
 	DefaultHandlerRotationMaxItems       int64 = 10

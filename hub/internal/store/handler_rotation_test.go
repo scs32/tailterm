@@ -3482,3 +3482,118 @@ func TestHandlerRotationProviderBlockedOwnerNoticeOnce(t *testing.T) {
 		t.Fatalf("notices %+v", notices)
 	}
 }
+
+// fillAgentCap sets the store's cap so that nothing more fits beside what
+// already stands against it, and returns the open and reserved counts.
+func (f *rotationFixture) fillAgentCap(t *testing.T) (open, reserved int) {
+	t.Helper()
+	open, reserved, err := projectAgentCapUsage(context.Background(), f.s.db, f.task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.s.MaxAgents = open + reserved
+	return open, reserved
+}
+
+// A full project refuses the prepare with no_agent_slot and saves nothing,
+// so queue dispatch still leases the old handler; one free slot prepares
+// (bug wi_caa61d47ad431bf5).
+func TestHandlerRotationNoAgentSlotRefusesAndHoldsNothing(t *testing.T) {
+	f := newRotationFixture(t)
+	ctx := context.Background()
+	s := f.s
+	q, err := s.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "no-slot-add", Operation: "add", ItemID: f.items[0].ID, OrderMessageSeq: f.orders[0].Seq, Host: "mini", Cwd: "/no-slot"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	open, _ := f.fillAgentCap(t)
+	_, err = f.prepare(t, "no-slot-prepare", api.Agent{}, "")
+	if code := refusalCode(err); code != api.HandlerRotationRefusedNoAgentSlot {
+		t.Fatalf("full project prepare: code %q, %v", code, err)
+	}
+	if want := fmt.Sprintf("project agent cap: %d open + 1 seats > %d", open, open); !strings.Contains(err.Error(), want) {
+		t.Fatalf("refusal detail %q lacks %q", err, want)
+	}
+	if n := countRows(t, s, `SELECT count(*) FROM handler_rotations WHERE task_id=?`, f.task.ID); n != 0 {
+		t.Fatalf("refused prepare saved %d rotation(s)", n)
+	}
+	if n := countRows(t, s, `SELECT count(*) FROM handler_rotation_requests WHERE task_id=?`, f.task.ID); n != 0 {
+		t.Fatalf("refused prepare saved %d request receipt(s)", n)
+	}
+	if n := countRows(t, s, `SELECT count(*) FROM events WHERE task_id=? AND text='Handler rotation prepared'`, f.task.ID); n != 0 {
+		t.Fatalf("refused prepare recorded %d event(s)", n)
+	}
+	// Admission has its own cap check for the team's seats; with room for the
+	// team, no prepared rotation holds the handler back from the lease.
+	s.MaxAgents = 64
+	claimed, err := s.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "no-slot-claim", Operation: "claim", EntryID: q.ID, ExpectedRevision: q.Revision, Host: "mini"})
+	if err != nil || claimed.HandlerID != f.old.ID {
+		t.Fatalf("dispatch after a refused prepare: %+v %v", claimed, err)
+	}
+	// The lease would make the handler busy; end it as a finished team does.
+	if _, err = s.db.Exec(`UPDATE team_queue_entries SET state='finished',released_at=? WHERE id=?`, ts(s.now()), q.ID); err != nil {
+		t.Fatal(err)
+	}
+	s.MaxAgents = open + 1
+	r, err := f.prepare(t, "no-slot-prepare-freed", api.Agent{}, "")
+	if err != nil || r.State != api.HandlerRotationPrepared {
+		t.Fatalf("prepare with one free slot: %+v %v", r, err)
+	}
+}
+
+// Seats an admitted launch still has to register count against the cap.
+func TestHandlerRotationNoAgentSlotCountsReservedSeats(t *testing.T) {
+	f := newRotationFixture(t)
+	if _, err := f.s.db.Exec(`INSERT INTO team_launch_reservations(task_id,entry_id,item_id,token,pause_generation,state,created_at) VALUES(?,'',?,'token',0,'reserved',?)`, f.task.ID, f.items[0].ID, ts(f.s.now())); err != nil {
+		t.Fatal(err)
+	}
+	open, reserved := f.fillAgentCap(t)
+	if reserved == 0 {
+		t.Fatal("the manual reservation reserved no seats")
+	}
+	_, err := f.prepare(t, "reserved-prepare", api.Agent{}, "")
+	if code := refusalCode(err); code != api.HandlerRotationRefusedNoAgentSlot {
+		t.Fatalf("reserved seats fill the cap: code %q, %v", code, err)
+	}
+	if want := fmt.Sprintf("%d open + %d reserved + 1 seats > %d", open, reserved, open+reserved); !strings.Contains(err.Error(), want) {
+		t.Fatalf("refusal detail %q lacks %q", err, want)
+	}
+	if _, err = f.s.db.Exec(`DELETE FROM team_launch_reservations WHERE task_id=?`, f.task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if r, err := f.prepare(t, "reserved-prepare-gone", api.Agent{}, ""); err != nil || r.State != api.HandlerRotationPrepared {
+		t.Fatalf("prepare once the reservation is gone: %+v %v", r, err)
+	}
+}
+
+// A busy handler keeps its silent busy refusal on a full project.
+func TestHandlerRotationBusyRefusalPrecedesNoAgentSlot(t *testing.T) {
+	f := newRotationFixture(t)
+	f.activity(t, f.old, "working", "")
+	f.fillAgentCap(t)
+	if _, err := f.prepare(t, "busy-full", api.Agent{}, ""); refusalCode(err) != api.HandlerRotationRefusedWorking {
+		t.Fatalf("busy full project: %v", err)
+	}
+}
+
+// After a manual abort on a full project, a new prepare is refused and only
+// the aborted rotation exists: nothing holds dispatch.
+func TestHandlerRotationManualAbortThenFullProjectPreparesNothing(t *testing.T) {
+	f := newRotationFixture(t)
+	ctx := context.Background()
+	r, err := f.prepare(t, "abort-first", api.Agent{}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.s.HandlerRotationAction(ctx, f.task.ID, api.HandlerRotationRequest{Operation: api.HandlerRotationAbort, RequestID: "abort-manual", RotationID: r.ID}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	f.fillAgentCap(t)
+	if _, err = f.prepare(t, "abort-again", api.Agent{}, ""); refusalCode(err) != api.HandlerRotationRefusedNoAgentSlot {
+		t.Fatalf("prepare after the manual abort on a full project: %v", err)
+	}
+	rotations, err := f.s.ListHandlerRotations(ctx, f.task.ID)
+	if err != nil || len(rotations) != 1 || rotations[0].ID != r.ID || rotations[0].State != api.HandlerRotationAborted {
+		t.Fatalf("rotations after the refused prepare: %+v %v", rotations, err)
+	}
+}

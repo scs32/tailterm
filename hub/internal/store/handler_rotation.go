@@ -1300,6 +1300,16 @@ func (s *Store) prepareHandlerRotation(ctx context.Context, tx *sql.Tx, t api.Ta
 			return zero, &api.HandlerRotationRefusal{Code: api.HandlerRotationRefusedNotBlocked, Detail: fmt.Sprintf("handler %s is not online and idle with a rate_limited or server_error block open for %s and an open obligation, or the dead primary replacement is off", old.Name, api.HandlerProviderBlockedAfter)}
 		}
 	}
+	// The successor registers like any agent, after the prepare. With no slot
+	// for it, a prepared rotation would only hold dispatch until it is
+	// aborted (bug wi_caa61d47ad431bf5), so nothing is prepared.
+	capOpen, capReserved, err := projectAgentCapUsage(ctx, tx, t.ID)
+	if err != nil {
+		return zero, err
+	}
+	if reason := projectAgentCapReason(capOpen, capReserved, 1, s.MaxAgents); reason != "" {
+		return zero, &api.HandlerRotationRefusal{Code: api.HandlerRotationRefusedNoAgentSlot, Detail: reason + "; the successor cannot register until an agent is closed"}
+	}
 	r := api.HandlerRotation{ID: api.NewID("hrot"), TaskID: t.ID, RequestID: req.RequestID, State: api.HandlerRotationPrepared, Reason: req.Reason, Trigger: req.Trigger,
 		HandlerRevision: t.HandlerRevision, OldAgentID: old.ID, OldRunID: old.RunID, OldName: old.Name, SuccessorAgentID: req.SuccessorAgentID,
 		SuccessorName: req.SuccessorName, CreatedAt: now, UpdatedAt: now}

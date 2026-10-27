@@ -294,6 +294,7 @@ The rotation row, successor and obligations stay as they were.
 | `successor_not_ready` | At commit, for every reason: the successor's exact run has no report since the prepare of a completed turn with a model reply. See [Successor readiness](#successor-readiness). |
 | `not_blocked` | A [provider-blocked](#a-provider-blocked-primary) prepare only: the old run is not online and idle with a `rate_limited` or `server_error` episode open for 20 minutes and an obligation that needs more than delivery, or the dead primary replacement is off. |
 | `death_unconfirmed` | A [dead primary](#a-dead-primary) rotation only: the host's evidence is missing, stale, from another host or run, names no session, or does not state both the session and the process gone; or the hub had a heartbeat from the run within 90 seconds; or the handler is not busy; or the replacement is off for the project. For a [primary whose wrapper reported exited](#a-primary-whose-wrapper-reported-exited): the hub has no exit report from the wrapper as the run's newest start, heartbeat or exit, or that report changed since prepare; the evidence carries no exit from the host's receipt; or it states an `idle_shell` session without the pane's process. |
+| `no_agent_slot` | Prepare only, for every reason and trigger, checked after the busy, primary and revision refusals: the project's open agents (every agent not closed or exited, done and retired ones and persistent roles included), plus the seats that admitted team launches still have to register, plus the successor, would exceed the project's agent cap (32). The detail carries the counts, such as `project agent cap: 32 open + 1 seats > 32`. Nothing is prepared, so queue dispatch is not held and the old handler stays primary. See [Policy and the runner](#policy-and-the-runner). |
 | `not_silent` | A dead primary rotation only: the run's last recorded activity is more recent than the project's silence, the run has no recorded activity at all, or it recorded activity after the rotation was prepared. |
 
 Commit repeats the idle checks. A handler that became busy after prepare gets a
@@ -745,6 +746,15 @@ list. For each listed project:
 - Due and idle with a saved spec: rotate, with trigger `runner` and the first
   due reason.
 - Due but busy: nothing this tick. It rotates on the first idle tick.
+- Due, but the hub refuses the prepare as `no_agent_slot`: a wait, the same
+  for the limits, `provider_blocked` and `dead_primary`. The runner keeps no
+  journal, launches nothing and reports no error; it tries again at every
+  tick and rotates at the first one after an agent is closed. It posts one
+  board NOTICE, "A handler rotation waits because the project has no free
+  agent slot", per exact old run and reason, keyed so a relay restart does
+  not repeat it. The notice gives the hub's counts and names, up to ten, the
+  done or retired ordinary agents an owner could close; a handler, deployer,
+  steward or owner helper is never named. It closes nothing.
 - Due with no saved spec: one board NOTICE per exact handler run, keyed so a
   relay restart does not repeat it. No spawn. Without a spec the host does not
   know the handler's prompt, so it reports a template change only for a legacy
@@ -877,7 +887,10 @@ run and reason doubles the interval, up to 24 hours. A due entry with another
 run or another reason ignores the record and prepares at its next tick; a
 committed rotation removes it; `tt handler rotate` ignores it; an abort when the
 old handler recovered, or a manual `--abort`, records none. The stuck notice
-states the back-off.
+states the back-off. A rotation that went stuck because its successor could
+not register at the agent cap needs no back-off after a manual `--abort`:
+while no slot is free, the runner's next prepare is refused as
+`no_agent_slot`, so nothing is prepared and dispatch keeps running.
 
 The stuck notice goes first: the runner aborts only at a tick where every
 recipient has been told, and posts nothing about the rotation after the abort.
@@ -992,3 +1005,14 @@ directory are inert without the new CLI.
   while another handler is available. Retire it first, then close it.
 - Team launch cleanup cannot close a failed launch that is the project's only
   handler; the handler stays starting and the owner sees it.
+- The `no_agent_slot` check runs at prepare; the successor registers later,
+  after its launch. An agent that registers in between without a queue
+  reservation, such as a manual `tt spawn` or a restarted owner helper, can
+  take the last slot. The successor's registration then fails with `409 limit
+  reached`, and the rotation follows the
+  [resume ceiling](#a-successor-that-never-comes-online) and the
+  [automatic abort](#automatic-abort-of-a-stuck-rotation). Queue admission
+  keeps no seat for a successor.
+- The `no_agent_slot` notice is posted once per exact old run and reason. If
+  the project fills again later for the same run and reason, no second notice
+  is posted.

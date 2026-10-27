@@ -542,7 +542,7 @@ func rotationRefusal(err error) (string, bool) {
 			api.HandlerRotationRefusedPaused, api.HandlerRotationRefusedNotPrimary, api.HandlerRotationRefusedSuccessor, api.HandlerRotationRefusedNameTaken,
 			api.HandlerRotationRefusedAgentCaller, api.HandlerRotationRefusedStaleHandler,
 			api.HandlerRotationRefusedDeathUnconfirmed, api.HandlerRotationRefusedNotSilent,
-			api.HandlerRotationRefusedSuccessorNotReady, api.HandlerRotationRefusedNotBlocked:
+			api.HandlerRotationRefusedSuccessorNotReady, api.HandlerRotationRefusedNotBlocked, api.HandlerRotationRefusedNoAgentSlot:
 			return httpErr.Code, true
 		}
 	}
@@ -554,12 +554,20 @@ func rotationBusy(err error) bool {
 	return ok && (code == api.HandlerRotationRefusedLiveLease || code == api.HandlerRotationRefusedWorking || code == api.HandlerRotationRefusedPendingTool)
 }
 
+// noAgentSlot reports the hub's refusal of a prepare whose successor would
+// not fit under the project's agent cap. Nothing was prepared.
+func noAgentSlot(err error) bool {
+	code, ok := rotationRefusal(err)
+	return ok && code == api.HandlerRotationRefusedNoAgentSlot
+}
+
 // rotationWait reports an outcome the runner waits out without counting or
 // logging it: a busy handler, a successor that has not completed a turn yet,
-// or a primary that is no longer provider blocked when the hub checks.
+// a primary that is no longer provider blocked when the hub checks, or a
+// project with no free agent slot for the successor.
 func rotationWait(err error) bool {
 	code, _ := rotationRefusal(err)
-	return rotationBusy(err) || errors.Is(err, errSuccessorNotReady) || code == api.HandlerRotationRefusedNotBlocked
+	return rotationBusy(err) || errors.Is(err, errSuccessorNotReady) || code == api.HandlerRotationRefusedNotBlocked || noAgentSlot(err)
 }
 
 // currentPrimaryHandler applies the hub's rule to a task detail: the
@@ -1832,7 +1840,11 @@ func (r *rotationRunner) tick(ctx context.Context, e env, c *api.Client, host st
 			if rotationBackedOff(hub, d, api.HandlerRotationReasonProviderBlocked, r.deps.now()) {
 				continue
 			}
-			if _, err := runHandlerRotation(ctx, r.deps, e, c, d.TaskID, api.HandlerRotationReasonProviderBlocked, api.HandlerRotationTriggerRunner, *spec, rotationAuthorization{}, nil, &d); err != nil && !rotationWait(err) && !staleDueEntry(err) {
+			_, err := runHandlerRotation(ctx, r.deps, e, c, d.TaskID, api.HandlerRotationReasonProviderBlocked, api.HandlerRotationTriggerRunner, *spec, rotationAuthorization{}, nil, &d)
+			if noAgentSlot(err) {
+				err = r.notifyNoAgentSlot(ctx, c, host, d, api.HandlerRotationReasonProviderBlocked, err)
+			}
+			if err != nil && !rotationWait(err) && !staleDueEntry(err) {
 				errs = append(errs, fmt.Errorf("handler rotation %s: %w", d.TaskID, err))
 			}
 			continue
@@ -1855,7 +1867,11 @@ func (r *rotationRunner) tick(ctx context.Context, e env, c *api.Client, host st
 		if !d.Idle || rotationBackedOff(hub, d, reasons[0], r.deps.now()) {
 			continue
 		}
-		if _, err := runHandlerRotation(ctx, r.deps, e, c, d.TaskID, reasons[0], api.HandlerRotationTriggerRunner, *spec, rotationAuthorization{}, nil, &d); err != nil && !rotationWait(err) && !staleDueEntry(err) {
+		_, err = runHandlerRotation(ctx, r.deps, e, c, d.TaskID, reasons[0], api.HandlerRotationTriggerRunner, *spec, rotationAuthorization{}, nil, &d)
+		if noAgentSlot(err) {
+			err = r.notifyNoAgentSlot(ctx, c, host, d, reasons[0], err)
+		}
+		if err != nil && !rotationWait(err) && !staleDueEntry(err) {
 			errs = append(errs, fmt.Errorf("handler rotation %s: %w", d.TaskID, err))
 		}
 	}
@@ -1876,7 +1892,11 @@ func (r *rotationRunner) replaceDeadPrimary(ctx context.Context, e env, c *api.C
 	if state != handlerProbeGone || evidence == nil {
 		return nil
 	}
-	if _, err := runHandlerRotation(ctx, r.deps, e, c, d.TaskID, api.HandlerRotationReasonDeadPrimary, api.HandlerRotationTriggerRunner, *spec, rotationAuthorization{}, evidence, &d); err != nil && !rotationBusy(err) && !deathUnconfirmedRefusal(err) && !staleDueEntry(err) {
+	_, err := runHandlerRotation(ctx, r.deps, e, c, d.TaskID, api.HandlerRotationReasonDeadPrimary, api.HandlerRotationTriggerRunner, *spec, rotationAuthorization{}, evidence, &d)
+	if noAgentSlot(err) {
+		return r.notifyNoAgentSlot(ctx, c, host, d, api.HandlerRotationReasonDeadPrimary, err)
+	}
+	if err != nil && !rotationBusy(err) && !deathUnconfirmedRefusal(err) && !staleDueEntry(err) {
 		return fmt.Errorf("handler rotation %s: %w", d.TaskID, err)
 	}
 	return nil
@@ -1909,6 +1929,60 @@ func (r *rotationRunner) notifyMissingSpec(ctx context.Context, c *api.Client, h
 		Body: api.EnvelopeBody{Text: fmt.Sprintf("Database handler %s (%s / %s) is due for rotation (%s) under the project's policy, but host %s has no saved launch spec, so nothing was rotated. Save the handler's launch settings on that host with tt handler spec --task %s -- <tt spawn launch flags>, or rotate it now with tt handler rotate --task %s -- <flags>.",
 			d.Agent.Name, d.Agent.ID, d.Agent.RunID, strings.Join(reasons, ", "), host, d.TaskID, d.TaskID)}}
 	if _, err := c.PostMessage(ctx, d.TaskID, api.PostMessageRequest{Envelope: &env, Text: api.RenderText(env), RequestID: key}); err != nil {
+		return fmt.Errorf("handler rotation notice %s: %w", d.TaskID, err)
+	}
+	r.notified[key] = true
+	return nil
+}
+
+// rotationNoSlotSubject is the subject of the runner's notice that a due
+// rotation waits for a free agent slot.
+const rotationNoSlotSubject = "A handler rotation waits because the project has no free agent slot"
+
+// rotationNoSlotListed caps the done or retired agents a no-slot notice names.
+const rotationNoSlotListed = 10
+
+// notifyNoAgentSlot posts one board notice per exact old run and reason that
+// the hub refused the rotation's prepare for want of an agent slot. It names
+// the done and retired ordinary agents an owner could close; it closes
+// nothing. A failed post is tried again on a later tick.
+func (r *rotationRunner) notifyNoAgentSlot(ctx context.Context, c *api.Client, host string, d api.HandlerRotationDue, reason string, refusal error) error {
+	key := "handler-rotation-no-slot-" + strings.TrimPrefix(d.Agent.ID, "agt_") + "-" + strings.TrimPrefix(d.Agent.RunID, "run_") + "-" + reason
+	if r.notified[key] {
+		return nil
+	}
+	detail, err := c.GetTask(ctx, d.TaskID)
+	if err != nil {
+		return fmt.Errorf("handler rotation notice %s: %w", d.TaskID, err)
+	}
+	// Ordinary team members only: a persistent role or the owner helper is
+	// never offered for closing.
+	var idle []string
+	for _, a := range detail.Agents {
+		if a.Role == "" && (a.Status == api.AgentDone || a.Status == api.AgentRetired) {
+			idle = append(idle, a.Name+" ("+a.Status+")")
+		}
+	}
+	slices.Sort(idle)
+	listed := "none"
+	if len(idle) > rotationNoSlotListed {
+		listed = strings.Join(idle[:rotationNoSlotListed], ", ") + fmt.Sprintf(" and %d more", len(idle)-rotationNoSlotListed)
+	} else if len(idle) > 0 {
+		listed = strings.Join(idle, ", ")
+	}
+	var httpErr *api.HTTPError
+	why := refusal.Error()
+	if errors.As(refusal, &httpErr) && httpErr.Msg != "" {
+		why = httpErr.Msg
+	}
+	env := api.Envelope{Kind: api.EnvelopeKindNotice, Subject: rotationNoSlotSubject,
+		Refs: map[string]string{"host": host, "project": d.TaskID, "handler": d.Agent.ID},
+		Body: api.EnvelopeBody{Text: fmt.Sprintf("The %s rotation of database handler %s (%s / %s) in project %s (%s) on host %s cannot be prepared. Hub: %s. Nothing was prepared, so queue dispatch is unaffected and the old handler stays the primary with its leases and obligations. The runner tries again every tick and rotates once a slot is free. Done or retired ordinary agents an owner could close: %s. This notice closes nothing.",
+			reason, d.Agent.Name, d.Agent.ID, d.Agent.RunID, detail.Task.Name, d.TaskID, host, noticeSafeError(why), listed)}}
+	_, err = c.PostMessage(ctx, d.TaskID, api.PostMessageRequest{Envelope: &env, Text: api.RenderText(env), RequestID: key})
+	// The identity is this run's and reason's notice, so a conflict means an
+	// earlier relay already sent it while the counts or the roster differed.
+	if err != nil && !requestIdentityConflict(err) {
 		return fmt.Errorf("handler rotation notice %s: %w", d.TaskID, err)
 	}
 	r.notified[key] = true
