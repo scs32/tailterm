@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import {
   migrateAgentData,
   normalizeAgentDefinition,
@@ -20,7 +21,12 @@ import {
   reconciledAgentProblem,
 } from "../client/launch-reconciliation.js";
 import { agentSpawnCommand } from "../shared/tmux-command.js";
-import { reasoningOptions, validateReasoning } from "../client/reasoning.js";
+import {
+  CLAUDE_EFFORT_MODELS,
+  CODEX_REASONING_MODELS,
+  reasoningOptions,
+  validateReasoning,
+} from "../client/reasoning.js";
 import { MODEL_OPTIONS } from "../client/model-picker.js";
 import { MAX_WORK_CONTEXT_BYTES } from "../shared/work-context.js";
 
@@ -742,4 +748,118 @@ test("Claude Sonnet 5.5 takes every documented effort level", () => {
   assert.ok(
     MODEL_OPTIONS.claude.some(([model]) => model === "claude-sonnet-5-5"),
   );
+});
+
+// wi_f64df8fce398eb9e: tt spawn validates reasoning against the Go maps in
+// hub/cmd/tt/reasoning.go, the client against client/reasoning.js. Nothing
+// else ties them together, so this test reads the Go source and compares.
+const goReasoningMap = (text, name) => {
+  const block = text.match(
+    new RegExp(
+      `\\nvar ${name} = map\\[string\\]map\\[string\\]bool\\{\\n([\\s\\S]*?)\\n\\}`,
+    ),
+  );
+  if (!block) throw new Error(`${name} not found in reasoning.go`);
+  const models = {};
+  for (const line of block[1].split("\n")) {
+    if (!line.trim() || line.trim().startsWith("//")) continue;
+    const entry = line.match(/^\s*"([^"]+)":\s*\{(.*)\},\s*$/);
+    if (!entry)
+      throw new Error(
+        `${name}: cannot parse ${JSON.stringify(line)}; update the parser`,
+      );
+    models[entry[1]] = entry[2]
+      .split(",")
+      .map((item) => {
+        const level = item.trim().match(/^"([^"]+)":\s*true$/);
+        if (!level)
+          throw new Error(
+            `${name}: cannot parse level ${JSON.stringify(item)} in ${entry[1]}`,
+          );
+        return level[1];
+      })
+      .sort();
+  }
+  if (!Object.keys(models).length) throw new Error(`${name} has no entries`);
+  return models;
+};
+
+const assertReasoningParity = (goText, name, jsModels) =>
+  assert.deepStrictEqual(
+    goReasoningMap(goText, name),
+    Object.fromEntries(
+      Object.entries(jsModels).map(([model, levels]) => [
+        model,
+        [...levels].sort(),
+      ]),
+    ),
+  );
+
+test("tt reasoning allow-lists in Go match client/reasoning.js", () => {
+  const go = readFileSync(
+    new URL("../hub/cmd/tt/reasoning.go", import.meta.url),
+    "utf8",
+  );
+  const maps = [
+    ["codexReasoningModels", CODEX_REASONING_MODELS, "gpt-6.1-sol", "xhigh"],
+    ["claudeEffortModels", CLAUDE_EFFORT_MODELS, "claude-sonnet-5", "max"],
+  ];
+  for (const [name, js] of maps) assertReasoningParity(go, name, js);
+
+  // Each control alters a copy of the real text; asserting the change first
+  // keeps a stale replace target from making the control vacuous.
+  const fails = (altered, name, js, pattern) => {
+    assert.notEqual(altered, go, `${name}: the alteration changed nothing`);
+    assert.throws(() => assertReasoningParity(altered, name, js), pattern);
+  };
+  for (const [name, js, model, level] of maps) {
+    const header = `var ${name} = map[string]map[string]bool{\n`;
+    assert.ok(go.includes(header), `${name}: header not found`);
+    const start = go.indexOf(header) + header.length;
+    const end = go.indexOf("\n}", start);
+    const entryLine = go
+      .slice(start, end)
+      .split("\n")
+      .find((line) => line.includes(`"${model}":`));
+    assert.ok(entryLine, `${name}: no ${model} line to alter`);
+    // Zero entries, or the map missing altogether.
+    fails(go.slice(0, start) + go.slice(end), name, js, /has no entries/);
+    fails(
+      go.replace(header, `var ${name}Renamed = map[string]map[string]bool{\n`),
+      name,
+      js,
+      /not found/,
+    );
+    // A model on the Go side only, then on the JS side only. These parse
+    // cleanly, so they must fail as a mismatch, not a parse error.
+    const mismatch = assert.AssertionError;
+    fails(
+      go.replace(header, `${header}\t"gpt-x-parity-test": {"low": true},\n`),
+      name,
+      js,
+      mismatch,
+    );
+    fails(go.replace(`${entryLine}\n`, ""), name, js, mismatch);
+    // A level on the Go side only, then on the JS side only.
+    fails(
+      go.replace(entryLine, entryLine.replace("}", `, "parity-test": true}`)),
+      name,
+      js,
+      mismatch,
+    );
+    fails(
+      go.replace(entryLine, entryLine.replace(`, "${level}": true`, "")),
+      name,
+      js,
+      mismatch,
+    );
+    assert.throws(
+      () =>
+        assertReasoningParity(go, name, {
+          ...js,
+          [model]: [...js[model], "parity-test"],
+        }),
+      mismatch,
+    );
+  }
 });
