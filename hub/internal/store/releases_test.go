@@ -8095,3 +8095,82 @@ func TestReleaseDatedHoldRefusesBatchAdd(t *testing.T) {
 		t.Fatal("a dated held job joined a batch", err)
 	}
 }
+
+// Review f1 (#47877): a requeue moves the failed entry's standing entry
+// hold to the new attempt, whose acceptance then creates the job held; the
+// failed entry keeps the moved row and has no standing hold.
+func TestReleaseEntryHoldMovesWithRequeue(t *testing.T) {
+	f := newRebindFixture(t, true)
+	d, err := f.s.AddAgent(f.ctx, f.task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "deployer", Host: "fixture", Session: "deployer", Role: api.AgentRoleDeployment}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.s.db.Exec(`UPDATE agents SET status='running',last_seen_at=? WHERE id=?`, ts(f.s.now()), d.ID); err != nil {
+		t.Fatal(err)
+	}
+	notBefore := f.s.now().Add(time.Hour).UTC().Format(time.RFC3339)
+	first := f.entry.ID
+	if _, err = f.s.ReleaseAction(f.ctx, f.task.ID, entryHoldRequest("entry-hold", "hold", f.handler.ID, f.handler.RunID, first, "Not before the measurement ends", notBefore)); err != nil {
+		t.Fatal(err)
+	}
+	f.failAndRelease(t)
+	retry, err := f.s.TeamQueueAction(f.ctx, f.task.ID, f.requeue())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state, _ := entryHoldState(t, f.s, f.task, first); state != "moved" {
+		t.Fatal("failed entry's hold", state)
+	}
+	page := windowPage(t, f.s, f.task)
+	if len(page.EntryHolds) != 1 || page.EntryHolds[0].EntryID != retry.ID || page.EntryHolds[0].NotBefore != notBefore || page.EntryHolds[0].MovedFrom == "" || page.EntryHolds[0].OrderMessageSeq != retry.OrderMessageSeq {
+		t.Fatalf("standing entry holds after the requeue %+v", page.EntryHolds)
+	}
+	var moved api.ReleaseEntryHold
+	var raw string
+	if err = f.s.db.QueryRow(`SELECT record_json FROM release_entry_holds WHERE task_id=? AND entry_id=?`, f.task.ID, first).Scan(&raw); err != nil || json.Unmarshal([]byte(raw), &moved) != nil {
+		t.Fatal(err)
+	}
+	if moved.ID != page.EntryHolds[0].MovedFrom || moved.MovedTo != page.EntryHolds[0].ID || moved.ReleasedAt == "" || !strings.Contains(moved.ReleaseReason, retry.ID) {
+		t.Fatalf("moved row %+v", moved)
+	}
+	// The retry runs and its done save accepts it before the hold's time.
+	q := f.action(t, api.TeamQueueRequest{Operation: "claim", EntryID: retry.ID, ExpectedRevision: retry.Revision, Host: "mini"})
+	lead := f.member(t, "lead-two")
+	plan, _ := json.Marshal(map[string]any{"task": f.task.ID, "item": f.item.ID, "revision": f.item.Revision, "order": f.order.Seq, "context": map[string]any{"version": 1}, "members": []any{map[string]any{"state": "unstarted", "runId": lead.RunID, "fields": map[string]any{"agentId": lead.ID, "name": lead.Name, "cwd": "/worktrees/rebind"}}}})
+	for _, step := range []api.TeamQueueRequest{{Operation: "freeze", LaunchJSON: plan}, {Operation: "attempt"}, {Operation: "started", MemberRunID: lead.RunID}, {Operation: "running"}} {
+		step.EntryID, step.ExpectedRevision = q.ID, q.Revision
+		q = f.action(t, step)
+	}
+	item, err := f.s.GetWorkItem(f.ctx, f.task.ID, f.item.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedPassingVerificationAt(t, f.s, item, candidateB, autoWorktree)
+	report, _, err := f.s.PutNarrativeReport(f.ctx, f.task.ID, f.item.ID, completeReportRequest(item, "requeued-report", 5), f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := "done"
+	if _, _, err = f.s.CreateWorkItemUpdate(f.ctx, f.task.ID, f.item.ID, api.CreateWorkItemUpdate{ExpectedRevision: item.Revision, Status: &done, AgentID: f.handler.ID, RunID: f.handler.RunID, RequestID: "done-save",
+		CompletionReport: &api.NarrativeReportPin{ReportID: report.ReportID, Version: report.Version, Digest: report.Digest, ScopeRevision: report.ScopeRevision},
+		QueueAcceptance:  &api.WorkItemQueueAcceptance{EntryID: retry.ID, Worktree: autoWorktree, Branch: autoBranch, Commit: candidateB}}, f.by); err != nil {
+		t.Fatalf("done save with acceptance: %v", err)
+	}
+	accepted, err := f.s.GetTeamQueueEntry(f.ctx, f.task.ID, retry.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j := accepted.Release
+	if j == nil || j.EntryID != retry.ID || j.State != "held" || j.Generation != 1 || j.Hold == nil || j.Hold.NotBefore != notBefore || len(j.HoldHistory) != 1 || j.HoldHistory[0].Cause != "entry" {
+		t.Fatalf("requeued entry's job %+v", j)
+	}
+	if state, job := entryHoldState(t, f.s, f.task, retry.ID); state != "applied" || job != j.ID {
+		t.Fatal("moved hold", state, job)
+	}
+	if _, err = f.s.ReleaseAction(f.ctx, f.task.ID, claimRequest("claim", d, *j)); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "until "+notBefore) {
+		t.Fatal("claim of the requeued entry's held job", err)
+	}
+	if page = windowPage(t, f.s, f.task); len(page.EntryHolds) != 0 {
+		t.Fatalf("standing entry holds after acceptance %+v", page.EntryHolds)
+	}
+}

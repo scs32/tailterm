@@ -359,7 +359,9 @@ type ReleaseHold struct {
 // release job exists, so the job acceptance, enqueue or retry creates is
 // created held and no claim can precede the hold. State is standing until
 // that job is created (applied, with JobID), the handler unholds it
-// (released) or its NotBefore passes first (expired).
+// (released) or its NotBefore passes first (expired). A requeue of the entry
+// moves a standing hold to the new attempt's entry: the old row is moved,
+// naming the new row in MovedTo, and the new row names it in MovedFrom.
 type ReleaseEntryHold struct {
 	ID              string `json:"id"`
 	EntryID         string `json:"entryId"`
@@ -377,6 +379,8 @@ type ReleaseEntryHold struct {
 	ReleaseReason   string `json:"releaseReason,omitempty"`
 	ReleaseAgentID  string `json:"releaseAgentId,omitempty"`
 	ReleaseRunID    string `json:"releaseRunId,omitempty"`
+	MovedFrom       string `json:"movedFrom,omitempty"`
+	MovedTo         string `json:"movedTo,omitempty"`
 }
 
 // ReleaseWindow is the project's release quiet window, set only by the owner

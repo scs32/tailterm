@@ -1883,6 +1883,34 @@ func saveReleaseEntryHold(ctx context.Context, tx *sql.Tx, task string, h api.Re
 	return err
 }
 
+// moveEntryReleaseHold carries the failed entry's standing entry hold to
+// the entry that requeues it, in the requeue transaction, so the new
+// attempt's job is created held too. The old row is kept, moved.
+func moveEntryReleaseHold(ctx context.Context, tx *sql.Tx, task, from string, to api.TeamQueueEntry, now string) error {
+	h, err := releaseEntryHoldStanding(ctx, tx, task, from)
+	if err != nil || h == nil {
+		return err
+	}
+	next := *h
+	next.ID = api.NewID("reh")
+	next.EntryID = to.ID
+	next.OrderMessageSeq = to.OrderMessageSeq
+	next.MovedFrom = h.ID
+	h.State = "moved"
+	h.MovedTo = next.ID
+	h.ReleasedAt = now
+	h.ReleaseReason = "entry " + from + " was requeued as " + to.ID
+	if err = saveReleaseEntryHold(ctx, tx, task, *h); err != nil {
+		return err
+	}
+	b, err := json.Marshal(next)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO release_entry_holds VALUES(?,?,?,?,?)`, task, next.ID, next.EntryID, next.State, string(b))
+	return err
+}
+
 // applyEntryReleaseHold runs as a job is created, in the creating
 // transaction (acceptance, enqueue or retry): the entry's standing entry hold
 // creates the job held at its first generation and is then applied. One

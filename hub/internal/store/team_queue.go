@@ -2675,6 +2675,11 @@ func requeueTeamQueueEntry(ctx context.Context, tx *sql.Tx, task string, failed 
 		e.ID, task, e.ItemID, e.ItemRevision, e.OrderMessageSeq, e.Template, e.Position, e.State, e.Revision, e.Host, e.Cwd, e.Repository, string(ownedJSON), e.BaseCommit, e.Serial, e.Attempt, e.RetryOf, now, now); err != nil {
 		return refuse("cannot be requeued: its item already has a live entry: %v", err)
 	}
+	// An owner hold saved on the failed entry before acceptance holds the
+	// retry's release too.
+	if err := moveEntryReleaseHold(ctx, tx, task, failed.ID, e, now); err != nil {
+		return zero, err
+	}
 	return e, nil
 }
 
