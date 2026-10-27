@@ -227,9 +227,16 @@ Notes:
   container"). Without it, or with its service stopped, such a release is
   refused before any deploy step (`Rehearsal container runtime unavailable` or
   `Rehearsal container runtime not running`); the runner never falls back to
-  running the migration on the host. Releases with no schema change do not use
-  it. Doctor does not check it yet. The service runs under the deployer's
-  user; confirm it after a reboot with `container system status`.
+  running the migration on the host. Before the one attempt is spent, the same
+  container runs once on an empty `/state`; if that probe fails the release is
+  refused as `Rehearsal container runtime probe HOW`, and a run on the copy
+  that cannot be started as `Rehearsal container runtime not started`, both
+  with no marker, so the same job can retry once the host is fixed. A changed
+  migration binary (`Candidate migration binary changed`) is refused with no
+  marker before the probe and spends the attempt after it. Releases with no
+  schema change do not use it. Doctor does not check it yet. The service runs
+  under the deployer's user; confirm it after a reboot with
+  `container system status`.
 - Without `--deploy-config`, the role prints one `missing` deploy config line.
   The field lines name the field only, never a value.
 - The deployer also keeps its own checkout with the four test fixtures

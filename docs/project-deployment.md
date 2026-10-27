@@ -2329,8 +2329,11 @@ other than `["ALL"]`, a missing `no-new-privileges`, a missing or unreadable
 volume, or a second writable volume. A change to `hub_compose` of that kind must
 change the runner's mapping in the same release.
 
-**Refusals.** All of these stop the release at step `rehearse`, before any
-deploy step:
+**Refusals.** Before the marker is saved, the same container runs once as
+`tt-rehearsal-ID-probe` on an empty `/state`, so a runtime, image, mount or
+entrypoint failure, or a candidate that cannot migrate a fresh database, is
+refused without spending the attempt. All of these stop the release at step
+`rehearse`, before any deploy step:
 
 | Reason | Meaning | Marker saved |
 |---|---|---|
@@ -2338,8 +2341,11 @@ deploy step:
 | `Rehearsal container runtime not running` | `container system status` exited non-zero | no |
 | `Rehearsal compose unsupported` | the composed hub service is not one the mapping above accepts | no |
 | `python3 exit N` | the candidate's plan validation or compose function failed | no |
+| `Candidate migration binary changed` | the pinned migration binary's hash changed; it is checked before the probe and again before the run on the copy | no before the probe, yes after it |
+| `Rehearsal container runtime probe HOW` | the probe failed; `HOW` is `exit N`, `signal NAME`, `timeout` or `not started` | no |
+| `Rehearsal container runtime not started` | after a passing probe, the run on the copy could not be started | no |
 | `Rehearsal container exit N` | the migration failed in the container (`exit 137` is the out-of-memory kill) | yes |
-| `Rehearsal container signal NAME`, `timeout`, `not started` | the run was killed, exceeded ten minutes, or could not start | yes |
+| `Rehearsal container signal NAME`, `timeout` | the run was killed or exceeded ten minutes | yes |
 
 A refusal with no marker can be retried by the same job once the host is fixed.
 A failed container run cannot: its marker refuses a second attempt, as before.
