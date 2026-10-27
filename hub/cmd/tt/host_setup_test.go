@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -333,8 +334,10 @@ func (s *hostSandbox) requireCanonicalHooks() {
 			s.t.Fatalf("Claude %s tt entries = %q", ev.event, got)
 		}
 	}
-	if got := ttCommands(s.t, s.p.codexHooks, "Stop", "stop"); len(got) != 1 || got[0] != adapters.HookCommand(s.p.install, "stop") {
-		s.t.Fatalf("Codex Stop tt entries = %q", got)
+	for _, ev := range codexHookEvents {
+		if got := ttCommands(s.t, s.p.codexHooks, ev.event, ev.name); len(got) != 1 || got[0] != adapters.HookCommand(s.p.install, ev.name) {
+			s.t.Fatalf("Codex %s tt entries = %q", ev.event, got)
+		}
 	}
 }
 
@@ -604,6 +607,8 @@ func TestHostSetupHookStaleEntries(t *testing.T) {
 			map[string]any{"type": "command", "command": canonical, "timeout": json.Number("7")},
 			map[string]any{"type": "command", "command": "user-sibling"}}},
 		map[string]any{"matcher": "x", "hooks": []any{map[string]any{"type": "command", "command": "matcher-sibling"}}},
+	}, "UserPromptSubmit": []any{
+		map[string]any{"hooks": []any{map[string]any{"type": "command", "command": adapters.HookCommand(s.p.install, "prompt")}}},
 	}}}
 	if got := decodeJSONFile(t, s.p.codexHooks); !reflect.DeepEqual(got, want) {
 		t.Fatalf("Codex hooks after stale entries:\n got %v\nwant %v", got, want)
@@ -1569,4 +1574,165 @@ func TestHostSetupClaudeUsageCommandCaptures(t *testing.T) {
 			t.Fatalf("the capture command left a temporary file: %s", entry.Name())
 		}
 	}
+}
+
+// A woken Codex turn runs tt hook prompt: host setup and tt hooks codex
+// --install add the UserPromptSubmit hook beside Stop, and a host with only
+// the Stop hook is reported outdated until it is re-run.
+func TestHostSetupCodexPromptHook(t *testing.T) {
+	t.Run("fresh", func(t *testing.T) {
+		s := newHostSandbox(t, "home")
+		s.holdRelayLock()
+		s.mustRun("--from", s.artifact("tt-v1"))
+		s.requireCanonicalHooks()
+		hooks := decodeJSONFile(t, s.p.codexHooks)["hooks"].(map[string]any)
+		want := map[string]any{}
+		for _, ev := range []hookEvent{{"UserPromptSubmit", "prompt"}, {"Stop", "stop"}} {
+			want[ev.event] = []any{map[string]any{"hooks": []any{map[string]any{"type": "command", "command": adapters.HookCommand(s.p.install, ev.name)}}}}
+		}
+		if !reflect.DeepEqual(hooks, want) {
+			t.Fatalf("fresh Codex hooks:\n got %v\nwant %v", hooks, want)
+		}
+	})
+	t.Run("stop only", func(t *testing.T) {
+		s := newHostSandbox(t, "home")
+		s.holdRelayLock()
+		v1 := s.artifact("tt-v1")
+		s.mustRun("--from", v1)
+		stopOnly := `{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"` + adapters.HookCommand(s.p.install, "stop") + `"}]}],"PreToolUse":[{"hooks":[{"type":"command","command":"other-tool check"}]}]}}`
+		s.write(s.p.codexHooks, stopOnly, 0o600)
+		wantUser := withoutTTHooks(decodeJSONFile(t, s.p.codexHooks), codexHookEvents)
+		before := s.hash(s.p.codexHooks)
+		out, code := s.run("--check", "--from", v1)
+		if code != 1 || !strings.Contains(out, "outdated   codex-hooks") || !strings.Contains(out, "current    claude-hooks") {
+			t.Fatalf("--check on a Stop-only Codex hooks.json exited %d:\n%s", code, out)
+		}
+		if s.hash(s.p.codexHooks) != before {
+			t.Fatal("--check changed the Codex hooks.json")
+		}
+		if out := s.mustRun("--from", v1); !strings.Contains(out, "updated    codex-hooks") {
+			t.Fatalf("the prompt hook was not reported as added:\n%s", out)
+		}
+		s.requireCanonicalHooks()
+		if got := withoutTTHooks(decodeJSONFile(t, s.p.codexHooks), codexHookEvents); !reflect.DeepEqual(got, wantUser) {
+			t.Fatalf("adding the prompt hook changed user content:\n got %v\nwant %v", got, wantUser)
+		}
+		if out := s.mustRun("--from", v1); !strings.Contains(out, "current    codex-hooks") {
+			t.Fatalf("a second run did not report the Codex hooks current:\n%s", out)
+		}
+	})
+	t.Run("install", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("CODEX_HOME", home)
+		path := filepath.Join(home, "hooks.json")
+		if err := os.WriteFile(path, []byte(`{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"/usr/local/bin/tt hook stop"}]}]}}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		install := func() {
+			t.Helper()
+			if _, err := captureCLIOutput(t, func() error { return installCodexStopHook("/usr/local/bin/tt") }); err != nil {
+				t.Fatal(err)
+			}
+		}
+		install()
+		for _, ev := range codexHookEvents {
+			if got := ttCommands(t, path, ev.event, ev.name); len(got) != 1 || got[0] != "/usr/local/bin/tt hook "+ev.name {
+				t.Fatalf("Codex %s tt entries after install = %q", ev.event, got)
+			}
+		}
+		first, _ := os.ReadFile(path)
+		install()
+		if second, _ := os.ReadFile(path); !bytes.Equal(first, second) {
+			t.Fatalf("a second install changed hooks.json:\n%s\n%s", first, second)
+		}
+		if !codexStopHookInstalled() {
+			t.Fatal("the Stop hook is no longer recognised after adding the prompt hook")
+		}
+	})
+}
+
+// tt hook prompt with the payload Codex 0.160.0 sends on UserPromptSubmit
+// marks the exact run running, prints the unread nudge as plain text (Codex
+// reads non-JSON stdout as context) and does nothing for a stale run or
+// without an agent identity.
+func TestHookPromptCodexMarksRunRunning(t *testing.T) {
+	const payload = `{"session_id":"s","turn_id":"t","transcript_path":null,"cwd":"/tmp","hook_event_name":"UserPromptSubmit","model":"m","permission_mode":"bypassPermissions","prompt":"p"}`
+	ctx := context.Background()
+	setup := func(t *testing.T) (env, *api.Client, api.Agent, api.Agent) {
+		t.Helper()
+		e, c, task, lead := cliWorkItemFixture(t)
+		self, err := c.GetAgent(ctx, task.ID, e.agent)
+		if err != nil {
+			t.Fatal(err)
+		}
+		e.runID = self.RunID
+		if _, err := c.PostEvent(ctx, task.ID, api.PostEventRequest{Kind: api.EventDone, AgentID: self.ID, RunID: self.RunID}); err != nil {
+			t.Fatal(err)
+		}
+		return e, c, self, lead
+	}
+	prompt := func(t *testing.T, e env) string {
+		t.Helper()
+		var out string
+		var err error
+		withStdin(t, payload, func() {
+			out, err = captureCLIOutput(t, func() error { return cmdHook(e, []string{"prompt"}) })
+		})
+		if err != nil {
+			t.Fatalf("tt hook prompt returned %v", err)
+		}
+		return out
+	}
+	status := func(t *testing.T, c *api.Client, e env) api.Agent {
+		t.Helper()
+		a, err := c.GetAgent(ctx, e.task, e.agent)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return a
+	}
+	t.Run("woken", func(t *testing.T) {
+		e, c, self, _ := setup(t)
+		if got := status(t, c, e); got.Status != api.AgentDone {
+			t.Fatalf("fixture agent is %s before the hook; want done", got.Status)
+		}
+		if out := prompt(t, e); out != "" {
+			t.Fatalf("hook printed %q with nothing unread", out)
+		}
+		if got := status(t, c, e); got.Status != api.AgentRunning || got.RunID != self.RunID {
+			t.Fatalf("after the prompt hook the agent is %s on run %s; want running on %s", got.Status, got.RunID, self.RunID)
+		}
+	})
+	t.Run("unread", func(t *testing.T) {
+		e, c, _, lead := setup(t)
+		if _, err := c.PostMessage(ctx, e.task, api.PostMessageRequest{AgentID: lead.ID, RunID: lead.RunID, To: e.agent, Text: "a note for the handler"}); err != nil {
+			t.Fatal(err)
+		}
+		out := prompt(t, e)
+		if !strings.Contains(out, "[tailterm] 1 unread") || strings.HasPrefix(strings.TrimSpace(out), "{") {
+			t.Fatalf("unread nudge = %q; want plain text naming 1 unread", out)
+		}
+		if got := status(t, c, e); got.Status != api.AgentRunning {
+			t.Fatalf("after the prompt hook the agent is %s; want running", got.Status)
+		}
+	})
+	t.Run("stale run", func(t *testing.T) {
+		e, c, _, _ := setup(t)
+		e.runID = api.NewID("run")
+		prompt(t, e)
+		if got := status(t, c, e); got.Status != api.AgentDone {
+			t.Fatalf("a stale run moved the agent to %s; want done", got.Status)
+		}
+	})
+	t.Run("no identity", func(t *testing.T) {
+		e, c, _, _ := setup(t)
+		empty := e
+		empty.agent, empty.agentName, empty.runID = "", "", ""
+		if out := prompt(t, empty); out != "" {
+			t.Fatalf("hook without an identity printed %q", out)
+		}
+		if got := status(t, c, e); got.Status != api.AgentDone {
+			t.Fatalf("hook without an identity moved the agent to %s", got.Status)
+		}
+	})
 }

@@ -126,3 +126,40 @@ func TestParseHookCommandRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+func TestCodexHooksJSONHasPromptAndStop(t *testing.T) {
+	var raw struct {
+		Hooks map[string][]map[string]json.RawMessage
+	}
+	if err := json.Unmarshal([]byte(CodexHooksJSON("/a b/tt")), &raw); err != nil {
+		t.Fatal(err)
+	}
+	if len(raw.Hooks) != 2 {
+		t.Errorf("hooks.json wires %d events; want 2", len(raw.Hooks))
+	}
+	for ev, name := range map[string]string{"UserPromptSubmit": "prompt", "Stop": "stop"} {
+		group := raw.Hooks[ev]
+		if len(group) != 1 {
+			t.Errorf("%s has %d groups; want 1", ev, len(group))
+			continue
+		}
+		if _, restricted := group[0]["matcher"]; restricted || len(group[0]) != 1 {
+			t.Errorf("%s group is not a bare hooks list: %s", ev, group[0])
+		}
+		var entries []struct{ Type, Command string }
+		if err := json.Unmarshal(group[0]["hooks"], &entries); err != nil {
+			t.Fatal(err)
+		}
+		want := "'/a b/tt' hook " + name
+		if len(entries) != 1 || entries[0].Type != "command" || entries[0].Command != want {
+			t.Errorf("%s entries = %+v; want one command %q", ev, entries, want)
+			continue
+		}
+		if exe, got, ok := ParseHookCommand(entries[0].Command); !ok || exe != "/a b/tt" || got != name {
+			t.Errorf("%s command round trip = %q %q %v", ev, exe, got, ok)
+		}
+	}
+	if !strings.Contains(CodexConfig("tt"), `notify = ["tt", "hook", "codex"]`) {
+		t.Error("codex config lost the notify line")
+	}
+}

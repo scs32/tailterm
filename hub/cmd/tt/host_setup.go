@@ -562,7 +562,7 @@ const hostBackupSuffix = ".before-tailterm"
 type hookEvent struct{ event, name string }
 
 var (
-	codexHookEvents  = []hookEvent{{"Stop", "stop"}}
+	codexHookEvents  = []hookEvent{{"UserPromptSubmit", "prompt"}, {"Stop", "stop"}}
 	claudeHookEvents = []hookEvent{{"SessionStart", "session-start"}, {"UserPromptSubmit", "prompt"}, {"Stop", "stop"}, {"Notification", "notification"}, {"PreToolUse", "tool"}, {"PostToolUse", "tool"}, {"PostToolUseFailure", "tool"},
 		{"SessionStart", "handoff"}, {"PreCompact", "handoff"}, {"SessionEnd", "handoff"}}
 )

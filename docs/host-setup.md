@@ -31,7 +31,7 @@ Each run works through seven steps and prints one line per step with its state.
 | --- | --- |
 | `binary` | Installs `--from PATH` (default: the running executable) as `~/.local/bin/tt`. |
 | `hub-config` | With `--hub URL`, writes `~/.config/tailterm/hub.json` when there is none. |
-| `codex-hooks` | Merges the Tailterm Stop hook into `~/.codex/hooks.json` (or `$CODEX_HOME`). |
+| `codex-hooks` | Merges the Tailterm UserPromptSubmit and Stop hooks into `~/.codex/hooks.json` (or `$CODEX_HOME`). |
 | `claude-hooks` | Merges the four Tailterm hooks into `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR`). |
 | `claude-usage` | Installs the [Claude usage capture](#claude-usage-capture) status line and its command. |
 | `relay-service` | Installs the inbox relay as a launchd service and starts or restarts it. |
@@ -88,9 +88,9 @@ Hooks are merged, never replaced. Every other key, event, group and hook in the
 file is kept, and the file keeps its mode. Before Tailterm first changes a file
 it keeps one copy beside it as `<file>.before-tailterm`.
 
-For each event it manages (Codex `Stop`; Claude Code `SessionStart`,
-`UserPromptSubmit`, `Stop` and `Notification`) the run ends with exactly one
-Tailterm entry that names the installed `tt` by absolute path:
+For each event it manages (Codex `UserPromptSubmit` and `Stop`; Claude Code
+`SessionStart`, `UserPromptSubmit`, `Stop` and `Notification`) the run ends
+with exactly one Tailterm entry that names the installed `tt` by absolute path:
 
 - An existing Tailterm entry with another path (a bare `tt`, an old location) is
   rewritten in place; only its command changes.
@@ -261,6 +261,14 @@ The first run on a host that was set up by hand makes these one-time changes:
 - A host with no Claude Code hooks gets the four hooks in
   `~/.claude/settings.json`, so its Claude agents start getting the session
   briefing and the turn-end check.
+
+Installed hooks change only when a host runs setup again: after a release that
+changes the managed hooks, re-run `tt host setup` or `tt hooks codex --install`
+on each host. A Codex `hooks.json` with only the Tailterm Stop hook then gains
+the UserPromptSubmit hook (`tt hook prompt`), so its Codex agents show
+`running` during a woken turn; until then `tt host setup --check` reports
+`codex-hooks` outdated. The relay's report of a woken done agent
+([provider-blocked.md](provider-blocked.md)) still applies.
 
 ## Testing against fakes
 

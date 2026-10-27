@@ -131,8 +131,9 @@ func ClaudeHooks(tt string) string {
 }
 
 // CodexConfig returns the ~/.codex/config.toml lines wiring Codex notify,
-// and the hooks.json that blocks a Tailterm agent's turn from ending while
-// it holds unacknowledged work (broker phase 3.1).
+// and the hooks.json that marks a woken Tailterm agent's turn running and
+// blocks its turn from ending while it holds unacknowledged work (broker
+// phase 3.1).
 func CodexConfig(tt string) string {
 	return fmt.Sprintf("# Add to ~/.codex/config.toml\nnotify = [%q, \"hook\", \"codex\"]\n\n# ~/.codex/hooks.json (install with: tt hooks codex --install)\n%s", tt, CodexHooksJSON(tt))
 }
@@ -143,11 +144,25 @@ const CodexStopMarker = "hook stop"
 // CodexStopHook is the Stop hook entry Tailterm adds to Codex's hooks.json.
 // Outside a Tailterm agent session, tt hook stop does nothing.
 func CodexStopHook(tt string) map[string]any {
-	return map[string]any{"hooks": []any{map[string]any{"type": "command", "command": HookCommand(tt, "stop")}}}
+	return codexHook(tt, "stop")
+}
+
+// CodexPromptHook is the UserPromptSubmit hook entry Tailterm adds to Codex's
+// hooks.json, so a woken turn marks its run running as Claude's does.
+// Outside a Tailterm agent session, tt hook prompt does nothing.
+func CodexPromptHook(tt string) map[string]any {
+	return codexHook(tt, "prompt")
+}
+
+func codexHook(tt, name string) map[string]any {
+	return map[string]any{"hooks": []any{map[string]any{"type": "command", "command": HookCommand(tt, name)}}}
 }
 
 func CodexHooksJSON(tt string) string {
-	b, _ := json.MarshalIndent(map[string]any{"hooks": map[string]any{"Stop": []any{CodexStopHook(tt)}}}, "", "  ")
+	b, _ := json.MarshalIndent(map[string]any{"hooks": map[string]any{
+		"UserPromptSubmit": []any{CodexPromptHook(tt)},
+		"Stop":             []any{CodexStopHook(tt)},
+	}}, "", "  ")
 	return string(b) + "\n"
 }
 
