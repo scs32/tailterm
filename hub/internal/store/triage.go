@@ -68,24 +68,20 @@ func (s *Store) WorkItemTriage(ctx context.Context, task string, staleDays int, 
 	ref := func(item api.WorkItem) api.TriageItem {
 		return api.TriageItem{ID: item.ID, Title: item.Title, Status: item.Status}
 	}
-	for i := range open {
-		for j := i + 1; j < len(open); j++ {
-			title := triage.Similarity(open[i].Title, open[j].Title)
-			criteria := triage.CriteriaSimilarity(open[i].Description, open[j].Description)
-			if title >= triage.TitleThreshold || criteria >= triage.CriteriaThreshold {
-				out.Duplicates = append(out.Duplicates, api.TriageDuplicate{Items: []api.TriageItem{ref(open[i]), ref(open[j])}, TitleSimilarity: title, CriteriaSimilarity: criteria})
-			}
-		}
+	openP := make([]triage.Profile, len(open))
+	for i, item := range open {
+		openP[i] = triage.NewProfile(item.Title, item.Description)
 	}
-	for _, item := range open {
-		for _, d := range done {
-			title := triage.Similarity(item.Title, d.Title)
-			criteria := triage.CriteriaSimilarity(item.Description, d.Description)
-			if title >= triage.TitleThreshold || criteria >= triage.CriteriaThreshold {
-				match := ref(d)
-				out.AlreadyReleased = append(out.AlreadyReleased, api.TriageAlreadyDone{Item: ref(item), Done: &match, TitleSimilarity: title, CriteriaSimilarity: criteria})
-			}
-		}
+	doneP := make([]triage.Profile, len(done))
+	for i, item := range done {
+		doneP[i] = triage.NewProfile(item.Title, item.Description)
+	}
+	for _, m := range triage.Duplicates(openP) {
+		out.Duplicates = append(out.Duplicates, api.TriageDuplicate{Items: []api.TriageItem{ref(open[m.A]), ref(open[m.B])}, TitleSimilarity: m.Title, CriteriaSimilarity: m.Criteria})
+	}
+	for _, m := range triage.Delivered(openP, doneP) {
+		match := ref(done[m.B])
+		out.AlreadyReleased = append(out.AlreadyReleased, api.TriageAlreadyDone{Item: ref(open[m.A]), Done: &match, TitleSimilarity: m.Title, CriteriaSimilarity: m.Criteria})
 	}
 	ids := make([]string, 0, len(open))
 	for _, item := range open {

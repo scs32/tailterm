@@ -107,4 +107,36 @@ func TestGoldenPairs(t *testing.T) {
 	if !reflect.DeepEqual(dups, goldenDuplicates) || !reflect.DeepEqual(delivered, goldenDelivered) {
 		t.Fatalf("reference duplicates %v delivered %v", dups, delivered)
 	}
+	profiles := func(items []goldenItem) []Profile {
+		out := make([]Profile, len(items))
+		for i, it := range items {
+			out[i] = NewProfile(it.title, it.description)
+		}
+		return out
+	}
+	scores := func(matches []Match) []pairScore {
+		var out []pairScore
+		for _, m := range matches {
+			out = append(out, pairScore{m.A, m.B, m.Title, m.Criteria})
+		}
+		return out
+	}
+	open, done := profiles(goldenOpen), profiles(goldenDone)
+	if got := scores(Duplicates(open)); !reflect.DeepEqual(got, goldenDuplicates) {
+		t.Fatalf("duplicates %v, want %v", got, goldenDuplicates)
+	}
+	if got := scores(Delivered(open, done)); !reflect.DeepEqual(got, goldenDelivered) {
+		t.Fatalf("delivered %v, want %v", got, goldenDelivered)
+	}
+	items, all := append(append([]goldenItem{}, goldenOpen...), goldenDone...), append(append([]Profile{}, open...), done...)
+	for i := range items {
+		for j := range items {
+			if title := Jaccard(all[i].title, all[j].title); title != Similarity(items[i].title, items[j].title) {
+				t.Fatalf("items %d/%d title %v", i, j, title)
+			}
+			if criteria := Jaccard(all[i].criteria, all[j].criteria); criteria != CriteriaSimilarity(items[i].description, items[j].description) {
+				t.Fatalf("items %d/%d criteria %v", i, j, criteria)
+			}
+		}
+	}
 }

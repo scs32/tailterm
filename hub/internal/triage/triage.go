@@ -92,6 +92,59 @@ func CriteriaSimilarity(a, b string) float64 {
 	return Similarity(strings.Join(ca, "\n"), strings.Join(cb, "\n"))
 }
 
+// Profile is one item's title and criteria tokens, computed once so a triage
+// pass scores pairs without re-tokenizing (wi_aaa28da19d1eb112).
+type Profile struct{ title, criteria []string }
+
+// NewProfile tokenizes an item's title and the combined criteria of its
+// description. Criteria tokens are nil when the description has none, so
+// pair scores equal Similarity and CriteriaSimilarity.
+func NewProfile(title, description string) Profile {
+	p := Profile{title: Tokens(title)}
+	if c := Criteria(description); len(c) > 0 {
+		p.criteria = Tokens(strings.Join(c, "\n"))
+	}
+	return p
+}
+
+// Match is a pair over either threshold: A and B index the profiles given.
+type Match struct {
+	A, B            int
+	Title, Criteria float64
+}
+
+func score(a, b Profile) (title, criteria float64, ok bool) {
+	title, criteria = Jaccard(a.title, b.title), Jaccard(a.criteria, b.criteria)
+	return title, criteria, title >= TitleThreshold || criteria >= CriteriaThreshold
+}
+
+// Duplicates scores every pair i<j of items, in order.
+func Duplicates(items []Profile) []Match {
+	var out []Match
+	for i := range items {
+		for j := i + 1; j < len(items); j++ {
+			if title, criteria, ok := score(items[i], items[j]); ok {
+				out = append(out, Match{A: i, B: j, Title: title, Criteria: criteria})
+			}
+		}
+	}
+	return out
+}
+
+// Delivered scores every open item against every done item: A indexes open
+// and B indexes done.
+func Delivered(open, done []Profile) []Match {
+	var out []Match
+	for i := range open {
+		for j := range done {
+			if title, criteria, ok := score(open[i], done[j]); ok {
+				out = append(out, Match{A: i, B: j, Title: title, Criteria: criteria})
+			}
+		}
+	}
+	return out
+}
+
 // ReleaseRow is one row of a markdown release-record table.
 type ReleaseRow struct {
 	Cells   []string
