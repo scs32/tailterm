@@ -2178,6 +2178,10 @@ export const LOADED_CODE=(()=>{try{return diskCode(dirname(fileURLToPath(import.
 export function publishedCode(cwd){
   const commit=git(cwd,"rev-parse","--verify","refs/heads/tasks-hub^{commit}");
   if(!sha(commit))throw releaseError("published-unreadable");
+  return commitCode(cwd,commit);
+}
+// The watched files as committed at commit, read from its blobs.
+export function commitCode(cwd,commit){
   const files=Object.fromEntries(RUNNER_CODE_FILES.map(n=>[n,bytesDigest(execFileSync("git",["cat-file","blob",`${commit}:${join("scripts",n)}`],{cwd,stdio:["ignore","pipe","ignore"],maxBuffer:64*1024*1024}))]));
   return {commit,files,digest:codeDigest(files)};
 }
@@ -2290,6 +2294,18 @@ export function prepareCode(cwd,published){
   let disk;try{disk=diskCode(join(cwd,"scripts"));}catch{throw releaseError("disk-mismatch");}
   if(disk.digest!==published.digest)throw releaseError("disk-mismatch");
 }
+// Puts a checkout prepareCode moved back on the commit this process loaded
+// from, after the published runner did not load (wi_f6bd907b134a9331 s6), so
+// re-provisioning from the checkout starts a runner that loads. The checkout
+// is moved only when it is clean and that commit's watched blobs are the
+// loaded bytes, and counts as restored only when HEAD is then that commit,
+// the checkout is clean and the files on disk are the loaded bytes; throws
+// otherwise.
+export function restoreCode(cwd,head,loaded){
+  if(!sha(head) || !validCode(loaded) || git(cwd,"status","--porcelain") || commitCode(cwd,head).digest!==loaded.digest)throw releaseError("not-restored");
+  if(git(cwd,"rev-parse","HEAD")!==head)git(cwd,"checkout","--detach",head);
+  if(git(cwd,"rev-parse","HEAD")!==head || git(cwd,"status","--porcelain") || diskCode(join(cwd,"scripts")).digest!==loaded.digest)throw releaseError("not-restored");
+}
 // Whether the published runner in the checkout loads (wi_56ac00ba2854fa3d
 // c2): a child imports scripts/release-runner.mjs, and with it every watched
 // file, within timeoutMs. No path is passed as an argument, so no daemon
@@ -2310,16 +2326,18 @@ export function runnerLoads(cwd,{timeoutMs=20000,signal}={}){
 // (same pid, parent, agent and run) and returns only in tests, or when a stop
 // signal arrived first: the new image would not know it was told to stop.
 // noticed and said hold what this process already posted and printed. loads
-// is the published runner's load check (runnerLoads) after prepare.
-// restartGeneration is which restart of this run made this process (1 for
-// the first), from the re-exec environment; a restart begun by a runner that
-// passed none counts as the first (wi_56ac00ba2854fa3d c5).
+// is the published runner's load check (runnerLoads) after prepare; restore
+// (restoreCode) puts the checkout back on loadedHead, the HEAD the first poll
+// of this process found, when that check fails. restartGeneration is which
+// restart of this run made this process (1 for the first), from the re-exec
+// environment; a restart begun by a runner that passed none counts as the
+// first (wi_56ac00ba2854fa3d c5).
 const stopSignalTurn=()=>new Promise(done=>setImmediate(()=>setImmediate(done)));
 const generationOf=v=>Number.isSafeInteger(v) && v>=1 && v<=999999?v:0;
 export function runnerCodeGate(over={}){
   const from=process.env.TAILTERM_RUNNER_REEXEC_FROM,gen=process.env.TAILTERM_RUNNER_REEXEC_GEN,generation=/^[1-9][0-9]{0,5}$/.test(gen||"")?Number(gen):0;
   return {loaded:LOADED_CODE,marker:process.env.TAILTERM_RUNNER_REEXEC||null,restartedFrom:HEX64.test(from||"")?from:null,restartGeneration:generation||(HEX64.test(from||"")?1:null),
-    published:publishedCode,prepare:prepareCode,now:()=>Date.now(),execve:(file,argv,env)=>process.execve(file,argv,env),
+    published:publishedCode,prepare:prepareCode,restore:restoreCode,now:()=>Date.now(),execve:(file,argv,env)=>process.execve(file,argv,env),
     loadTimeoutMs:20000,loads(cwd,signal){return runnerLoads(cwd,{timeoutMs:this.loadTimeoutMs,signal});},
     async exec(published,signal,generation){
       // Whatever this process printed reaches a piped terminal before it is replaced.
@@ -2346,8 +2364,11 @@ export function restartGeneration(config,code,published){
 }
 // JOURNAL/runner-code.json (0600): the code this process loaded and the
 // published code it was last compared with, and the latest restart
-// generation of this run when there is one. Rewritten only when something
-// other than checkedAt changes, so checkedAt is when this state was first seen.
+// generation of this run when there is one. A load-failed refusal also says
+// whether the checkout is back on loadedCommit (checkout restored) or still
+// holds the published scripts that do not load (not-restored). Rewritten
+// only when something other than checkedAt changes, so checkedAt is when this
+// state was first seen.
 export function codeRecord(config,code,decision,published){
   const iso=ms=>new Date(ms).toISOString(),loaded=validCode(code.loaded)?{digest:code.loaded.digest,files:code.loaded.files}:null;
   const current=validCode(published)&&sha(published.commit)?{commit:published.commit,digest:published.digest,files:published.files}:null;
@@ -2355,7 +2376,7 @@ export function codeRecord(config,code,decision,published){
   const path=join(config.journalDirectory,"runner-code.json"),unchecked=r=>JSON.stringify({...r,checkedAt:null}),prior=readCodeRecord(config);
   const generation=Math.max(generationOf(code.restartFor?.generation),generationOf(code.restartGeneration),recordedGeneration(prior));
   const record={version:1,agentId:process.env.TAILTERM_AGENT||null,runId:process.env.TAILTERM_RUN||null,pid:process.pid,startedAt:code.startedAt,checkedAt:iso(code.now()),state:decision.state,...(decision.reason?{reason:decision.reason}:{}),...(decision.state==="restart"&&decision.heldJob?{heldJob:decision.heldJob}:{}),
-    loaded,current,changed:loaded&&current?RUNNER_CODE_FILES.filter(n=>loaded.files[n]!==current.files[n]):[],...(loaded&&code.restartedFrom&&[loaded.digest,scriptsDigest(loaded.files)].includes(code.marker)?{restartedFrom:code.restartedFrom}:{}),...(generation?{restartGeneration:generation}:{})};
+    ...(decision.reason==="load-failed"?{checkout:decision.checkout==="restored"?"restored":"not-restored",...(sha(decision.loadedCommit)?{loadedCommit:decision.loadedCommit}:{})}:{}),loaded,current,changed:loaded&&current?RUNNER_CODE_FILES.filter(n=>loaded.files[n]!==current.files[n]):[],...(loaded&&code.restartedFrom&&[loaded.digest,scriptsDigest(loaded.files)].includes(code.marker)?{restartedFrom:code.restartedFrom}:{}),...(generation?{restartGeneration:generation}:{})};
   if(prior && unchecked(prior)===unchecked(record))return prior;
   save(path,record);return record;
 }
@@ -2373,16 +2394,31 @@ export function codeNotice(record,kind=record?.state){
   const changed=(Array.isArray(record.changed)?record.changed:[]).filter(n=>RUNNER_CODE_FILES.includes(n)).join(", ")||"none";
   const seen=`Deployer run ${run} loaded scripts ${loaded}; ${record.current?`published tasks-hub ${short(record.current.commit)} has ${current}`:"the published tasks-hub scripts could not be read"}. Changed: ${changed}.`;
   const generation=generationOf(record.restartGeneration),restartId=["restart","restarted"].includes(kind) && generation>=2?`-r${generation}`:"";
-  const requestId=`runner-code-${run}-${loaded}-${current}-${kind}${kind==="refused"?"-"+reason:restartId}`;
+  const unrestored=kind==="refused" && reason==="load-failed" && record.checkout!=="restored";
+  const requestId=`runner-code-${run}-${loaded}-${current}-${kind}${kind==="refused"?"-"+reason:restartId}${unrestored?"-not-restored":""}`;
   if(kind==="draining")return {requestId,wake:WAKE.routine,subject:"Deployer code is out of date; it restarts itself after the current release",text:`${seen} It claims no new release, and restarts itself onto the published scripts once no release, matrix run or host release lock is active.`};
   // A restart with a held job is its own notice and names the job.
   if(kind==="restart" && record.heldJob!==undefined){const job=NAME(record.heldJob);return {requestId:`${requestId}-held-${job}`,wake:WAKE.routine,subject:"Deployer is restarting itself onto the published scripts with a held job",text:`${seen} Its only owned release ${job} is held, with no release effects, nothing published, no unsettled matrix run and no host release lock, so it restarts itself now with that held job and the same agent and run; the published scripts then run the job. A notice that it runs the published scripts follows; if none arrives the deployer did not come back. ${RESTART_ACTION}`};}
   if(kind==="restart")return {requestId,wake:WAKE.routine,subject:"Deployer is restarting itself onto the published scripts",text:`${seen} No release is active, so it restarts itself now with the same agent and run. A notice that it runs the published scripts follows; if none arrives the deployer did not come back. ${RESTART_ACTION}`};
   if(kind==="restarted")return {requestId,wake:WAKE.routine,subject:"Deployer now runs the published scripts",text:`Deployer run ${run} restarted itself from scripts ${short(record.restartedFrom)} and now runs ${loaded}, the scripts of published tasks-hub ${short(record.current?.commit)}.`};
+  // A published runner that does not load is not one to re-provision onto
+  // (wi_f6bd907b134a9331 s6): the notice names the checkout's state instead.
+  if(kind==="refused" && reason==="load-failed"){
+    const head=short(record.loadedCommit),fix="fix the published scripts on tasks-hub; the deployer checks a new published digest again and restarts itself once its runner loads";
+    if(!unrestored)return {requestId,wake:WAKE.attention,subject:"Deployer is not claiming releases: its scripts are out of date",
+      text:`${seen} The published runner does not load, so it did not restart itself and claims no release; its checkout is back on the loaded commit ${head}. Reason: load-failed. Action: ${fix} (docs/project-deployment.md).`};
+    return {requestId,wake:WAKE.attention,subject:"Deployer is not claiming releases: do not re-provision it from its checkout",
+      text:`${seen} The published runner does not load, so it did not restart itself and claims no release, and its checkout could not be put back on the loaded commit ${head}: it still holds the scripts that do not load. Reason: load-failed. Do not re-provision from this checkout. Action: ${fix}, or restore the checkout to the loaded commit before any re-provision (docs/project-deployment.md).`};
+  }
   return {requestId,wake:WAKE.attention,subject:["loaded-unreadable","published-unreadable"].includes(reason)?"Deployer is not claiming releases: it cannot compare its scripts with the published ones":"Deployer is not claiming releases: its scripts are out of date",
     text:`${seen} It could not restart itself and claims no release. Reason: ${reason}. ${RESTART_ACTION}`};
 }
-const CODE_LINES={draining:"Deployer code is out of date; no new release is claimed and a restart follows the active work.\n",restart:"Deployer restarting itself onto the published scripts.\n",refused:"Deployer code is out of date and it cannot restart itself; no release is claimed until it is re-provisioned.\n"};
+const CODE_LINES={draining:"Deployer code is out of date; no new release is claimed and a restart follows the active work.\n",restart:"Deployer restarting itself onto the published scripts.\n",refused:"Deployer code is out of date and it cannot restart itself; no release is claimed until it is re-provisioned.\n",
+  restored:"Deployer code is out of date and the published runner does not load; its checkout is back on the loaded commit and no release is claimed until a published runner loads.\n",
+  unrestored:"Deployer code is out of date and the published runner does not load; its checkout could not be restored, so do not re-provision from it: restore it to the loaded commit or fix the published scripts.\n"};
+// The terminal line for a code state: a load-failed refusal says whether its
+// checkout was restored rather than asking for a re-provision.
+const codeLine=(record,kind)=>kind==="refused" && record.reason==="load-failed"?CODE_LINES[record.checkout==="restored"?"restored":"unrestored"]:CODE_LINES[kind];
 export function runnableJob(jobs,agent,run,skipped=new Set()){
   const owned=jobs.find(j=>["claimed","merged"].includes(j.state) && j.agentId===agent && j.runId===run);
   if(owned)return owned;
@@ -2718,7 +2754,8 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
   // digest for this process; a failed post is retried by the next poll.
   const codeNotify=(reader,record,kind=record.state)=>{
     const notice=codeNotice(record,kind);if(!notice)return;
-    if(CODE_LINES[kind] && !code.said.has(notice.requestId)){code.said.add(notice.requestId);process.stderr.write(CODE_LINES[kind]);}
+    const line=codeLine(record,kind);
+    if(line && !code.said.has(notice.requestId)){code.said.add(notice.requestId);process.stderr.write(line);}
     if(code.noticed.has(notice.requestId))return;
     try{say(reader,[config.tt||"tt","send","--kind","notice","--subject",notice.subject,"--text",notice.text,"--request-id",notice.requestId,...wakeRef(notice.wake)]);code.noticed.add(notice.requestId);}
     catch{process.stderr.write("Runner code notice not posted; the next poll retries.\n");}
@@ -2831,11 +2868,15 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
     // A re-exec that failed in this process is not tried again for the same
     // published code, so its refusal is not rewritten on every poll.
     if(decision.state==="restart" && code.execFailed===published.digest)decision={state:"refused",reason:"exec-failed"};
-    // Nor is a published runner that did not load spawned again.
-    if(decision.state==="restart" && code.loadFailed===published.digest)decision={state:"refused",reason:"load-failed"};
+    // Nor is a published runner that did not load spawned again; its
+    // refusal keeps the checkout state that load failure left.
+    if(decision.state==="restart" && code.loadFailed===published.digest)decision={state:"refused",reason:"load-failed",checkout:code.loadRestored?"restored":"not-restored",loadedCommit:code.loadedHead};
     // A runner told to stop does not restart: nothing below moves the
     // checkout, replaces the process or claims once the signal is set.
     if(decision.state==="restart"){await stopSignalTurn();if(signal?.aborted)return STOP;}
+    // The HEAD this process loaded from is the one its first poll finds:
+    // nothing before that poll moves the checkout.
+    if(code.loadedHead===undefined){try{code.loadedHead=git(config.cwd,"rev-parse","HEAD");}catch{code.loadedHead=null;}}
     if(decision.state==="restart"){
       try{code.prepare(config.cwd,published);}
       catch(error){const reason=failureReason(error);decision={state:"refused",reason:CODE_REASONS.includes(reason)?reason:"checkout-failed"};}
@@ -2844,7 +2885,13 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
     if(decision.state==="restart"){
       let loads=false;try{loads=await code.loads(config.cwd,signal)===true;}catch{}
       if(signal?.aborted)return STOP;
-      if(!loads){code.loadFailed=published.digest;decision={state:"refused",reason:"load-failed"};}
+      // The checkout goes back to the loaded commit, so re-provisioning from
+      // it starts a runner that loads (wi_f6bd907b134a9331 s6).
+      if(!loads){
+        let restored=false;try{code.restore(config.cwd,code.loadedHead,code.loaded);restored=true;}catch{}
+        code.loadFailed=published.digest;code.loadRestored=restored;
+        decision={state:"refused",reason:"load-failed",checkout:restored?"restored":"not-restored",loadedCommit:code.loadedHead};
+      }
     }
     if(decision.state==="restart"){
       // Recorded and announced first: a successful exec never returns.

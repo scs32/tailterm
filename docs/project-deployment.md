@@ -741,9 +741,12 @@ A release can change the scripts the deployer itself runs. One process loads
 them once, so after such a release the running deployer is older than what it
 just published. It checks this itself, once per poll and before any claim.
 
-**What is compared.** The watched set is `RUNNER_CODE_FILES`, six files under
-`scripts/`: `release-inputs.mjs`, `release-probe.mjs`, `release-runner.mjs`,
-`release-targets.mjs`, `verify-matrix-host-lock.mjs` and `verify-matrix.mjs`. A
+**What is compared.** The watched set is `RUNNER_CODE_FILES`: the modules the
+runner loads through its relative imports, each named by its path from
+`scripts/`. They are `../tests/test-binaries.mjs` (which `verify-matrix.mjs`
+imports from `tests/`), `release-inputs.mjs`, `release-probe.mjs`,
+`release-runner.mjs`, `release-targets.mjs`, `verify-matrix-host-lock.mjs` and
+`verify-matrix.mjs`; a drift test keeps the list equal to those imports. A
 code digest is the sha256 of their `name:sha256` lines. The loaded digest is
 read once as the process starts, from the files beside the running module. The
 published digest is read at every poll from the blobs of the commit that
@@ -793,7 +796,7 @@ is no held job without a ledger. Otherwise it drains.
 **Restart.** A deployer that was told to stop does not restart. Otherwise it
 first prepares the checkout: `git status --porcelain` must be empty (ignored
 build outputs do not count), `HEAD` is moved to the published commit with `git
-checkout --detach` when it differs, and the six files on disk must then have
+checkout --detach` when it differs, and the watched files on disk must then have
 the published digest. It then proves that the published runner loads
 (wi_56ac00ba2854fa3d c2): a child Node process imports the checkout's
 `scripts/release-runner.mjs`, and with it every watched file, within 20
@@ -802,8 +805,16 @@ no entry point's own-path check matches and nothing runs but the imports; it
 gets the deployer's environment without the re-exec markers. A child that
 throws, exits non-zero or times out (it is then killed, as it is when the
 deployer is told to stop) refuses the restart with `load-failed`: no restart
-notice, no exec, one refused notice. Only after the check does it record and
-announce the restart, then replace its own process image with the same Node
+notice, no exec, one refused notice. Before that notice the deployer puts its
+checkout back on the commit this process loaded from (wi_f6bd907b134a9331 s6),
+the `HEAD` its first poll found, since a release may since have left the
+checkout on the published commit. It moves the checkout only when it is clean
+and that commit's watched blobs are the loaded bytes, and counts it restored
+only when `HEAD` is then that commit, the checkout is clean and the watched
+files on disk are the loaded bytes. A restored checkout holds a runner that
+loads. One that could not be restored still holds the published scripts that do
+not load: its notice says not to re-provision from it. Only after the check
+does it record and announce the restart, then replace its own process image with the same Node
 executable and arguments. The pid, agent
 and run stay the same. The new image is told which published digest the
 restart aimed at and which digest it came from. When it then finds itself
@@ -817,25 +828,27 @@ and `restart-did-not-refresh` hold for as long as the published digest stays
 the same: the child of `load-failed` is not spawned again for that digest, and
 a new published digest is checked afresh.
 
-| Reason                    | Meaning                                                                                                                   | Operator action                                                                                     |
-| ------------------------- | ------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| `loaded-unreadable`       | The scripts beside the running module could not be read when the process started.                                         | Restore the checkout's `scripts/`, then re-provision.                                               |
-| `published-unreadable`    | `refs/heads/tasks-hub` does not resolve to a commit in the checkout, or one of the six blobs is missing from it.          | Repair the local ref or the missing objects; the next poll compares again.                          |
-| `checkout-dirty`          | `git status --porcelain` is not empty, so the checkout was not moved.                                                     | Inspect the checkout and remove or preserve what is there; the next poll retries.                   |
-| `checkout-failed`         | `git status`, `git rev-parse` or the detached checkout failed.                                                            | Repair the worktree; the next poll retries.                                                         |
-| `disk-mismatch`           | After the checkout the six files are unreadable or are not the published bytes.                                           | Restore the files to the published commit; the next poll retries.                                   |
-| `exec-failed`             | Replacing the process image failed. This process does not try again for the same published digest.                        | Re-provision.                                                                                       |
-| `load-failed`             | The published runner did not load in a child process within its bound, so the process was not replaced by it.             | Fix the published scripts on `tasks-hub`; a new published digest is checked again. Or re-provision. |
-| `restart-did-not-refresh` | The process was already restarted for this published digest and is still stale: the restart did not change what it loads. | Re-provision, and check that the deployer's command starts the runner from the configured checkout. |
+| Reason                    | Meaning                                                                                                                   | Operator action                                                                                                                                                                                       |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `loaded-unreadable`       | The scripts beside the running module could not be read when the process started.                                         | Restore the checkout's `scripts/`, then re-provision.                                                                                                                                                 |
+| `published-unreadable`    | `refs/heads/tasks-hub` does not resolve to a commit in the checkout, or one of the watched blobs is missing from it.      | Repair the local ref or the missing objects; the next poll compares again.                                                                                                                            |
+| `checkout-dirty`          | `git status --porcelain` is not empty, so the checkout was not moved.                                                     | Inspect the checkout and remove or preserve what is there; the next poll retries.                                                                                                                     |
+| `checkout-failed`         | `git status`, `git rev-parse` or the detached checkout failed.                                                            | Repair the worktree; the next poll retries.                                                                                                                                                           |
+| `disk-mismatch`           | After the checkout the watched files are unreadable or are not the published bytes.                                       | Restore the files to the published commit; the next poll retries.                                                                                                                                     |
+| `exec-failed`             | Replacing the process image failed. This process does not try again for the same published digest.                        | Re-provision.                                                                                                                                                                                         |
+| `load-failed`             | The published runner did not load in a child process within its bound, so the process was not replaced by it.             | Fix the published scripts on `tasks-hub`; a new published digest is checked again. Re-provision only from a `restored` checkout: with `not-restored`, first check the checkout out at `loadedCommit`. |
+| `restart-did-not-refresh` | The process was already restarted for this published digest and is still stale: the restart did not change what it loads. | Re-provision, and check that the deployer's command starts the runner from the configured checkout.                                                                                                   |
 
-Re-provision means the action every refusal notice names: run `tt deployment
-setup` for the deployer with its current run as predecessor (the provisioning
-order at the top of this document). No release is active in a refusal that
+Re-provision means the action every refusal notice but `load-failed` names: run
+`tt deployment setup` for the deployer with its current run as predecessor (the
+provisioning order at the top of this document). No release is active in a refusal that
 followed a restart attempt, because only an idle deployer attempts one.
 
 **Where it shows.** The private record is `runner-code.json` in the journal
 directory, mode 0600: `agentId`, `runId`, `pid`, `startedAt`, `checkedAt`,
-`state`, `reason` when refused, `loaded` (`digest` and per-file `files`),
+`state`, `reason` when refused, for `load-failed` also `checkout` (`restored`
+or `not-restored`) and `loadedCommit` (the commit this process loaded from),
+`loaded` (`digest` and per-file `files`),
 `current` (the published `commit`, `digest` and `files`; null when unreadable),
 `changed` (the watched files that differ), `restartedFrom` after a restart, and
 `restartGeneration`, the latest restart of this run (1 for its first), once the
@@ -858,18 +871,23 @@ set and the fixed reason tokens reach its text:
   not come back: re-provision.
 - "Deployer is not claiming releases: its scripts are out of date", or for the
   two unreadable reasons "Deployer is not claiming releases: it cannot compare
-  its scripts with the published ones" (`refused`, with `Reason: TOKEN`).
+  its scripts with the published ones" (`refused`, with `Reason: TOKEN`). A
+  `load-failed` refusal whose checkout was not restored is "Deployer is not
+  claiming releases: do not re-provision it from its checkout".
   `published-unreadable` is posted only when it withholds a claim.
 
 The request id is `runner-code-RUN-LOADED-CURRENT-STATE`, with `-REASON` for a
-refusal and no time, so a restarted process resends the same notice and an
+refusal (then `-not-restored` for a `load-failed` one whose checkout was not
+restored) and no time, so a restarted process resends the same notice and an
 unchanged poll posts nothing. From a run's second restart on, the `restart` and
 `restarted` ids end in `-rN`, the restart generation (wi_56ac00ba2854fa3d c5),
 and a held restart's `-held-JOB` follows it: a run that goes A to B, B to C and
 C back to B, or repeats A to B after a revert, gets a new id for each restart,
 while a retry of the same restart in one process repeats its id. A run's first
 restart and every `draining` and `refused` id are as before. The deployer's
-terminal prints one line for each of `draining`, `restart` and `refused`.
+terminal prints one line for each of `draining`, `restart` and `refused`; a
+`load-failed` refusal's line says whether its checkout was restored instead of
+asking for a re-provision.
 
 **Failed CLI calls.** When a call of the configured `tt` fails, the journal
 directory keeps the evidence in `cli-failures.json`, mode 0600: for each

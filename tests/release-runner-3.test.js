@@ -5,7 +5,7 @@ import {mkdtempSync,mkdirSync,copyFileSync,writeFileSync,readFileSync,chmodSync,
 import {tmpdir} from "node:os";
 import {join,dirname,resolve} from "node:path";
 import {execFileSync,execFile,spawnSync} from "node:child_process";
-import {refusalText,heldClaimNotice,integrateCandidate,integrateBatch,NO_CHANGE,publishIntegration,revertCommit,moveReleaseRef,runRelease,HostAdapter,serveDeployment,releaseError,compatibilityArgv,dispatchCompatibility,validateNativeRelease,failureReason,failureDetail,matrixWaitNotice,RUNNER_CODE_FILES,LOADED_CODE,CODE_REASONS,codeDigest,diskCode,publishedCode,codeDecision,prepareCode,runnerCodeGate,codeRecord,codeNotice,cliFailureNotice,cliRetry,transportWait,transportWaitNotice,heldRetry,journalIdle,runnerLoads} from "../scripts/release-runner.mjs";
+import {refusalText,heldClaimNotice,integrateCandidate,integrateBatch,NO_CHANGE,publishIntegration,revertCommit,moveReleaseRef,runRelease,HostAdapter,serveDeployment,releaseError,compatibilityArgv,dispatchCompatibility,validateNativeRelease,failureReason,failureDetail,matrixWaitNotice,RUNNER_CODE_FILES,LOADED_CODE,CODE_REASONS,codeDigest,diskCode,publishedCode,codeDecision,prepareCode,restoreCode,runnerCodeGate,codeRecord,codeNotice,cliFailureNotice,cliRetry,transportWait,transportWaitNotice,heldRetry,journalIdle,runnerLoads} from "../scripts/release-runner.mjs";
 import {acquireHostLock,readHostState as rawReadHostState,holdersOf} from "../scripts/verify-matrix-host-lock.mjs";
 import {createHash} from "node:crypto";
 import {RELEASE_READ_ATTEMPTS,wranglerBin} from "../scripts/release-inputs.mjs";
@@ -691,7 +691,7 @@ test("code a7 every code notice is safe text with 12-hex digests and only watche
  const saved=process.env.TAILTERM_RUN;process.env.TAILTERM_RUN=CODE_RUN;t.after(()=>{if(saved===undefined)delete process.env.TAILTERM_RUN;else process.env.TAILTERM_RUN=saved;});
  const build=(decision,over={})=>codeRecord({journalDirectory:home},{loaded:r.codeA,marker:null,restartedFrom:null,now:()=>0,...over},decision,r.codeB);
  const l=r.codeA.digest.slice(0,12),c=r.codeB.digest.slice(0,12),ids=new Set();
- const cases=[[build({state:"draining"}),"draining"],[build({state:"restart"}),"restart"],...CODE_REASONS.map(reason=>[build({state:"refused",reason}),"refused"]),
+ const cases=[[build({state:"draining"}),"draining"],[build({state:"restart"}),"restart"],...CODE_REASONS.map(reason=>[build({state:"refused",reason}),"refused"]),[build({state:"refused",reason:"load-failed",checkout:"restored",loadedCommit:r.a}),"refused"],
   [codeRecord({journalDirectory:home},{loaded:r.codeB,marker:r.codeB.digest,restartedFrom:r.codeA.digest,now:()=>0},{state:"current"},r.codeB),"restarted"]];
  for(const [record,kind] of cases){
   const notice=codeNotice(record,kind);
@@ -707,6 +707,8 @@ test("code a7 every code notice is safe text with 12-hex digests and only watche
  // Unlisted names, reasons and run ids never reach the text.
  const hostile=codeNotice({state:"refused",reason:"x'; rm -rf /",runId:"run with spaces'",loaded:{digest:"SECRET"},current:{commit:"../../etc/passwd",digest:r.codeB.digest},changed:["../../etc/passwd","release-runner.mjs","evil.mjs"]});
  assert.match(hostile.text,SAFE_TEXT);assert.ok(!/passwd|evil|rm -rf|SECRET|spaces/.test(hostile.text+hostile.requestId));assert.ok(hostile.text.includes("Reason: unclassified."));assert.ok(hostile.text.includes("Changed: release-runner.mjs."));
+ const hostileHead=codeNotice({state:"refused",reason:"load-failed",checkout:"restored",loadedCommit:"../../etc/passwd",runId:CODE_RUN,loaded:{digest:r.codeA.digest},current:{commit:r.b,digest:r.codeB.digest},changed:[]});
+ assert.match(hostileHead.text,SAFE_TEXT);assert.ok(!/passwd/.test(hostileHead.text));assert.ok(hostileHead.text.includes("loaded commit none."));
  assert.equal(codeNotice({state:"current"}),null);
  // The decision itself, with a fixed clock and digests only.
  assert.deepEqual(codeDecision({loaded:r.codeA,published:r.codeA,idle:false}),{state:"current"});
@@ -997,23 +999,66 @@ test("code c1 a runner that cannot read its job list and cannot restart refuses 
  assert.match(await q.poll(quiet.gate),/^Deployment poll held \(/);assert.deepEqual(codeSends(q),[]);assert.equal(q.record().reason,"published-unreadable");assert.equal(quiet.execs.length,0);
 });
 // The published runner's load check (wi_56ac00ba2854fa3d c2).
-test("code c2 a published runner that does not load is refused once, with no exec, and is not retried for that digest",{timeout:60000},async t=>{
+const RESTORED_LINE="Deployer code is out of date and the published runner does not load; its checkout is back on the loaded commit and no release is claimed until a published runner loads.\n";
+const UNRESTORED_LINE="Deployer code is out of date and the published runner does not load; its checkout could not be restored, so do not re-provision from it: restore it to the loaded commit or fix the published scripts.\n";
+test("code c2 a published runner that does not load is refused once, with no exec, its checkout is restored, and it is not retried for that digest",{timeout:60000},async t=>{
  for(const mode of ["throw","hang"]){
   const r=codeRepo(t),h=codeHost(t,r.cwd),counter=join(h.home,"loads-"+mode),bad=codeCommit(r,r.a,unloadable(counter,mode));r.at(r.a,bad.commit);h.setJobs([verifiedJob()]);
-  const {gate,execs}=codeGate(r.codeA,{loadTimeoutMs:300}),started=Date.now();
+  const {gate,execs}=codeGate(r.codeA,{loadTimeoutMs:300}),started=Date.now(),heads=[];gate.loads=(load=>function(cwd,signal){heads.push(git(cwd,"rev-parse","HEAD"));return load.call(this,cwd,signal);})(gate.loads);
   const err=await h.poll(gate)+await h.poll(gate)+await h.poll(gate);
   assert.ok(Date.now()-started<15000,mode);
   assert.equal(readFileSync(counter,"utf8"),"x",mode);assert.equal(execs.length,0,mode);assert.equal(h.claims().length,0,mode);
-  assert.equal(h.record().state,"refused",mode);assert.equal(h.record().reason,"load-failed",mode);
+  // The load check ran on the published commit; the checkout is back on the loaded one, clean, and later polls leave it there.
+  assert.deepEqual(heads,[bad.commit],mode);assert.equal(r.head(),r.a,mode);assert.equal(git(r.cwd,"status","--porcelain"),"",mode);assert.equal(diskCode(join(r.cwd,"scripts")).digest,r.codeA.digest,mode);
+  assert.equal(h.record().state,"refused",mode);assert.equal(h.record().reason,"load-failed",mode);assert.equal(h.record().checkout,"restored",mode);assert.equal(h.record().loadedCommit,r.a,mode);
   assert.deepEqual(codeSends(h).map(s=>s.requestId),[`runner-code-${CODE_RUN}-${r.codeA.digest.slice(0,12)}-${bad.code.digest.slice(0,12)}-refused-load-failed`],mode);
-  assert.equal(codeSends(h)[0].subject,"Deployer is not claiming releases: its scripts are out of date",mode);assert.match(codeSends(h)[0].text,/Reason: load-failed\. Action: run tt deployment setup/,mode);
-  assert.equal(err,"Deployer code is out of date and it cannot restart itself; no release is claimed until it is re-provisioned.\n",mode);
+  const sent=codeSends(h)[0];assert.equal(sent.subject,"Deployer is not claiming releases: its scripts are out of date",mode);
+  assert.match(sent.text,/its checkout is back on the loaded commit [a-f0-9]{12}\. Reason: load-failed\. Action: fix the published scripts on tasks-hub/,mode);assert.ok(sent.text.includes(r.a.slice(0,12)),mode);
+  assert.doesNotMatch(sent.text,/tt deployment setup|re-provision/,mode);assert.match(sent.text,SAFE_TEXT,mode);
+  assert.equal(err,RESTORED_LINE,mode);
   // A new published digest is checked again, and restarts once it loads.
   const fixed=codeCommit(r,r.a,"// release-runner.mjs fixed\n");r.at(r.head(),fixed.commit);
   await h.poll(gate);assert.equal(execs.length,1,mode);assert.equal(r.head(),fixed.commit,mode);assert.equal(h.record().state,"restart",mode);assert.equal(readFileSync(counter,"utf8"),"x",mode);
   assert.deepEqual(codeSends(h).map(s=>s.requestId.split("-").slice(5).join("-")),["refused-load-failed","restart"],mode);
  }
  assert.ok(CODE_REASONS.includes("load-failed"));
+});
+test("code c2 a runner whose own release published scripts that do not load restores the commit it loaded from",{timeout:60000},async t=>{
+ // The usual case: its release left HEAD and tasks-hub on the new commit, so the restart's prepare does not move HEAD.
+ const r=codeRepo(t),h=codeHost(t,r.cwd),counter=join(h.home,"loads"),bad=codeCommit(r,r.a,unloadable(counter,"throw"));r.at(r.a,r.a);
+ const {gate,execs}=codeGate(r.codeA,{loadTimeoutMs:300});
+ await h.poll(gate);assert.equal(h.record().state,"current");assert.equal(codeSends(h).length,0);
+ r.at(bad.commit,bad.commit);h.setJobs([verifiedJob()]);
+ const err=await h.poll(gate)+await h.poll(gate);
+ assert.equal(readFileSync(counter,"utf8"),"x");assert.equal(execs.length,0);assert.equal(h.claims().length,0);
+ assert.equal(r.head(),r.a);assert.equal(git(r.cwd,"status","--porcelain"),"");assert.equal(git(r.cwd,"rev-parse","refs/heads/tasks-hub"),bad.commit);
+ assert.equal(h.record().checkout,"restored");assert.equal(h.record().loadedCommit,r.a);
+ assert.deepEqual(codeSends(h).map(s=>s.requestId.split("-").slice(5).join("-")),["refused-load-failed"]);assert.equal(err,RESTORED_LINE);
+});
+test("code c2 a load-failed refusal whose checkout cannot be restored says not to re-provision from it",{timeout:60000},async t=>{
+ // Two real restore failures: the checkout is left dirty, or the HEAD the first poll found does not hold the loaded scripts.
+ const cases={dirty:(r,bad)=>{r.at(r.a,bad.commit);return cwd=>writeFileSync(join(cwd,"stray.txt"),"x");},moved:(r,bad)=>{r.at(r.b,bad.commit);return ()=>{};}};
+ for(const [name,setup] of Object.entries(cases)){
+  const r=codeRepo(t),h=codeHost(t,r.cwd),counter=join(h.home,"loads"),bad=codeCommit(r,r.a,unloadable(counter,"throw")),after=setup(r,bad);h.setJobs([verifiedJob()]);
+  const {gate,execs}=codeGate(r.codeA,{loadTimeoutMs:300});gate.loads=(load=>async function(cwd,signal){const out=await load.call(this,cwd,signal);after(cwd);return out;})(gate.loads);
+  const err=await h.poll(gate);const head=r.head();
+  const again=await h.poll(gate);
+  assert.equal(readFileSync(counter,"utf8"),"x",name);assert.equal(execs.length,0,name);assert.equal(h.claims().length,0,name);
+  // Left where the failed load check put it, and not moved by the later poll.
+  assert.equal(head,bad.commit,name);assert.equal(r.head(),head,name);
+  const record=h.record();assert.equal(record.state,"refused",name);assert.equal(record.reason,"load-failed",name);assert.equal(record.checkout,"not-restored",name);assert.equal(record.loadedCommit,name==="moved"?r.b:r.a,name);
+  const sends=codeSends(h);assert.deepEqual(sends.map(s=>s.requestId),[`runner-code-${CODE_RUN}-${r.codeA.digest.slice(0,12)}-${bad.code.digest.slice(0,12)}-refused-load-failed-not-restored`],name);
+  assert.equal(sends[0].subject,"Deployer is not claiming releases: do not re-provision it from its checkout",name);
+  assert.match(sends[0].text,/Reason: load-failed\. Do not re-provision from this checkout\. Action: fix the published scripts on tasks-hub; .*, or restore the checkout to the loaded commit before any re-provision/,name);
+  assert.doesNotMatch(sends[0].text,/tt deployment setup/,name);assert.match(sends[0].text,SAFE_TEXT,name);assert.ok(!/[a-f0-9]{13}/.test(sends[0].text),name);
+  assert.equal(err,UNRESTORED_LINE,name);assert.equal(again,"",name);
+ }
+ // restoreCode alone: it refuses a commit that is not a sha, or loaded code that is not valid.
+ const r=codeRepo(t);r.at(r.b,r.b);
+ for(const [head,loaded] of [[null,r.codeA],["x",r.codeA],[r.a,null]])assert.throws(()=>restoreCode(r.cwd,head,loaded),/not-restored/);
+ // A commit whose watched blobs are not the loaded bytes is not checked out.
+ assert.throws(()=>restoreCode(r.cwd,r.b,r.codeA),/not-restored/);assert.throws(()=>restoreCode(r.cwd,r.a,r.codeB),/not-restored/);
+ assert.equal(r.head(),r.b);restoreCode(r.cwd,r.a,r.codeA);assert.equal(r.head(),r.a);assert.equal(git(r.cwd,"status","--porcelain"),"");
 });
 test("code c2 the load check imports the published runner without running its entry",{timeout:60000},async t=>{
  // A tt on PATH that logs any call: the import must make none.
