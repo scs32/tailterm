@@ -1608,13 +1608,15 @@ decision that a verified job must wait is saved on the job itself, where the
 hub enforces it. Both commands are handler-only:
 
 ```
-tt deployment hold   --job ID --generation N --reason TEXT [--until-items wi_a,wi_b] --request-id KEY
+tt deployment hold   --job ID --generation N --reason TEXT [--not-before RFC3339 | --until-items wi_a,wi_b] --request-id KEY
 tt deployment unhold --job ID --generation N --reason TEXT --request-id KEY
+tt deployment hold   --entry ENTRY --reason TEXT [--not-before RFC3339] --request-id KEY
+tt deployment unhold --entry ENTRY --reason TEXT --request-id KEY
 ```
 
 `hold` moves a `verified` job that no deployer has claimed to state `held` and
-saves its `hold`: the reason, the release condition (`untilItems`), the handler
-agent and run, and the time. While the job is `held`:
+saves its `hold`: the reason, the release condition (`untilItems` or
+`notBefore`), the handler agent and run, and the time. While the job is `held`:
 
 - A claim of it is refused (`job ID is on an owner hold (REASON)`), and so is
   adding it to a batch. The runner picks only `verified` jobs, so it passes over
@@ -1630,19 +1632,24 @@ agent and run, and the time. While the job is `held`:
 claimed in its original order. The hub also lifts a hold by itself when it
 names items: once every item in `untilItems` has a release job that is
 `released` or `superseded`, the request that settled the last one returns the
-held job to `verified`. A hold with no items ends only with `unhold`.
+held job to `verified`. A hold with a not-before time is lifted at the first
+ledger list after that time (`tt deployment list`, which the runner reads
+before each claim); until then its claim is refused with `until TIME`. Inside an
+open quiet window the lifted job is window-held again. A hold with neither ends
+only with `unhold`.
 
 Every transition is appended to the job's `holdHistory` and never rewritten: a
 `hold` event, then a `release` event whose `cause` is `handler` (an unhold, with
-the handler's agent, run and reason) or `items_released` (with `triggerJobId`,
-the job whose release met the condition). Each carries the job generation after
+the handler's agent, run and reason), `items_released` (with `triggerJobId`,
+the job whose release met the condition) or `not_before` (its time passed). Each carries the job generation after
 the event and the hub time.
 
 Rules the hub checks:
 
 - The reason is one line of at most 512 characters. `--until-items` names at
   most 16 existing work items of the project, none twice and not the job's own
-  item. A condition that is already met is refused.
+  item. A condition that is already met is refused, and so is a `--not-before`
+  time that is not after the hub time. A hold names items or a time, not both.
 - Only a `verified`, unclaimed job can be held. A claimed job with no effects is
   set aside first and then held; the refusal says so. A job whose latest
   reconcile record carries a host lock digest (a requeue) cannot be held: the
@@ -1660,11 +1667,44 @@ list read and its claim makes that one claim fail: the runner posts its usual
 for a claim the hub refuses; a claim that fails only in transport is not a
 held claim (A lasting transport wait, above).
 
-Which of the four to use:
+#### Holding before acceptance (dated owner holds)
+
+An order that says a change must not release before a time T asks the database
+handler to save an entry hold on the item's queue entry as soon as the entry
+exists, before the done save with queue acceptance:
+`tt deployment hold --entry ENTRY --reason TEXT --not-before T`. The acceptance
+transaction then creates the release job already `held` (a `hold` event with
+cause `entry`), so the deployer, which claims a verified job as soon as it is
+created and reads no board messages, never sees it `verified`. A hold saved on
+the job after acceptance races that claim. A board message alone (a notice,
+request or block) cannot stop the deployer; only a hold saved in the ledger
+does. At T the hub lifts the hold at the next ledger list (cause `not_before`);
+inside an open quiet window the job is window-held again.
+
+An entry hold is `standing` until the entry's next release job exists
+(acceptance, enqueue or retry); that job is created `held` and the entry hold
+becomes `applied`. One whose time passed before the job exists becomes
+`expired` and the job is created `verified`. `unhold --entry` releases a
+standing one (`released`); after it applies, the job is held like any owner
+hold. A requeue moves a standing entry hold to the new entry (the old one
+becomes `moved`, naming the new entry), so the requeued entry's acceptance
+creates its job held. `tt deployment list` shows standing entry holds under
+`entryHolds`. An entry hold is refused while the entry already has a release
+job that is not `refused` or `rolled_back`: hold that job instead. For a
+refused or rolled-back job that must not be retried before T, save the entry
+hold before `tt deployment retry`. A claimed job cannot be held: see "Setting
+aside a job that holds the fence".
+
+After the hub saves an entry hold or its release, the CLI posts one board
+notice linked to the entry's item ("A release is on hold before acceptance" or
+"An entry release hold was released").
+
+Which of these to use:
 
 | | Applies to | Effect | Ends when |
 |---|---|---|---|
-| Owner hold (`hold`) | a `verified`, unclaimed job | state `held`; never claimed or batched; queue position kept | `unhold`, or its named items release |
+| Owner hold (`hold`) | a `verified`, unclaimed job | state `held`; never claimed or batched; queue position kept | `unhold`, its named items release, or its not-before time |
+| Entry hold (`hold --entry`) | a queue entry before its next release job exists | that job is created `held` | `unhold --entry` before it applies; afterwards as an owner hold, or its not-before time |
 | Release quiet window (`tt deployment window set`, owner) | every covered `verified`, unclaimed job while the window is open, including one the ledger check covers | the hub saves a window hold (state `held`); claim and batch-add of a covered job are refused | `unhold` after the window ends, or after the owner clears it |
 | Set-aside (`set-aside`) | a `claimed` job with no effects while a later verified job waits | back to `verified` behind every queued job; claimed again when its turn comes | it is not a hold: nothing stops the next claim |
 | Refuse (`refuse`, or `reconcile` with `refuse`) | a claimed job that must not release as it is | terminal state `refused` | never; a new job needs `tt deployment retry` |
