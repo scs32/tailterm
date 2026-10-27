@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
+	"github.com/scs32/tailterm/hub/internal/store"
 )
 
 // captureHome gives the test its own HOME and returns the capture file path
@@ -328,6 +329,16 @@ func TestProviderUsageTickReportRule(t *testing.T) {
 	tick("an older hub, half an hour later")
 	now = now.Add(31 * time.Minute)
 	tick("an older hub, an hour later", api.ProviderUsageOK)
+}
+
+// The store's staleness floor must cover a keep-fresh report plus one retry,
+// or a budget row at the floor would read stale between reports. The store
+// cannot import cmd/tt, so this test ties the two.
+func TestProviderUsageIntervalsFitStaleFloor(t *testing.T) {
+	floor := time.Duration(store.MinUsageBudgetStaleSeconds) * time.Second
+	if floor < providerUsageKeepFresh+providerUsageRetry {
+		t.Fatalf("store staleness floor %s is below keep-fresh %s plus retry %s (%s)", floor, providerUsageKeepFresh, providerUsageRetry, providerUsageKeepFresh+providerUsageRetry)
+	}
 }
 
 // a7 against a real hub: after a good reading then an invalidation the hub

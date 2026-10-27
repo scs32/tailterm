@@ -665,14 +665,16 @@ func (s *Store) UsageBudgets(ctx context.Context, task, host string) (api.UsageB
 	return readUsageBudgets(ctx, s.db, task, host, s.now())
 }
 
-// minUsageBudgetStaleSeconds and maxUsageBudgetStaleSeconds bound a budget
+// MinUsageBudgetStaleSeconds and maxUsageBudgetStaleSeconds bound a budget
 // row's staleness setting. The floor is what the relay can keep fresh: it
 // re-reports an unchanged reading every 5 minutes (providerUsageKeepFresh in
 // cmd/tt/provider_usage.go) and retries a failed report after 1 minute
 // (providerUsageRetry), so a smaller bound would make the reading stale most
-// of the time. The store cannot import cmd/tt; keep the three in step.
+// of the time. The store cannot import cmd/tt, so the floor is exported and
+// TestProviderUsageIntervalsFitStaleFloor in cmd/tt fails if it is below
+// the two intervals together.
 const (
-	minUsageBudgetStaleSeconds = 6 * 60
+	MinUsageBudgetStaleSeconds = 6 * 60
 	maxUsageBudgetStaleSeconds = 24 * 60 * 60
 )
 
@@ -699,7 +701,7 @@ func (s *Store) SetUsageBudget(ctx context.Context, task string, req api.UsageBu
 	if stale == 0 {
 		stale = api.DefaultUsageBudgetStaleSeconds
 	}
-	if stale < minUsageBudgetStaleSeconds || stale > maxUsageBudgetStaleSeconds {
+	if stale < MinUsageBudgetStaleSeconds || stale > maxUsageBudgetStaleSeconds {
 		return zero, usageInvalid("budget staleness bound must be 6 minutes (360 seconds) to 24 hours: the relay re-reports an unchanged reading every 5 minutes and retries a failed report after 1 minute")
 	}
 	reset := ""
