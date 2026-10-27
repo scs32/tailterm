@@ -4306,6 +4306,11 @@ func TestReleaseHoldRefusesClaimedAndTerminalJobs(t *testing.T) {
 		if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "tt deployment set-aside") || !strings.Contains(err.Error(), j.State) {
 			t.Fatalf("%s: %v", name, err)
 		}
+		// h3 (wi_c09132e28129688d): a claimed job's refusal names the
+		// supported path, set-aside after the integrated run, then hold.
+		if j.State == "claimed" && (!strings.Contains(err.Error(), "After its integrated verification run ends") || !strings.Contains(err.Error(), "and then held") || !strings.Contains(err.Error(), "tt deployment hold --entry")) {
+			t.Fatalf("%s: %v", name, err)
+		}
 		if releaseRow(t, s, task, j.ID) != row {
 			t.Fatalf("%s: refused hold changed the job", name)
 		}
@@ -7747,5 +7752,346 @@ func TestReleaseWindowSweepStalesPagedList(t *testing.T) {
 	page := windowPage(t, s, task)
 	if pageJob(t, page, jobs[0].ID).State != "held" || pageJob(t, page, jobs[1].ID).State != "held" {
 		t.Fatalf("fresh list %+v", page.Jobs)
+	}
+}
+
+// Entry holds and dated holds (wi_c09132e28129688d): an owner hold saved on
+// a queue entry before acceptance creates the job held, and a hold with a
+// not-before time is lifted by the hub once the time passes.
+
+func entryHoldRequest(key, op, agent, run, entry, reason, notBefore string) api.ReleaseRequest {
+	return api.ReleaseRequest{RequestID: key, Operation: op, AgentID: agent, RunID: run, EntryID: entry, Hold: &api.ReleaseHold{Reason: reason, NotBefore: notBefore}}
+}
+
+// entryHoldAcceptance is a running entry not yet accepted, with a running
+// deployer, its handler and the store clock set to a whole second.
+func entryHoldAcceptance(t *testing.T) (planAcceptance, api.TeamQueueEntry, api.Agent, time.Time) {
+	t.Helper()
+	p := newPlanAcceptance(t, "", true)
+	d, err := p.s.AddAgent(context.Background(), p.task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "deployer", Host: "fixture", Session: "deployer", Role: api.AgentRoleDeployment}, api.Caller{Node: "fixture", User: "owner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = p.s.db.Exec(`UPDATE agents SET status='running' WHERE id=?`, d.ID); err != nil {
+		t.Fatal(err)
+	}
+	clock := time.Now().UTC().Truncate(time.Second)
+	setWindowClock(t, p.s, d, clock)
+	e, err := p.s.GetTeamQueueEntry(context.Background(), p.task.ID, p.entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p, e, d, clock
+}
+
+func entryHoldState(t *testing.T, s *Store, task api.Task, entry string) (state, job string) {
+	t.Helper()
+	if err := s.db.QueryRow(`SELECT state,COALESCE(json_extract(record_json,'$.jobId'),'') FROM release_entry_holds WHERE task_id=? AND entry_id=? ORDER BY rowid DESC LIMIT 1`, task.ID, entry).Scan(&state, &job); err != nil {
+		t.Fatal(err)
+	}
+	return state, job
+}
+
+// h1/h4: a dated entry hold saved before acceptance; the accepting
+// transaction creates the job held at its first generation and a claim of it
+// is refused.
+func TestReleaseEntryHoldCreatesAcceptedJobHeld(t *testing.T) {
+	p, e, d, clock := entryHoldAcceptance(t)
+	ctx := context.Background()
+	notBefore := clock.Add(time.Hour).Format(time.RFC3339)
+	reason := "Owner: no release before the measurement ends"
+	saved, err := p.s.ReleaseAction(ctx, p.task.ID, entryHoldRequest("entry-hold", "hold", e.HandlerID, e.HandlerRunID, p.entry, reason, notBefore))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.ID != "" || saved.State != "" || saved.EntryID != p.entry || saved.ItemID != e.ItemID || saved.OrderMessageSeq != e.OrderMessageSeq || saved.Hold == nil || saved.Hold.Reason != reason || saved.Hold.NotBefore != notBefore || saved.Hold.AgentID != e.HandlerID || saved.Hold.RunID != e.HandlerRunID {
+		t.Fatalf("entry hold response %+v %+v", saved, saved.Hold)
+	}
+	if page := windowPage(t, p.s, p.task); len(page.EntryHolds) != 1 || page.EntryHolds[0].EntryID != p.entry || page.EntryHolds[0].State != "standing" || page.EntryHolds[0].NotBefore != notBefore {
+		t.Fatalf("page entry holds %+v", page.EntryHolds)
+	}
+	got, err := p.accept(t, "accept", candidateC, candidateB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j := got.Release
+	if j == nil || j.State != "held" || j.Generation != 1 || j.AgentID != "" || j.Hold == nil || j.Hold.Reason != reason || j.Hold.NotBefore != notBefore || j.Hold.AgentID != e.HandlerID || j.Hold.HeldAt != ts(clock) {
+		t.Fatalf("accepted job %+v", j)
+	}
+	if h := j.HoldHistory; len(h) != 1 || h[0].Action != "hold" || h[0].Cause != "entry" || h[0].NotBefore != notBefore || h[0].Generation != 1 || h[0].AgentID != e.HandlerID {
+		t.Fatalf("history %+v", h)
+	}
+	if saved, err := releaseLoad(ctx, p.s.db, p.task.ID, j.ID); err != nil || saved.State != "held" || saved.Generation != 1 {
+		t.Fatal("saved job", saved.State, saved.Generation, err)
+	}
+	if state, job := entryHoldState(t, p.s, p.task, p.entry); state != "applied" || job != j.ID {
+		t.Fatal("entry hold", state, job)
+	}
+	row := releaseRow(t, p.s, p.task, j.ID)
+	if _, err = p.s.ReleaseAction(ctx, p.task.ID, claimRequest("claim", d, *j)); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "owner hold ("+reason+") until "+notBefore) {
+		t.Fatal("claim of a job created held", err)
+	}
+	if releaseRow(t, p.s, p.task, j.ID) != row {
+		t.Fatal("the refused claim changed the job")
+	}
+	if page := windowPage(t, p.s, p.task); len(page.EntryHolds) != 0 || pageJob(t, page, j.ID).State != "held" {
+		t.Fatalf("page after acceptance %+v", page)
+	}
+}
+
+// h2/h4: the job created held is lifted at the first list once its time
+// has passed, compared as a time, not text, and is then claimable.
+func TestReleaseEntryHoldLiftsAfterNotBefore(t *testing.T) {
+	p, e, d, clock := entryHoldAcceptance(t)
+	ctx := context.Background()
+	notBefore := clock.Add(time.Hour)
+	if _, err := p.s.ReleaseAction(ctx, p.task.ID, entryHoldRequest("entry-hold", "hold", e.HandlerID, e.HandlerRunID, p.entry, "Not before the boundary", notBefore.Format(time.RFC3339))); err != nil {
+		t.Fatal(err)
+	}
+	got, err := p.accept(t, "accept", candidateC, candidateB)
+	if err != nil || got.Release == nil || got.Release.State != "held" {
+		t.Fatal("accept", got.Release, err)
+	}
+	id := got.Release.ID
+	setWindowClock(t, p.s, d, notBefore.Add(-500*time.Millisecond))
+	if listed := pageJob(t, windowPage(t, p.s, p.task), id); listed.State != "held" || listed.Generation != 1 {
+		t.Fatalf("lifted before its time %+v", listed)
+	}
+	setWindowClock(t, p.s, d, notBefore.Add(250*time.Millisecond))
+	if listed := pageJob(t, windowPage(t, p.s, p.task), id); listed.State != "verified" || listed.Generation != 2 || listed.Hold != nil {
+		t.Fatalf("not lifted after its time %+v", listed)
+	}
+	j, err := p.s.Release(ctx, p.task.ID, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h := j.HoldHistory; len(h) != 2 || h[0].Cause != "entry" || h[1].Action != "release" || h[1].Cause != "not_before" || h[1].NotBefore != notBefore.Format(time.RFC3339) || h[1].Generation != 2 || h[1].At != ts(notBefore.Add(250*time.Millisecond)) {
+		t.Fatalf("history %+v", h)
+	}
+	// A second list writes nothing more.
+	if listed := pageJob(t, windowPage(t, p.s, p.task), id); listed.Generation != 2 {
+		t.Fatalf("relisted %+v", listed)
+	}
+	if claimed, err := p.s.ReleaseAction(ctx, p.task.ID, claimRequest("claim", d, j)); err != nil || claimed.State != "claimed" {
+		t.Fatal("lifted job not claimable", claimed.State, err)
+	}
+}
+
+// h4: without an entry hold acceptance behaves as before.
+func TestReleaseAcceptanceWithoutEntryHoldStaysVerified(t *testing.T) {
+	p, _, d, _ := entryHoldAcceptance(t)
+	ctx := context.Background()
+	got, err := p.accept(t, "accept", candidateC, candidateB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j := got.Release
+	if j == nil || j.State != "verified" || j.Generation != 1 || j.Hold != nil || len(j.HoldHistory) != 0 {
+		t.Fatalf("accepted job %+v", j)
+	}
+	if page := windowPage(t, p.s, p.task); len(page.EntryHolds) != 0 || pageJob(t, page, j.ID).State != "verified" {
+		t.Fatalf("page %+v", page)
+	}
+	if n := countRows(t, p.s, `SELECT count(*) FROM release_entry_holds`); n != 0 {
+		t.Fatal("entry holds", n)
+	}
+	if claimed, err := p.s.ReleaseAction(ctx, p.task.ID, claimRequest("claim", d, *j)); err != nil || claimed.State != "claimed" {
+		t.Fatal("claim", claimed.State, err)
+	}
+}
+
+// h1: an entry hold is the handler's, checked before it is saved, replays
+// by request ID, applies only before the entry's next job, and an unhold
+// releases it.
+func TestReleaseEntryHoldValidationAndUnhold(t *testing.T) {
+	s, task, h, d, entry := releaseFixture(t)
+	ctx := context.Background()
+	future := s.now().Add(time.Hour).UTC().Format(time.RFC3339)
+	hold := func(key, agent, run, entry, reason, notBefore string) (api.ReleaseJob, error) {
+		return s.ReleaseAction(ctx, task.ID, entryHoldRequest(key, "hold", agent, run, entry, reason, notBefore))
+	}
+	if _, err := hold("by-deployer", d.ID, d.RunID, entry, "Hold it", future); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("deployer saved an entry hold", err)
+	}
+	generation := entryHoldRequest("generation", "hold", h.ID, h.RunID, entry, "Hold it", future)
+	generation.ExpectedGeneration = 1
+	items := entryHoldRequest("items", "hold", h.ID, h.RunID, entry, "Hold it", "")
+	items.Hold.UntilItems = []string{api.NewID("wi")}
+	for name, req := range map[string]api.ReleaseRequest{"generation": generation, "items": items, "reason": entryHoldRequest("reason", "hold", h.ID, h.RunID, entry, "", future), "unparseable": entryHoldRequest("unparseable", "hold", h.ID, h.RunID, entry, "Hold it", "tomorrow")} {
+		if _, err := s.ReleaseAction(ctx, task.ID, req); !errors.Is(err, api.ErrInvalid) {
+			t.Fatal(name, err)
+		}
+	}
+	if _, err := hold("past", h.ID, h.RunID, entry, "Hold it", s.now().Add(-time.Minute).Format(time.RFC3339)); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "is not after the hub time") {
+		t.Fatal("past not-before", err)
+	}
+	if _, err := hold("unknown", h.ID, h.RunID, api.NewID("tqe"), "Hold it", future); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "is not in this project") {
+		t.Fatal("unknown entry", err)
+	}
+	if n := countRows(t, s, `SELECT count(*) FROM release_entry_holds`); n != 0 {
+		t.Fatal("a refused entry hold was saved", n)
+	}
+	saved, err := hold("hold", h.ID, h.RunID, entry, "Owner hold", future)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again, err := hold("hold", h.ID, h.RunID, entry, "Owner hold", future); err != nil || again.Hold == nil || again.Hold.HeldAt != saved.Hold.HeldAt {
+		t.Fatal("replay", again.Hold, err)
+	}
+	if _, err = hold("hold", h.ID, h.RunID, entry, "Another reason", future); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "retry changed") {
+		t.Fatal("changed replay", err)
+	}
+	// A job operation reusing the entry hold's request ID is a changed retry.
+	if _, err = s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "hold", Operation: "enqueue", AgentID: h.ID, RunID: h.RunID, EntryID: entry}); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "retry changed") {
+		t.Fatal("job operation on an entry hold receipt", err)
+	}
+	if _, err = hold("second", h.ID, h.RunID, entry, "Again", ""); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "already has a standing entry hold") {
+		t.Fatal("second standing hold", err)
+	}
+	page := windowPage(t, s, task)
+	if len(page.EntryHolds) != 1 || page.EntryHolds[0].Reason != "Owner hold" || page.EntryHolds[0].AgentID != h.ID || page.EntryHolds[0].RequestID != "hold" || !strings.HasPrefix(page.EntryHolds[0].ID, "reh_") {
+		t.Fatalf("page entry holds %+v", page.EntryHolds)
+	}
+	if _, err = s.ReleaseAction(ctx, task.ID, entryHoldRequest("unhold-dated", "unhold", h.ID, h.RunID, entry, "Go", future)); !errors.Is(err, api.ErrInvalid) {
+		t.Fatal("unhold with a not-before time", err)
+	}
+	free, err := s.ReleaseAction(ctx, task.ID, entryHoldRequest("unhold", "unhold", h.ID, h.RunID, entry, "Owner go", ""))
+	if err != nil || free.Hold != nil || free.EntryID != entry {
+		t.Fatal("unhold", free, err)
+	}
+	if state, _ := entryHoldState(t, s, task, entry); state != "released" {
+		t.Fatal("released entry hold", state)
+	}
+	if _, err = s.ReleaseAction(ctx, task.ID, entryHoldRequest("unhold-again", "unhold", h.ID, h.RunID, entry, "Owner go", "")); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "has no standing entry hold") {
+		t.Fatal("second unhold", err)
+	}
+	if page = windowPage(t, s, task); len(page.EntryHolds) != 0 {
+		t.Fatalf("page after unhold %+v", page.EntryHolds)
+	}
+	j := windowEnqueue(t, s, task, h, "enqueue", entry)
+	if j.State != "verified" || j.Hold != nil {
+		t.Fatalf("job after a released entry hold %+v", j)
+	}
+	if _, err = hold("after-job", h.ID, h.RunID, entry, "Too late", future); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "tt deployment hold --job "+j.ID) {
+		t.Fatal("entry hold over a verified job", err)
+	}
+}
+
+// h1: an entry hold saved after a refusal creates the retry held; one whose
+// time passed first expires and the retry stays verified.
+func TestReleaseEntryHoldAppliesToRetry(t *testing.T) {
+	s, task, h, d, entry := releaseFixture(t)
+	ctx := context.Background()
+	first := refusedJob(t, s, task, h, d, entry)
+	notBefore := s.now().Add(time.Hour).UTC().Format(time.RFC3339)
+	if _, err := s.ReleaseAction(ctx, task.ID, entryHoldRequest("entry-hold", "hold", h.ID, h.RunID, entry, "Retry after the boundary", notBefore)); err != nil {
+		t.Fatal(err)
+	}
+	retried, err := s.ReleaseAction(ctx, task.ID, retryRequest("retry", h, entry, first))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retried.State != "held" || retried.Generation != 1 || retried.Hold == nil || retried.Hold.NotBefore != notBefore || len(retried.HoldHistory) != 1 || retried.HoldHistory[0].Cause != "entry" {
+		t.Fatalf("retry %+v", retried)
+	}
+	if state, job := entryHoldState(t, s, task, entry); state != "applied" || job != retried.ID {
+		t.Fatal("entry hold", state, job)
+	}
+	other := releaseEntry(t, s, task, "expired hold item", "expired-hold")
+	refused := windowEnqueue(t, s, task, h, "other-enqueue", other)
+	for _, op := range []string{"claim", "refuse"} {
+		if refused, err = s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "other-" + op, Operation: op, AgentID: d.ID, RunID: d.RunID, JobID: refused.ID, ExpectedGeneration: refused.Generation}); err != nil {
+			t.Fatal(op, err)
+		}
+	}
+	soon := s.now().Add(time.Minute)
+	if _, err = s.ReleaseAction(ctx, task.ID, entryHoldRequest("entry-hold-soon", "hold", h.ID, h.RunID, other, "Briefly", soon.UTC().Format(time.RFC3339))); err != nil {
+		t.Fatal(err)
+	}
+	setWindowClock(t, s, d, soon.Add(time.Minute))
+	again, err := s.ReleaseAction(ctx, task.ID, retryRequest("retry-other", h, other, refused))
+	if err != nil || again.State != "verified" || again.Hold != nil || len(again.HoldHistory) != 0 {
+		t.Fatal("retry after the entry hold's time", again, err)
+	}
+	if state, job := entryHoldState(t, s, task, other); state != "expired" || job != "" {
+		t.Fatal("expired entry hold", state, job)
+	}
+}
+
+// h2: a dated job hold refuses claim and batch-add until its time, is lifted
+// by the first list after it, and is held again by an open quiet window.
+func TestReleaseDatedHoldOnVerifiedJob(t *testing.T) {
+	s, task, h, d, jobs := holdFixture(t, 2)
+	ctx := context.Background()
+	setWindowClock(t, s, d, windowAt("2026-10-18T20:00:00-07:00"))
+	a, b := jobs[0], jobs[1]
+	notBefore := "2026-10-18T21:00:00-07:00"
+	both := holdRequest("both", h, a, "Hold it", b.ItemID)
+	both.Hold.NotBefore = notBefore
+	if _, err := s.ReleaseAction(ctx, task.ID, both); !errors.Is(err, api.ErrInvalid) {
+		t.Fatal("items and a not-before time", err)
+	}
+	past := holdRequest("past", h, a, "Hold it")
+	past.Hold.NotBefore = "2026-10-18T19:00:00-07:00"
+	if _, err := s.ReleaseAction(ctx, task.ID, past); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "is not after the hub time") {
+		t.Fatal("past not-before", err)
+	}
+	req := holdRequest("hold", h, a, "Owner: not before nine")
+	req.Hold.NotBefore = notBefore
+	held, err := s.ReleaseAction(ctx, task.ID, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if held.State != "held" || held.Hold == nil || held.Hold.NotBefore != "2026-10-19T04:00:00Z" || held.HoldHistory[0].NotBefore != "2026-10-19T04:00:00Z" {
+		t.Fatalf("dated hold %+v", held.Hold)
+	}
+	if _, err = s.ReleaseAction(ctx, task.ID, claimRequest("claim-held", d, held)); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "until 2026-10-19T04:00:00Z") {
+		t.Fatal("claim of a dated hold", err)
+	}
+	early := unholdRequest("unhold-dated", h, held, "Go")
+	early.Hold.NotBefore = notBefore
+	if _, err = s.ReleaseAction(ctx, task.ID, early); !errors.Is(err, api.ErrInvalid) {
+		t.Fatal("unhold with a not-before time", err)
+	}
+	setWindowClock(t, s, d, windowAt("2026-10-18T20:59:59-07:00"))
+	if listed := pageJob(t, windowPage(t, s, task), a.ID); listed.State != "held" {
+		t.Fatalf("lifted early %+v", listed)
+	}
+	// The quiet window opens at 22:00: a lift inside it is window-held in
+	// the same list.
+	setNightWindow(t, s, task)
+	setWindowClock(t, s, d, windowAt("2026-10-18T22:30:00-07:00"))
+	page := windowPage(t, s, task)
+	listed := pageJob(t, page, a.ID)
+	if listed.State != "held" || listed.Hold == nil || listed.Hold.Window == nil || listed.Hold.NotBefore != "" {
+		t.Fatalf("dated hold lifted inside the window %+v %+v", listed, listed.Hold)
+	}
+	j, err := s.Release(ctx, task.ID, a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h := j.HoldHistory; len(h) != 3 || h[1].Cause != "not_before" || h[1].Generation != held.Generation+1 || h[2].Cause != "window" || h[2].Generation != held.Generation+2 {
+		t.Fatalf("history %+v", h)
+	}
+}
+
+// h2: batch-add refuses a member on a dated hold.
+func TestReleaseDatedHoldRefusesBatchAdd(t *testing.T) {
+	ctx := context.Background()
+	f := newBatchFixture(t, 1)
+	req := holdRequest("hold", f.h, f.members[0], "Not before the boundary")
+	req.Hold.NotBefore = f.s.now().Add(time.Hour).UTC().Format(time.RFC3339)
+	held, err := f.s.ReleaseAction(ctx, f.task.ID, req)
+	if err != nil || held.State != "held" || held.Hold.NotBefore != req.Hold.NotBefore {
+		t.Fatal(held.State, err)
+	}
+	if _, err = f.deployer("batch-open", "", batchBase); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.deployer("batch-add", f.lead.EntryID, batchTo(1)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.deployer("batch-add", held.EntryID, candidateA); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "is not an unclaimed verified job") {
+		t.Fatal("a dated held job joined a batch", err)
 	}
 }

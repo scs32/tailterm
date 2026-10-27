@@ -24,6 +24,11 @@ const releasesSchema = `CREATE TABLE IF NOT EXISTS release_jobs (
  PRIMARY KEY(task_id,id));
  CREATE UNIQUE INDEX IF NOT EXISTS release_project_fence ON release_jobs(task_id) WHERE state IN ('claimed','merged','blocked');
  CREATE INDEX IF NOT EXISTS release_jobs_entry ON release_jobs(task_id,entry_id);
+ CREATE TABLE IF NOT EXISTS release_entry_holds (
+ task_id TEXT NOT NULL REFERENCES tasks(id),id TEXT NOT NULL,entry_id TEXT NOT NULL,
+ state TEXT NOT NULL,record_json TEXT NOT NULL,
+ PRIMARY KEY(task_id,id));
+ CREATE UNIQUE INDEX IF NOT EXISTS release_entry_hold_standing ON release_entry_holds(task_id,entry_id) WHERE state='standing';
  CREATE TABLE IF NOT EXISTS release_action_receipts (
  task_id TEXT NOT NULL,request_id TEXT NOT NULL,payload_hash TEXT NOT NULL,record_json TEXT NOT NULL,
  PRIMARY KEY(task_id,request_id));
@@ -205,6 +210,11 @@ func (s *Store) ReleasesPage(ctx context.Context, task string, opts api.ReleaseL
 			return out, api.ErrInvalid
 		}
 	}
+	// A dated hold whose time passed is lifted first, so a window still
+	// open holds the job again in the same list.
+	if err := s.liftDatedReleaseHolds(ctx, task); err != nil {
+		return out, err
+	}
 	if err := s.sweepReleaseWindow(ctx, task); err != nil {
 		return out, err
 	}
@@ -219,6 +229,9 @@ func (s *Store) ReleasesPage(ctx context.Context, task string, opts api.ReleaseL
 	}
 	if window != nil {
 		out.Window = releaseWindowView(*window, s.now())
+	}
+	if out.EntryHolds, err = releaseEntryHoldsStanding(ctx, tx, task); err != nil {
+		return out, err
 	}
 	rows, err := tx.QueryContext(ctx, `SELECT rowid,id,generation,state FROM release_jobs WHERE task_id=? ORDER BY rowid`, task)
 	if err != nil {
@@ -747,6 +760,11 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 	if req.Operation == "window-set" || req.Operation == "window-clear" {
 		return zero, s.releaseWindowAction(ctx, task, req)
 	}
+	// A hold or unhold that names an entry and no job is an entry hold: it
+	// has its own record, saved before the entry's next job exists.
+	if (req.Operation == "hold" || req.Operation == "unhold") && req.JobID == "" && req.EntryID != "" {
+		return s.releaseEntryHoldAction(ctx, task, req)
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return zero, err
@@ -1035,7 +1053,11 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 			switch req.Operation {
 			case "claim":
 				if j.State == "held" && j.Hold != nil {
-					return zero, releaseConflict("job " + j.ID + " is on an owner hold (" + j.Hold.Reason + "); the handler releases it with tt deployment unhold")
+					until := ""
+					if j.Hold.NotBefore != "" {
+						until = " until " + j.Hold.NotBefore
+					}
+					return zero, releaseConflict("job " + j.ID + " is on an owner hold (" + j.Hold.Reason + ")" + until + "; the handler releases it with tt deployment unhold")
 				}
 				if j.State != "verified" {
 					return zero, releaseConflict("job cannot be taken over")
@@ -1197,6 +1219,13 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 			}
 		}
 		j.Generation++
+	}
+	// An entry hold saved before this job existed creates it held, so no
+	// claim can precede the hold; W1 then leaves it alone.
+	if req.Operation == "enqueue" || req.Operation == "retry" {
+		if err = applyEntryReleaseHold(ctx, tx, task, &j, s.now()); err != nil {
+			return zero, err
+		}
 	}
 	// W1: a handler operation that leaves its job verified and unclaimed
 	// inside the release quiet window saves it held instead.
@@ -1617,12 +1646,14 @@ func clearReleaseClaim(j *api.ReleaseJob, generation int64) {
 // holdRelease puts an owner hold on a verified job no deployer holds: the job
 // moves to state held, where claim and batch-add refuse it and the deployer
 // takes the next verified job. It keeps its place in the queue. A claimed job
-// is not held here: one with no effects is set aside first.
+// is not held here: one with no effects is set aside first. A hold names
+// items or a not-before time, not both: liftReleaseHolds lifts only holds
+// with items, liftDatedReleaseHolds only dated ones.
 func holdRelease(ctx context.Context, tx *sql.Tx, task string, j *api.ReleaseJob, req api.ReleaseRequest, now time.Time) error {
 	switch j.State {
 	case "verified":
 		if j.AgentID != "" {
-			return releaseConflict("job " + j.ID + " is claimed by " + j.AgentID + "; a hold applies only to a verified job no deployer holds. A claimed job with no effects is freed with tt deployment set-aside, then held")
+			return releaseConflict("job " + j.ID + " is claimed by " + j.AgentID + "; " + releaseClaimedHoldPath)
 		}
 	case "held":
 		reason := ""
@@ -1631,7 +1662,7 @@ func holdRelease(ctx context.Context, tx *sql.Tx, task string, j *api.ReleaseJob
 		}
 		return releaseConflict("job " + j.ID + " is already on hold" + reason)
 	case "claimed", "merged", "blocked":
-		return releaseConflict("job " + j.ID + " is " + j.State + "; a hold applies only to a verified job no deployer holds. A claimed job with no effects is freed with tt deployment set-aside, then held")
+		return releaseConflict("job " + j.ID + " is " + j.State + "; " + releaseClaimedHoldPath)
 	default:
 		return releaseConflict("job " + j.ID + " is already " + j.State + "; a hold applies only before a claim (a claimed job with no effects uses tt deployment set-aside)")
 	}
@@ -1644,6 +1675,13 @@ func holdRelease(ctx context.Context, tx *sql.Tx, task string, j *api.ReleaseJob
 	h := req.Hold
 	if h == nil || !releaseText(h.Reason) || len(h.UntilItems) > 16 {
 		return api.ErrInvalid
+	}
+	notBefore, err := releaseNotBefore(h.NotBefore, now)
+	if err != nil {
+		return err
+	}
+	if notBefore != "" && len(h.UntilItems) > 0 {
+		return fmt.Errorf("%w: a hold names items or a not-before time, not both", api.ErrInvalid)
 	}
 	seen := map[string]bool{}
 	for _, id := range h.UntilItems {
@@ -1672,9 +1710,205 @@ func holdRelease(ctx context.Context, tx *sql.Tx, task string, j *api.ReleaseJob
 	}
 	at := ts(now)
 	j.State = "held"
-	j.Hold = &api.ReleaseHold{Reason: h.Reason, UntilItems: slices.Clone(h.UntilItems), AgentID: req.AgentID, RunID: req.RunID, HeldAt: at}
-	j.HoldHistory = append(j.HoldHistory, api.ReleaseHoldEvent{Action: "hold", Reason: h.Reason, UntilItems: slices.Clone(h.UntilItems), AgentID: req.AgentID, RunID: req.RunID, Generation: j.Generation + 1, At: at})
+	j.Hold = &api.ReleaseHold{Reason: h.Reason, UntilItems: slices.Clone(h.UntilItems), NotBefore: notBefore, AgentID: req.AgentID, RunID: req.RunID, HeldAt: at}
+	j.HoldHistory = append(j.HoldHistory, api.ReleaseHoldEvent{Action: "hold", Reason: h.Reason, UntilItems: slices.Clone(h.UntilItems), NotBefore: notBefore, AgentID: req.AgentID, RunID: req.RunID, Generation: j.Generation + 1, At: at})
 	return nil
+}
+
+// releaseClaimedHoldPath is the refusal tail for a hold on a job a deployer
+// holds. The claimed-job fence is unchanged: such a job is never held. One
+// with no effects is set aside once its integrated verification run has
+// ended, and then held; or reconciled refused, with an entry hold saved
+// before its retry.
+const releaseClaimedHoldPath = "a hold applies only to a verified job no deployer holds. After its integrated verification run ends, a claimed job with no effects is set aside with tt deployment set-aside (a later verified job must wait) and then held; otherwise reconcile it refused and save an entry hold with tt deployment hold --entry before tt deployment retry"
+
+// releaseNotBefore checks an owner not-before time: empty, or RFC 3339
+// strictly after now. It returns the time in UTC, to the second.
+func releaseNotBefore(text string, now time.Time) (string, error) {
+	if text == "" {
+		return "", nil
+	}
+	t, err := time.Parse(time.RFC3339, text)
+	if err != nil {
+		return "", fmt.Errorf("%w: not-before time %q is not RFC 3339", api.ErrInvalid, text)
+	}
+	out := t.UTC().Format(time.RFC3339)
+	if !t.UTC().Truncate(time.Second).After(now) {
+		return "", releaseConflict("not-before time " + out + " is not after the hub time " + now.UTC().Format(time.RFC3339))
+	}
+	return out, nil
+}
+
+// releaseNotBeforePassed reports whether a saved not-before time is at or
+// before now. Times are compared parsed: saved job times carry fractions.
+func releaseNotBeforePassed(text string, now time.Time) bool {
+	t, err := time.Parse(time.RFC3339, text)
+	return err == nil && !t.After(now)
+}
+
+// releaseEntryHoldAction saves or releases an entry hold: an owner hold on a
+// queue entry before its next release job exists. The database handler
+// saves it, as it does a job hold. Its receipt is a job with no ID or state
+// carrying the entry, item, order and saved hold, nil after an unhold.
+func (s *Store) releaseEntryHoldAction(ctx context.Context, task string, req api.ReleaseRequest) (api.ReleaseJob, error) {
+	zero := api.ReleaseJob{}
+	h := req.Hold
+	if req.ExpectedGeneration != 0 || len(req.EntryID) > 64 || h == nil || !releaseText(h.Reason) || len(h.UntilItems) > 0 || h.Window != nil {
+		return zero, api.ErrInvalid
+	}
+	if req.Operation == "unhold" && h.NotBefore != "" {
+		return zero, fmt.Errorf("%w: an unhold takes only a reason", api.ErrInvalid)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return zero, err
+	}
+	defer tx.Rollback()
+	hash := verificationDigest(req)
+	var prior, raw string
+	err = tx.QueryRowContext(ctx, `SELECT payload_hash,record_json FROM release_action_receipts WHERE task_id=? AND request_id=?`, task, req.RequestID).Scan(&prior, &raw)
+	if err == nil {
+		if hash != prior {
+			return zero, releaseConflict("retry changed")
+		}
+		var out api.ReleaseJob
+		err = json.Unmarshal([]byte(raw), &out)
+		return out, err
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return zero, err
+	}
+	var state, pause string
+	if err = tx.QueryRowContext(ctx, `SELECT status,pause_state FROM tasks WHERE id=?`, task).Scan(&state, &pause); err != nil {
+		return zero, err
+	}
+	if state != api.TaskOpen || pause != api.ProjectPauseActive {
+		return zero, releaseConflict("active project required")
+	}
+	now := s.now()
+	if err = ackGate(ctx, tx, req.AgentID, req.RunID, 0, now); err != nil {
+		return zero, err
+	}
+	if err = requireScopeHandler(tx, ctx, task, req.AgentID, req.RunID); err != nil {
+		return zero, err
+	}
+	notBefore, err := releaseNotBefore(h.NotBefore, now)
+	if err != nil {
+		return zero, err
+	}
+	e, err := scanTeamQueue(tx.QueryRowContext(ctx, `SELECT `+teamQueueCols+` FROM team_queue_entries WHERE task_id=? AND id=?`, task, req.EntryID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return zero, releaseConflict("queue entry " + req.EntryID + " is not in this project")
+	}
+	if err != nil {
+		return zero, err
+	}
+	standing, err := releaseEntryHoldStanding(ctx, tx, task, e.ID)
+	if err != nil {
+		return zero, err
+	}
+	out := api.ReleaseJob{TaskID: task, EntryID: e.ID, ItemID: e.ItemID, OrderMessageSeq: e.OrderMessageSeq}
+	at := ts(now)
+	if req.Operation == "hold" {
+		if standing != nil {
+			return zero, releaseConflict("entry " + e.ID + " already has a standing entry hold " + standing.ID + " (" + standing.Reason + ")")
+		}
+		var job, jobState string
+		err = tx.QueryRowContext(ctx, `SELECT id,state FROM release_jobs WHERE task_id=? AND entry_id=? ORDER BY rowid DESC LIMIT 1`, task, e.ID).Scan(&job, &jobState)
+		if err == nil && jobState != "refused" && jobState != "rolled_back" {
+			return zero, releaseConflict(fmt.Sprintf("entry %s already has release job %s (%s); hold the job with tt deployment hold --job %s", e.ID, job, jobState, job))
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return zero, err
+		}
+		standing = &api.ReleaseEntryHold{ID: api.NewID("reh"), EntryID: e.ID, ItemID: e.ItemID, OrderMessageSeq: e.OrderMessageSeq, Reason: h.Reason, NotBefore: notBefore, AgentID: req.AgentID, RunID: req.RunID, HeldAt: at, RequestID: req.RequestID, State: "standing"}
+		b, merr := json.Marshal(standing)
+		if merr != nil {
+			return zero, merr
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO release_entry_holds VALUES(?,?,?,?,?)`, task, standing.ID, e.ID, standing.State, string(b)); err != nil {
+			return zero, err
+		}
+		out.Hold = &api.ReleaseHold{Reason: standing.Reason, NotBefore: notBefore, AgentID: req.AgentID, RunID: req.RunID, HeldAt: at}
+	} else {
+		if standing == nil {
+			return zero, releaseConflict("entry " + e.ID + " has no standing entry hold")
+		}
+		standing.State = "released"
+		standing.ReleasedAt = at
+		standing.ReleaseReason = h.Reason
+		standing.ReleaseAgentID = req.AgentID
+		standing.ReleaseRunID = req.RunID
+		if err = saveReleaseEntryHold(ctx, tx, task, *standing); err != nil {
+			return zero, err
+		}
+	}
+	record, err := json.Marshal(out)
+	if err != nil {
+		return zero, err
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO release_action_receipts VALUES(?,?,?,?)`, task, req.RequestID, hash, string(record)); err != nil {
+		return zero, err
+	}
+	if err = tx.Commit(); err != nil {
+		return zero, err
+	}
+	s.notify(task)
+	return out, nil
+}
+
+// releaseEntryHoldStanding returns the entry's standing entry hold, or nil.
+func releaseEntryHoldStanding(ctx context.Context, q queryRower, task, entry string) (*api.ReleaseEntryHold, error) {
+	var raw string
+	err := q.QueryRowContext(ctx, `SELECT record_json FROM release_entry_holds WHERE task_id=? AND entry_id=? AND state='standing'`, task, entry).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var h api.ReleaseEntryHold
+	if err = json.Unmarshal([]byte(raw), &h); err != nil {
+		return nil, err
+	}
+	return &h, nil
+}
+
+func saveReleaseEntryHold(ctx context.Context, tx *sql.Tx, task string, h api.ReleaseEntryHold) error {
+	b, err := json.Marshal(h)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE release_entry_holds SET state=?,record_json=? WHERE task_id=? AND id=?`, h.State, string(b), task, h.ID)
+	return err
+}
+
+// applyEntryReleaseHold runs as a job is created, in the creating
+// transaction (acceptance, enqueue or retry): the entry's standing entry hold
+// creates the job held at its first generation and is then applied. One
+// whose not-before time has passed is expired instead, and the job stays
+// verified.
+func applyEntryReleaseHold(ctx context.Context, tx *sql.Tx, task string, j *api.ReleaseJob, now time.Time) error {
+	if j.State != "verified" {
+		return nil
+	}
+	h, err := releaseEntryHoldStanding(ctx, tx, task, j.EntryID)
+	if err != nil || h == nil {
+		return err
+	}
+	at := ts(now)
+	if h.NotBefore != "" && releaseNotBeforePassed(h.NotBefore, now) {
+		h.State = "expired"
+		h.ReleasedAt = at
+		h.ReleaseReason = "the not-before time passed before job " + j.ID + " was created"
+		return saveReleaseEntryHold(ctx, tx, task, *h)
+	}
+	j.State = "held"
+	j.Hold = &api.ReleaseHold{Reason: h.Reason, NotBefore: h.NotBefore, AgentID: h.AgentID, RunID: h.RunID, HeldAt: at}
+	j.HoldHistory = append(j.HoldHistory, api.ReleaseHoldEvent{Action: "hold", Cause: "entry", Reason: h.Reason, NotBefore: h.NotBefore, AgentID: h.AgentID, RunID: h.RunID, Generation: j.Generation, At: at})
+	h.State = "applied"
+	h.JobID = j.ID
+	return saveReleaseEntryHold(ctx, tx, task, *h)
 }
 
 // unholdRelease is the handler's release of an owner hold: the job is
@@ -1683,7 +1917,7 @@ func unholdRelease(j *api.ReleaseJob, req api.ReleaseRequest, now time.Time) err
 	if j.State != "held" {
 		return releaseConflict("job " + j.ID + " is not on hold")
 	}
-	if req.Hold == nil || !releaseText(req.Hold.Reason) || len(req.Hold.UntilItems) > 0 {
+	if req.Hold == nil || !releaseText(req.Hold.Reason) || len(req.Hold.UntilItems) > 0 || req.Hold.NotBefore != "" {
 		return api.ErrInvalid
 	}
 	liftReleaseHold(j, api.ReleaseHoldEvent{Action: "release", Cause: "handler", Reason: req.Hold.Reason, AgentID: req.AgentID, RunID: req.RunID, At: ts(now)})
@@ -1695,6 +1929,7 @@ func unholdRelease(j *api.ReleaseJob, req api.ReleaseRequest, now time.Time) err
 func liftReleaseHold(j *api.ReleaseJob, event api.ReleaseHoldEvent) {
 	if j.Hold != nil {
 		event.UntilItems = slices.Clone(j.Hold.UntilItems)
+		event.NotBefore = j.Hold.NotBefore
 	}
 	event.Generation = j.Generation + 1
 	j.State = "verified"
@@ -2378,6 +2613,93 @@ func liftReleaseHolds(ctx context.Context, tx *sql.Tx, task, trigger string, now
 			return err
 		}
 	}
+	return nil
+}
+
+// releaseEntryHoldsStanding lists the project's standing entry holds in the
+// order saved.
+func releaseEntryHoldsStanding(ctx context.Context, q queryRower, task string) ([]api.ReleaseEntryHold, error) {
+	rows, err := q.QueryContext(ctx, `SELECT record_json FROM release_entry_holds WHERE task_id=? AND state='standing' ORDER BY rowid`, task)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []api.ReleaseEntryHold
+	for rows.Next() {
+		var raw string
+		var h api.ReleaseEntryHold
+		if err = rows.Scan(&raw); err == nil {
+			err = json.Unmarshal([]byte(raw), &h)
+		}
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, h)
+	}
+	return out, rows.Err()
+}
+
+// heldJobsDue lists the held jobs whose not-before time is at or before now.
+func heldJobsDue(ctx context.Context, q queryRower, task string, now time.Time) ([]api.ReleaseJob, error) {
+	rows, err := q.QueryContext(ctx, `SELECT record_json FROM release_jobs WHERE task_id=? AND state='held' AND json_extract(record_json,'$.hold.notBefore') IS NOT NULL ORDER BY rowid`, task)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var due []api.ReleaseJob
+	for rows.Next() {
+		var raw string
+		var j api.ReleaseJob
+		if err = rows.Scan(&raw); err == nil {
+			err = json.Unmarshal([]byte(raw), &j)
+		}
+		if err != nil {
+			return nil, err
+		}
+		if j.Hold != nil && j.Hold.NotBefore != "" && releaseNotBeforePassed(j.Hold.NotBefore, now) {
+			due = append(due, j)
+		}
+	}
+	return due, rows.Err()
+}
+
+// liftDatedReleaseHolds is the not-before sibling of liftReleaseHolds, run
+// before a ledger list because a time passing has no settling write: every
+// held job whose not-before time has passed returns to verified with a
+// not_before hold-history event. The runner lists before it claims, so it
+// sees the lift at its next poll. It writes nothing when no hold is due.
+func (s *Store) liftDatedReleaseHolds(ctx context.Context, task string) error {
+	if due, err := heldJobsDue(ctx, s.db, task, s.now()); err != nil || len(due) == 0 {
+		return err
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	now := s.now()
+	due, err := heldJobsDue(ctx, tx, task, now)
+	if err != nil || len(due) == 0 {
+		return err
+	}
+	for i := range due {
+		j := &due[i]
+		liftReleaseHold(j, api.ReleaseHoldEvent{Action: "release", Cause: "not_before", Reason: "the hold's not-before time passed", At: ts(now)})
+		j.Generation++
+		b, err := json.Marshal(j)
+		if err != nil {
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE release_jobs SET state=?,generation=?,record_json=? WHERE task_id=? AND id=?`, j.State, j.Generation, string(b), task, j.ID); err != nil {
+			return err
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	s.notify(task)
 	return nil
 }
 

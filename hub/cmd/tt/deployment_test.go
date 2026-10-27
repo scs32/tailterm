@@ -779,7 +779,14 @@ func newHoldHub(t *testing.T) (*holdHub, env) {
 			out.State = "verified"
 			if req.Operation == "hold" {
 				out.State = "held"
-				out.Hold = &api.ReleaseHold{Reason: req.Hold.Reason, UntilItems: req.Hold.UntilItems, AgentID: req.AgentID, RunID: req.RunID, HeldAt: "2026-10-07T09:00:00Z"}
+				out.Hold = &api.ReleaseHold{Reason: req.Hold.Reason, UntilItems: req.Hold.UntilItems, NotBefore: req.Hold.NotBefore, AgentID: req.AgentID, RunID: req.RunID, HeldAt: "2026-10-07T09:00:00Z"}
+			}
+			if req.JobID == "" && req.EntryID != "" {
+				// An entry hold's response: no job yet.
+				out = api.ReleaseJob{TaskID: h.task, EntryID: req.EntryID, ItemID: h.job.ItemID, OrderMessageSeq: h.job.OrderMessageSeq}
+				if req.Operation == "hold" {
+					out.Hold = &api.ReleaseHold{Reason: req.Hold.Reason, NotBefore: req.Hold.NotBefore, AgentID: req.AgentID, RunID: req.RunID, HeldAt: "2026-10-07T09:00:00Z"}
+				}
 			}
 			w.WriteHeader(http.StatusCreated)
 			_ = json.NewEncoder(w).Encode(out)
@@ -890,6 +897,100 @@ func TestDeploymentHoldSendsRequestThenNotice(t *testing.T) {
 		return cmdDeployment(e, []string{"claim", "--job", h.job.ID, "--generation", "1", "--request-id", "claim-1"})
 	}); err != nil || len(h.actions) != 3 || h.actions[2].Operation != "claim" || h.actions[2].Hold != nil || len(h.posts) != 2 {
 		t.Fatalf("claim %+v %v", h.actions, err)
+	}
+}
+
+// wi_c09132e28129688d h1: hold --entry saves an entry hold before the
+// entry's next job exists, then posts one notice linked to its item and
+// order; bad combinations never reach the hub.
+func TestDeploymentHoldEntrySendsEntryRequestThenNotice(t *testing.T) {
+	h, e := newHoldHub(t)
+	run := func(op string, args ...string) (string, error) {
+		return captureRelayOutput(t, false, func() error { return cmdDeployment(e, append([]string{op}, args...)) })
+	}
+	const entry = "tqe_0123456789abcdef"
+	const notBefore = "2026-10-29T07:00:00-07:00"
+	for name, c := range map[string]struct {
+		op   string
+		args []string
+		want string
+	}{
+		"entry and job":         {"hold", []string{"--entry", entry, "--job", h.job.ID, "--request-id", "e", "--reason", "wait"}, "exactly one of --job"},
+		"neither":               {"hold", []string{"--request-id", "e", "--reason", "wait", "--not-before", notBefore}, "exactly one of --job"},
+		"entry with items":      {"hold", []string{"--entry", entry, "--request-id", "e", "--reason", "wait", "--until-items", "wi_0123456789abcdee"}, "does not accept --until-items"},
+		"entry with generation": {"hold", []string{"--entry", entry, "--generation", "1", "--request-id", "e", "--reason", "wait"}, "does not accept --generation"},
+		"not-before and items":  {"hold", []string{"--job", h.job.ID, "--generation", "1", "--request-id", "e", "--reason", "wait", "--not-before", notBefore, "--until-items", "wi_0123456789abcdee"}, "not both"},
+		"bad time":              {"hold", []string{"--entry", entry, "--request-id", "e", "--reason", "wait", "--not-before", "2026-10-29 07:00"}, "RFC 3339"},
+		"unhold not-before":     {"unhold", []string{"--entry", entry, "--request-id", "e", "--reason", "go", "--not-before", notBefore}, "does not accept --not-before"},
+		"unhold neither":        {"unhold", []string{"--request-id", "e", "--reason", "go"}, "exactly one of --job"},
+	} {
+		if _, err := run(c.op, c.args...); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	if len(h.requests) != 0 {
+		t.Fatalf("refused entry holds reached the hub: %v", h.requests)
+	}
+	out, err := run("hold", "--entry", entry, "--request-id", "entry-hold-1", "--reason", "Owner: not before the measurement ends", "--not-before", notBefore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(h.actions) != 1 || len(h.posts) != 1 {
+		t.Fatalf("requests %v", h.requests)
+	}
+	got := h.actions[0]
+	if got.Operation != "hold" || got.EntryID != entry || got.JobID != "" || got.ExpectedGeneration != 0 || got.Hold == nil || got.Hold.NotBefore != notBefore || got.Hold.UntilItems != nil || got.Hold.Reason != "Owner: not before the measurement ends" {
+		t.Fatalf("entry hold request %+v %+v", got, got.Hold)
+	}
+	var printed api.ReleaseJob
+	if json.Unmarshal([]byte(out), &printed) != nil || printed.EntryID != entry || printed.Hold == nil || printed.Hold.NotBefore != notBefore {
+		t.Fatal("output", out)
+	}
+	post := h.posts[0]
+	if post.Envelope == nil || post.Envelope.Kind != api.EnvelopeKindNotice || post.Envelope.Subject != "A release is on hold before acceptance" || post.Text != api.RenderText(*post.Envelope) || len(api.ValidateEnvelope(*post.Envelope)) != 0 {
+		t.Fatalf("notice %+v", post)
+	}
+	if post.Envelope.Refs["entry"] != entry || post.Envelope.Refs["item"] != h.job.ItemID || post.RequestID != entry+"-hold-entry-hold-1" {
+		t.Fatalf("notice identity %+v %v", post, post.Envelope.Refs)
+	}
+	for _, want := range []string{"entry " + entry, "created held", "Reason: Owner: not before the measurement ends. Held by " + e.agent, "lifts it at " + notBefore} {
+		if !strings.Contains(post.Envelope.Body.Text, want) {
+			t.Fatalf("notice text lacks %q: %s", want, post.Envelope.Body.Text)
+		}
+	}
+	if len(post.WorkItems) != 1 || post.WorkItems[0].ItemRevision != 5 || post.WorkOrderMessage == nil || post.WorkOrderMessage.Seq != 41 {
+		t.Fatalf("notice links %+v %+v", post.WorkItems, post.WorkOrderMessage)
+	}
+	if _, err = run("unhold", "--entry", entry, "--request-id", "entry-unhold-1", "--reason", "Owner go"); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.actions[1]; got.Operation != "unhold" || got.EntryID != entry || got.JobID != "" || got.Hold == nil || got.Hold.NotBefore != "" {
+		t.Fatalf("entry unhold %+v", got)
+	}
+	if post := h.posts[1]; post.Envelope.Subject != "An entry release hold was released" || post.RequestID != entry+"-unhold-entry-unhold-1" || !strings.Contains(post.Envelope.Body.Text, "created verified") {
+		t.Fatalf("unhold notice %+v", post)
+	}
+	// A failed notice still reports the saved entry hold and the notice.
+	h.failPost = true
+	_, err = run("hold", "--entry", entry, "--request-id", "entry-hold-2", "--reason", "Again")
+	if err == nil || !strings.Contains(err.Error(), "entry "+entry+" has an entry hold") || !strings.Contains(err.Error(), "NOTICE: A release is on hold before acceptance") {
+		t.Fatal("failed entry notice", err)
+	}
+}
+
+// h2: hold --job with --not-before sends the time and the notice names it.
+func TestDeploymentHoldNotBeforeOnJob(t *testing.T) {
+	h, e := newHoldHub(t)
+	if _, err := captureRelayOutput(t, false, func() error {
+		return cmdDeployment(e, []string{"hold", "--job", h.job.ID, "--generation", "1", "--request-id", "hold-dated", "--reason", "Not before the boundary", "--not-before", "2026-10-29T14:00:00Z"})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.actions[0]; got.JobID != h.job.ID || got.EntryID != "" || got.Hold == nil || got.Hold.NotBefore != "2026-10-29T14:00:00Z" {
+		t.Fatalf("dated hold request %+v", got)
+	}
+	if text := h.posts[0].Envelope.Body.Text; !strings.Contains(text, "The hub lifts the hold at 2026-10-29T14:00:00Z; tt deployment unhold releases it earlier.") {
+		t.Fatal("notice", text)
 	}
 }
 

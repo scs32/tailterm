@@ -2453,7 +2453,7 @@ func (s *Store) teamQueueAction(ctx context.Context, task string, req api.TeamQu
 	// Acceptance with a native exact-SHA receipt durably enqueues delivery in
 	// the same transaction. Legacy acceptance remains visibly unreleased.
 	if req.Operation == "accept" {
-		if err = enqueueAcceptedRelease(ctx, tx, t, &e); err != nil {
+		if err = enqueueAcceptedRelease(ctx, tx, t, &e, now); err != nil {
 			return zero, err
 		}
 	}
@@ -3118,8 +3118,9 @@ func acceptanceOutsideOwnership(changed, ownership []string, reason string, leas
 // enqueueAcceptedRelease durably enqueues delivery for an acceptance with a
 // native exact-SHA receipt, in the accepting transaction. The entry's
 // acceptance must already be written. Legacy acceptance remains visibly
-// unreleased.
-func enqueueAcceptedRelease(ctx context.Context, tx *sql.Tx, t api.Task, e *api.TeamQueueEntry) error {
+// unreleased. An entry hold saved before acceptance creates the job held in
+// this transaction, so no claim can precede it; now is the acceptance time.
+func enqueueAcceptedRelease(ctx context.Context, tx *sql.Tx, t api.Task, e *api.TeamQueueEntry, now string) error {
 	records, err := verificationRecords(ctx, tx, t.ID, e.ItemID)
 	if err != nil {
 		return err
@@ -3133,6 +3134,9 @@ func enqueueAcceptedRelease(ctx context.Context, tx *sql.Tx, t api.Task, e *api.
 		return err
 	}
 	j := api.ReleaseJob{ID: api.NewID("rel"), TaskID: t.ID, EntryID: e.ID, ItemID: e.ItemID, ItemRevision: e.Acceptance.ItemRevision, ScopeRevision: p.ScopeRevision, OrderMessageSeq: p.OrderMessageSeq, Repository: p.Repository, BaseCommit: p.BaseCommit, Commit: p.Commit, VerificationDigest: verificationDigest(r), Plan: p, State: "verified", Generation: 1, PauseGeneration: t.PauseGeneration}
+	if err = applyEntryReleaseHold(ctx, tx, t.ID, &j, parseTS(now)); err != nil {
+		return err
+	}
 	b, err := json.Marshal(j)
 	if err != nil {
 		return err
@@ -3309,5 +3313,5 @@ func acceptTeamQueueOnDoneSave(ctx context.Context, tx *sql.Tx, t api.Task, e *a
 	if rows, rowsErr := result.RowsAffected(); rowsErr != nil || rows != 1 {
 		return fmt.Errorf("%w: entry revision changed", api.ErrConflict)
 	}
-	return enqueueAcceptedRelease(ctx, tx, t, e)
+	return enqueueAcceptedRelease(ctx, tx, t, e, now)
 }
