@@ -1085,6 +1085,37 @@ test("code c2 the load check imports the published runner without running its en
  const u=codeRepo(t),k=codeHost(t,u.cwd),stop=new AbortController();u.at(u.a,u.b);k.setJobs([verifiedJob()]);
  const halted=codeGate(u.codeA);halted.gate.loads=async()=>{stop.abort();return true;};
  assert.equal(await k.poll(halted.gate,undefined,{signal:stop.signal}),"");assert.equal(halted.execs.length,0);assert.equal(k.claims().length,0);assert.deepEqual(k.sends(),[]);
+ assert.equal(u.head(),u.a);
+});
+// A stop that ends the load check (wi_cda779de751962f6 p1): the child is killed
+// once the published runner is importing, so its load is unproven.
+const UNPROVEN_LINE="Deployer stopped during the published runner's load check; its checkout could not be restored and holds published scripts not proven to load (load-unproven), so do not re-provision from it: restore it to the loaded commit first.\n";
+const stopDuringLoad=(gate,counter,stop,after=()=>{})=>{gate.loads=(load=>function(cwd,signal){
+ const pending=load.call(this,cwd,signal);
+ (async()=>{for(const end=Date.now()+20000;!existsSync(counter)&&Date.now()<end;)await new Promise(r=>setTimeout(r,10));after(cwd);stop.abort();})();
+ return pending;})(gate.loads);};
+test("code a stop during the load check puts the checkout back on the loaded commit, with no exec, claim or notice",{timeout:60000},async t=>{
+ const r=codeRepo(t),h=codeHost(t,r.cwd),counter=join(h.home,"loads"),slow=codeCommit(r,r.a,unloadable(counter,"hang"));r.at(r.a,slow.commit);h.setJobs([verifiedJob()]);
+ const stop=new AbortController(),{gate,execs}=codeGate(r.codeA,{loadTimeoutMs:60000}),heads=[];stopDuringLoad(gate,counter,stop,cwd=>heads.push(git(cwd,"rev-parse","HEAD")));
+ const began=Date.now(),err=await h.poll(gate,undefined,{signal:stop.signal});
+ assert.ok(Date.now()-began<20000);assert.equal(readFileSync(counter,"utf8"),"x");
+ // The check ran on the published commit; the checkout is back on the loaded one and clean.
+ assert.deepEqual(heads,[slow.commit]);assert.equal(r.head(),r.a);assert.equal(git(r.cwd,"status","--porcelain"),"");assert.equal(diskCode(join(r.cwd,"scripts")).digest,r.codeA.digest);
+ assert.equal(execs.length,0);assert.equal(h.claims().length,0);assert.deepEqual(h.sends(),[]);assert.equal(err,"");assert.equal(existsSync(join(h.home,"runner-code.json")),false);
+});
+test("code a stop during the load check whose checkout cannot be restored records load-unproven and says not to re-provision from it",{timeout:60000},async t=>{
+ // The two real restore failures of s6: the checkout is left dirty, or the HEAD the first poll found does not hold the loaded scripts.
+ const cases={dirty:(r,slow)=>{r.at(r.a,slow.commit);return cwd=>writeFileSync(join(cwd,"stray.txt"),"x");},moved:(r,slow)=>{r.at(r.b,slow.commit);return ()=>{};}};
+ for(const [name,setup] of Object.entries(cases)){
+  const r=codeRepo(t),h=codeHost(t,r.cwd),counter=join(h.home,"loads"),slow=codeCommit(r,r.a,unloadable(counter,"hang")),after=setup(r,slow);h.setJobs([verifiedJob()]);
+  const stop=new AbortController(),{gate,execs}=codeGate(r.codeA,{loadTimeoutMs:60000});stopDuringLoad(gate,counter,stop,after);
+  const err=await h.poll(gate,undefined,{signal:stop.signal});
+  assert.equal(r.head(),slow.commit,name);assert.equal(execs.length,0,name);assert.equal(h.claims().length,0,name);assert.deepEqual(h.sends(),[],name);
+  // Not a completed load-failed check: state stopped, reason load-unproven.
+  const record=h.record();assert.equal(record.state,"stopped",name);assert.equal(record.reason,"load-unproven",name);assert.equal(record.checkout,"not-restored",name);
+  assert.equal(record.loadedCommit,name==="moved"?r.b:r.a,name);assert.equal(record.current.commit,slow.commit,name);assert.equal(record.current.digest,slow.code.digest,name);assert.equal(record.loaded.digest,r.codeA.digest,name);
+  assert.equal(err,UNPROVEN_LINE,name);
+ }
 });
 // A request id per restart (wi_56ac00ba2854fa3d c5). Each gate stands in for
 // one process of the run, with what the re-exec environment would give it.

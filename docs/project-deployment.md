@@ -813,7 +813,18 @@ and that commit's watched blobs are the loaded bytes, and counts it restored
 only when `HEAD` is then that commit, the checkout is clean and the watched
 files on disk are the loaded bytes. A restored checkout holds a runner that
 loads. One that could not be restored still holds the published scripts that do
-not load: its notice says not to re-provision from it. Only after the check
+not load: its notice says not to re-provision from it. A stop signal during the
+check kills the child, so the published scripts are not proven to load either
+way (wi_cda779de751962f6 p1): the deployer restores the checkout the same way
+before it exits, with no exec, claim or notice. If that restore fails,
+`runner-code.json` records `state` `stopped`, `reason` `load-unproven`,
+`checkout` `not-restored` and `loadedCommit`, and the terminal prints
+"Deployer stopped during the published runner's load check; its checkout could
+not be restored and holds published scripts not proven to load
+(load-unproven), so do not re-provision from it: restore it to the loaded
+commit first." Check the checkout out at `loadedCommit` before any
+re-provision. A stop after the check passed needs no restore: the checkout then
+holds a published runner that loads. Only after the check
 does it record and announce the restart, then replace its own process image with the same Node
 executable and arguments. The pid, agent
 and run stay the same. The new image is told which published digest the
@@ -848,6 +859,9 @@ followed a restart attempt, because only an idle deployer attempts one.
 directory, mode 0600: `agentId`, `runId`, `pid`, `startedAt`, `checkedAt`,
 `state`, `reason` when refused, for `load-failed` also `checkout` (`restored`
 or `not-restored`) and `loadedCommit` (the commit this process loaded from),
+or after a stop during the load check whose checkout could not be restored
+`state` `stopped` with `reason` `load-unproven`, `checkout` `not-restored` and
+`loadedCommit`,
 `loaded` (`digest` and per-file `files`),
 `current` (the published `commit`, `digest` and `files`; null when unreadable),
 `changed` (the watched files that differ), `restartedFrom` after a restart, and
@@ -887,7 +901,8 @@ while a retry of the same restart in one process repeats its id. A run's first
 restart and every `draining` and `refused` id are as before. The deployer's
 terminal prints one line for each of `draining`, `restart` and `refused`; a
 `load-failed` refusal's line says whether its checkout was restored instead of
-asking for a re-provision.
+asking for a re-provision. A stop during the load check prints a line only when
+its checkout could not be restored (`load-unproven`, above).
 
 **Failed CLI calls.** When a call of the configured `tt` fails, the journal
 directory keeps the evidence in `cli-failures.json`, mode 0600: for each

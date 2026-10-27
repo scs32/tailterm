@@ -2366,7 +2366,9 @@ export function restartGeneration(config,code,published){
 // published code it was last compared with, and the latest restart
 // generation of this run when there is one. A load-failed refusal also says
 // whether the checkout is back on loadedCommit (checkout restored) or still
-// holds the published scripts that do not load (not-restored). Rewritten
+// holds the published scripts that do not load (not-restored). A stop during
+// the load check that could not restore the checkout is state stopped,
+// reason load-unproven, checkout not-restored. Rewritten
 // only when something other than checkedAt changes, so checkedAt is when this
 // state was first seen.
 export function codeRecord(config,code,decision,published){
@@ -2376,7 +2378,7 @@ export function codeRecord(config,code,decision,published){
   const path=join(config.journalDirectory,"runner-code.json"),unchecked=r=>JSON.stringify({...r,checkedAt:null}),prior=readCodeRecord(config);
   const generation=Math.max(generationOf(code.restartFor?.generation),generationOf(code.restartGeneration),recordedGeneration(prior));
   const record={version:1,agentId:process.env.TAILTERM_AGENT||null,runId:process.env.TAILTERM_RUN||null,pid:process.pid,startedAt:code.startedAt,checkedAt:iso(code.now()),state:decision.state,...(decision.reason?{reason:decision.reason}:{}),...(decision.state==="restart"&&decision.heldJob?{heldJob:decision.heldJob}:{}),
-    ...(decision.reason==="load-failed"?{checkout:decision.checkout==="restored"?"restored":"not-restored",...(sha(decision.loadedCommit)?{loadedCommit:decision.loadedCommit}:{})}:{}),loaded,current,changed:loaded&&current?RUNNER_CODE_FILES.filter(n=>loaded.files[n]!==current.files[n]):[],...(loaded&&code.restartedFrom&&[loaded.digest,scriptsDigest(loaded.files)].includes(code.marker)?{restartedFrom:code.restartedFrom}:{}),...(generation?{restartGeneration:generation}:{})};
+    ...(["load-failed","load-unproven"].includes(decision.reason)?{checkout:decision.checkout==="restored"?"restored":"not-restored",...(sha(decision.loadedCommit)?{loadedCommit:decision.loadedCommit}:{})}:{}),loaded,current,changed:loaded&&current?RUNNER_CODE_FILES.filter(n=>loaded.files[n]!==current.files[n]):[],...(loaded&&code.restartedFrom&&[loaded.digest,scriptsDigest(loaded.files)].includes(code.marker)?{restartedFrom:code.restartedFrom}:{}),...(generation?{restartGeneration:generation}:{})};
   if(prior && unchecked(prior)===unchecked(record))return prior;
   save(path,record);return record;
 }
@@ -2415,7 +2417,8 @@ export function codeNotice(record,kind=record?.state){
 }
 const CODE_LINES={draining:"Deployer code is out of date; no new release is claimed and a restart follows the active work.\n",restart:"Deployer restarting itself onto the published scripts.\n",refused:"Deployer code is out of date and it cannot restart itself; no release is claimed until it is re-provisioned.\n",
   restored:"Deployer code is out of date and the published runner does not load; its checkout is back on the loaded commit and no release is claimed until a published runner loads.\n",
-  unrestored:"Deployer code is out of date and the published runner does not load; its checkout could not be restored, so do not re-provision from it: restore it to the loaded commit or fix the published scripts.\n"};
+  unrestored:"Deployer code is out of date and the published runner does not load; its checkout could not be restored, so do not re-provision from it: restore it to the loaded commit or fix the published scripts.\n",
+  unproven:"Deployer stopped during the published runner's load check; its checkout could not be restored and holds published scripts not proven to load (load-unproven), so do not re-provision from it: restore it to the loaded commit first.\n"};
 // The terminal line for a code state: a load-failed refusal says whether its
 // checkout was restored rather than asking for a re-provision.
 const codeLine=(record,kind)=>kind==="refused" && record.reason==="load-failed"?CODE_LINES[record.checkout==="restored"?"restored":"unrestored"]:CODE_LINES[kind];
@@ -2884,7 +2887,18 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
     // The published runner must load before this process is replaced by it.
     if(decision.state==="restart"){
       let loads=false;try{loads=await code.loads(config.cwd,signal)===true;}catch{}
-      if(signal?.aborted)return STOP;
+      // A stop ends the check (its child is killed), so the published
+      // scripts are unproven: the checkout goes back to the loaded commit as
+      // for load-failed, or the record and line say it holds them
+      // (wi_cda779de751962f6 p1).
+      if(signal?.aborted){
+        try{code.restore(config.cwd,code.loadedHead,code.loaded);}
+        catch{
+          try{codeRecord(config,code,{state:"stopped",reason:"load-unproven",checkout:"not-restored",loadedCommit:code.loadedHead},published);}catch{}
+          process.stderr.write(CODE_LINES.unproven);
+        }
+        return STOP;
+      }
       // The checkout goes back to the loaded commit, so re-provisioning from
       // it starts a runner that loads (wi_f6bd907b134a9331 s6).
       if(!loads){
