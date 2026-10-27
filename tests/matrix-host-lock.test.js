@@ -50,7 +50,7 @@ import {
 } from "../scripts/verify-matrix-host-lock.mjs";
 import { makePlan, runPlan, digest, runScheduled, planRunTimeout } from "../scripts/verify-matrix.mjs";
 import { utimesSync } from "node:fs";
-import { exclusiveCapMs, DEFAULT_EXCLUSIVE_CAP_MS } from "../scripts/verify-matrix-host-lock.mjs";
+import { exclusiveCapMs, DEFAULT_EXCLUSIVE_CAP_MS, EXEC_HOLDER_ENV } from "../scripts/verify-matrix-host-lock.mjs";
 
 // No test here may fall back to the host's own lock file.
 const isolated = mkdtempSync(join(tmpdir(), "matrix-host-lock-default-"));
@@ -2581,6 +2581,63 @@ test("H1 a holder that cannot update its groups within busyAbortMs journals hold
   await lease.release();
   assert.deepEqual(allHeld(path), []);
   assert.equal(readJournal(path).at(-1).event, "release");
+});
+test("N1 a request from inside an exec hold for the same worktree is refused at once; another worktree or a gone hold is as before", async (t) => {
+  const path = lockFile(t), worktree = tempDir(t), other = tempDir(t);
+  const two = { TAILTERM_MATRIX_MAX_HOLDERS: "2" };
+  const hold = await acquireHostLock(request(path, { item: "wi_exec", kind: "exec", worktree, environment: two }));
+  const inside = (extra) => request(path, { item: "wi_nested", maxWaitMs: 60000, ...extra, environment: { ...two, [EXEC_HOLDER_ENV]: hold.id } });
+  const began = Date.now();
+  await assert.rejects(acquireHostLock(inside({ worktree })), (error) => {
+    assert.equal(error.code, "nested-exec");
+    assert.equal(error.exitCode, EXIT_LOCK_UNUSABLE);
+    assert.match(error.message, new RegExp(`inside exec hold wi_exec/tester/pid ${process.pid} for the same worktree`));
+    assert(error.message.endsWith("run verify-matrix.mjs run directly; it takes the host lock itself"), error.message);
+    return true;
+  });
+  assert(Date.now() - began < 5000, "refused at once, not after a wait");
+  assert.deepEqual(waitersOf(path), [], "it never joined the list");
+  assert.deepEqual(events(path), ["request", "acquire"]);
+  // Another worktree inside the same hold is admitted beside it.
+  const beside = await acquireHostLock(inside({ worktree: other }));
+  assert.deepEqual(allHeld(path).map(h => h.item), ["wi_exec", "wi_nested"]);
+  await beside.release();
+  // A hold id that is not live (a stale variable) refuses nothing: the
+  // request waits on the worktree as before.
+  const stale = request(path, { item: "wi_stale", worktree, maxWaitMs: 300, environment: { ...two, [EXEC_HOLDER_ENV]: "not-a-holder" } });
+  await assert.rejects(acquireHostLock(stale), (error) => error.code === "wait-expired");
+  await hold.release();
+  assert.deepEqual(allHeld(path), []);
+});
+test("N2 verify-matrix.mjs run under exec for the same worktree is refused at once, and an ordinary exec still runs with its hold named", async (t) => {
+  const fixture = runnerFixture(t, "process.exit(0);"), lock = lockFile(t), records = tempDir(t);
+  const planFile = join(tempDir(t), "plan.json"), output = tempDir(t, "matrix-host-lock-logs-");
+  writeFileSync(planFile, JSON.stringify(fixture.plan));
+  const env = { ...process.env, TAILTERM_AGENT: undefined, TAILTERM_AGENT_NAME: undefined, TAILTERM_TASK: undefined, TAILTERM_MATRIX_HOST_LOCK: lock, TAILTERM_MATRIX_MAX_HOLDERS: "2" };
+  const exec = (name, command) => spawnSync(process.execPath,
+    [moduleFile, "exec", "--item", name, "--agent", "nester", "--timeout-minutes", "10", "--record", join(records, name), "--", ...command],
+    { cwd: fixture.cwd, env, encoding: "utf8", timeout: 120000 });
+  const runner = fileURLToPath(new URL("../scripts/verify-matrix.mjs", import.meta.url));
+  const began = Date.now();
+  const nested = exec("wi_nested", [process.execPath, runner, "run", planFile, output, "--priority", "normal", "--min-free-bytes", "0"]);
+  const said = nested.stdout + nested.stderr;
+  assert.equal(nested.status, EXIT_LOCK_UNUSABLE, said);
+  assert(Date.now() - began < 60000, "refused at once, not at the exec cap");
+  assert.match(said, /inside exec hold wi_nested\/nester\/pid \d+ for the same worktree/);
+  assert.match(said, /run verify-matrix\.mjs run directly; it takes the host lock itself/);
+  assert.doesNotMatch(said, /matrix host: waiting/);
+  assert(!existsSync(join(output, "receipt.json")), "no receipt");
+  assert.deepEqual(events(lock), ["request", "acquire", "release"], "only the exec joined the list");
+  const nestedRecord = JSON.parse(readFileSync(join(records, "wi_nested", "host-lock.json"), "utf8"));
+  assert.equal(nestedRecord.exitCode, EXIT_LOCK_UNUSABLE);
+  // An ordinary exec runs its command and passes its exit code through; the
+  // command's environment names the hold.
+  const plain = exec("wi_plain", [process.execPath, "-e", `console.log("holder=" + process.env.${EXEC_HOLDER_ENV}); process.exit(3)`]);
+  assert.equal(plain.status, 3, plain.stdout + plain.stderr);
+  const plainRecord = JSON.parse(readFileSync(join(records, "wi_plain", "host-lock.json"), "utf8"));
+  assert.match(plain.stdout, new RegExp(`holder=${plainRecord.id}\\n`));
+  assert.deepEqual([plainRecord.kind, plainRecord.outcome, plainRecord.exitCode], ["exec", "released", 3]);
+  assert.deepEqual(allHeld(lock), []);
 });
 test("M12 no test in this file, child processes included, probed the host's memory", () => {
   assert.equal(process.env.PATH.split(":")[0], dirname(probeMarker) + "/bin");

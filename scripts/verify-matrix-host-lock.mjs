@@ -44,6 +44,10 @@ export const DEFAULT_HOLDER_CAP_MS = 120 * 60000;
 export const RUN_TIMEOUT_GRACE_MS = 120000;
 // A holder that cannot update the lock file for this long aborts its run.
 export const HOLDER_BUSY_ABORT_MS = 30000;
+// exec puts its holder id here in its command's environment. A request from
+// inside that hold for the same worktree is refused at once: it would only
+// wait on its own caller (wi_87ffcc0183401161).
+export const EXEC_HOLDER_ENV = "TAILTERM_MATRIX_EXEC_HOLDER";
 export const EXIT_WAIT_EXPIRED = 75;
 export const EXIT_LOCK_UNUSABLE = 78;
 const REPEAT_LINE_MS = 60000;
@@ -769,6 +773,7 @@ export async function acquireHostLock(options = {}) {
   const pressureMax = memoryPressureMax(options.environment ?? process.env);
   const releaseMarked = options.release === true;
   const exclusive = options.exclusive === true;
+  const caller = (options.environment ?? process.env)[EXEC_HOLDER_ENV] || null;
   if (exclusive && releaseMarked) throw new Error("A release run cannot be exclusive");
   const capMs = exclusive ? exclusiveCapMs(options.environment ?? process.env) : undefined;
   const paths = lockPaths(options.path ?? lockPath());
@@ -925,6 +930,14 @@ export async function acquireHostLock(options = {}) {
       }
       if (state.version === 2 && state.holderLimit !== limit)
         throw new HostLockError("capacity-mismatch", `Host holder limit is frozen at ${state.holderLimit} until holders and waiters drain`);
+      const hold = caller && live.find(h => h.id === caller);
+      if (hold && entry.worktree && hold.worktree && canonicalResource(hold.worktree) === entry.worktree)
+        throw new HostLockError(
+          "nested-exec",
+          `matrix host: this request comes from inside exec hold ${describe(hold)} for the same worktree (${entry.worktree}), ` +
+            "so it would wait on its own caller's hold and never start; run verify-matrix.mjs run directly; it takes the host lock itself",
+          EXIT_LOCK_UNUSABLE,
+        );
       const resources = [entry.output, entry.recordDirectory].filter(Boolean);
       if ([...live, ...waiters].some(e =>
         [e.output, e.recordDirectory].filter(Boolean).some(path => resources.includes(canonicalResource(path)))))
@@ -1349,7 +1362,8 @@ export function recordedEnvironment(environment = process.env) {
 
 // Runs one supplemental command (a race suite, say) while holding the lock.
 // The command gets its own process group, recorded as the holder's group, and
-// is stopped at the run timeout. Resolves with the exit code to pass through.
+// is stopped at the run timeout, and its environment names this hold in
+// EXEC_HOLDER_ENV. Resolves with the exit code to pass through.
 export async function execWithHostLock(argv, options = {}) {
   if (!Array.isArray(argv) || !argv.length) throw new Error("exec needs a command");
   const interrupted = new AbortController();
@@ -1370,7 +1384,11 @@ export async function execWithHostLock(argv, options = {}) {
       extra: { checkSet: "supplemental", argv, environment: recordedEnvironment(process.env) },
     });
     const code = await new Promise((done, fail) => {
-      const child = spawn(argv[0], argv.slice(1), { detached: true, stdio: options.stdio || "inherit" });
+      const child = spawn(argv[0], argv.slice(1), {
+        detached: true,
+        stdio: options.stdio || "inherit",
+        env: { ...process.env, [EXEC_HOLDER_ENV]: lease.id },
+      });
       let killTimer,
         reason = "";
       const signalGroup = (name) => {

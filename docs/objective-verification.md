@@ -1578,6 +1578,15 @@ for the names that are set: `GOMAXPROCS`, `GOFLAGS`, `GOGC`, `GOMEMLIMIT`,
 `GOMAXPROCS=2` can be checked from the record. No other variable is recorded,
 so neither are secrets (bug `wi_28a18cbc08d3d598`).
 
+Never wrap `verify-matrix.mjs run` (or `targeted`) in `exec`: the runner takes
+the host lock itself, so inside an exec hold for the same worktree it would
+wait on its own caller's hold and never start. Run it directly. `exec` puts its
+holder id in the command's environment as `TAILTERM_MATRIX_EXEC_HOLDER`, and a
+host-lock request made from inside that live hold for the same worktree is
+refused at once (exit 78) with "run verify-matrix.mjs run directly; it takes
+the host lock itself". A nested request for another worktree is admitted as
+any other request (bug `wi_87ffcc0183401161`).
+
 **Exclusive holds.** Bug `wi_6be7e47bd2358699`, order #36061. A normal holder
 shares the host: a second run, a release run included, can start beside it at
 any time. `exec --exclusive` holds the host alone. Use it only for checks whose
