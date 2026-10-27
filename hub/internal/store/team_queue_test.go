@@ -3253,6 +3253,55 @@ func TestQueueLimitDecreaseSkipsHostAdmissionGates(t *testing.T) {
 	})
 }
 
+// A decrease skips the host gates but not the active-reservation rule
+// (wi_45a7338271138624, merged into wi_1964acd246370eda): lowering below the
+// entries that hold resources is refused and leaves the limit alone, even
+// with the host below its disk reserve; lowering to exactly that count is
+// accepted.
+func TestTeamQueueLimitDecreaseBelowActiveEntriesRefused(t *testing.T) {
+	s, task, items, orders, _ := uncappedFixture(t, 3, 3)
+	ctx := context.Background()
+	setQueueLimit(t, s, task.ID, 0)
+	for i := range items {
+		q := addScopedEntry(t, s, task, items[i], orders[i], fmt.Sprintf("src/%d", i))
+		if _, err := claimEntry(s, task, q); err != nil {
+			t.Fatalf("claim %d: %v", i, err)
+		}
+	}
+	observeFixtureHost(t, s, task.ID, 0, freeDiskMiB(4000))
+	limit := func(n int) error {
+		_, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: api.NewID("tqr"), Operation: "set_limit", Host: "mini", ConcurrencyLimit: n})
+		return err
+	}
+	listed := func() int {
+		t.Helper()
+		list, err := s.ListTeamQueue(ctx, task.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return list.ConcurrencyLimit
+	}
+	// The host gates are live: an unchanged none is refused for the disk.
+	if err := limit(0); err == nil || !strings.Contains(err.Error(), "below the 8192 MiB reserve") {
+		t.Fatalf("unchanged none below the disk reserve: %v", err)
+	}
+	for _, next := range []int{2, 1} {
+		err := limit(next)
+		if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "active safety reservations exceed requested limit") {
+			t.Fatalf("lower to %d below 3 active: %v", next, err)
+		}
+		if got := listed(); got != 0 {
+			t.Fatalf("refused lower to %d saved %d", next, got)
+		}
+	}
+	if err := limit(3); err != nil {
+		t.Fatalf("lower to the 3 active: %v", err)
+	}
+	if got := listed(); got != 3 {
+		t.Fatalf("lowered to 3, listed %d", got)
+	}
+}
+
 // wi_0c5c5add2242991b a12: a release job on an owner hold is still in the
 // deployment path, so the owner's integration record is refused until the
 // hold ends in a finished job.

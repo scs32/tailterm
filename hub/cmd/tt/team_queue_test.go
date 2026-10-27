@@ -207,6 +207,99 @@ func TestTeamQueueCLILimitNoneAndCeiling(t *testing.T) {
 	}
 }
 
+// l1/l3 (wi_1964acd246370eda): a decrease or a change to serial reads no host
+// listing and posts no census, so a hub that refuses every census still lets
+// the limit fall; a raise or an unchanged parallel limit still posts the
+// census first and is refused with it.
+func TestTeamQueueCLILimitDecreaseSkipsCensus(t *testing.T) {
+	f := newTeamFixture(t, true)
+	ctx := context.Background()
+	parallelCLIProject(t, f, "4")
+	target, err := url.Parse(f.e.hub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forward := httputil.NewSingleHostReverseProxy(target)
+	var hostLists, censuses atomic.Int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" && strings.HasSuffix(r.URL.Path, "/v1/team-queues") {
+			hostLists.Add(1)
+		}
+		if r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/team-queue/actions") {
+			body, _ := io.ReadAll(r.Body)
+			r.Body, r.ContentLength = io.NopCloser(bytes.NewReader(body)), int64(len(body))
+			var req api.TeamQueueRequest
+			if json.Unmarshal(body, &req) == nil && req.Operation == "observe_host" {
+				censuses.Add(1)
+				http.Error(w, `{"error":"census refused"}`, http.StatusConflict)
+				return
+			}
+		}
+		forward.ServeHTTP(w, r)
+	}))
+	t.Cleanup(proxy.Close)
+	refusing := f.e
+	refusing.hub = proxy.URL
+	// bump saves a new host policy version, so the next census cannot take
+	// saveHostRelayCensus's fresh-census skip and would really be posted.
+	bump := func() {
+		t.Helper()
+		if _, err := captureCLIOutput(t, func() error {
+			return cmdTeamQueue(f.e, []string{"policy", "--policy-version", fmt.Sprint(time.Now().UnixNano()), "--expires", time.Now().Add(time.Hour).UTC().Format(time.RFC3339), "--sessions", "100", "--polling", "10", "--bindings", "100", "--requests-per-minute", "100000", "--burst", "10000", "--headroom-percent", "20", "--min-free-disk-mib", "1"})
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	listed := func() int {
+		t.Helper()
+		list, err := f.c.ListTeamQueuePage(ctx, f.task.ID, api.TeamQueueListOptions{View: api.TeamQueueViewActive})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return list.ConcurrencyLimit
+	}
+	lower := func(from, to string, want int) {
+		t.Helper()
+		bump()
+		out, err := captureCLIOutput(t, func() error { return cmdTeamQueue(refusing, []string{"limit", "--limit", to}) })
+		if err != nil || !strings.Contains(out, "concurrency limit="+to) {
+			t.Fatalf("lower %s to %s: %q %v", from, to, out, err)
+		}
+		if got := listed(); got != want {
+			t.Fatalf("lowered %s to %s, listed %d", from, to, got)
+		}
+		if hostLists.Load() != 0 || censuses.Load() != 0 {
+			t.Fatalf("lower %s to %s: %d host listings, %d censuses", from, to, hostLists.Load(), censuses.Load())
+		}
+	}
+	lower("4", "3", 3)
+	if _, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"limit", "--limit", "none"}) }); err != nil {
+		t.Fatal(err)
+	}
+	lower("none", "2", 2)
+	lower("2", "1", 1)
+	// gated runs a raise or an unchanged limit through the refusing hub: the
+	// census is posted before set_limit, refused, and the limit stays.
+	gated := func(to string, saved, wantCensuses int) {
+		t.Helper()
+		bump()
+		if _, err := captureCLIOutput(t, func() error { return cmdTeamQueue(refusing, []string{"limit", "--limit", to}) }); err == nil {
+			t.Fatalf("limit %d to %s with the census refused succeeded", saved, to)
+		}
+		if got := listed(); got != saved {
+			t.Fatalf("refused limit %d to %s, listed %d", saved, to, got)
+		}
+		if got := censuses.Load(); got != int32(wantCensuses) {
+			t.Fatalf("limit %d to %s posted %d censuses, want %d", saved, to, got, wantCensuses)
+		}
+	}
+	gated("2", 1, 1)
+	if _, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"limit", "--limit", "2"}) }); err != nil {
+		t.Fatal(err)
+	}
+	gated("2", 2, 2)
+}
+
 // a5: a parallel project's add creates the entry's own detached worktree by
 // default; --no-new-worktree keeps the checkout; a taken path is refused.
 func TestTeamQueueCLINewWorktreeDefault(t *testing.T) {

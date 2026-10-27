@@ -45,6 +45,13 @@ func parseQueueLimit(raw string) (int, bool) {
 	return n, err == nil && n >= 1
 }
 
+// queueLimitLowers mirrors the hub's set_limit rule: next admits fewer
+// teams than previous. Zero has no cap, so none to N lowers and N to none
+// raises.
+func queueLimitLowers(previous, next int) bool {
+	return next > 0 && (previous == 0 || next < previous)
+}
+
 func queueLimitText(limit int) string {
 	if limit == 0 {
 		return "none"
@@ -428,13 +435,21 @@ func cmdTeamQueue(e env, args []string) error {
 		}
 		req.Operation, req.ConcurrencyLimit, req.Host = "set_limit", value, spawn.Host()
 		if queueParallel(value) {
-			list, listErr := c.TeamQueueByHost(ctx, req.Host)
+			current, listErr := c.ListTeamQueuePage(ctx, *task, api.TeamQueueListOptions{View: api.TeamQueueViewActive})
 			if listErr != nil {
 				return listErr
 			}
-			if list.HostPolicy != nil {
-				if err := saveHostRelayCensus(ctx, c, *task, req.Host, *list.HostPolicy, list.HostUsage, queueCwds(list.Entries), time.Now()); err != nil {
-					return err
+			// A decrease never adds load and the hub skips its host gates for
+			// it, so it needs no census that could refuse the change.
+			if !queueLimitLowers(current.ConcurrencyLimit, value) {
+				list, listErr := c.TeamQueueByHost(ctx, req.Host)
+				if listErr != nil {
+					return listErr
+				}
+				if list.HostPolicy != nil {
+					if err := saveHostRelayCensus(ctx, c, *task, req.Host, *list.HostPolicy, list.HostUsage, queueCwds(list.Entries), time.Now()); err != nil {
+						return err
+					}
 				}
 			}
 		}
