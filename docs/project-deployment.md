@@ -1752,7 +1752,9 @@ releases a standing entry hold (`released`, with a reason naming the cause) in
 the same transaction that ends its entry: the entry is removed from the queue,
 or its item becomes done or dismissed while the entry has no release job and
 no acceptance. An entry with a job (a refused or rolled-back one can be
-retried) or an acceptance (enqueue creates its first job) keeps its hold.
+retried) or an acceptance (enqueue creates its first job) keeps its hold, and
+so does a done item's running entry still waiting on acceptance, since
+`tt team queue accept` creates its job later and applies the hold.
 Holds on entries that ended before this rule shipped stay as saved.
 `tt deployment list` shows standing entry holds under `entryHolds`. An entry
 hold is refused while the entry already has a release job that is not

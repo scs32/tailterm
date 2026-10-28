@@ -8312,6 +8312,42 @@ func TestReleaseEntryHoldLiftsWhenItemSavedDoneWithoutAcceptance(t *testing.T) {
 	}
 }
 
+// wi_2bc0817fd3f8101c b1: an owner's done save without acceptance keeps the
+// hold of an entry still waiting on acceptance, so the later tt team queue
+// accept creates its job held.
+func TestReleaseEntryHoldKeptWhenItemDoneBeforeAccept(t *testing.T) {
+	p, e, _, clock := entryHoldAcceptance(t)
+	ctx := context.Background()
+	if _, err := p.s.db.Exec(`UPDATE work_items SET status='open' WHERE id=?`, e.ItemID); err != nil {
+		t.Fatal(err)
+	}
+	notBefore := clock.Add(time.Hour).Format(time.RFC3339)
+	if _, err := p.s.ReleaseAction(ctx, p.task.ID, entryHoldRequest("entry-hold", "hold", e.HandlerID, e.HandlerRunID, p.entry, "Not before the measurement ends", notBefore)); err != nil {
+		t.Fatal(err)
+	}
+	item, err := p.s.GetWorkItem(ctx, p.task.ID, e.ItemID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := "done"
+	if _, err = p.s.UpdateWorkItem(ctx, p.task.ID, item.ID, api.UpdateWorkItemRequest{Revision: item.Revision, Status: &done}, api.Caller{Node: "fixture", User: "owner"}); err != nil {
+		t.Fatal(err)
+	}
+	if state, _ := entryHoldState(t, p.s, p.task, p.entry); state != "standing" {
+		t.Fatal("hold after the done save", state)
+	}
+	got, err := p.accept(t, "accept", candidateC, candidateB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if j := got.Release; j == nil || j.State != "held" || j.Hold == nil || j.Hold.NotBefore != notBefore {
+		t.Fatalf("accepted job %+v", j)
+	}
+	if state, job := entryHoldState(t, p.s, p.task, p.entry); state != "applied" || job != got.Release.ID {
+		t.Fatal("entry hold", state, job)
+	}
+}
+
 // wi_2bc0817fd3f8101c: an entry that can still get a job keeps its hold when
 // its item is dismissed, and an edit of an item already dismissed lifts
 // nothing, so holds saved before this change stay as saved.

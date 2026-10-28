@@ -1947,18 +1947,24 @@ func liftEntryReleaseHold(ctx context.Context, tx *sql.Tx, task, entry, reason, 
 }
 
 // liftItemEntryReleaseHolds lifts the standing entry holds of an item's
-// entries as the item becomes done or dismissed.
+// entries as the item becomes done or dismissed. A done item's entry that
+// still waits on acceptance (pendingTeamQueueAcceptance) keeps its hold:
+// tt team queue accept creates its job later and applies it.
 func liftItemEntryReleaseHolds(ctx context.Context, tx *sql.Tx, task, item, status, agentID, runID, now string) error {
-	rows, err := tx.QueryContext(ctx, `SELECT id FROM team_queue_entries WHERE task_id=? AND item_id=? ORDER BY attempt`, task, item)
+	rows, err := tx.QueryContext(ctx, `SELECT id,state='running' AND released_at='' AND repository<>'' AND acceptance_json='' FROM team_queue_entries WHERE task_id=? AND item_id=? ORDER BY attempt`, task, item)
 	if err != nil {
 		return err
 	}
 	var entries []string
 	for rows.Next() {
 		var id string
-		if err = rows.Scan(&id); err != nil {
+		var acceptable bool
+		if err = rows.Scan(&id, &acceptable); err != nil {
 			rows.Close()
 			return err
+		}
+		if status == "done" && acceptable {
+			continue
 		}
 		entries = append(entries, id)
 	}
