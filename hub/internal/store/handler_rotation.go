@@ -40,7 +40,10 @@ CREATE TABLE IF NOT EXISTS handler_rotation_requests (
  task_id TEXT NOT NULL, request_id TEXT NOT NULL, operation TEXT NOT NULL, payload_hash TEXT NOT NULL,
  rotation_id TEXT NOT NULL, PRIMARY KEY(task_id,request_id));
 CREATE TABLE IF NOT EXISTS handler_runs (
- task_id TEXT NOT NULL, agent_id TEXT NOT NULL, run_id TEXT PRIMARY KEY, template_digest TEXT NOT NULL, created_at TEXT NOT NULL);`); err != nil {
+ task_id TEXT NOT NULL, agent_id TEXT NOT NULL, run_id TEXT PRIMARY KEY, template_digest TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS handler_successor_holds (
+ task_id TEXT PRIMARY KEY REFERENCES tasks(id), reason TEXT NOT NULL CHECK(reason IN ('template','manual')), trigger_kind TEXT NOT NULL,
+ old_agent_id TEXT NOT NULL, old_run_id TEXT NOT NULL, handler_revision INTEGER NOT NULL, created_at TEXT NOT NULL);`); err != nil {
 		return err
 	}
 	// An owner-authorized change of runtime, model or arm (wi_f250a91c85367e6f).
@@ -416,6 +419,119 @@ func openHandlerRotation(ctx context.Context, q queryRower, task string) (*api.H
 		return nil, err
 	}
 	return &r, nil
+}
+
+// successorHoldRow is the project's successor hold, whichever run it names,
+// or nil.
+func successorHoldRow(ctx context.Context, q queryRower, task string) (*api.HandlerSuccessorHold, error) {
+	var h api.HandlerSuccessorHold
+	var created string
+	err := q.QueryRowContext(ctx, `SELECT reason,trigger_kind,old_agent_id,old_run_id,handler_revision,created_at FROM handler_successor_holds WHERE task_id=?`, task).
+		Scan(&h.Reason, &h.Trigger, &h.OldAgentID, &h.OldRunID, &h.HandlerRevision, &created)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	h.CreatedAt = parseTS(created)
+	return &h, nil
+}
+
+// loadSuccessorHold is the project's successor hold only while it names the
+// current primary handler's exact agent and run; a hold for an earlier run
+// is nil.
+func loadSuccessorHold(ctx context.Context, q queryRower, t api.Task) (*api.HandlerSuccessorHold, error) {
+	h, err := successorHoldRow(ctx, q, t.ID)
+	if err != nil || h == nil {
+		return nil, err
+	}
+	primary, err := primaryHandler(ctx, q, t)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if primary.ID != h.OldAgentID || primary.RunID != h.OldRunID {
+		return nil, nil
+	}
+	return h, nil
+}
+
+// successorHoldCounts reports whether a current hold holds the seat: a
+// manual hold always, a template hold only while the policy would rotate for
+// a template change.
+func successorHoldCounts(h api.HandlerSuccessorHold, policy api.HandlerRotationPolicy) bool {
+	return h.Reason == api.HandlerRotationReasonManual || (h.Reason == api.HandlerRotationReasonTemplate && policy.Enabled && policy.OnTemplateChange)
+}
+
+// successorHeldRefusal is a no_agent_slot refusal whose prepare recorded a
+// successor hold: HandlerRotationAction commits the hold and returns the bare
+// refusal, with no rotation or request receipt.
+type successorHeldRefusal struct{ refusal *api.HandlerRotationRefusal }
+
+func (e successorHeldRefusal) Error() string { return e.refusal.Error() }
+func (e successorHeldRefusal) Unwrap() error { return e.refusal }
+
+// recordSuccessorHold writes the hold for a refused template or manual
+// prepare of the exact old run. A hold for another run is replaced; one for
+// the same run is kept, with its first reason. One event marks a new hold.
+func (s *Store) recordSuccessorHold(ctx context.Context, tx *sql.Tx, t api.Task, old api.Agent, req api.HandlerRotationRequest, now time.Time, by api.Caller) error {
+	h, err := successorHoldRow(ctx, tx, t.ID)
+	if err != nil {
+		return err
+	}
+	if h != nil && h.OldAgentID == old.ID && h.OldRunID == old.RunID {
+		return nil
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT OR REPLACE INTO handler_successor_holds(task_id,reason,trigger_kind,old_agent_id,old_run_id,handler_revision,created_at) VALUES(?,?,?,?,?,?,?)`,
+		t.ID, req.Reason, req.Trigger, old.ID, old.RunID, t.HandlerRevision, ts(now)); err != nil {
+		return err
+	}
+	_, err = s.insertEvent(ctx, tx, t.ID, "task_updated", old.ID, "Handler successor seat held", map[string]any{"reason": req.Reason, "trigger": req.Trigger,
+		"oldAgentId": old.ID, "oldRunId": old.RunID, "handlerRevision": t.HandlerRevision}, by)
+	return err
+}
+
+// releaseSuccessorHold is the release_hold operation: it deletes the hold of
+// the exact old run, writes no request receipt, and is NotFound when that run
+// holds none. The result is an aborted rotation with no ID that names the
+// hold.
+func (s *Store) releaseSuccessorHold(ctx context.Context, tx *sql.Tx, task string, req api.HandlerRotationRequest, by api.Caller) (api.HandlerRotation, error) {
+	var zero api.HandlerRotation
+	if !api.ValidID(req.OldAgentID, "agt") || !validRunID(req.OldRunID) || req.ExpectedHandlerRevision != 0 || req.SuccessorAgentID != "" || req.SuccessorName != "" ||
+		req.Reason != "" || req.Trigger != "" || req.AuthorizedBy != "" || req.AuthorizationReason != "" || req.DeathEvidence != nil || req.RotationID != "" {
+		return zero, api.ErrInvalid
+	}
+	t, err := scanTask(tx.QueryRowContext(ctx, `SELECT `+taskCols+` FROM tasks WHERE id=?`, task))
+	if errors.Is(err, sql.ErrNoRows) {
+		return zero, api.ErrNotFound
+	}
+	if err != nil {
+		return zero, err
+	}
+	h, err := successorHoldRow(ctx, tx, t.ID)
+	if err != nil {
+		return zero, err
+	}
+	if h == nil || h.OldAgentID != req.OldAgentID || h.OldRunID != req.OldRunID {
+		return zero, api.ErrNotFound
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM handler_successor_holds WHERE task_id=? AND old_agent_id=? AND old_run_id=?`, t.ID, h.OldAgentID, h.OldRunID); err != nil {
+		return zero, err
+	}
+	var name string
+	if err = tx.QueryRowContext(ctx, `SELECT name FROM agents WHERE task_id=? AND id=?`, t.ID, h.OldAgentID).Scan(&name); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return zero, err
+	}
+	now := s.now()
+	if _, err = s.insertEvent(ctx, tx, t.ID, "task_updated", h.OldAgentID, "Handler successor seat released", map[string]any{"reason": h.Reason, "trigger": h.Trigger,
+		"oldAgentId": h.OldAgentID, "oldRunId": h.OldRunID}, by); err != nil {
+		return zero, err
+	}
+	return api.HandlerRotation{TaskID: t.ID, RequestID: req.RequestID, State: api.HandlerRotationAborted, Reason: h.Reason, Trigger: h.Trigger, HandlerRevision: h.HandlerRevision,
+		OldAgentID: h.OldAgentID, OldRunID: h.OldRunID, OldName: name, CreatedAt: h.CreatedAt, UpdatedAt: now}, nil
 }
 
 func (s *Store) GetHandlerRotation(ctx context.Context, task, id string) (api.HandlerRotation, error) {
@@ -1152,6 +1268,18 @@ func (s *Store) HandlerRotationAction(ctx context.Context, task string, req api.
 		return zero, err
 	}
 	defer tx.Rollback()
+	// A release is idempotent by its exact run, so it keeps no receipt.
+	if req.Operation == api.HandlerRotationReleaseHold {
+		out, err := s.releaseSuccessorHold(ctx, tx, task, req, by)
+		if err != nil {
+			return zero, err
+		}
+		if err = tx.Commit(); err != nil {
+			return zero, err
+		}
+		s.notify(task)
+		return out, nil
+	}
 	if id, replay, err := handlerRotationReceipt(ctx, tx, task, req.RequestID, req.Operation, hash); err != nil {
 		return zero, err
 	} else if replay {
@@ -1177,6 +1305,15 @@ func (s *Store) HandlerRotationAction(ctx context.Context, task string, req api.
 		out, err = s.abortHandlerRotation(ctx, tx, t, req, by)
 	default:
 		return zero, api.ErrInvalid
+	}
+	var held successorHeldRefusal
+	if errors.As(err, &held) {
+		// The hold is the refusal's only save.
+		if err = tx.Commit(); err != nil {
+			return zero, err
+		}
+		s.notify(task)
+		return zero, held.refusal
 	}
 	if err != nil {
 		return zero, err
@@ -1308,7 +1445,23 @@ func (s *Store) prepareHandlerRotation(ctx context.Context, tx *sql.Tx, t api.Ta
 		return zero, err
 	}
 	if reason := projectAgentCapReason(capOpen, capReserved, 1, s.MaxAgents); reason != "" {
-		return zero, &api.HandlerRotationRefusal{Code: api.HandlerRotationRefusedNoAgentSlot, Detail: reason + "; the successor cannot register until an agent is closed"}
+		refusal := &api.HandlerRotationRefusal{Code: api.HandlerRotationRefusedNoAgentSlot, Detail: reason + "; the successor cannot register until an agent is closed"}
+		// The hub's due rule cannot see a template or manual rotation, so
+		// the refusal itself holds the next free seat (bug
+		// wi_bbea3ea3ad6068a1); every other reason's seat is held by that rule.
+		if req.Reason != api.HandlerRotationReasonTemplate && req.Reason != api.HandlerRotationReasonManual {
+			return zero, refusal
+		}
+		if err = s.recordSuccessorHold(ctx, tx, t, old, req, now, by); err != nil {
+			return zero, err
+		}
+		refusal.Detail += "; the next free agent seat is held for the successor"
+		return zero, successorHeldRefusal{refusal}
+	}
+	// The prepared rotation holds the seat from here until its successor
+	// registers.
+	if _, err = tx.ExecContext(ctx, `DELETE FROM handler_successor_holds WHERE task_id=?`, t.ID); err != nil {
+		return zero, err
 	}
 	r := api.HandlerRotation{ID: api.NewID("hrot"), TaskID: t.ID, RequestID: req.RequestID, State: api.HandlerRotationPrepared, Reason: req.Reason, Trigger: req.Trigger,
 		HandlerRevision: t.HandlerRevision, OldAgentID: old.ID, OldRunID: old.RunID, OldName: old.Name, SuccessorAgentID: req.SuccessorAgentID,
@@ -1952,6 +2105,11 @@ func primaryRotationDue(ctx context.Context, q queryRower, t api.Task, policy ap
 		return api.HandlerRotationDue{}, false, err
 	}
 	d.DigestMatches = templateDigest != "" && d.RecordedDigest == templateDigest
+	if hold, err := successorHoldRow(ctx, q, t.ID); err != nil {
+		return api.HandlerRotationDue{}, false, err
+	} else if hold != nil && hold.OldAgentID == primary.ID && hold.OldRunID == primary.RunID {
+		d.SuccessorHold = hold
+	}
 	// The limits are due only under an enabled limit policy.
 	if policy.Enabled && policy.MaxItems > 0 && d.FinishedItems >= policy.MaxItems {
 		d.DueReasons = append(d.DueReasons, api.HandlerRotationReasonItems)

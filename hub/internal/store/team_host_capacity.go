@@ -246,13 +246,17 @@ func projectAgentCapReason(open, reserved, seats, maxAgents int) string {
 	return fmt.Sprintf("%s%d open + %d seats > %d", projectAgentCapPrefix, open, seats, maxAgents)
 }
 
-// handlerSuccessorSeat is the seat queue admission holds for the primary
-// handler's successor (bug wi_31ec140ea47e3441): 1 while a prepared rotation
+// handlerSuccessorSeat is the seat queue admission and automatic handler
+// provisioning hold for the primary handler's successor (bugs
+// wi_31ec140ea47e3441, wi_bbea3ea3ad6068a1): 1 while a prepared rotation
 // waits for its successor to register, or, with none prepared, while the
-// rotation is due by its items or tokens limit, provider_blocked, or a dead
-// primary whose silence is met; otherwise 0. Due is HandlerRotationsDue's
-// own rule, read through q, without the runner's template digest. A
-// rotation's prepare never counts this seat: it is that seat.
+// current primary run has a successor hold that counts (successorHoldCounts),
+// or while the rotation is due by its items or tokens limit,
+// provider_blocked, or a dead primary whose silence is met; otherwise 0. Due
+// is HandlerRotationsDue's own rule, read through q, without the runner's
+// template digest: a template rotation holds the seat only through the hold
+// its refused prepare recorded. A rotation's prepare never counts this seat:
+// it is that seat.
 func handlerSuccessorSeat(ctx context.Context, q queryRower, task string, now time.Time) (int, error) {
 	r, err := openHandlerRotation(ctx, q, task)
 	if err != nil {
@@ -281,6 +285,11 @@ func handlerSuccessorSeat(ctx context.Context, q queryRower, task string, now ti
 	policy, err := loadHandlerRotationPolicy(ctx, q, task)
 	if err != nil {
 		return 0, err
+	}
+	if hold, err := loadSuccessorHold(ctx, q, t); err != nil {
+		return 0, err
+	} else if hold != nil && successorHoldCounts(*hold, policy) {
+		return 1, nil
 	}
 	d, listed, err := primaryRotationDue(ctx, q, t, policy, "", "", now)
 	if err != nil || !listed || (len(d.DueReasons) == 0 && !d.SilenceMet) {

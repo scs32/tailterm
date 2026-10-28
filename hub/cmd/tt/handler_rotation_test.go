@@ -4182,3 +4182,155 @@ func TestHandlerRotationProviderBlockedFallback(t *testing.T) {
 		t.Fatalf("owner helper notices %d spawns %d", n, f.spawns)
 	}
 }
+
+// Successor holds (bug wi_bbea3ea3ad6068a1, order #49564). Isolated fixture
+// hub only (newRotationCLI).
+
+// holdCount counts the fixture project's successor holds, or the events
+// named text when text is set.
+func (f *rotationCLI) holdCount(t *testing.T, text string) int {
+	t.Helper()
+	query, args := `SELECT count(*) FROM handler_successor_holds WHERE task_id=?`, []any{f.task.ID}
+	if text != "" {
+		query, args = `SELECT count(*) FROM events WHERE task_id=? AND text=?`, []any{f.task.ID, text}
+	}
+	var n int
+	if err := f.db(t).QueryRow(query, args...).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// dueHold is the successor hold the host's due list names for the project.
+func (f *rotationCLI) dueHold(t *testing.T) *api.HandlerSuccessorHold {
+	t.Helper()
+	list, err := f.c.HandlerRotationsDue(context.Background(), "fixture", handlerTemplateDigest(""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range list.Entries {
+		if d.TaskID == f.task.ID {
+			return d.SuccessorHold
+		}
+	}
+	return nil
+}
+
+// templateHeldOnFullProject is a runner whose saved prompt differs from the
+// primary's recorded template, on a project with no free agent slot: its
+// ticks are refused no_agent_slot, which holds the successor seat.
+func templateHeldOnFullProject(t *testing.T) (*rotationCLI, *rotationRunner, []api.Agent) {
+	t.Helper()
+	f := newRotationCLI(t, handlerTemplateDigest("earlier handler assignment"))
+	if err := saveHandlerSpec(f.spec); err != nil {
+		t.Fatal(err)
+	}
+	setRotationPolicy(t, f, api.HandlerRotationPolicyRequest{Enabled: true, OnTemplateChange: true})
+	fillers := f.fillAgentSlots(t)
+	r := f.runner()
+	for i := 0; i < 2; i++ {
+		f.tick(t, r)
+	}
+	if rotations := f.rotations(t); len(rotations) != 0 || f.spawns != 0 || f.journalExists() {
+		t.Fatalf("a full project prepared: rotations %+v spawns %d journal %v", rotations, f.spawns, f.journalExists())
+	}
+	if n, held := f.holdCount(t, ""), f.holdCount(t, "Handler successor seat held"); n != 1 || held != 1 {
+		t.Fatalf("holds %d, held events %d", n, held)
+	}
+	h := f.dueHold(t)
+	if h == nil || h.Reason != api.HandlerRotationReasonTemplate || h.Trigger != api.HandlerRotationTriggerRunner || h.OldAgentID != f.old.ID || h.OldRunID != f.old.RunID {
+		t.Fatalf("due list hold %+v", h)
+	}
+	return f, r, fillers
+}
+
+// a1: a template rotation refused on a full project holds the seat and says
+// so; once a slot frees, the next tick rotates and the hold is gone. While
+// the template is still due the runner releases nothing.
+func TestHandlerRotationRunnerTemplateHoldOnFullProject(t *testing.T) {
+	f, r, fillers := templateHeldOnFullProject(t)
+	notices := f.noSlotNotices(t)
+	if len(notices) != 1 {
+		t.Fatalf("no-slot notices: %d", len(notices))
+	}
+	text := notices[0].Envelope.Body.Text
+	for _, want := range []string{"The template rotation", "seat is held for the successor", "Queue admission and automatic handler provisioning hold the next free agent seat for the successor.", "Nothing was prepared", "This notice closes nothing"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("notice lacks %q: %s", want, text)
+		}
+	}
+	if n := f.holdCount(t, "Handler successor seat released"); n != 0 {
+		t.Fatalf("released a hold that is still due: %d", n)
+	}
+	f.closeAgent(t, fillers[0])
+	f.tick(t, r)
+	rotations := f.rotations(t)
+	if len(rotations) != 1 {
+		t.Fatalf("rotations once a slot freed: %+v", rotations)
+	}
+	got, err := f.c.GetHandlerRotation(context.Background(), f.task.ID, rotations[0].ID)
+	if err != nil || got.State != api.HandlerRotationCommitted || got.Reason != api.HandlerRotationReasonTemplate {
+		t.Fatalf("rotation once a slot freed: %+v %v", got, err)
+	}
+	if n := f.holdCount(t, ""); n != 0 || f.dueHold(t) != nil {
+		t.Fatalf("hold left after the rotation: %d", n)
+	}
+}
+
+// a3: once this host's saved prompt matches the recorded template, one tick
+// releases the template hold, and later ticks release nothing more.
+func TestHandlerRotationRunnerReleasesStaleTemplateHold(t *testing.T) {
+	f, r, _ := templateHeldOnFullProject(t)
+	spec, err := newHandlerSpec(f.c.Base, f.task.ID, []string{"--run", "sleep 300", "--runtime", "generic", "--cwd", f.dir, "--prompt", "earlier handler assignment"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = saveHandlerSpec(spec); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		f.tick(t, r)
+	}
+	if n, released := f.holdCount(t, ""), f.holdCount(t, "Handler successor seat released"); n != 0 || released != 1 {
+		t.Fatalf("holds %d, released events %d", n, released)
+	}
+	if rotations := f.rotations(t); len(rotations) != 0 {
+		t.Fatalf("a current template rotated: %+v", rotations)
+	}
+}
+
+// a4: an owner rotate on a full project holds the seat and says how to end
+// it; an abort with nothing prepared releases it, and a second abort finds
+// nothing.
+func TestHandlerRotationOwnerAbortReleasesManualHold(t *testing.T) {
+	f := newRotationCLI(t, "")
+	ctx := context.Background()
+	f.fillAgentSlots(t)
+	_, err := f.rotate(t)
+	err = ownerRotateNoSlotHint(err, f.task.ID)
+	if !noAgentSlot(err) || !strings.Contains(err.Error(), "the next free agent seat is held for this rotation; rerun tt handler rotate --task "+f.task.ID+" once an agent is closed, or release the seat with tt handler rotate --abort --task "+f.task.ID) {
+		t.Fatalf("owner rotate on a full project: %v", err)
+	}
+	if h := f.dueHold(t); f.holdCount(t, "") != 1 || (h != nil && h.Reason != api.HandlerRotationReasonManual) {
+		t.Fatalf("manual hold %+v", h)
+	}
+	r, err := abortHandlerRotation(ctx, f.deps, f.e, f.c, f.task.ID)
+	if err != nil || r.ID != "" || r.State != api.HandlerRotationAborted || r.Reason != api.HandlerRotationReasonManual || r.OldAgentID != f.old.ID || r.OldRunID != f.old.RunID {
+		t.Fatalf("abort with a manual hold: %+v %v", r, err)
+	}
+	if line := abortedRotationLine(r); line != "Released the agent seat held for the manual rotation of "+f.old.Name+"; nothing was prepared." {
+		t.Fatalf("release line %q", line)
+	}
+	if n := f.holdCount(t, ""); n != 0 {
+		t.Fatalf("holds after the abort: %d", n)
+	}
+	if _, err = abortHandlerRotation(ctx, f.deps, f.e, f.c, f.task.ID); err == nil || err.Error() != "no prepared handler rotation to abort" {
+		t.Fatalf("second abort: %v", err)
+	}
+	if line := abortedRotationLine(api.HandlerRotation{ID: "hrot_x", OldName: "db-handler"}); line != "Aborted handler rotation hrot_x; db-handler stays primary." {
+		t.Fatalf("abort line %q", line)
+	}
+	if other := errors.New("other"); ownerRotateNoSlotHint(other, f.task.ID) != other {
+		t.Fatal("the hint changed another error")
+	}
+}

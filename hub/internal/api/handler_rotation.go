@@ -22,6 +22,9 @@ const (
 	HandlerRotationPrepare = "prepare"
 	HandlerRotationCommit  = "commit"
 	HandlerRotationAbort   = "abort"
+	// HandlerRotationReleaseHold ends the successor hold of an exact old run
+	// (HandlerSuccessorHold); it prepares and aborts nothing.
+	HandlerRotationReleaseHold = "release_hold"
 
 	HandlerRotationReasonManual   = "manual"
 	HandlerRotationReasonItems    = "items"
@@ -64,7 +67,9 @@ const (
 	HandlerRotationRefusedNotBlocked = "not_blocked"
 	// Prepare only: registering the successor would exceed the project's
 	// agent cap, counting the seats admitted team launches still have to
-	// register (bug wi_caa61d47ad431bf5).
+	// register (bug wi_caa61d47ad431bf5). A refused template or manual
+	// prepare records a successor hold (bug wi_bbea3ea3ad6068a1); nothing
+	// else is saved.
 	HandlerRotationRefusedNoAgentSlot = "no_agent_slot"
 
 	// Owner decision #14233, option A.
@@ -203,7 +208,7 @@ type HandlerRotationPolicyRequest struct {
 type HandlerRotationRequest struct {
 	Operation string `json:"operation"`
 	RequestID string `json:"requestId"`
-	// prepare
+	// prepare; release_hold takes only OldAgentID and OldRunID
 	ExpectedHandlerRevision int64  `json:"expectedHandlerRevision,omitempty"`
 	OldAgentID              string `json:"oldAgentId,omitempty"`
 	OldRunID                string `json:"oldRunId,omitempty"`
@@ -421,6 +426,22 @@ type HandlerRotationDue struct {
 	LastActivityAt *time.Time `json:"lastActivityAt,omitempty"`
 	DeadCandidate  bool       `json:"deadCandidate"`
 	SilenceMet     bool       `json:"silenceMet"`
+	// SuccessorHold is the hold recorded for this exact primary run, if any.
+	SuccessorHold *HandlerSuccessorHold `json:"successorHold,omitempty"`
+}
+
+// HandlerSuccessorHold is the seat the hub holds for a primary handler's
+// successor after it refused a template or manual prepare no_agent_slot (bug
+// wi_bbea3ea3ad6068a1): the refused prepare is the runner's or the owner's
+// report. It names the exact old run and ends at a successful prepare, a
+// changed primary run, or release_hold.
+type HandlerSuccessorHold struct {
+	Reason          string    `json:"reason"`
+	Trigger         string    `json:"trigger"`
+	OldAgentID      string    `json:"oldAgentId"`
+	OldRunID        string    `json:"oldRunId"`
+	HandlerRevision int64     `json:"handlerRevision"`
+	CreatedAt       time.Time `json:"createdAt"`
 }
 
 type HandlerRotationDueList struct {

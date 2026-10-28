@@ -105,7 +105,7 @@ tt handler spec --task TASK            # show the saved spec
 
 # Rotate now, below any threshold. Spawn flags after -- replace the saved spec.
 tt handler rotate --task TASK [-- <launch flags>]
-tt handler rotate --task TASK --abort  # abort a prepared rotation
+tt handler rotate --task TASK --abort  # abort a prepared rotation, or release a held seat
 
 # Move the primary to another runtime, model or arm (see below).
 tt handler rotate --task TASK --authorized-by NAME --authorization-reason "..." \
@@ -234,7 +234,12 @@ obligations. A new prepare is allowed afterwards. Once the hub confirms an
 abort, the host saves the journal as `aborted`, then cleans up the successor
 and removes the journal. If the cleanup fails, the `aborted` journal stays:
 `--abort` again, a rerun of `tt handler rotate`, or the runner's next tick
-finishes the cleanup first. An `aborted` journal is never resumed.
+finishes the cleanup first. An `aborted` journal is never resumed. With no
+prepared rotation, `--abort` releases the
+[successor hold](#successor-seat-hold) of the current primary run, whatever
+its reason, and prints "Released the agent seat held for the REASON rotation
+of NAME; nothing was prepared." With no hold either it fails with "no prepared
+handler rotation to abort".
 
 ## Successor readiness
 
@@ -294,7 +299,7 @@ The rotation row, successor and obligations stay as they were.
 | `successor_not_ready` | At commit, for every reason: the successor's exact run has no report since the prepare of a completed turn with a model reply. See [Successor readiness](#successor-readiness). |
 | `not_blocked` | A [provider-blocked](#a-provider-blocked-primary) prepare only: the old run is not online and idle with a `rate_limited` or `server_error` episode open for 20 minutes and an obligation that needs more than delivery, or the dead primary replacement is off. |
 | `death_unconfirmed` | A [dead primary](#a-dead-primary) rotation only: the host's evidence is missing, stale, from another host or run, names no session, or does not state both the session and the process gone; or the hub had a heartbeat from the run within 90 seconds; or the handler is not busy; or the replacement is off for the project. For a [primary whose wrapper reported exited](#a-primary-whose-wrapper-reported-exited): the hub has no exit report from the wrapper as the run's newest start, heartbeat or exit, or that report changed since prepare; the evidence carries no exit from the host's receipt; or it states an `idle_shell` session without the pane's process. |
-| `no_agent_slot` | Prepare only, for every reason and trigger, checked after the busy, primary and revision refusals: the project's open agents (every agent not closed or exited, done and retired ones and persistent roles included), plus the seats that admitted team launches still have to register, plus the successor, would exceed the project's agent cap (32). The detail carries the counts, such as `project agent cap: 32 open + 1 seats > 32`. Nothing is prepared, so queue dispatch is not held and the old handler stays primary. See [Policy and the runner](#policy-and-the-runner). |
+| `no_agent_slot` | Prepare only, for every reason and trigger, checked after the busy, primary and revision refusals: the project's open agents (every agent not closed or exited, done and retired ones and persistent roles included), plus the seats that admitted team launches still have to register, plus the successor, would exceed the project's agent cap (32). The detail carries the counts, such as `project agent cap: 32 open + 1 seats > 32`. Nothing is prepared, so queue dispatch is not held and the old handler stays primary. A `template` or `manual` prepare also records a [successor hold](#successor-seat-hold), and its detail ends "; the next free agent seat is held for the successor". See [Policy and the runner](#policy-and-the-runner). |
 | `not_silent` | A dead primary rotation only: the run's last recorded activity is more recent than the project's silence, the run has no recorded activity at all, or it recorded activity after the rotation was prepared. |
 
 Commit repeats the idle checks. A handler that became busy after prepare gets a
@@ -755,10 +760,18 @@ list. For each listed project:
   not repeat it. The notice gives the hub's counts and names, up to ten, the
   done or retired ordinary agents an owner could close; a handler, deployer,
   steward or owner helper is never named. It closes nothing. Meanwhile queue
-  admission holds one seat for the successor, so the next agent closed frees
-  a slot for the rotation rather than for a new team
+  admission and automatic handler provisioning hold one seat for the
+  successor, so the next agent closed frees a slot for the rotation rather
+  than for a new team or handler
   ([project-queue.md](project-queue.md#project-agent-cap), "Handler successor
-  seat"); a rotation due only for a template change gets no held seat.
+  seat"). The notice says so. A rotation due only for a template change holds
+  its seat through the [successor hold](#successor-seat-hold) its refused
+  prepare recorded.
+- A template [successor hold](#successor-seat-hold) for the primary's run
+  that this host no longer finds due (the limit policy or
+  `onTemplateChange` is off, or the run's recorded template is this host's
+  saved prompt): released with `release_hold`, once, before the rest of the
+  tick. The runner never releases a manual hold.
 - Due with no saved spec: one board NOTICE per exact handler run, keyed so a
   relay restart does not repeat it. No spawn. Without a spec the host does not
   know the handler's prompt, so it reports a template change only for a legacy
@@ -772,6 +785,42 @@ list. For each listed project:
 - Policy disabled: the project is listed only while its primary is a dead
   candidate or provider blocked, or a `provider_blocked` rotation is prepared,
   and the runner acts on no limit for it.
+
+### Successor seat hold
+
+The hub's own due rule cannot see two rotations: one due only for a template
+change (only the runner knows its saved prompt) and a manual one. For these
+the refused prepare is the report (bug wi_bbea3ea3ad6068a1, order #49564):
+
+- **Recorded.** A prepare with reason `template` or `manual` that the hub
+  refuses `no_agent_slot` saves one hold for the project, naming the exact old
+  agent and run, the reason, the trigger and the handler revision, and still
+  returns the 409. No rotation, request receipt or "Handler rotation prepared"
+  event is saved. A retry for the same run keeps the hold and its first
+  reason; a refusal for another run replaces it. The event "Handler successor
+  seat held" marks a new hold only. Other reasons record nothing: the due rule
+  already holds their seat.
+- **Counted.** With no prepared rotation, the hold holds the successor seat
+  for queue admission and automatic handler provisioning while it names the
+  current primary's exact agent and run, and, for a template hold, while the
+  limit policy and `onTemplateChange` are on. A manual hold counts whatever
+  the policy says. Prepare's own check never counts it, so one free slot
+  prepares the rotation.
+- **Ended.** A prepare that succeeds, for any reason, deletes the hold: the
+  prepared rotation holds the seat from then until its successor registers.
+  A hold for an earlier run of the primary no longer counts.
+- **Released.** The operation `release_hold` on
+  `POST /v1/tasks/{id}/handler-rotations` takes only `requestId`, `oldAgentId`
+  and `oldRunId`. It deletes the hold of that exact run, records "Handler
+  successor seat released" and returns an aborted rotation with no ID that
+  names the hold. It keeps no receipt; with no hold for that run it is
+  `404`. The runner releases a stale template hold (above); the owner
+  releases any hold with `tt handler rotate --abort`. A refused
+  `tt handler rotate` says so: "the next free agent seat is held for this
+  rotation; rerun tt handler rotate --task ID once an agent is closed, or
+  release the seat with tt handler rotate --abort --task ID".
+
+With no hold, admission, provisioning and every refusal text are as before.
 
 ### A successor that never comes online
 
@@ -911,9 +960,9 @@ recovered `provider_blocked` primary with its limit policy off).
 | Method and path | Purpose |
 | --- | --- |
 | `GET/PUT /v1/tasks/{id}/handler-rotation/policy` | Read, or save with `expectedRevision` |
-| `POST /v1/tasks/{id}/handler-rotations` | `operation` `prepare`, `commit` or `abort`, keyed by `requestId` |
+| `POST /v1/tasks/{id}/handler-rotations` | `operation` `prepare`, `commit` or `abort`, keyed by `requestId`; `release_hold` ends a [successor hold](#successor-seat-hold) and keeps no receipt |
 | `GET /v1/tasks/{id}/handler-rotations[/{rid}]` | List, or read one |
-| `GET /v1/handler-rotations/due?host=H&templateDigest=D` | Runner due list, with `online`, `lastActivityAt`, `deadCandidate` and `silenceMet` per primary; `dueReasons` may include `provider_blocked` |
+| `GET /v1/handler-rotations/due?host=H&templateDigest=D` | Runner due list, with `online`, `lastActivityAt`, `deadCandidate`, `silenceMet` and any `successorHold` of the exact run per primary; `dueReasons` may include `provider_blocked` |
 
 Reusing a request ID with the same input returns the saved record without
 writing anything. Reusing it with different input is refused.
@@ -922,14 +971,17 @@ writing anything. Reusing it with different input is refused.
 
 The new columns (`tasks.primary_handler_id`, `tasks.handler_revision`) and
 tables (`handler_rotation_policy`, `handler_rotations`,
-`handler_rotation_requests`, `handler_runs`) stay in place, as do the
+`handler_rotation_requests`, `handler_runs`, `handler_successor_holds`) stay
+in place, as do the
 `handler_rotations` columns `authorized_by`, `authorization_reason`,
 `old_runtime` and `successor_runtime`, which default to empty, and the dead
 primary columns: `handler_rotation_policy.dead_silence_minutes` (default 10) and
 `handler_rotations.evidence_json`, `commit_evidence_json`,
 `last_activity_at` and `exit_json` (the saved exit report, empty for any other
 rotation). An older hub binary
-ignores them and returns to the legacy primary rules. A handler closed by a
+ignores them and returns to the legacy primary rules; it counts no
+successor hold, and the next prepare that succeeds after an upgrade deletes
+any hold left from before. A handler closed by a
 rotation stays closed. An older CLI does not forward the old name, so address the
 successor by its new name. Host specs and journals under the relay state
 directory are inert without the new CLI.
@@ -1016,12 +1068,18 @@ directory are inert without the new CLI.
   reached`, and the rotation follows the
   [resume ceiling](#a-successor-that-never-comes-online) and the
   [automatic abort](#automatic-abort-of-a-stuck-rotation). Queue admission
-  holds one seat for a successor while a rotation is prepared and waiting for
-  it, or due on the hub's own rule (limits, `provider_blocked`, or
-  `dead_primary` with the silence met), but registration outside the queue
-  does not honor that seat. A rotation due only for a template change, and a
-  manual rotation before its prepare, hold no seat
+  and automatic handler provisioning hold one seat for a successor while a
+  rotation is prepared and waiting for it, due on the hub's own rule (limits,
+  `provider_blocked`, or `dead_primary` with the silence met), or held by a
+  [successor hold](#successor-seat-hold), but registration outside the queue
+  does not honor that seat
   ([project-queue.md](project-queue.md#project-agent-cap)).
+- A manual rotation holds a seat only from the first `tt handler rotate` the
+  hub refuses `no_agent_slot`; before that the hub cannot know the owner
+  means to rotate. A [successor hold](#successor-seat-hold) does not expire:
+  if its runner host stops ticking, or an owner never reruns or aborts a
+  manual rotation, it holds the seat until `tt handler rotate --abort` or a
+  new primary run.
 - The `no_agent_slot` notice is posted once per exact old run and reason. If
   the project fills again later for the same run and reason, no second notice
   is posted.

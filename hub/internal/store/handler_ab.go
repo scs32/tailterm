@@ -1806,7 +1806,10 @@ type handlerNeedContext struct {
 	now               time.Time
 	handlers          []api.HandlerArmHandler
 	capOpen, capSeats int
-	pending           *handlerProvisionRow
+	// capHeld is the seat held for the primary handler's successor
+	// (handlerSuccessorSeat), which a provision must leave free.
+	capHeld int
+	pending *handlerProvisionRow
 	// over is a reserved row that has become registered or abandoned but is
 	// not saved as such yet; it already counts as a finished attempt.
 	over               *handlerProvisionRow
@@ -1834,6 +1837,9 @@ func loadHandlerNeedContext(ctx context.Context, q queryRower, p api.HandlerArmP
 		}
 	}
 	if c.capOpen, c.capSeats, err = projectAgentCapUsage(ctx, q, p.TaskID); err != nil {
+		return nil, err
+	}
+	if c.capHeld, err = handlerSuccessorSeat(ctx, q, p.TaskID, now); err != nil {
 		return nil, err
 	}
 	if err = q.QueryRowContext(ctx, `SELECT primary_handler_id FROM tasks WHERE id=?`, p.TaskID).Scan(&c.primaryID); err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -1958,12 +1964,16 @@ func (c *handlerNeedContext) need(ctx context.Context, q queryRower, e api.TeamQ
 		// ever. The hub runs and resets nothing: the entry waits for a
 		// handler like any other, and says what a person should look at.
 		n.Reason = counts + "; cannot add one: " + ceilingText(e.TaskID, n.Arm, ended)
-	case c.capOpen+c.capSeats+seats+1 > c.maxAgents:
-		// The new handler and the waiting team must both fit, so a provision
-		// is never what pushes the team over the cap.
+	case c.capOpen+c.capSeats+c.capHeld+seats+1 > c.maxAgents:
+		// The new handler and the waiting team must both fit beside the
+		// seat held for the handler successor, so a provision is never what
+		// pushes the team over the cap or takes that seat.
 		reserved := ""
 		if c.capSeats > 0 {
 			reserved = fmt.Sprintf(" + %d reserved", c.capSeats)
+		}
+		if c.capHeld > 0 {
+			reserved += fmt.Sprintf(" + %d seat held for the handler successor", c.capHeld)
 		}
 		n.Fix = lower
 		n.Reason = fmt.Sprintf("%s; cannot add one: %s%d open%s + %d seats + 1 handler > %d. Fix: %s", counts, projectAgentCapPrefix, c.capOpen, reserved, seats, c.maxAgents, n.Fix)

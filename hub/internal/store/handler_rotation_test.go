@@ -3495,10 +3495,12 @@ func (f *rotationFixture) fillAgentCap(t *testing.T) (open, reserved int) {
 	return open, reserved
 }
 
-// A full project refuses the prepare with no_agent_slot and saves nothing,
-// so queue dispatch still leases the old handler; one free slot prepares
-// (bug wi_caa61d47ad431bf5).
-func TestHandlerRotationNoAgentSlotRefusesAndHoldsNothing(t *testing.T) {
+// A full project refuses the prepare with no_agent_slot and saves no
+// rotation, so queue dispatch still leases the old handler; one free slot
+// prepares (bug wi_caa61d47ad431bf5). This manual refusal also records a
+// successor hold (wi_bbea3ea3ad6068a1), which a team that fits beside it
+// does not notice.
+func TestHandlerRotationNoAgentSlotRefusesAndSavesNoRotation(t *testing.T) {
 	f := newRotationFixture(t)
 	ctx := context.Background()
 	s := f.s
@@ -3596,4 +3598,378 @@ func TestHandlerRotationManualAbortThenFullProjectPreparesNothing(t *testing.T) 
 	if err != nil || len(rotations) != 1 || rotations[0].ID != r.ID || rotations[0].State != api.HandlerRotationAborted {
 		t.Fatalf("rotations after the refused prepare: %+v %v", rotations, err)
 	}
+}
+
+// Successor holds (bug wi_bbea3ea3ad6068a1, order #49564): a template or
+// manual prepare refused no_agent_slot holds the next free agent seat.
+
+// prepareFor prepares the fixture's primary for a reason and trigger.
+func (f *rotationFixture) prepareFor(t *testing.T, key, reason, trigger string) (api.HandlerRotation, error) {
+	t.Helper()
+	task, err := f.s.GetTask(context.Background(), f.task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return f.s.HandlerRotationAction(context.Background(), f.task.ID, api.HandlerRotationRequest{Operation: api.HandlerRotationPrepare, RequestID: key,
+		ExpectedHandlerRevision: task.HandlerRevision, OldAgentID: f.old.ID, OldRunID: f.old.RunID, SuccessorAgentID: api.NewID("agt"),
+		SuccessorName: api.HandlerSuccessorName(f.old.Name, task.HandlerRevision), Reason: reason, Trigger: trigger}, f.by)
+}
+
+// releaseHold sends release_hold for an exact run.
+func (f *rotationFixture) releaseHold(key string, a api.Agent) (api.HandlerRotation, error) {
+	return f.s.HandlerRotationAction(context.Background(), f.task.ID, api.HandlerRotationRequest{Operation: api.HandlerRotationReleaseHold, RequestID: key,
+		OldAgentID: a.ID, OldRunID: a.RunID}, f.by)
+}
+
+func (f *rotationFixture) holdRows(t *testing.T) int {
+	t.Helper()
+	return countRows(t, f.s, `SELECT count(*) FROM handler_successor_holds WHERE task_id=?`, f.task.ID)
+}
+
+// heldOnFullProject fills the cap and has the hub refuse a prepare for
+// reason, so the refusal records a hold; it returns the open count.
+func (f *rotationFixture) heldOnFullProject(t *testing.T, reason, trigger string) int {
+	t.Helper()
+	open, _ := f.fillAgentCap(t)
+	_, err := f.prepareFor(t, "hold-"+reason, reason, trigger)
+	if refusalCode(err) != api.HandlerRotationRefusedNoAgentSlot || !strings.Contains(err.Error(), "; the next free agent seat is held for the successor") {
+		t.Fatalf("%s prepare on a full project: %v", reason, err)
+	}
+	if n := f.holdRows(t); n != 1 {
+		t.Fatalf("%s refusal saved %d hold(s)", reason, n)
+	}
+	return open
+}
+
+// a1: a runner template prepare refused no_agent_slot saves one hold and no
+// rotation, receipt or prepared event; the freed seats go to the successor,
+// not to a queue claim, and the template prepare takes the one seat it needs.
+func TestHandlerRotationTemplateHoldHoldsSuccessorSeat(t *testing.T) {
+	f := newRotationFixture(t)
+	s := f.s
+	ctx := context.Background()
+	q, err := s.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "hold-add", Operation: "add", ItemID: f.items[0].ID, OrderMessageSeq: f.orders[0].Seq, Host: "mini", Cwd: "/hold"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if held := successorSeat(t, s, f.task.ID); held != 0 {
+		t.Fatalf("seat held before any refusal: %d", held)
+	}
+	open := f.heldOnFullProject(t, api.HandlerRotationReasonTemplate, api.HandlerRotationTriggerRunner)
+	// The runner retries every tick with a new request ID: the hold stays one
+	// row with one event.
+	if _, err = f.prepareFor(t, "hold-template-retry", api.HandlerRotationReasonTemplate, api.HandlerRotationTriggerRunner); refusalCode(err) != api.HandlerRotationRefusedNoAgentSlot {
+		t.Fatalf("retried template prepare: %v", err)
+	}
+	for query, want := range map[string]int{
+		`SELECT count(*) FROM handler_successor_holds WHERE task_id=? AND reason='template' AND trigger_kind='runner'`: 1,
+		`SELECT count(*) FROM handler_rotations WHERE task_id=?`:                                                       0,
+		`SELECT count(*) FROM handler_rotation_requests WHERE task_id=?`:                                               0,
+		`SELECT count(*) FROM events WHERE task_id=? AND text='Handler rotation prepared'`:                             0,
+		`SELECT count(*) FROM events WHERE task_id=? AND text='Handler successor seat held'`:                           1,
+	} {
+		if n := countRows(t, s, query, f.task.ID); n != want {
+			t.Fatalf("%s: %d, want %d", query, n, want)
+		}
+	}
+	if held := successorSeat(t, s, f.task.ID); held != 1 {
+		t.Fatalf("seat held after the template refusal: %d", held)
+	}
+	s.MaxAgents = open + 6
+	reason := fmt.Sprintf("project agent cap: %d open + 1 seat held for the handler successor + 6 seats > %d", open, open+6)
+	claim := api.TeamQueueRequest{RequestID: "hold-claim", Operation: "claim", EntryID: q.ID, ExpectedRevision: q.Revision, Host: "mini"}
+	if _, err := s.TeamQueueAction(ctx, f.task.ID, claim); !errors.Is(err, api.ErrConflict) || err.Error() != "conflict: "+reason {
+		t.Fatalf("claim beside a template hold: %v", err)
+	}
+	if list, err := s.ListTeamQueue(ctx, f.task.ID); err != nil || list.Entries[0].BlockReason != reason {
+		t.Fatalf("list reason beside a template hold %+v %v", list.Entries, err)
+	}
+	// The prepare's own check ignores the hold: one free slot prepares, and
+	// the prepared rotation holds the seat from then on.
+	s.MaxAgents = open + 1
+	r, err := f.prepareFor(t, "hold-template-freed", api.HandlerRotationReasonTemplate, api.HandlerRotationTriggerRunner)
+	if err != nil || r.State != api.HandlerRotationPrepared {
+		t.Fatalf("template prepare with one free slot: %+v %v", r, err)
+	}
+	if n := f.holdRows(t); n != 0 {
+		t.Fatalf("hold left after the prepare: %d", n)
+	}
+	if held := successorSeat(t, s, f.task.ID); held != 1 {
+		t.Fatalf("seat held while the successor has not registered: %d", held)
+	}
+}
+
+// a2: with no hold, admission and its text are today's.
+func TestHandlerRotationNoHoldLeavesAdmissionUnchanged(t *testing.T) {
+	f := newRotationFixture(t)
+	s := f.s
+	ctx := context.Background()
+	q, err := s.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "nohold-add", Operation: "add", ItemID: f.items[0].ID, OrderMessageSeq: f.orders[0].Seq, Host: "mini", Cwd: "/nohold"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if held := successorSeat(t, s, f.task.ID); held != 0 || f.holdRows(t) != 0 {
+		t.Fatalf("seat held with no hold: %d", held)
+	}
+	open, _ := queueCapUsage(t, s, f.task.ID)
+	s.MaxAgents = open + 5
+	reason := fmt.Sprintf("project agent cap: %d open + 6 seats > %d", open, open+5)
+	if list, err := s.ListTeamQueue(ctx, f.task.ID); err != nil || list.Entries[0].BlockReason != reason {
+		t.Fatalf("list reason %+v %v", list.Entries, err)
+	}
+	s.MaxAgents = open + 6
+	claim := api.TeamQueueRequest{RequestID: "nohold-claim", Operation: "claim", EntryID: q.ID, ExpectedRevision: q.Revision, Host: "mini"}
+	if claimed, err := s.TeamQueueAction(ctx, f.task.ID, claim); err != nil || claimed.State != "launching" {
+		t.Fatalf("claim at exact fit %+v %v", claimed, err)
+	}
+}
+
+// a3: a template hold counts only while the limit policy and its template
+// check are on.
+func TestHandlerRotationTemplateHoldNeedsPolicy(t *testing.T) {
+	f := newRotationFixture(t)
+	s := f.s
+	ctx := context.Background()
+	f.heldOnFullProject(t, api.HandlerRotationReasonTemplate, api.HandlerRotationTriggerRunner)
+	setPolicy := func(enabled, onTemplate bool) {
+		t.Helper()
+		policy, err := s.HandlerRotationPolicy(ctx, f.task.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = s.SetHandlerRotationPolicy(ctx, f.task.ID, api.HandlerRotationPolicyRequest{ExpectedRevision: policy.Revision, Enabled: enabled, MaxItems: 10, MaxTotalTokens: 1 << 40, OnTemplateChange: onTemplate}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, c := range []struct {
+		enabled, onTemplate bool
+		want                int
+	}{{false, true, 0}, {true, false, 0}, {false, false, 0}, {true, true, 1}} {
+		setPolicy(c.enabled, c.onTemplate)
+		if held := successorSeat(t, s, f.task.ID); held != c.want {
+			t.Fatalf("enabled=%v onTemplateChange=%v: held %d, want %d", c.enabled, c.onTemplate, held, c.want)
+		}
+	}
+	// The hold row stays: the policy only decides whether it counts.
+	if n := f.holdRows(t); n != 1 {
+		t.Fatalf("hold rows %d", n)
+	}
+}
+
+// a3: a hold names the exact old run; once the primary runs a new run, it no
+// longer counts or appears in the due list.
+func TestHandlerRotationHoldForOldRunDoesNotCount(t *testing.T) {
+	f := newRotationFixture(t)
+	s := f.s
+	f.heldOnFullProject(t, api.HandlerRotationReasonManual, api.HandlerRotationTriggerOwner)
+	if held := successorSeat(t, s, f.task.ID); held != 1 {
+		t.Fatalf("seat held for the current run: %d", held)
+	}
+	// A relaunch of the same handler starts a new run.
+	if _, err := s.db.Exec(`UPDATE agents SET run_id=? WHERE id=?`, api.NewID("run"), f.old.ID); err != nil {
+		t.Fatal(err)
+	}
+	if held := successorSeat(t, s, f.task.ID); held != 0 {
+		t.Fatalf("seat held for an earlier run: %d", held)
+	}
+	list, err := s.HandlerRotationsDue(context.Background(), "mini", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range list.Entries {
+		if d.TaskID == f.task.ID && d.SuccessorHold != nil {
+			t.Fatalf("due list names an earlier run's hold %+v", d.SuccessorHold)
+		}
+	}
+}
+
+// a4: a manual hold counts from its refusal, with the limit policy off too,
+// until release_hold for the exact run ends it; a release with no hold is
+// NotFound and writes nothing.
+func TestHandlerRotationManualHoldUntilReleased(t *testing.T) {
+	f := newRotationFixture(t)
+	s := f.s
+	ctx := context.Background()
+	q, err := s.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "manual-add", Operation: "add", ItemID: f.items[0].ID, OrderMessageSeq: f.orders[0].Seq, Host: "mini", Cwd: "/manual"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := s.HandlerRotationPolicy(ctx, f.task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zero := int64(0)
+	if _, err = s.SetHandlerRotationPolicy(ctx, f.task.ID, api.HandlerRotationPolicyRequest{ExpectedRevision: policy.Revision, Enabled: false, DeadSilenceMinutes: &zero}); err != nil {
+		t.Fatal(err)
+	}
+	open := f.heldOnFullProject(t, api.HandlerRotationReasonManual, api.HandlerRotationTriggerOwner)
+	s.MaxAgents = open + 6
+	claim := api.TeamQueueRequest{RequestID: "manual-claim", Operation: "claim", EntryID: q.ID, ExpectedRevision: q.Revision, Host: "mini"}
+	reason := fmt.Sprintf("project agent cap: %d open + 1 seat held for the handler successor + 6 seats > %d", open, open+6)
+	if _, err := s.TeamQueueAction(ctx, f.task.ID, claim); err == nil || err.Error() != "conflict: "+reason {
+		t.Fatalf("claim beside a manual hold: %v", err)
+	}
+	wrongRun := f.old
+	wrongRun.RunID = "run_0000000000000009"
+	for name, a := range map[string]api.Agent{"wrong run": wrongRun, "wrong agent": f.worker} {
+		if _, err := f.releaseHold("release-"+strings.ReplaceAll(name, " ", "-"), a); !errors.Is(err, api.ErrNotFound) {
+			t.Fatalf("release for the %s: %v", name, err)
+		}
+	}
+	if n := f.holdRows(t); n != 1 {
+		t.Fatalf("a refused release removed the hold: %d", n)
+	}
+	r, err := f.releaseHold("release-exact", f.old)
+	if err != nil || r.ID != "" || r.State != api.HandlerRotationAborted || r.Reason != api.HandlerRotationReasonManual || r.OldAgentID != f.old.ID || r.OldRunID != f.old.RunID || r.OldName != f.old.Name {
+		t.Fatalf("release %+v %v", r, err)
+	}
+	if n := f.holdRows(t); n != 0 {
+		t.Fatalf("hold rows after the release: %d", n)
+	}
+	if n := countRows(t, s, `SELECT count(*) FROM events WHERE task_id=? AND text='Handler successor seat released'`, f.task.ID); n != 1 {
+		t.Fatalf("released events %d", n)
+	}
+	if n := countRows(t, s, `SELECT count(*) FROM handler_rotation_requests WHERE task_id=?`, f.task.ID); n != 0 {
+		t.Fatalf("release saved %d receipt(s)", n)
+	}
+	if _, err := f.releaseHold("release-exact", f.old); !errors.Is(err, api.ErrNotFound) {
+		t.Fatalf("second release: %v", err)
+	}
+	if claimed, err := s.TeamQueueAction(ctx, f.task.ID, claim); err != nil || claimed.State != "launching" {
+		t.Fatalf("claim after the release %+v %v", claimed, err)
+	}
+	// A release takes only the run it names.
+	for name, change := range map[string]func(*api.HandlerRotationRequest){
+		"reason":    func(r *api.HandlerRotationRequest) { r.Reason = api.HandlerRotationReasonManual },
+		"rotation":  func(r *api.HandlerRotationRequest) { r.RotationID = "hrot_0000000000000001" },
+		"successor": func(r *api.HandlerRotationRequest) { r.SuccessorAgentID = api.NewID("agt") },
+		"no run":    func(r *api.HandlerRotationRequest) { r.OldRunID = "" },
+	} {
+		req := api.HandlerRotationRequest{Operation: api.HandlerRotationReleaseHold, RequestID: "release-invalid", OldAgentID: f.old.ID, OldRunID: f.old.RunID}
+		change(&req)
+		if _, err := s.HandlerRotationAction(ctx, f.task.ID, req, f.by); !errors.Is(err, api.ErrInvalid) {
+			t.Fatalf("release with %s: %v", name, err)
+		}
+	}
+	agentReq := api.HandlerRotationRequest{Operation: api.HandlerRotationReleaseHold, RequestID: "release-agent", OldAgentID: f.old.ID, OldRunID: f.old.RunID, ActorAgentID: f.worker.ID}
+	if _, err := s.HandlerRotationAction(ctx, f.task.ID, agentReq, f.by); refusalCode(err) != api.HandlerRotationRefusedAgentCaller {
+		t.Fatalf("release by an agent session: %v", err)
+	}
+}
+
+// The due list carries the hold of the exact primary run.
+func TestHandlerRotationDueListCarriesHold(t *testing.T) {
+	f := newRotationFixture(t)
+	f.heldOnFullProject(t, api.HandlerRotationReasonTemplate, api.HandlerRotationTriggerRunner)
+	list, err := f.s.HandlerRotationsDue(context.Background(), "mini", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range list.Entries {
+		if d.TaskID == f.task.ID {
+			if h := d.SuccessorHold; h == nil || h.Reason != api.HandlerRotationReasonTemplate || h.Trigger != api.HandlerRotationTriggerRunner || h.OldAgentID != f.old.ID || h.OldRunID != f.old.RunID {
+				t.Fatalf("due entry hold %+v", d.SuccessorHold)
+			}
+			return
+		}
+	}
+	t.Fatal("the project is not listed")
+}
+
+// a6: items, tokens, provider_blocked and dead_primary prepares refused
+// no_agent_slot record no hold (the hub's due rule holds their seat), and
+// their refusal text is today's.
+func TestHandlerRotationOtherReasonsRecordNoHold(t *testing.T) {
+	check := func(t *testing.T, f *rotationFixture, name string, err error) {
+		t.Helper()
+		if refusalCode(err) != api.HandlerRotationRefusedNoAgentSlot || strings.Contains(err.Error(), "held for the successor") {
+			t.Fatalf("%s prepare on a full project: %v", name, err)
+		}
+		if n := f.holdRows(t); n != 0 {
+			t.Fatalf("%s refusal saved %d hold(s)", name, n)
+		}
+	}
+	for _, reason := range []string{api.HandlerRotationReasonItems, api.HandlerRotationReasonTokens} {
+		f := newRotationFixture(t)
+		f.fillAgentCap(t)
+		_, err := f.prepareFor(t, "other-"+reason, reason, api.HandlerRotationTriggerRunner)
+		check(t, f, reason, err)
+	}
+	blocked := newBlockedFixture(t, api.ProviderBlockRateLimited, api.DefaultHandlerDeadSilenceMinutes)
+	blocked.at(t, api.HandlerProviderBlockedAfter)
+	blocked.fillAgentCap(t)
+	_, err := blocked.prepareBlocked(t, "other-blocked", nil)
+	check(t, blocked.rotationFixture, "provider_blocked", err)
+	dead := newDeadPrimaryFixture(t)
+	dead.advance(11 * time.Minute)
+	dead.fillAgentCap(t)
+	_, err = dead.prepareDead(t, "other-dead", nil)
+	check(t, dead.rotationFixture, "dead_primary", err)
+}
+
+// a5 (g3): automatic provisioning leaves the held seat free, in the listed
+// need and in the reserve, for a seat held by the due rule and by a hold.
+func TestHandlerRotationProvisionCountsHeldSeat(t *testing.T) {
+	for _, held := range []string{"tokens due", "manual hold"} {
+		f := newProvisionFixture(t, 4, 3, 3)
+		ctx := context.Background()
+		primary := provisionPrimary(t, f)
+		open, reserved, err := projectAgentCapUsage(ctx, f.s.db, f.task.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Room for the team and the new handler: today's rule provisions.
+		f.s.MaxAgents = open + reserved + featureTeamSlots + 1
+		if got := listedEntry(t, f.s, f.task.ID, f.entries[3].ID); got.HandlerNeed == nil || !got.HandlerNeed.Provision {
+			t.Fatalf("%s: before the seat is held %+v", held, got.HandlerNeed)
+		}
+		switch held {
+		case "tokens due":
+			rotationDueByTokens(t, f.s, f.task.ID, primary)
+		case "manual hold":
+			// This fixture's primary holds a live lease, which refuses a
+			// prepare before its cap check; the row is the one a refused
+			// manual prepare writes (TestHandlerRotationManualHoldUntilReleased).
+			if _, err = f.s.db.Exec(`INSERT INTO handler_successor_holds(task_id,reason,trigger_kind,old_agent_id,old_run_id,handler_revision,created_at) VALUES(?,'manual','owner',?,?,?,?)`,
+				f.task.ID, primary.ID, primary.RunID, f.task.HandlerRevision, ts(f.s.now())); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if n := successorSeat(t, f.s, f.task.ID); n != 1 {
+			t.Fatalf("%s: seat held %d", held, n)
+		}
+		want := fmt.Sprintf("cannot add one: project agent cap: %d open", open)
+		if reserved > 0 {
+			want += fmt.Sprintf(" + %d reserved", reserved)
+		}
+		want += fmt.Sprintf(" + 1 seat held for the handler successor + %d seats + 1 handler > %d", featureTeamSlots, f.s.MaxAgents)
+		got := listedEntry(t, f.s, f.task.ID, f.entries[3].ID)
+		if n := got.HandlerNeed; n == nil || n.Provision || !strings.Contains(got.BlockReason, want) {
+			t.Fatalf("%s: need %+v reason %q lacks %q", held, n, got.BlockReason, want)
+		}
+		if _, err = f.provision(got, "held-"+strings.ReplaceAll(held, " ", "-"), api.NewID("agt"), armS, digestP); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), want) {
+			t.Fatalf("%s: provision beside the held seat: %v", held, err)
+		}
+		if f.allRows(t) != 0 || f.notices(t, provisionNotice) != 0 {
+			t.Fatalf("%s: refused provision left a row or notice", held)
+		}
+		f.s.MaxAgents++
+		if got := listedEntry(t, f.s, f.task.ID, f.entries[3].ID); got.HandlerNeed == nil || !got.HandlerNeed.Provision {
+			t.Fatalf("%s: one more seat %+v", held, got.HandlerNeed)
+		}
+	}
+}
+
+// provisionPrimary is the provision fixture's primary database handler.
+func provisionPrimary(t *testing.T, f *provisionFixture) api.Agent {
+	t.Helper()
+	task, err := f.s.GetTask(context.Background(), f.task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	primary, err := primaryHandler(context.Background(), f.s.db, task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return primary
 }

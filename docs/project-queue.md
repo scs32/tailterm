@@ -615,7 +615,9 @@ handler`, and continues, for example after `: 3 of 3 leased, limit 4`:
 - `; the runner is adding one`
 - `; automatic provisioning is off. Fix: tt team queue provision --task TSK --auto on`
 - `; cannot add one: project agent cap: 23 open + 6 seats + 1 handler > 29.
-  Fix: tt team queue limit --task TSK --limit 3`
+  Fix: tt team queue limit --task TSK --limit 3`, with `+ 1 seat held for the
+  handler successor` before the seats while a
+  [handler successor seat](#project-agent-cap) is held
 - `; cannot add one: the saved launch spec on HOST is RUNTIME/MODEL/REASONING
   digest D1, arm S needs RUNTIME/MODEL/REASONING digest D2. Fix:
   PROMPT="$(cat PROMPT_FILE)" && tt handler spec --task TSK -- --run 'SAVED
@@ -1678,15 +1680,25 @@ as the queued entry's reason, and `--json` carries it as `blockReason`.
 for its successor ([handler-rotation.md](handler-rotation.md)), and without
 a held seat a busy queue could take every slot a finished team frees (bug
 wi_31ec140ea47e3441). So the claim and the limit raise (and the listed reason)
-count one seat held for the handler successor while either:
+count one seat held for the handler successor while any of these holds:
 
 - a prepared rotation waits for its successor to register; the hold ends
   when the successor's agent is registered and so counted as open; or
 - with no rotation prepared, the project's primary rotation is due on the
   hub's own due rule (the runner's due list, `GET /v1/handler-rotations/due`,
   without a template digest): its items or tokens limit under an enabled
-  policy, `provider_blocked`, or `dead_primary` with the silence met. A prepare refused `no_agent_slot` saves nothing, so a refused
-  rotation that is still due is held this way.
+  policy, `provider_blocked`, or `dead_primary` with the silence met. A prepare
+  for one of these reasons refused `no_agent_slot` saves nothing, so a refused
+  rotation that is still due is held this way; or
+- with no rotation prepared, a successor hold names the primary's exact agent
+  and run (bug wi_bbea3ea3ad6068a1): the hub records it when it refuses a
+  `template` or `manual` prepare `no_agent_slot`, the two rotations its due
+  rule cannot see. A template hold counts while the limit policy and
+  `onTemplateChange` are on; a manual hold counts whatever the policy says. A
+  prepare that succeeds deletes it, a new primary run no longer counts it, and
+  `release_hold` ends it: the runner releases a template hold it no longer
+  finds due, and the owner releases any hold with `tt handler rotate --abort`
+  ([handler-rotation.md](handler-rotation.md#successor-seat-hold)).
 
 The rotation's own prepare never counts the held seat, because it is that
 seat; one free slot still prepares it. The attempt check does not count it
@@ -1698,11 +1710,19 @@ reads
 
 and with none held it is exactly the text above. The seat is held while the
 rotation is due even when the primary is busy with a live lease, so one slot
-can stay empty until the lease ends and the rotation runs. Two cases hold no
-seat: a rotation due only for a template change (the runner computes the
-template digest and the hub does not store it), and a manual rotation until it
-is prepared, since neither is due on the hub's rule. Automatic handler
-provision does not count the held seat either.
+can stay empty until the lease ends and the rotation runs. A rotation due
+only for a template change (the runner computes the template digest and the
+hub does not store it), and a manual rotation, hold a seat only through their
+successor hold, so not before their first refused prepare.
+
+Automatic handler provision counts the held seat too: a new handler is added
+only when the handler, the waiting team and the held seat all fit, so a
+provision never takes the successor's seat. Its refusal then reads
+
+    cannot add one: project agent cap: N open[ + R reserved] + 1 seat held for the handler successor + M seats + 1 handler > CAP
+
+in the listed reason and in the `provision_handler` refusal; with no seat
+held the text is unchanged.
 
 **Three check points.**
 

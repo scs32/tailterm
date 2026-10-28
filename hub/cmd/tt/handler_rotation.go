@@ -1175,6 +1175,21 @@ func abortHandlerRotation(ctx context.Context, d rotationDeps, e env, c *api.Cli
 				return zero, err
 			}
 		}
+		// With nothing prepared, the abort releases the seat held for the
+		// current primary's successor, whatever its reason.
+		detail, err := c.GetTask(ctx, task)
+		if err != nil {
+			return zero, err
+		}
+		if primary, ok := currentPrimaryHandler(detail); ok {
+			r, err := releaseSuccessorHold(ctx, c, task, api.HandlerSuccessorHold{OldAgentID: primary.ID, OldRunID: primary.RunID})
+			if err == nil {
+				return r, nil
+			}
+			if !noSuccessorHold(err) {
+				return zero, err
+			}
+		}
 		return zero, errors.New("no prepared handler rotation to abort")
 	}
 	if j != nil && j.RotationID != "" && j.RotationID != open.ID {
@@ -1352,6 +1367,7 @@ func cmdHandlerRotate(e env, args []string) error {
 			return errors.New("no handler launch spec is saved on this host; pass the handler's tt spawn launch flags after --, for example tt handler rotate --task ID -- --run codex --cwd DIR --prompt TEXT")
 		}
 		r, err = rotateHandler(ctx, deps, e, c, *task, api.HandlerRotationReasonManual, api.HandlerRotationTriggerOwner, *spec, auth)
+		err = ownerRotateNoSlotHint(err, *task)
 	}
 	if err != nil {
 		return err
@@ -1361,7 +1377,7 @@ func cmdHandlerRotate(e env, args []string) error {
 		return nil
 	}
 	if r.State == api.HandlerRotationAborted {
-		fmt.Printf("Aborted handler rotation %s; %s stays primary.\n", r.ID, r.OldName)
+		fmt.Println(abortedRotationLine(r))
 		return nil
 	}
 	moved := 0
@@ -1373,6 +1389,25 @@ func cmdHandlerRotate(e env, args []string) error {
 		fmt.Println(line)
 	}
 	return nil
+}
+
+// ownerRotateNoSlotHint tells the owner that a rotate refused no_agent_slot
+// holds the next free agent seat, and how to end the hold; any other error is
+// returned as is.
+func ownerRotateNoSlotHint(err error, task string) error {
+	if !noAgentSlot(err) {
+		return err
+	}
+	return fmt.Errorf("%w; the next free agent seat is held for this rotation; rerun tt handler rotate --task %s once an agent is closed, or release the seat with tt handler rotate --abort --task %s", err, task, task)
+}
+
+// abortedRotationLine reports an abort: of a prepared rotation, or, with no
+// rotation ID, the release of a successor hold.
+func abortedRotationLine(r api.HandlerRotation) string {
+	if r.ID == "" {
+		return fmt.Sprintf("Released the agent seat held for the %s rotation of %s; nothing was prepared.", r.Reason, r.OldName)
+	}
+	return fmt.Sprintf("Aborted handler rotation %s; %s stays primary.", r.ID, r.OldName)
 }
 
 // rotationAuthorizationLine is the record of an owner-authorized change, or
@@ -1733,6 +1768,32 @@ func rotationDueReasons(d api.HandlerRotationDue, spec *handlerSpec) []string {
 	return reasons
 }
 
+// staleTemplateHold reports a template successor hold for the due entry's
+// run that this host no longer finds due: the limit policy or its template
+// check is off, or the run's recorded template is this host's.
+func staleTemplateHold(d api.HandlerRotationDue, spec *handlerSpec) bool {
+	h := d.SuccessorHold
+	if h == nil || h.Reason != api.HandlerRotationReasonTemplate {
+		return false
+	}
+	return !d.Policy.Enabled || !d.Policy.OnTemplateChange || !slices.Contains(rotationDueReasons(d, spec), api.HandlerRotationReasonTemplate)
+}
+
+// noSuccessorHold reports the hub's answer to a release_hold for a run that
+// holds no seat.
+func noSuccessorHold(err error) bool {
+	var httpErr *api.HTTPError
+	return errors.As(err, &httpErr) && httpErr.Status == http.StatusNotFound
+}
+
+// releaseSuccessorHold ends the seat the hub holds for the hold's exact run.
+// The hub keeps no receipt for it: NotFound (noSuccessorHold) means no such
+// hold remains.
+func releaseSuccessorHold(ctx context.Context, c *api.Client, task string, h api.HandlerSuccessorHold) (api.HandlerRotation, error) {
+	return c.HandlerRotationAction(ctx, task, api.HandlerRotationRequest{Operation: api.HandlerRotationReleaseHold,
+		RequestID: "rotation-release-hold-" + strings.TrimPrefix(h.OldRunID, "run_"), OldAgentID: h.OldAgentID, OldRunID: h.OldRunID})
+}
+
 func (r *rotationRunner) tick(ctx context.Context, e env, c *api.Client, host string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -1815,6 +1876,13 @@ func (r *rotationRunner) tick(ctx context.Context, e env, c *api.Client, host st
 		}
 		if d.OpenRotation != nil {
 			continue // another host or process owns it
+		}
+		// The seat a refused template prepare holds is released once this
+		// host no longer finds the template due; a manual hold is the owner's.
+		if staleTemplateHold(d, spec) {
+			if _, err := releaseSuccessorHold(ctx, c, d.TaskID, *d.SuccessorHold); err != nil && !noSuccessorHold(err) {
+				errs = append(errs, fmt.Errorf("handler rotation %s: release the successor seat: %w", d.TaskID, err))
+			}
 		}
 		if d.DeadCandidate {
 			// A busy primary the hub no longer hears from. It is never idle, so
@@ -1977,7 +2045,7 @@ func (r *rotationRunner) notifyNoAgentSlot(ctx context.Context, c *api.Client, h
 	}
 	env := api.Envelope{Kind: api.EnvelopeKindNotice, Subject: rotationNoSlotSubject,
 		Refs: map[string]string{"host": host, "project": d.TaskID, "handler": d.Agent.ID},
-		Body: api.EnvelopeBody{Text: fmt.Sprintf("The %s rotation of database handler %s (%s / %s) in project %s (%s) on host %s cannot be prepared. Hub: %s. Nothing was prepared, so queue dispatch is unaffected and the old handler stays the primary with its leases and obligations. The runner tries again every tick and rotates once a slot is free. Done or retired ordinary agents an owner could close: %s. This notice closes nothing.",
+		Body: api.EnvelopeBody{Text: fmt.Sprintf("The %s rotation of database handler %s (%s / %s) in project %s (%s) on host %s cannot be prepared. Hub: %s. Nothing was prepared, so queue dispatch is unaffected and the old handler stays the primary with its leases and obligations. Queue admission and automatic handler provisioning hold the next free agent seat for the successor. The runner tries again every tick and rotates once a slot is free. Done or retired ordinary agents an owner could close: %s. This notice closes nothing.",
 			reason, d.Agent.Name, d.Agent.ID, d.Agent.RunID, detail.Task.Name, d.TaskID, host, noticeSafeError(why), listed)}}
 	_, err = c.PostMessage(ctx, d.TaskID, api.PostMessageRequest{Envelope: &env, Text: api.RenderText(env), RequestID: key})
 	// The identity is this run's and reason's notice, so a conflict means an
