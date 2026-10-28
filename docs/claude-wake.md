@@ -290,7 +290,7 @@ Feature `wi_f38d51348f280538` revision 3, owner order #25975 with amendments #25
 
 Every tool call in a Tailterm Claude agent session leaves one private local row: which tool, a digest of its arguments, how it ended, how long it took, and the agent and run. The owner helper's Claude session is covered too (see "Owner helper session"). The ledger is observe-only. It uses Claude Code settings hooks, the same mechanism as the four hooks above. It is not a Claude Code mod; a mod front end can come later. Codex workers are not covered.
 
-A Bash call that matches a protected-operation rule leaves one extra row per matched rule, written when the call is attempted (see "Would-deny report"). The report blocks nothing. Codex sessions are not covered by it either: Codex has only a Stop hook, so no Codex tool call is seen.
+A Bash call that matches a protected-operation rule leaves one extra row per matched rule, written when the call is attempted (see "Would-deny report"). The report blocks nothing. Codex sessions are not covered by it either: neither of Codex's Tailterm hooks (Stop and UserPromptSubmit) sees a tool call, so no Codex tool call is seen.
 
 An Edit, Write, MultiEdit or NotebookEdit of a file outside the paths of the agent's latest ASSIGN leaves one extra row too (see "Owned-paths report"). That report also blocks nothing and does not cover Codex.
 
