@@ -272,6 +272,9 @@ type reviewFixingResult struct {
 type reviewFollowUpIndex struct {
 	followUps []reviewFollowUpRecord
 	fixes     map[string][]reviewFixingResult
+	// blockers holds each reviewed item's blocker IDs by review stage. A
+	// fixing RESULT never settles a follow-up that reuses one of them.
+	blockers map[string]map[int]map[string]bool
 }
 
 // reviewStageOf is the index of the review stage seq falls in: the number of
@@ -291,7 +294,7 @@ func reviewStageOf(stages []api.ReviewStage, seq int64) int {
 // blockerIds are read from that RESULT's stored envelope; a RESULT stored
 // without review metadata names nothing fixed.
 func loadReviewFollowUpIndex(ctx context.Context, q queryRower, task string) (reviewFollowUpIndex, error) {
-	out := reviewFollowUpIndex{fixes: map[string][]reviewFixingResult{}}
+	out := reviewFollowUpIndex{fixes: map[string][]reviewFixingResult{}, blockers: map[string]map[int]map[string]bool{}}
 	rows, err := q.QueryContext(ctx, `SELECT item_id,state_json FROM review_convergence WHERE task_id=? ORDER BY item_id`, task)
 	if err != nil {
 		return out, err
@@ -316,6 +319,16 @@ func loadReviewFollowUpIndex(ctx context.Context, q queryRower, task string) (re
 			out.followUps = append(out.followUps, reviewFollowUpRecord{parent: parent, messageSeq: f.MessageSeq, findingID: f.Finding.ID, itemID: f.ItemID, folded: f.Folded, stage: reviewStageOf(state.Stages, f.MessageSeq)})
 		}
 		for _, r := range state.Rounds {
+			stage := reviewStageOf(state.Stages, r.RequestSeq)
+			for _, b := range r.Blockers {
+				if out.blockers[parent] == nil {
+					out.blockers[parent] = map[int]map[string]bool{}
+				}
+				if out.blockers[parent][stage] == nil {
+					out.blockers[parent][stage] = map[string]bool{}
+				}
+				out.blockers[parent][stage][b.ID] = true
+			}
 			if r.Number == 2 && r.ResultSeq != 0 {
 				pending = append(pending, roundTwo{parent, reviewFixingResult{how: "round-two review", candidate: r.Candidate, resultSeq: r.ResultSeq, stage: reviewStageOf(state.Stages, r.RequestSeq)}})
 			}
@@ -449,12 +462,14 @@ func (x reviewFollowUpIndex) duplicates(open []api.WorkItem) [][2]int {
 
 // verifiedFixed describes, for each follow-up record that filed item, the
 // first later RESULT of the same review stage that recorded its finding fixed.
+// A follow-up whose ID is also a blocker ID of that stage is never listed: a
+// RESULT naming the ID verified the blocker.
 // It reads saved review records only, so it lists the item whatever its queue,
 // order or run state is.
 func (x reviewFollowUpIndex) verifiedFixed(item string) []string {
 	var out []string
 	for _, f := range x.followUps {
-		if f.folded || f.itemID != item {
+		if f.folded || f.itemID != item || x.blockers[f.parent][f.stage][f.findingID] {
 			continue
 		}
 		for _, fix := range x.fixes[f.parent] {

@@ -1136,9 +1136,12 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 				f.Passed = passed
 				f.ResultSeq = m.Seq
 				if passed {
+					// An ID that is also a blocker of this stage names that
+					// blocker, never a follow-up that reuses its ID.
+					blockers := stageBlockerIDs(state.Rounds)
 					for _, id := range f.BlockerIDs {
 						for _, follow := range state.FollowUps {
-							if follow.Finding.ID == id && follow.MessageSeq < m.Seq {
+							if follow.Finding.ID == id && follow.MessageSeq < m.Seq && !blockers[id] {
 								fixedFollowUps = append(fixedFollowUps, follow)
 								fixedCandidate = f.Candidate
 								break
@@ -1156,12 +1159,7 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 		if err = saveReviewStage(ctx, tx, m.TaskID, earlier, state); err != nil {
 			return err
 		}
-		for _, follow := range fixedFollowUps {
-			if err = s.settleFixedFollowUp(ctx, tx, item, follow, fixedCandidate, "focused verification", m, req, by); err != nil {
-				return err
-			}
-		}
-		return nil
+		return s.settleFixedFollowUps(ctx, tx, item, fixedFollowUps, fixedCandidate, "focused verification", m, req, by)
 	}
 	if meta.Mode != "general" || e.Kind != "result" {
 		return reviewConflict("invalid review transition")
@@ -1357,12 +1355,7 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 	if err = saveReviewStage(ctx, tx, m.TaskID, earlier, state); err != nil {
 		return err
 	}
-	for _, follow := range fixedFollowUps {
-		if err = s.settleFixedFollowUp(ctx, tx, item, follow, round.Candidate, "round-two review", m, req, by); err != nil {
-			return err
-		}
-	}
-	return nil
+	return s.settleFixedFollowUps(ctx, tx, item, fixedFollowUps, round.Candidate, "round-two review", m, req, by)
 }
 
 // reviewFindingIDEcho makes a finding ID safe to return to the client through
@@ -1656,14 +1649,48 @@ func (s *Store) foldReviewFinding(ctx context.Context, tx *sql.Tx, parent api.Wo
 // refined review follow-up to the RESULT that recorded its finding fixed.
 const reviewFixedNamespace = "review-fixed"
 
+// stageBlockerIDs is the set of blocker IDs the stage's saved rounds hold.
+func stageBlockerIDs(rounds []api.ReviewRound) map[string]bool {
+	out := map[string]bool{}
+	for _, r := range rounds {
+		for _, b := range r.Blockers {
+			out[b.ID] = true
+		}
+	}
+	return out
+}
+
+// settleFixedFollowUps settles each of follows in the RESULT's transaction,
+// reading the fold rule once for all of them.
+func (s *Store) settleFixedFollowUps(ctx context.Context, tx *sql.Tx, parent api.WorkItem, follows []api.ReviewFollowUp, candidate, how string, m api.Message, req api.PostMessageRequest, by api.Caller) error {
+	if len(follows) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(follows))
+	for _, follow := range follows {
+		ids = append(ids, follow.ItemID)
+	}
+	reasons, err := foldIneligible(ctx, tx, parent.TaskID, ids)
+	if err != nil {
+		return err
+	}
+	for _, follow := range follows {
+		if err = s.settleFixedFollowUp(ctx, tx, parent, follow, reasons[follow.ItemID], candidate, how, m, req, by); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // settleFixedFollowUp settles a follow-up whose finding the RESULT m, a
 // round-two review or a passing focused verification (how), recorded fixed in
-// parent on candidate. It runs in the RESULT's transaction. An unchanged held
-// stub the fold rule allows is dismissed as delivered by parent. Any other item
-// the fold rule allows gets one evidence note and its row is unchanged. An item
-// the fold rule refuses, and a folded finding's target, are not written.
-func (s *Store) settleFixedFollowUp(ctx context.Context, tx *sql.Tx, parent api.WorkItem, follow api.ReviewFollowUp, candidate, how string, m api.Message, req api.PostMessageRequest, by api.Caller) error {
-	if follow.Folded || follow.ItemID == "" {
+// parent on candidate. Ineligible is the fold rule's reason for its item. An
+// unchanged held stub the fold rule allows is dismissed as delivered by parent.
+// Any other item the fold rule allows gets one evidence note and its row is
+// unchanged. An item the fold rule refuses, and a folded finding's target, are
+// not written.
+func (s *Store) settleFixedFollowUp(ctx context.Context, tx *sql.Tx, parent api.WorkItem, follow api.ReviewFollowUp, ineligible, candidate, how string, m api.Message, req api.PostMessageRequest, by api.Caller) error {
+	if follow.Folded || follow.ItemID == "" || ineligible != "" {
 		return nil
 	}
 	item, err := getWorkItem(tx, ctx, parent.TaskID, follow.ItemID)
@@ -1671,10 +1698,6 @@ func (s *Store) settleFixedFollowUp(ctx context.Context, tx *sql.Tx, parent api.
 		return nil
 	}
 	if err != nil {
-		return err
-	}
-	reasons, err := foldIneligible(ctx, tx, parent.TaskID, []string{item.ID})
-	if err != nil || reasons[item.ID] != "" {
 		return err
 	}
 	f := follow.Finding

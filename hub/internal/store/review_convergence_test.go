@@ -5089,3 +5089,52 @@ func TestReviewFollowUpCloseRollback(t *testing.T) {
 		t.Fatalf("refined notes after replay %+v", notes)
 	}
 }
+
+// a5, a6 (review #49256 b1): a round-two regression blocker that reuses a
+// round-one follow-up's ID is verified by a focused pass; the pass names the
+// blocker, so the follow-up is not settled: an unchanged stub stays open at
+// revision 1, a refined copy gets no note, and triage does not list it.
+func TestReviewFollowUpIDCollisionNotSettled(t *testing.T) {
+	for _, refined := range []bool{false, true} {
+		t.Run(fmt.Sprintf("refined=%v", refined), func(t *testing.T) {
+			f := newConvergenceFixture(t)
+			_, r2, stubs := roundOneFollowUps(t, f)
+			stub := stubs["f1"]
+			if refined {
+				text := "Refined by the handler: explain the fixture retry in fixture.go."
+				var err error
+				if stub, err = f.s.UpdateWorkItem(f.ctx, f.task.ID, stub.ID, api.UpdateWorkItemRequest{Revision: 1, Description: &text}, f.by); err != nil {
+					t.Fatal(err)
+				}
+			}
+			reg := api.ReviewFinding{ID: "f1", Regression: true, Baseline: candidateA, Candidate: candidateB, Title: "Fixture regression", File: "fixture.go", Line: 8}
+			if err := f.roundTwoResult(passConvergence, api.ReviewMetadata{BlockerIDs: []string{"b1"}, Blockers: []api.ReviewFinding{reg}}, r2.Seq); err != nil {
+				t.Fatal(err)
+			}
+			focus := api.ReviewMetadata{Mode: "focused", Candidate: candidateC, Fix: "Fix the regression", BlockerIDs: []string{"f1"}}
+			req, err := f.post(api.Envelope{Kind: "request", Subject: "Verify exactly the regression fix", Review: &focus, Body: api.EnvelopeBody{Ask: "Verify exact regression fix"}}, f.reviewer.ID, 0, api.Agent{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = f.post(f.resultEnv(candidateC, map[string]string{"f1": "pass"}, focus), "", req.Seq, f.reviewer); err != nil {
+				t.Fatal(err)
+			}
+			if st := f.state(t); len(st.Focused) != 2 || !st.Focused[1].Passed || len(outstandingOnCandidate(st, candidateC)) != 0 {
+				t.Fatalf("regression blocker not verified: %+v", st.Focused)
+			}
+			got, err := f.s.GetWorkItem(f.ctx, f.task.ID, stub.ID)
+			if err != nil || got.Status != "open" || got.Revision != stub.Revision || got.Description != stub.Description || itemRevisionCount(t, f.s, stub.ID) != int(stub.Revision) || len(foldNotes(t, f.s, stub.ID)) != 0 {
+				t.Fatalf("colliding follow-up settled: %+v %v", got, err)
+			}
+			tri, err := f.s.WorkItemTriage(f.ctx, f.task.ID, 0, "", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, r := range tri.AlreadyReleased {
+				if r.Item.ID == stub.ID {
+					t.Fatalf("colliding follow-up listed: %+v", r)
+				}
+			}
+		})
+	}
+}
