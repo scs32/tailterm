@@ -1747,9 +1747,11 @@ standing one (`released`); after it applies, the job is held like any owner
 hold. A requeue moves a standing entry hold to the new entry (the old one
 becomes `moved`, naming the new entry), so the requeued entry's acceptance
 creates its job held. A failed entry's release keeps its entry hold
-`standing`, since a requeue needs the release and then moves it. The hub
-releases a standing entry hold (`released`, with a reason naming the cause) in
-the same transaction that ends its entry: the entry is removed from the queue,
+`standing`, since a requeue needs the release and then moves it; when the
+entry's item is already done or dismissed, a requeue is refused, so the
+release lifts it (`released`). The hub releases a standing entry hold
+(`released`, with a reason naming the cause) in the same transaction that ends
+its entry: the entry is removed from the queue,
 or its item becomes done or dismissed while the entry has no release job and
 no acceptance. An entry with a job (a refused or rolled-back one can be
 retried) or an acceptance (enqueue creates its first job) keeps its hold, and

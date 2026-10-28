@@ -8348,6 +8348,39 @@ func TestReleaseEntryHoldKeptWhenItemDoneBeforeAccept(t *testing.T) {
 	}
 }
 
+// wi_2bc0817fd3f8101c f1: the release of a failed entry whose item is
+// already done lifts its hold, since a requeue refuses a done item; an open
+// item's failed entry keeps it (StandsThroughReleaseAndMovesWithRequeue).
+func TestReleaseEntryHoldLiftsWhenDoneItemEntryReleased(t *testing.T) {
+	f := newRebindFixture(t, true)
+	f.holdEntry(t, "entry-hold", f.entry.ID)
+	item, err := f.s.GetWorkItem(f.ctx, f.task.ID, f.item.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedPassingVerificationAt(t, f.s, item, candidateB, autoWorktree)
+	report, _, err := f.s.PutNarrativeReport(f.ctx, f.task.ID, f.item.ID, completeReportRequest(item, "done-report", 5), f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := "done"
+	if _, err = f.s.UpdateWorkItem(f.ctx, f.task.ID, f.item.ID, api.UpdateWorkItemRequest{Revision: item.Revision, Status: &done,
+		CompletionReport: &api.NarrativeReportPin{ReportID: report.ReportID, Version: report.Version, Digest: report.Digest, ScopeRevision: report.ScopeRevision}}, f.by); err != nil {
+		t.Fatalf("owner done save: %v", err)
+	}
+	if state, _ := entryHoldState(t, f.s, f.task, f.entry.ID); state != "standing" {
+		t.Fatal("hold after the done save", state)
+	}
+	f.failAndRelease(t)
+	h, _ := entryHoldRecord(t, f.s, f.task, f.entry.ID)
+	if h.State != "released" || h.ReleasedAt == "" || h.ReleaseReason != "entry "+f.entry.ID+" was released after a failure and item "+f.item.ID+" is done, so no requeue can follow" {
+		t.Fatalf("released done item's entry hold %+v", h)
+	}
+	if page := windowPage(t, f.s, f.task); len(page.EntryHolds) != 0 {
+		t.Fatalf("standing entry holds after the release %+v", page.EntryHolds)
+	}
+}
+
 // wi_2bc0817fd3f8101c: an entry that can still get a job keeps its hold when
 // its item is dismissed, and an edit of an item already dismissed lifts
 // nothing, so holds saved before this change stay as saved.

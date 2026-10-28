@@ -1867,6 +1867,18 @@ func (s *Store) teamQueueAction(ctx context.Context, task string, req api.TeamQu
 			if err = stopEntryBudgetHold(ctx, tx, task, e.ID, now, req.Caller); err != nil {
 				return zero, err
 			}
+			// A requeue refuses a done or dismissed item, so no next job can
+			// follow this release: its entry hold is lifted here. An open
+			// item's failed entry keeps it for the requeue to move.
+			item, err := getWorkItem(tx, ctx, task, e.ItemID)
+			if err != nil {
+				return zero, err
+			}
+			if item.Status == "done" || item.Status == "dismissed" {
+				if err = liftEntryReleaseHold(ctx, tx, task, e.ID, "entry "+e.ID+" was released after a failure and item "+e.ItemID+" is "+item.Status+", so no requeue can follow", req.HandlerAgentID, req.HandlerRunID, now); err != nil {
+					return zero, err
+				}
+			}
 			e.ReleasedAt = now
 		case "remove":
 			if e.State != "queued" {
