@@ -1471,6 +1471,12 @@ function rehearsalFailure(run,runtime,service,prefix="Rehearsal container "){
   error.rehearsal={runtime,image:service.image,exit:how,lines:sanitizeCapture({logs:[{service:"hub",lines}]},Object.values(service.environment)).logs[0].lines};
   return error;
 }
+// The refusal for a probe container the runner could not clear names it and
+// the delete to run by hand, shortened until failureReason accepts it.
+function leftoverProbeReason(runtime,name){
+  const runtimes=[runtime,basename(runtime)],forms=[...runtimes.map(rt=>`Leftover probe container ${name}; run ${rt} delete -f ${name}`),...runtimes.map(rt=>`Leftover probe container; run ${rt} delete -f ${name}`)];
+  return forms.find(r=>REASON.test(r))??"Leftover rehearsal probe container";
+}
 // The only shape of a failed rehearsal the private journal keeps; anything
 // else on the error is dropped whole.
 export function failureRehearsal(error){
@@ -1999,13 +2005,20 @@ export class HostAdapter {
     // A run that did not end by itself may have left its container; the
     // removal is best effort and never changes the result.
     const remove=(run,id)=>{if(!Number.isInteger(run?.status)){try{this.container([runtime,"delete","-f",id],{timeout:30000});}catch{}}};
+    // A probe container a killed deployer left behind would clash on this
+    // name on every retry. The probe precedes the marker, so the name is
+    // never a live rehearsal's. The delete is best effort; only a container
+    // the runtime still inspects after a failed delete is refused, and a
+    // directory an earlier run left behind is removed first.
+    const probeName=name+"-probe",quiet=argv=>{try{return this.container(argv,{timeout:30000});}catch{return null;}};
+    if(quiet([runtime,"delete","-f",probeName])?.status!==0 && quiet([runtime,"inspect",probeName])?.status===0){clear();throw releaseError(leftoverProbeReason(runtime,probeName));}
     // The probe is the same container on an empty /state: a fresh database
     // needs no table rebuild, so its failure is the runtime's (image, mount,
     // entrypoint) or a candidate that cannot migrate at all, never the backup.
     // A directory an earlier run left behind is replaced, sidecars included.
     clear();mkdirSync(stateDir,{mode:0o700});
-    const probe=this.container(rehearsalArgv(service,{runtime,name:name+"-probe",binary:a.migrationBinary,stateDir}));
-    if(probe?.status!==0 || probe.signal || probe.error){remove(probe,name+"-probe");clear();throw rehearsalFailure(probe,runtime,service,"Rehearsal container runtime probe ");}
+    const probe=this.container(rehearsalArgv(service,{runtime,name:probeName,binary:a.migrationBinary,stateDir}));
+    if(probe?.status!==0 || probe.signal || probe.error){remove(probe,probeName);clear();throw rehearsalFailure(probe,runtime,service,"Rehearsal container runtime probe ");}
     clear();
     const record={version:1,jobId:this.job.id,backupSHA256:a.backupSHA256,startedAt:new Date(this.now()).toISOString(),outcome:"started"};
     save(marker,record);
