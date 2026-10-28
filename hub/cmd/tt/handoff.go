@@ -3446,10 +3446,15 @@ func handoffRestoreCommand(e env, args []string) error {
 	case a.Role != api.AgentRoleOwnerHelper:
 		return handoffRefusal("g3 current run", "the hub's agent "+file.Agent+" is not an owner helper", register)
 	case a.RunID != expected:
-		// The agent row holds no registration time and the event feed cannot
-		// be read boundedly, so none is printed.
-		return handoffRefusal("g3 current run", fmt.Sprintf("the hub's helper run is %s, not the helper file's %s: someone registered after this host's file was written; host of the current registration: %s; registration time: unavailable",
-			a.RunID, expected, a.Host), "if this session's own registration answer was lost, run `tt helper register --task "+*task+"`")
+		// The time is the current run's registration receipt, read from the
+		// hub. It is "unavailable" when that read fails (an older hub has no
+		// such route), which does not change the refusal.
+		when := "unavailable"
+		if reg, err := c.GetOwnerHelperRegistration(ctx, *task, a.RunID); err == nil && reg.AgentID == a.ID && reg.RunID == a.RunID && !reg.CreatedAt.IsZero() {
+			when = handoffStamped(reg.CreatedAt)
+		}
+		return handoffRefusal("g3 current run", fmt.Sprintf("the hub's helper run is %s, not the helper file's %s: someone registered after this host's file was written; host of the current registration: %s; registration time: %s",
+			a.RunID, expected, a.Host, when), "if this session's own registration answer was lost, run `tt helper register --task "+*task+"`")
 	}
 	switch a.Status {
 	case api.AgentRunning, api.AgentDone, api.AgentNeedsInput:

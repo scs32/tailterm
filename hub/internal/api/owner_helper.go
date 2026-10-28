@@ -91,3 +91,13 @@ func ValidateRegisterOwnerHelper(req *RegisterOwnerHelperRequest) error {
 func (c *Client) RegisterOwnerHelper(ctx context.Context, task string, req RegisterOwnerHelperRequest) (OwnerActionResult, error) {
 	return c.ownerAction(ctx, "/v1/tasks/"+url.PathEscape(task)+"/owner-helper", req)
 }
+
+// ValidOwnerHelperRun reports whether run has the shape of a run ID.
+func ValidOwnerHelperRun(run string) bool { return ownerHelperRunRE.MatchString(run) }
+
+// GetOwnerHelperRegistration returns the receipt of the registration that
+// started the named owner-helper run.
+func (c *Client) GetOwnerHelperRegistration(ctx context.Context, task, run string) (OwnerHelperRegistration, error) {
+	var out OwnerHelperRegistration
+	return out, c.do(ctx, "GET", "/v1/tasks/"+url.PathEscape(task)+"/owner-helper/registrations/"+url.PathEscape(run), nil, &out)
+}

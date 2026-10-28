@@ -412,3 +412,72 @@ func TestOwnerHelperExpectedRunHTTP(t *testing.T) {
 		}
 	})
 }
+
+// g1 (wi_9abdaaafd63049bf): one run's registration receipt, by run ID. It is
+// read-only, needs an identity, refuses the Discord bridge and stays inside its
+// project.
+func TestOwnerHelperRegistrationByRunHTTP(t *testing.T) {
+	h := newTokenHub(t)
+	task, _, _ := h.project()
+	other, _, _ := h.project()
+	base := "/v1/tasks/" + task.ID
+	register := func(key, host string) api.OwnerActionResult {
+		t.Helper()
+		var out api.OwnerActionResult
+		if code, _ := h.do(ownerToken, "POST", base+"/owner-helper", api.RegisterOwnerHelperRequest{Host: host, Session: "owner", Runtime: "claude", RequestID: key}, &out); code != http.StatusCreated || out.Agent == nil || out.Registration == nil {
+			t.Fatalf("register %s %d %+v", key, code, out)
+		}
+		return out
+	}
+	first := register("ohreg-1", "owner-mac")
+	second := register("ohreg-2", "owner-mac-2")
+	state := func() (receipts []api.OwnerHelperRegistration, events []int64) {
+		t.Helper()
+		receipts, err := h.st.ListOwnerHelperRegistrations(context.Background(), task.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var list []api.Event
+		if code, _ := h.do(ownerToken, "GET", base+"/events?limit=1000", nil, &list); code != http.StatusOK {
+			t.Fatalf("events %d", code)
+		}
+		for _, e := range list {
+			events = append(events, e.Seq)
+		}
+		return receipts, events
+	}
+	beforeReceipts, beforeEvents := state()
+
+	get := func(token, path string) (int, api.OwnerHelperRegistration) {
+		t.Helper()
+		var reg api.OwnerHelperRegistration
+		code, _ := h.do(token, "GET", path, nil, &reg)
+		return code, reg
+	}
+	runPath := func(b, run string) string { return b + "/owner-helper/registrations/" + run }
+	code, got := get(ownerToken, runPath(base, first.Agent.RunID))
+	if code != http.StatusOK || got.Host != "owner-mac" || got.Mode != api.OwnerHelperCreated || got.AgentID != first.Agent.ID || got.RunID != first.Agent.RunID || !got.CreatedAt.Equal(first.Registration.CreatedAt) {
+		t.Fatalf("first run %d %+v, want %+v", code, got, *first.Registration)
+	}
+	code, got = get(ownerToken, runPath(base, second.Agent.RunID))
+	if code != http.StatusOK || got.Host != "owner-mac-2" || got.Mode != api.OwnerHelperReplaced || got.PreviousRunID != first.Agent.RunID || !got.CreatedAt.Equal(second.Registration.CreatedAt) {
+		t.Fatalf("second run %d %+v, want %+v", code, got, *second.Registration)
+	}
+	for name, c := range map[string]struct {
+		token, path string
+		want        int
+	}{
+		"no identity":   {"", runPath(base, first.Agent.RunID), http.StatusForbidden},
+		"bridge":        {bridgeToken, runPath(base, first.Agent.RunID), http.StatusForbidden},
+		"unknown run":   {ownerToken, runPath(base, "run_0123456789abcdef"), http.StatusNotFound},
+		"malformed run": {ownerToken, runPath(base, "nope"), http.StatusNotFound},
+		"other project": {ownerToken, runPath("/v1/tasks/"+other.ID, first.Agent.RunID), http.StatusNotFound},
+	} {
+		if code, reg := get(c.token, c.path); code != c.want || reg.RunID != "" {
+			t.Fatalf("%s: %d %+v, want %d and no receipt", name, code, reg, c.want)
+		}
+	}
+	if afterReceipts, afterEvents := state(); !reflect.DeepEqual(beforeReceipts, afterReceipts) || !reflect.DeepEqual(beforeEvents, afterEvents) {
+		t.Fatalf("the reads wrote something:\nbefore %+v %v\nafter  %+v %v", beforeReceipts, beforeEvents, afterReceipts, afterEvents)
+	}
+}

@@ -2131,6 +2131,10 @@ type handoffHubFixture struct {
 	b        *handoffBox
 	mu       sync.Mutex
 	requests []string
+	// refuse answers a request whose path contains a key with that status
+	// instead of passing it to the hub, as an older hub without the route
+	// would.
+	refuse map[string]int
 }
 
 func newHandoffHubFixture(t *testing.T) *handoffHubFixture {
@@ -2153,7 +2157,14 @@ func newHandoffHubFixture(t *testing.T) *handoffHubFixture {
 	front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		f.requests = append(f.requests, r.Method+" "+r.URL.Path)
+		refuse := f.refuse
 		f.mu.Unlock()
+		for part, status := range refuse {
+			if strings.Contains(r.URL.Path, part) {
+				http.Error(w, "not found", status)
+				return
+			}
+		}
 		proxy.ServeHTTP(w, r)
 	}))
 	t.Cleanup(front.Close)
@@ -2658,6 +2669,38 @@ func TestHandoffRestoreGuards(t *testing.T) {
 		}
 	}
 	ctx := context.Background()
+	// The g3 cases leave the registration read restore must send and the
+	// agent row's times, which are not registration times, for the checks
+	// after restore.
+	var registrationGET string
+	var rowStamps []string
+	hubRunDiffers := func(t *testing.T, f *handoffHubFixture, readable bool) []string {
+		other, err := f.c.RegisterOwnerHelper(ctx, f.task.ID, api.RegisterOwnerHelperRequest{Host: "other-host", Session: "owner", Runtime: "claude", RequestID: "other-host-1"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Later activity moves lastSeenAt and lastEventAt on the agent row;
+		// neither is a registration time.
+		time.Sleep(1100 * time.Millisecond)
+		if _, err := f.c.PostEvent(ctx, f.task.ID, api.PostEventRequest{Kind: api.EventDone, AgentID: other.Agent.ID, RunID: other.Agent.RunID}); err != nil {
+			t.Fatal(err)
+		}
+		row, err := f.c.GetAgent(ctx, f.task.ID, other.Agent.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rowStamps = []string{handoffStamped(row.LastEventAt), handoffStamped(row.LastSeenAt)}
+		registrationGET = "GET /v1/tasks/" + f.task.ID + "/owner-helper/registrations/" + other.Agent.RunID
+		when := handoffStamped(other.Registration.CreatedAt)
+		if !readable {
+			f.mu.Lock()
+			f.refuse = map[string]int{"/owner-helper/registrations/": http.StatusNotFound}
+			f.mu.Unlock()
+			when = "unavailable"
+		}
+		return []string{"the hub's helper run is " + other.Agent.RunID + ", not the helper file's " + f.b.helper.Run, "host of the current registration: other-host",
+			"registration time: " + when, "if this session's own registration answer was lost, run `tt helper register --task " + f.task.ID + "`"}
+	}
 	guards := []guard{
 		{"outside tmux", "g1 in tmux, one pane", func(t *testing.T, f *handoffHubFixture) []string {
 			t.Setenv("TMUX", "")
@@ -2696,21 +2739,12 @@ func TestHandoffRestoreGuards(t *testing.T) {
 			return []string{"the helper file names tmux session elsewhere, not this one: the helper lives elsewhere"}
 		}},
 		{"hub run differs", "g3 current run", func(t *testing.T, f *handoffHubFixture) []string {
-			other, err := f.c.RegisterOwnerHelper(ctx, f.task.ID, api.RegisterOwnerHelperRequest{Host: "other-host", Session: "owner", Runtime: "claude", RequestID: "other-host-1"})
-			if err != nil {
-				t.Fatal(err)
-			}
-			// Later activity moves lastSeenAt and lastEventAt on the agent row;
-			// neither is a registration time.
-			time.Sleep(1100 * time.Millisecond)
-			if _, err := f.c.PostEvent(ctx, f.task.ID, api.PostEventRequest{Kind: api.EventDone, AgentID: other.Agent.ID, RunID: other.Agent.RunID}); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := f.c.GetAgent(ctx, f.task.ID, other.Agent.ID); err != nil {
-				t.Fatal(err)
-			}
-			return []string{"the hub's helper run is " + other.Agent.RunID + ", not the helper file's " + f.b.helper.Run, "host of the current registration: other-host",
-				"registration time: unavailable", "if this session's own registration answer was lost, run `tt helper register --task " + f.task.ID + "`"}
+			return hubRunDiffers(t, f, true)
+		}},
+		// An older hub has no registration route: the time is unavailable
+		// and the refusal is the same.
+		{"hub run differs, registration unreadable", "g3 current run", func(t *testing.T, f *handoffHubFixture) []string {
+			return hubRunDiffers(t, f, false)
 		}},
 		{"closed", "g4 status", func(t *testing.T, f *handoffHubFixture) []string {
 			if _, err := f.c.CloseAgent(ctx, f.task.ID, f.b.helper.Agent, f.b.helper.Run); err != nil {
@@ -2776,6 +2810,7 @@ func TestHandoffRestoreGuards(t *testing.T) {
 	}
 	for _, g := range guards {
 		t.Run(g.name, func(t *testing.T) {
+			registrationGET, rowStamps = "", nil
 			f := newHandoffHubFixture(t)
 			b := f.b
 			f.successor(t)
@@ -2783,6 +2818,9 @@ func TestHandoffRestoreGuards(t *testing.T) {
 			before := f.state(t)
 			f.seen()
 			out, err := f.restore()
+			// One snapshot of restore's own requests, before any other read
+			// goes through the front: seen clears the log.
+			log := f.seen()
 			if err == nil || out != "" {
 				t.Fatalf("restore = %v, printed %q; want a refusal and no output", err, out)
 			}
@@ -2791,7 +2829,13 @@ func TestHandoffRestoreGuards(t *testing.T) {
 					t.Fatalf("the refusal lacks %q:\n%v", want, err)
 				}
 			}
-			if sent := f.writes(); len(sent) != 0 {
+			var sent []string
+			for _, r := range log {
+				if !strings.HasPrefix(r, "GET ") {
+					sent = append(sent, r)
+				}
+			}
+			if len(sent) != 0 {
 				t.Fatalf("a refused restore sent %v", sent)
 			}
 			if after := f.state(t); after != before {
@@ -2809,9 +2853,17 @@ func TestHandoffRestoreGuards(t *testing.T) {
 				if helpers := f.helpers(t); len(helpers) != 1 || helpers[0].Status != api.AgentRetired || helpers[0].RunID != b.helper.Run {
 					t.Fatalf("the retired helper changed: %+v", helpers)
 				}
-			case "hub run differs":
+			case "hub run differs", "hub run differs, registration unreadable":
+				if !slices.Contains(log, registrationGET) {
+					t.Fatalf("restore did not read the registration (%s): %v", registrationGET, log)
+				}
 				// No time from the agent row is printed as a registration time.
-				if regexp.MustCompile(`[0-9]{4}-[0-9]{2}-[0-9]{2}`).MatchString(err.Error()) {
+				for _, stamp := range rowStamps {
+					if strings.Contains(err.Error(), stamp) {
+						t.Fatalf("the refusal prints the agent row's time %s:\n%v", stamp, err)
+					}
+				}
+				if g.name == "hub run differs, registration unreadable" && regexp.MustCompile(`[0-9]{4}-[0-9]{2}-[0-9]{2}`).MatchString(err.Error()) {
 					t.Fatalf("the refusal prints a time:\n%v", err)
 				}
 			}
