@@ -1914,6 +1914,66 @@ func moveEntryReleaseHold(ctx context.Context, tx *sql.Tx, task, from string, to
 	return err
 }
 
+// liftEntryReleaseHold releases the entry's standing entry hold, in the
+// transaction that ends the entry (its removal, or its item becoming done or
+// dismissed), so a hold no job can ever take is not listed for ever. An entry
+// with a release job (a refused or rolled-back one can be retried) or an
+// acceptance (enqueue creates its first job) can still get one, and keeps
+// its hold. A failed entry's release does not call this: a requeue follows
+// it and moves the hold.
+func liftEntryReleaseHold(ctx context.Context, tx *sql.Tx, task, entry, reason, agentID, runID, now string) error {
+	h, err := releaseEntryHoldStanding(ctx, tx, task, entry)
+	if err != nil || h == nil {
+		return err
+	}
+	var jobs int
+	if err = tx.QueryRowContext(ctx, `SELECT count(*) FROM release_jobs WHERE task_id=? AND entry_id=?`, task, entry).Scan(&jobs); err != nil || jobs > 0 {
+		return err
+	}
+	var acceptance string
+	err = tx.QueryRowContext(ctx, `SELECT acceptance_json FROM team_queue_entries WHERE task_id=? AND id=?`, task, entry).Scan(&acceptance)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if acceptance != "" {
+		return nil
+	}
+	h.State = "released"
+	h.ReleasedAt = now
+	h.ReleaseReason = reason
+	h.ReleaseAgentID = agentID
+	h.ReleaseRunID = runID
+	return saveReleaseEntryHold(ctx, tx, task, *h)
+}
+
+// liftItemEntryReleaseHolds lifts the standing entry holds of an item's
+// entries as the item becomes done or dismissed.
+func liftItemEntryReleaseHolds(ctx context.Context, tx *sql.Tx, task, item, status, agentID, runID, now string) error {
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM team_queue_entries WHERE task_id=? AND item_id=? ORDER BY attempt`, task, item)
+	if err != nil {
+		return err
+	}
+	var entries []string
+	for rows.Next() {
+		var id string
+		if err = rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		entries = append(entries, id)
+	}
+	rows.Close()
+	if err = rows.Err(); err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if err = liftEntryReleaseHold(ctx, tx, task, entry, "item "+item+" became "+status+" while entry "+entry+" had no release job", agentID, runID, now); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // applyEntryReleaseHold runs as a job is created, in the creating
 // transaction (acceptance, enqueue or retry): the entry's standing entry hold
 // creates the job held at its first generation and is then applied. One

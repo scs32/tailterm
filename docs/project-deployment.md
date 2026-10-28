@@ -1746,9 +1746,17 @@ becomes `applied`. One whose time passed before the job exists becomes
 standing one (`released`); after it applies, the job is held like any owner
 hold. A requeue moves a standing entry hold to the new entry (the old one
 becomes `moved`, naming the new entry), so the requeued entry's acceptance
-creates its job held. `tt deployment list` shows standing entry holds under
-`entryHolds`. An entry hold is refused while the entry already has a release
-job that is not `refused` or `rolled_back`: hold that job instead. For a
+creates its job held. A failed entry's release keeps its entry hold
+`standing`, since a requeue needs the release and then moves it. The hub
+releases a standing entry hold (`released`, with a reason naming the cause) in
+the same transaction that ends its entry: the entry is removed from the queue,
+or its item becomes done or dismissed while the entry has no release job and
+no acceptance. An entry with a job (a refused or rolled-back one can be
+retried) or an acceptance (enqueue creates its first job) keeps its hold.
+Holds on entries that ended before this rule shipped stay as saved.
+`tt deployment list` shows standing entry holds under `entryHolds`. An entry
+hold is refused while the entry already has a release job that is not
+`refused` or `rolled_back`: hold that job instead. For a
 refused or rolled-back job that must not be retried before T, save the entry
 hold before `tt deployment retry`. A claimed job cannot be held: see "Setting
 aside a job that holds the fence".

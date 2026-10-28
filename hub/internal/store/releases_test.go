@@ -8175,6 +8175,190 @@ func TestReleaseEntryHoldMovesWithRequeue(t *testing.T) {
 	}
 }
 
+// entryHoldRecord reads the entry's latest entry hold row.
+func entryHoldRecord(t *testing.T, s *Store, task api.Task, entry string) (api.ReleaseEntryHold, string) {
+	t.Helper()
+	var raw string
+	var h api.ReleaseEntryHold
+	if err := s.db.QueryRow(`SELECT record_json FROM release_entry_holds WHERE task_id=? AND entry_id=? ORDER BY rowid DESC LIMIT 1`, task.ID, entry).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(raw), &h); err != nil {
+		t.Fatal(err)
+	}
+	return h, raw
+}
+
+// wi_2bc0817fd3f8101c: holdEntry saves the handler's dated entry hold.
+func (f *rebindFixture) holdEntry(t *testing.T, key, entry string) {
+	t.Helper()
+	if _, err := f.s.ReleaseAction(f.ctx, f.task.ID, entryHoldRequest(key, "hold", f.handler.ID, f.handler.RunID, entry, "Not before the measurement ends", f.s.now().Add(time.Hour).UTC().Format(time.RFC3339))); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// dismiss saves the fixture's item dismissed at its current revision.
+func (f *rebindFixture) dismiss(t *testing.T) api.WorkItem {
+	t.Helper()
+	item, err := f.s.GetWorkItem(f.ctx, f.task.ID, f.item.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := "dismissed"
+	dismissed, err := f.s.UpdateWorkItem(f.ctx, f.task.ID, f.item.ID, api.UpdateWorkItemRequest{Revision: item.Revision, Status: &status}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dismissed
+}
+
+// wi_2bc0817fd3f8101c e1/e2: removing a queued entry releases its standing
+// entry hold in the removal, naming why; a refused remove changes nothing
+// and a replay writes nothing.
+func TestReleaseEntryHoldLiftsWhenEntryRemoved(t *testing.T) {
+	f := newRebindFixture(t, false)
+	f.holdEntry(t, "entry-hold", f.entry.ID)
+	if _, err := f.s.TeamQueueAction(f.ctx, f.task.ID, api.TeamQueueRequest{RequestID: "stale-remove", Operation: "remove", EntryID: f.entry.ID, ExpectedRevision: f.entry.Revision + 1}); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("stale remove", err)
+	}
+	if state, _ := entryHoldState(t, f.s, f.task, f.entry.ID); state != "standing" {
+		t.Fatal("hold after a refused remove", state)
+	}
+	remove := api.TeamQueueRequest{RequestID: "remove", Operation: "remove", EntryID: f.entry.ID, ExpectedRevision: f.entry.Revision}
+	f.action(t, remove)
+	h, raw := entryHoldRecord(t, f.s, f.task, f.entry.ID)
+	if h.State != "released" || h.ReleasedAt == "" || h.ReleaseReason != "entry "+f.entry.ID+" was removed from the team queue before a release job existed" || h.ReleaseAgentID != "" {
+		t.Fatalf("removed entry's hold %+v", h)
+	}
+	if page := windowPage(t, f.s, f.task); len(page.EntryHolds) != 0 {
+		t.Fatalf("standing entry holds after the remove %+v", page.EntryHolds)
+	}
+	if _, err := f.s.TeamQueueAction(f.ctx, f.task.ID, remove); err != nil {
+		t.Fatal("remove replay", err)
+	}
+	if _, again := entryHoldRecord(t, f.s, f.task, f.entry.ID); again != raw {
+		t.Fatalf("replay changed the hold %s", again)
+	}
+}
+
+// wi_2bc0817fd3f8101c e2: a failed entry's release keeps its entry hold
+// standing, since a requeue needs the release; the requeue then moves it.
+func TestReleaseEntryHoldStandsThroughReleaseAndMovesWithRequeue(t *testing.T) {
+	f := newRebindFixture(t, true)
+	first := f.entry.ID
+	f.holdEntry(t, "entry-hold", first)
+	f.failAndRelease(t)
+	if state, _ := entryHoldState(t, f.s, f.task, first); state != "standing" {
+		t.Fatal("hold after the release", state)
+	}
+	if page := windowPage(t, f.s, f.task); len(page.EntryHolds) != 1 || page.EntryHolds[0].EntryID != first {
+		t.Fatalf("standing entry holds after the release %+v", page.EntryHolds)
+	}
+	retry, err := f.s.TeamQueueAction(f.ctx, f.task.ID, f.requeue())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state, _ := entryHoldState(t, f.s, f.task, first); state != "moved" {
+		t.Fatal("failed entry's hold after the requeue", state)
+	}
+	if state, _ := entryHoldState(t, f.s, f.task, retry.ID); state != "standing" {
+		t.Fatal("retry's hold", state)
+	}
+	if page := windowPage(t, f.s, f.task); len(page.EntryHolds) != 1 || page.EntryHolds[0].EntryID != retry.ID {
+		t.Fatalf("standing entry holds after the requeue %+v", page.EntryHolds)
+	}
+}
+
+// wi_2bc0817fd3f8101c e1/e2: dismissing the item of a failed, released entry
+// releases the entry's hold in the dismissal, naming the item and entry.
+func TestReleaseEntryHoldLiftsWhenFailedEntryItemDismissed(t *testing.T) {
+	f := newRebindFixture(t, true)
+	f.holdEntry(t, "entry-hold", f.entry.ID)
+	f.failAndRelease(t)
+	f.dismiss(t)
+	h, _ := entryHoldRecord(t, f.s, f.task, f.entry.ID)
+	if h.State != "released" || h.ReleasedAt == "" || h.ReleaseReason != "item "+f.item.ID+" became dismissed while entry "+f.entry.ID+" had no release job" {
+		t.Fatalf("dismissed item's entry hold %+v", h)
+	}
+	if page := windowPage(t, f.s, f.task); len(page.EntryHolds) != 0 {
+		t.Fatalf("standing entry holds after the dismissal %+v", page.EntryHolds)
+	}
+}
+
+// wi_2bc0817fd3f8101c e1: the keyed done save of an item whose failed entry
+// was released, with no queue acceptance, releases the entry's hold and
+// records the saving handler.
+func TestReleaseEntryHoldLiftsWhenItemSavedDoneWithoutAcceptance(t *testing.T) {
+	f := newRebindFixture(t, true)
+	f.holdEntry(t, "entry-hold", f.entry.ID)
+	f.failAndRelease(t)
+	item, err := f.s.GetWorkItem(f.ctx, f.task.ID, f.item.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedPassingVerificationAt(t, f.s, item, candidateB, autoWorktree)
+	report, _, err := f.s.PutNarrativeReport(f.ctx, f.task.ID, f.item.ID, completeReportRequest(item, "done-report", 5), f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := "done"
+	if _, _, err = f.s.CreateWorkItemUpdate(f.ctx, f.task.ID, f.item.ID, api.CreateWorkItemUpdate{ExpectedRevision: item.Revision, Status: &done, AgentID: f.handler.ID, RunID: f.handler.RunID, RequestID: "done-save",
+		CompletionReport: &api.NarrativeReportPin{ReportID: report.ReportID, Version: report.Version, Digest: report.Digest, ScopeRevision: report.ScopeRevision}}, f.by); err != nil {
+		t.Fatalf("done save: %v", err)
+	}
+	h, _ := entryHoldRecord(t, f.s, f.task, f.entry.ID)
+	if h.State != "released" || h.ReleaseReason != "item "+f.item.ID+" became done while entry "+f.entry.ID+" had no release job" || h.ReleaseAgentID != f.handler.ID || h.ReleaseRunID != f.handler.RunID {
+		t.Fatalf("done item's entry hold %+v", h)
+	}
+}
+
+// wi_2bc0817fd3f8101c: an entry that can still get a job keeps its hold when
+// its item is dismissed, and an edit of an item already dismissed lifts
+// nothing, so holds saved before this change stay as saved.
+func TestReleaseEntryHoldKeptForEntryWithJobOrAcceptance(t *testing.T) {
+	t.Run("refused job", func(t *testing.T) {
+		s, task, h, d, entry := releaseFixture(t)
+		ctx := context.Background()
+		refusedJob(t, s, task, h, d, entry)
+		if _, err := s.ReleaseAction(ctx, task.ID, entryHoldRequest("entry-hold", "hold", h.ID, h.RunID, entry, "Retry after the boundary", s.now().Add(time.Hour).UTC().Format(time.RFC3339))); err != nil {
+			t.Fatal(err)
+		}
+		e, err := s.GetTeamQueueEntry(ctx, task.ID, entry)
+		if err != nil {
+			t.Fatal(err)
+		}
+		item, err := s.GetWorkItem(ctx, task.ID, e.ItemID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		status := "dismissed"
+		if _, err = s.UpdateWorkItem(ctx, task.ID, item.ID, api.UpdateWorkItemRequest{Revision: item.Revision, Status: &status}, api.Caller{Node: "fixture", User: "owner"}); err != nil {
+			t.Fatal(err)
+		}
+		if state, _ := entryHoldState(t, s, task, entry); state != "standing" {
+			t.Fatal("hold of an entry with a refused job", state)
+		}
+	})
+	t.Run("already dismissed", func(t *testing.T) {
+		f := newRebindFixture(t, true)
+		f.failAndRelease(t)
+		dismissed := f.dismiss(t)
+		f.holdEntry(t, "entry-hold", f.entry.ID)
+		priority := "high"
+		edited, err := f.s.UpdateWorkItem(f.ctx, f.task.ID, f.item.ID, api.UpdateWorkItemRequest{Revision: dismissed.Revision, Priority: &priority}, f.by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		status := "dismissed"
+		if _, err = f.s.UpdateWorkItem(f.ctx, f.task.ID, f.item.ID, api.UpdateWorkItemRequest{Revision: edited.Revision, Status: &status}, f.by); err != nil {
+			t.Fatal(err)
+		}
+		if state, _ := entryHoldState(t, f.s, f.task, f.entry.ID); state != "standing" {
+			t.Fatal("hold after edits of a dismissed item", state)
+		}
+	})
+}
+
 // wi_63c71acaf4f4f7b5 s1-s4: the runner's code state on its progress report.
 var (
 	codeLoaded, codePublished = "0123456789ab", "ba9876543210"

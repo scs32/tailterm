@@ -1872,6 +1872,9 @@ func (s *Store) teamQueueAction(ctx context.Context, task string, req api.TeamQu
 			if e.State != "queued" {
 				return zero, fmt.Errorf("%w: only queued entries can be removed", api.ErrConflict)
 			}
+			if err = liftEntryReleaseHold(ctx, tx, task, e.ID, "entry "+e.ID+" was removed from the team queue before a release job existed", req.HandlerAgentID, req.HandlerRunID, now); err != nil {
+				return zero, err
+			}
 			_, err = tx.ExecContext(ctx, `DELETE FROM team_queue_entries WHERE id=?`, e.ID)
 			if err != nil {
 				return zero, err

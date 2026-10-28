@@ -456,6 +456,9 @@ func (s *Store) UpdateWorkItem(ctx context.Context, taskID, itemID string, req a
 		}
 	}
 	transitioningDone := item.Kind == "feature" && item.Status != "done" && req.Status != nil && *req.Status == "done"
+	// Only a change into done or dismissed ends the item's entries: an edit
+	// of an item already terminal leaves their entry holds as saved.
+	endingItem := item.Status != "done" && item.Status != "dismissed" && req.Status != nil && (*req.Status == "done" || *req.Status == "dismissed")
 	if transitioningDone {
 		if req.Title != nil || req.Description != nil {
 			return api.WorkItem{}, api.ErrNarrativeReportStale
@@ -552,6 +555,11 @@ func (s *Store) UpdateWorkItem(ctx context.Context, taskID, itemID string, req a
 	}
 	if err = s.syncQueueForWorkItem(ctx, tx, item, "", by); err != nil {
 		return api.WorkItem{}, err
+	}
+	if endingItem {
+		if err = liftItemEntryReleaseHolds(ctx, tx, taskID, item.ID, item.Status, req.AgentID, "", ts(now)); err != nil {
+			return api.WorkItem{}, err
+		}
 	}
 	if _, err = s.insertEvent(ctx, tx, taskID, "work_item_updated", req.AgentID, item.Title, map[string]any{"itemId": item.ID, "kind": item.Kind, "revision": item.Revision, "fields": changedFields}, by); err != nil {
 		return api.WorkItem{}, err
@@ -808,6 +816,9 @@ func (s *Store) CreateWorkItemUpdate(ctx context.Context, taskID, itemID string,
 		}
 	}
 	transitioningDone := item.Kind == "feature" && item.Status != "done" && req.Status != nil && *req.Status == "done"
+	// Only a change into done or dismissed ends the item's entries: an edit
+	// of an item already terminal leaves their entry holds as saved.
+	endingItem := item.Status != "done" && item.Status != "dismissed" && req.Status != nil && (*req.Status == "done" || *req.Status == "dismissed")
 	if transitioningDone {
 		if req.Title != nil || req.Description != nil {
 			return api.WorkItemUpdateResult{}, false, api.ErrNarrativeReportStale
@@ -908,6 +919,12 @@ func (s *Store) CreateWorkItemUpdate(ctx context.Context, taskID, itemID string,
 	}
 	if queueEntry != nil {
 		if err = acceptTeamQueueOnDoneSave(ctx, tx, task, queueEntry, *req.QueueAcceptance, req.AgentID, req.RunID, receipt.ID, ts(now)); err != nil {
+			return api.WorkItemUpdateResult{}, false, err
+		}
+	}
+	// After acceptance, so an accepted entry's new job takes its hold first.
+	if endingItem {
+		if err = liftItemEntryReleaseHolds(ctx, tx, taskID, item.ID, item.Status, req.AgentID, req.RunID, ts(now)); err != nil {
 			return api.WorkItemUpdateResult{}, false, err
 		}
 	}
