@@ -5358,6 +5358,46 @@ func TestReviewDispositionFollowUpIDCollisionSkipped(t *testing.T) {
 	})
 }
 
+// t2 (review #49814 f1): a disposition naming follow-ups round two already
+// settled through its blockerIds writes nothing more: the dismissed stub keeps
+// its revision and the refined item keeps its one note.
+func TestReviewDispositionSkipsFollowUpSettledByRoundTwo(t *testing.T) {
+	f := newConvergenceFixture(t)
+	_, r2, stubs := roundOneFollowUps(t, f)
+	text := "Refined by the handler: keep the receipt on fixture retries."
+	refined, err := f.s.UpdateWorkItem(f.ctx, f.task.ID, stubs["f2"].ID, api.UpdateWorkItemRequest{Revision: 1, Description: &text}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = f.roundTwoResult(passConvergence, api.ReviewMetadata{BlockerIDs: []string{"b1", "f1", "f2"}}, r2.Seq); err != nil {
+		t.Fatal(err)
+	}
+	closed, err := f.s.GetWorkItem(f.ctx, f.task.ID, stubs["f1"].ID)
+	if err != nil || closed.Status != "dismissed" || len(foldNotes(t, f.s, refined.ID)) != 1 {
+		t.Fatalf("round two did not settle: %+v %v", closed, err)
+	}
+	counts := foldCounts(t, f.s)
+	if _, err = f.dispose("follow-ups", candidateB, []string{"f1", "f2"}); err != nil {
+		t.Fatal(err)
+	}
+	counts[0]++
+	if after := foldCounts(t, f.s); after != counts {
+		t.Fatalf("disposition wrote follow-up rows: %v -> %v", counts, after)
+	}
+	if got, err := f.s.GetWorkItem(f.ctx, f.task.ID, closed.ID); err != nil || got.Revision != closed.Revision || got.Description != closed.Description {
+		t.Fatalf("dismissed stub changed: %+v %v", got, err)
+	}
+	if got, err := f.s.GetWorkItem(f.ctx, f.task.ID, refined.ID); err != nil || got.Revision != refined.Revision || got.Status != "open" {
+		t.Fatalf("refined item changed: %+v %v", got, err)
+	}
+	if notes := foldNotes(t, f.s, refined.ID); len(notes) != 1 {
+		t.Fatalf("refined notes %+v", notes)
+	}
+	if c, x := eventCount(t, f, "review_follow_up_closed"), eventCount(t, f, "review_follow_up_fixed"); c != 1 || x != 1 {
+		t.Fatalf("events closed=%d fixed=%d", c, x)
+	}
+}
+
 // t2: a disposition without fixedFollowUpIds records exactly as before and
 // writes no follow-up.
 func TestReviewDispositionWithoutFixedFollowUpsWritesNoFollowUp(t *testing.T) {

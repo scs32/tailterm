@@ -706,7 +706,8 @@ review stage that the item fixed. In the NOTICE's transaction the hub settles
 each the way round two's `blockerIds` does. An unchanged held stub is dismissed
 as delivered. A refined item the fold rule allows gets one `review-fixed` note
 and keeps its row. Any other item is not written. An ID that a saved blocker of
-the stage reuses names that blocker and is skipped. The NOTICE is refused for an
+the stage reuses names that blocker and is skipped, as is a follow-up that round
+two's `blockerIds` already settled. The NOTICE is refused for an
 ID that is not a round-one follow-up of the stage, an ID named twice, a
 follow-up whose criterion did not pass in the latest round (except on
 `accept`), the field on `owner-accept`, or the field outside a disposition. A

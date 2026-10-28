@@ -938,8 +938,8 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 			return reviewConflict("disposition already recorded")
 		}
 		// fixedFollowUpIds names round-one follow-ups the item fixed. An ID
-		// that a saved blocker of this stage reuses names that blocker and is
-		// skipped, as in focused verification.
+		// that a saved blocker of this stage reuses names that blocker, and an
+		// ID round two's blockerIds already settled is done; both are skipped.
 		if ownerAccept && len(meta.FixedFollowUpIDs) > 0 {
 			return reviewConflict("owner-accept names no fixed follow-ups")
 		}
@@ -952,6 +952,10 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 				}
 			}
 			blockers := stageBlockerIDs(state.Rounds)
+			settled, err := roundTwoResolvedIDs(ctx, tx, m.TaskID, state.Rounds)
+			if err != nil {
+				return err
+			}
 			verdicts := state.Rounds[len(state.Rounds)-1].Verdicts
 			named := map[string]bool{}
 			for _, id := range meta.FixedFollowUpIDs {
@@ -960,7 +964,7 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 					return reviewConflict("fixedFollowUpIds must name distinct round-one follow-ups")
 				}
 				named[id] = true
-				if blockers[id] {
+				if blockers[id] || settled[id] {
 					continue
 				}
 				if c := follow.Finding.Criterion; c != "" && meta.Disposition != "accept" && verdicts[c] != "pass" {
@@ -1696,6 +1700,29 @@ func stageBlockerIDs(rounds []api.ReviewRound) map[string]bool {
 		}
 	}
 	return out
+}
+
+// roundTwoResolvedIDs is the blockerIds of the stage's saved round-two RESULT:
+// the prior blockers and round-one follow-ups it resolved.
+func roundTwoResolvedIDs(ctx context.Context, tx *sql.Tx, task string, rounds []api.ReviewRound) (map[string]bool, error) {
+	out := map[string]bool{}
+	if len(rounds) < 2 || rounds[1].ResultSeq == 0 {
+		return out, nil
+	}
+	var raw string
+	if err := tx.QueryRowContext(ctx, `SELECT envelope FROM messages WHERE task_id=? AND seq=?`, task, rounds[1].ResultSeq).Scan(&raw); err != nil {
+		return nil, err
+	}
+	var e api.Envelope
+	if err := json.Unmarshal([]byte(raw), &e); err != nil {
+		return nil, err
+	}
+	if e.Review != nil {
+		for _, id := range e.Review.BlockerIDs {
+			out[id] = true
+		}
+	}
+	return out, nil
 }
 
 // settleFixedFollowUps settles each of follows in the RESULT's transaction,
