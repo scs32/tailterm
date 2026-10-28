@@ -532,8 +532,11 @@ verification and other write routes are not recorded yet; that is a follow-up.
   `rate_limit` opens an episode. Adding another code is a one-line change.
 - Token accounting counts every handler request attributed to the item; the
   item's usage models group shows whether only the arm's model served it.
-- Stall notices (`team_queue_stall.go`) do not know about arms; the list reason
-  names the arm and the wait.
+- Stall notices (`team_queue_stall.go`) follow the arm: an entry whose drawn
+  arm's handler is leased by a stuck entry, with no fallback, is stalled behind
+  that entry even while another arm is free, and its reason and notice end with
+  `. It waits for a free handler of arm S`. A wait behind working teams or
+  provider limits is not a stall.
 
 ## Rollback
 

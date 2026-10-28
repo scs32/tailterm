@@ -765,13 +765,16 @@ func (s *Store) explainTeamQueue(ctx context.Context, task string, out *api.Team
 	// sharedOnly lists, per queued entry, the active entries that block it
 	// only by sharing its checkout, when nothing blocks it by ownership.
 	sharedOnly := map[string][]string{}
+	// capHeld lists the queued entries the project agent cap holds: a move
+	// to their own checkout frees no seat.
+	capHeld := map[string]bool{}
 	// The project's open agents and reserved seats are counted once, and only
 	// when a queued entry has a free slot to be held by them.
 	var capReader queryRower = s.db
 	if capacityTx != nil {
 		capReader = capacityTx
 	}
-	var capOpen, capReserved, capHeld int
+	var capOpen, capReserved, capSeatHeld int
 	capCounted := false
 	for i := range out.Entries {
 		if parallel && out.Entries[i].State == "failed" && out.Entries[i].ReleasedAt == "" {
@@ -796,7 +799,7 @@ func (s *Store) explainTeamQueue(ctx context.Context, task string, out *api.Team
 				if capOpen, capReserved, err = projectAgentCapUsage(ctx, capReader, task); err != nil {
 					return err
 				}
-				if capHeld, err = handlerSuccessorSeat(ctx, capReader, task, s.now()); err != nil {
+				if capSeatHeld, err = handlerSuccessorSeat(ctx, capReader, task, s.now()); err != nil {
 					return err
 				}
 				capCounted = true
@@ -805,7 +808,8 @@ func (s *Store) explainTeamQueue(ctx context.Context, task string, out *api.Team
 			if kindErr != nil {
 				return kindErr
 			}
-			capReason = queueAgentCapReason(capOpen, capReserved, capHeld, queueTeamSeats(kind, out.Entries[i].Template), s.MaxAgents)
+			capReason = queueAgentCapReason(capOpen, capReserved, capSeatHeld, queueTeamSeats(kind, out.Entries[i].Template), s.MaxAgents)
+			capHeld[out.Entries[i].ID] = capReason != ""
 		}
 		if queueSlotsFull(out.ConcurrencyLimit, activeCount) {
 			out.Entries[i].BlockReason = "All team slots are reserved"
@@ -867,7 +871,8 @@ func (s *Store) explainTeamQueue(ctx context.Context, task string, out *api.Team
 	if err := explainArmWaits(ctx, reader, out, holding, s.MaxAgents, s.now()); err != nil {
 		return err
 	}
-	if err := s.explainQueueStalls(ctx, reader, capacityTx, out); err != nil {
+	movable, err := s.explainQueueStalls(ctx, reader, capacityTx, out)
+	if err != nil {
 		return err
 	}
 	// Waiting for the token budget, or behind a team held past its estimate,
@@ -877,11 +882,13 @@ func (s *Store) explainTeamQueue(ctx context.Context, task string, out *api.Team
 		return err
 	}
 	suppressBudgetStalls(out, budgetHeld)
-	// A stall behind an entry that only shares the checkout keeps the move,
-	// which frees the queued entry at once; the stall notice carries it too.
+	// A stall behind an entry that only shares the checkout keeps the move
+	// when moving frees the queued entry at once: a parallel project with a
+	// free slot, a free handler (of its drawn arm) and room under the project
+	// agent cap. The stall notice carries it too.
 	for i := range out.Entries {
 		e := &out.Entries[i]
-		if e.Stall == nil {
+		if e.Stall == nil || !movable[e.ID] || capHeld[e.ID] {
 			continue
 		}
 		for _, id := range sharedOnly[e.ID] {

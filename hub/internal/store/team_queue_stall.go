@@ -69,32 +69,51 @@ func parseStallTime(values ...string) time.Time {
 // classifyStallBlocker reports whether a resource-holding entry is stuck and
 // why, with the durable time it has been so.
 func (s *Store) classifyStallBlocker(ctx context.Context, q queryRower, e api.TeamQueueEntry, parallel bool) (*stallBlocker, error) {
+	b, _, err := s.classifyStallBlockerHeld(ctx, q, e, parallel)
+	return b, err
+}
+
+// classifyStallBlockerHeld is classifyStallBlocker that also returns the
+// project agent cap reason of a launch the cap holds, which is no stall.
+func (s *Store) classifyStallBlockerHeld(ctx context.Context, q queryRower, e api.TeamQueueEntry, parallel bool) (*stallBlocker, string, error) {
 	if !queueEntryHoldsResources(e) {
-		return nil, nil
+		return nil, "", nil
 	}
 	shipped := fmt.Sprintf("tt team queue integrated --task %s --entry %s --commit SHA", e.TaskID, e.ID)
 	if e.State == "failed" {
 		live, err := liveItemRuns(ctx, q, e.TaskID, e.ItemID)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		if parallel && live == 0 {
-			return nil, nil // the runner releases it on its next pass
+			return nil, "", nil // the runner releases it on its next pass
 		}
 		fix := fmt.Sprintf("if its candidate shipped, %s; otherwise close its team once the item is terminal (tt close --team --task %s --item %s) so it can be released", shipped, e.TaskID, e.ItemID)
 		if !parallel && live == 0 {
 			fix = fmt.Sprintf("if its candidate shipped, %s; otherwise tt team queue release --task %s --entry %s", shipped, e.TaskID, e.ID)
 		}
-		return &stallBlocker{cause: api.StallFailedEntry, since: parseStallTime(e.UpdatedAt), fix: fix}, nil
+		return &stallBlocker{cause: api.StallFailedEntry, since: parseStallTime(e.UpdatedAt), fix: fix}, "", nil
 	}
 	var live int
 	if err := q.QueryRowContext(ctx, `SELECT count(*) FROM agent_work_item_bindings b JOIN agents a ON a.id=b.agent_id AND a.run_id=b.run_id WHERE b.item_task_id=? AND b.item_id=? AND a.status NOT IN ('closed','exited')`, e.TaskID, e.ItemID).Scan(&live); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if live == 0 {
+		// A launch whose next member registration the project agent cap
+		// refuses waits for a seat, as the attempt does: failing it frees
+		// nothing the cap holds (wi_d85481431355ef78).
+		if e.State == "launching" {
+			var open int
+			if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM agents WHERE task_id=? AND status NOT IN ('closed','exited')`, e.TaskID).Scan(&open); err != nil {
+				return nil, "", err
+			}
+			if reason := projectAgentCapReason(open, 0, 1, s.MaxAgents); reason != "" {
+				return nil, reason, nil
+			}
+		}
 		var last sql.NullString
 		if err := q.QueryRowContext(ctx, `SELECT MAX(a.last_event_at) FROM agent_work_item_bindings b JOIN agents a ON a.id=b.agent_id AND a.run_id=b.run_id WHERE b.item_task_id=? AND b.item_id=? AND a.status IN ('closed','exited')`, e.TaskID, e.ItemID).Scan(&last); err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		// Held since the later of the item's last run and the entry's own
 		// last write: a relaunch is not dated from an earlier team's exit.
@@ -102,12 +121,12 @@ func (s *Store) classifyStallBlocker(ctx context.Context, q queryRower, e api.Te
 		// A launch in progress has no runs yet; only an entry that has had
 		// none for the whole grace period is stuck.
 		if s.now().Sub(since) < s.queueNoticeGrace() {
-			return nil, nil
+			return nil, "", nil
 		}
-		return &stallBlocker{cause: api.StallNothingRunning, since: since, fix: fmt.Sprintf("if its candidate shipped, %s; otherwise tt team queue fail --task %s --entry %s --reason TEXT, and the runner releases it", shipped, e.TaskID, e.ID)}, nil
+		return &stallBlocker{cause: api.StallNothingRunning, since: since, fix: fmt.Sprintf("if its candidate shipped, %s; otherwise tt team queue fail --task %s --entry %s --reason TEXT, and the runner releases it", shipped, e.TaskID, e.ID)}, "", nil
 	}
 	if e.State != "running" {
-		return nil, nil
+		return nil, "", nil
 	}
 	// idle-entry: every live member idle or done, no open work between them
 	// and anyone, for at least the idle threshold. A provider-blocked member
@@ -116,7 +135,7 @@ func (s *Store) classifyStallBlocker(ctx context.Context, q queryRower, e api.Te
  LEFT JOIN agent_activity x ON x.agent_id=b.agent_id AND x.run_id=b.run_id
  WHERE b.item_task_id=? AND b.item_id=? AND a.status NOT IN ('closed','exited')`, e.TaskID, e.ItemID)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	since := parseStallTime(e.UpdatedAt)
 	idle := true
@@ -124,7 +143,7 @@ func (s *Store) classifyStallBlocker(ctx context.Context, q queryRower, e api.Te
 		var status, state, observed, payload string
 		if err := rows.Scan(&status, &state, &observed, &payload); err != nil {
 			rows.Close()
-			return nil, err
+			return nil, "", err
 		}
 		if status != api.AgentDone && state != "idle" && state != "finished_silent" && state != "provider_blocked" {
 			idle = false
@@ -153,17 +172,17 @@ func (s *Store) classifyStallBlocker(ctx context.Context, q queryRower, e api.Te
 	err = rows.Err()
 	rows.Close()
 	if err != nil || !idle {
-		return nil, err
+		return nil, "", err
 	}
 	team := `SELECT b.agent_id FROM agent_work_item_bindings b JOIN agents a ON a.id=b.agent_id AND a.run_id=b.run_id WHERE b.item_task_id=? AND b.item_id=? AND a.role<>?`
 	var open int
 	var changed sql.NullString
 	if err := q.QueryRowContext(ctx, `SELECT COALESCE(SUM(CASE WHEN o.state<>? AND o.needs<>? THEN 1 ELSE 0 END),0),MAX(o.changed_at) FROM obligations o JOIN messages m ON m.seq=o.message_seq WHERE o.task_id=? AND (o.agent_id IN (`+team+`) OR m.from_agent IN (`+team+`))`,
 		api.ObligationClosed, api.ObligationNeedsDelivery, e.TaskID, e.TaskID, e.ItemID, api.AgentRoleDatabaseHandler, e.TaskID, e.ItemID, api.AgentRoleDatabaseHandler).Scan(&open, &changed); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if open > 0 {
-		return nil, nil // someone owes this team, or it owes someone
+		return nil, "", nil // someone owes this team, or it owes someone
 	}
 	if at := parseStallTime(changed.String); at.After(since) {
 		since = at
@@ -176,18 +195,18 @@ func (s *Store) classifyStallBlocker(ctx context.Context, q queryRower, e api.Te
 	if err := q.QueryRowContext(ctx, `SELECT COALESCE(SUM(CASE WHEN d.message_seq IS NULL THEN 1 ELSE 0 END),0),MAX(d.created_at) FROM decision_requests r JOIN messages m ON m.seq=r.message_seq
  LEFT JOIN decision_answers d ON d.task_id=r.task_id AND d.request_seq=r.message_seq WHERE r.task_id=? AND m.from_agent IN (`+team+`)`,
 		e.TaskID, e.TaskID, e.ItemID, api.AgentRoleDatabaseHandler).Scan(&unanswered, &answered); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if unanswered > 0 {
-		return nil, nil // the owner owes this team an answer
+		return nil, "", nil // the owner owes this team an answer
 	}
 	if at := parseStallTime(answered.String); at.After(since) {
 		since = at
 	}
 	if s.now().Sub(since) < s.queueIdleAfter() {
-		return nil, nil
+		return nil, "", nil
 	}
-	return &stallBlocker{cause: api.StallIdleEntry, since: since, fix: fmt.Sprintf("if its candidate shipped, %s; otherwise narrow it to what it changed: tt team queue scope --task %s --entry %s --owns PATH", shipped, e.TaskID, e.ID)}, nil
+	return &stallBlocker{cause: api.StallIdleEntry, since: since, fix: fmt.Sprintf("if its candidate shipped, %s; otherwise narrow it to what it changed: tt team queue scope --task %s --entry %s --owns PATH", shipped, e.TaskID, e.ID)}, "", nil
 }
 
 var stallCauseText = map[string]string{
@@ -199,43 +218,57 @@ var stallCauseText = map[string]string{
 }
 
 // explainQueueStalls sets Stall and its BlockReason on queued entries that
-// wait only on stall blockers or a missing handler. q must see the same
-// snapshot the list was built from.
-func (s *Store) explainQueueStalls(ctx context.Context, q queryRower, capacity *sql.Tx, out *api.TeamQueueList) error {
+// wait only on stall blockers or a missing handler, and the cap reason on a
+// launch the project agent cap holds. q must see the same snapshot the list
+// was built from. It returns the stalled queued entries that moving to their
+// own checkout would free: parallel, with a free slot and a free handler (of
+// the drawn arm under an arm policy).
+func (s *Store) explainQueueStalls(ctx context.Context, q queryRower, capacity *sql.Tx, out *api.TeamQueueList) (map[string]bool, error) {
 	parallel := queueParallel(out.ConcurrencyLimit)
 	if len(out.Entries) == 0 {
-		return nil
+		return nil, nil
 	}
+	task := out.Entries[0].TaskID
 	// An owner-paused project launches nothing, so nothing in it is stalled.
 	var pauseState string
-	if err := q.QueryRowContext(ctx, `SELECT pause_state FROM tasks WHERE id=?`, out.Entries[0].TaskID).Scan(&pauseState); err != nil {
-		return err
+	if err := q.QueryRowContext(ctx, `SELECT pause_state FROM tasks WHERE id=?`, task).Scan(&pauseState); err != nil {
+		return nil, err
 	}
 	if pauseState != api.ProjectPauseActive {
-		return nil
+		return nil, nil
 	}
 	blockers := map[string]*stallBlocker{}
+	capHeld := map[string]string{}
 	var active []api.TeamQueueEntry
 	for _, e := range out.Entries {
 		if !queueEntryHoldsResources(e) {
 			continue
 		}
 		active = append(active, e)
-		b, err := s.classifyStallBlocker(ctx, q, e, parallel)
+		b, held, err := s.classifyStallBlockerHeld(ctx, q, e, parallel)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if b != nil {
 			blockers[e.ID] = b
 		}
+		if held != "" {
+			capHeld[e.ID] = held
+		}
 	}
 	// A launch with nothing running past the grace is a stall of its own,
-	// shown even when no queued entry waits behind it.
+	// shown even when no queued entry waits behind it. One the cap holds
+	// shows the cap instead.
 	for i := range out.Entries {
 		e := &out.Entries[i]
-		if b := blockers[e.ID]; e.State == "launching" && b != nil {
+		if e.State != "launching" {
+			continue
+		}
+		if b := blockers[e.ID]; b != nil {
 			self := *e
 			setQueueStall(e, &self, b.cause, b.fix, b.since)
+		} else if held := capHeld[e.ID]; held != "" {
+			e.BlockReason = "Launch held at the " + held
 		}
 	}
 	var working []api.TeamQueueEntry
@@ -244,25 +277,40 @@ func (s *Store) explainQueueStalls(ctx context.Context, q queryRower, capacity *
 			working = append(working, e)
 		}
 	}
-	anyHandler, err := freeQueueHandler(ctx, q, out.Entries[0].TaskID, nil)
+	anyHandler, err := freeQueueHandler(ctx, q, task, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	freeAll, err := freeQueueHandler(ctx, q, out.Entries[0].TaskID, active)
+	freeAll, err := freeQueueHandler(ctx, q, task, active)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	freeWorking, err := freeQueueHandler(ctx, q, out.Entries[0].TaskID, working)
+	freeWorking, err := freeQueueHandler(ctx, q, task, working)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	// Under an enabled arm policy an entry needs a free handler of its drawn
+	// arm, as the claim's lease does; a free handler of another arm frees it
+	// only when the policy falls back.
+	policy, err := loadHandlerArmPolicy(ctx, q, task)
+	if err != nil {
+		return nil, err
+	}
+	armFree := func(e api.TeamQueueEntry, holders []api.TeamQueueEntry) (free bool, drawn string, limited bool, err error) {
+		d, err := decideHandlerArm(ctx, q, policy, e.ID, holders, s.now())
+		if err != nil {
+			return false, "", false, err
+		}
+		return d.wait == "", d.drawn, d.wait == armAllLimitedMessage, nil
+	}
+	movable := map[string]bool{}
 	for i := range out.Entries {
 		e := &out.Entries[i]
 		if e.State != "queued" {
 			continue
 		}
 		var blocker *api.TeamQueueEntry
-		cause, fix := "", ""
+		cause, fix, armWait := "", "", ""
 		var since time.Time
 		if !parallel {
 			for j := range active {
@@ -302,11 +350,45 @@ func (s *Store) explainQueueStalls(ctx context.Context, q queryRower, capacity *
 					overlapping = append(overlapping, a)
 				}
 			}
-			blocked := len(overlapping) > 0 || queueSlotsFull(out.ConcurrencyLimit, len(active)) || freeAll.ID == ""
+			freeAllE, freeWorkingE := freeAll.ID != "", freeWorking.ID != ""
+			// freeWithout says whether releasing one blocker's lease frees
+			// a handler for e.
+			freeWithout := func(a api.TeamQueueEntry) (bool, error) { return a.HandlerID != "", nil }
+			if policy.Enabled {
+				free, drawn, limited, err := armFree(*e, active)
+				if err != nil {
+					return nil, err
+				}
+				if limited {
+					continue // every arm at a provider limit clears by itself
+				}
+				freeAllE = free
+				if !free {
+					armWait = drawn
+				}
+				if freeWorkingE, _, _, err = armFree(*e, working); err != nil {
+					return nil, err
+				}
+				freeWithout = func(a api.TeamQueueEntry) (bool, error) {
+					if a.HandlerID == "" {
+						return false, nil
+					}
+					var rest []api.TeamQueueEntry
+					for _, other := range active {
+						if other.ID != a.ID {
+							rest = append(rest, other)
+						}
+					}
+					free, _, _, err := armFree(*e, rest)
+					return free, err
+				}
+			}
+			slotsFull := queueSlotsFull(out.ConcurrencyLimit, len(active))
+			blocked := len(overlapping) > 0 || slotsFull || !freeAllE
 			if !blocked {
 				continue
 			}
-			if freeWorking.ID == "" {
+			if !freeWorkingE {
 				if anyHandler.ID != "" {
 					continue // every handler is leased by working teams
 				}
@@ -314,7 +396,7 @@ func (s *Store) explainQueueStalls(ctx context.Context, q queryRower, capacity *
 				fix = fmt.Sprintf("set up a database handler (Projects → Set up database handler) or resume a retired one with tt resume NAME, in project %s", e.TaskID)
 				since, err = s.lastHandlerChange(ctx, q, e.TaskID)
 				if err != nil {
-					return err
+					return nil, err
 				}
 				if since.IsZero() {
 					since = parseStallTime(e.UpdatedAt)
@@ -325,7 +407,16 @@ func (s *Store) explainQueueStalls(ctx context.Context, q queryRower, capacity *
 					// Full slots: any stall blocker holds one. No free
 					// handler: only a blocker that holds a lease frees one.
 					for _, a := range active {
-						if blockers[a.ID] != nil && (freeAll.ID != "" || a.HandlerID != "") {
+						if blockers[a.ID] == nil {
+							continue
+						}
+						frees := freeAllE
+						if !frees {
+							if frees, err = freeWithout(a); err != nil {
+								return nil, err
+							}
+						}
+						if frees {
 							candidates = append(candidates, a)
 						}
 					}
@@ -337,10 +428,14 @@ func (s *Store) explainQueueStalls(ctx context.Context, q queryRower, capacity *
 				b := blockers[blocker.ID]
 				cause, since, fix = b.cause, b.since, b.fix
 			}
+			movable[e.ID] = !slotsFull && freeAllE
 		}
 		setQueueStall(e, blocker, cause, fix, since)
+		if armWait != "" && blocker != nil {
+			e.BlockReason += ". It waits for a free handler of arm " + armWait
+		}
 	}
-	return nil
+	return movable, nil
 }
 
 // setQueueStall names the entry's stall and its blocker (nil: the project).

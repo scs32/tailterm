@@ -588,6 +588,14 @@ of arm S` or `Every handler arm is at a provider limit`, and the claim returns a
 ordinary wait. With no policy, or a disabled one, entries lease the first free
 handler as before.
 
+An arm wait is a stall when a stuck entry (failed, nothing running or idle)
+holds the lease of the drawn arm's handler and the policy has no fallback,
+even while a handler of another arm is free. The reason is the usual
+`Stalled:` reason naming that entry and its fix, ending with
+`. It waits for a free handler of arm S`, and the stall notice carries the same
+text. An arm wait behind working teams, or with every arm at a provider limit,
+is ordinary waiting (`wi_376dfb3ee857ffcd`).
+
 ## Handlers and the limit
 
 Bug `wi_01b6d3afed81167c`, work order #27052; the full description is
@@ -726,8 +734,11 @@ older hub has still saved any `--owns` change and incremented the revision.
 
 When a queued entry that only shares a checkout waits behind a stalled active
 entry, its `Stalled:` reason, and the stall notice posted to the Board, ends
-with `Or: Shares checkout DIR with active entry tqe_A; move it: ...`, since
-moving frees it at once.
+with `Or: Shares checkout DIR with active entry tqe_A; move it: ...` when moving
+frees it at once: in a parallel project with a free team slot, a free handler
+(of its drawn arm under an arm policy) and room for its team under the project
+agent cap. In a serial project, with full slots, with no such handler or at the
+cap, moving frees nothing, so the hint is left out.
 
 ## Team queue shared-path waits
 
@@ -1763,9 +1774,12 @@ write itself is lost, the member stays `uncertain` and the next launch fails
 the entry under the unchanged never-respawn rule.
 
 A partly launched team that is held this way keeps its slot, handler lease
-and ownership until seats free. After the stall grace it shows as the
-`nothing-running` stall only if none of its members is live; the stall notice
-then carries the text above as the last launch error.
+and ownership until seats free. While the project has no seat for its next
+member and none of its members is live, it is no stall: its reason is
+`Launch held at the project agent cap: N open + 1 seats > CAP`, and the work
+behind it waits as behind any working team. Once a seat frees and still no
+member is live, after the stall grace it shows as the `nothing-running` stall;
+the stall notice then carries the text above as the last launch error.
 
 **Interaction with the concurrency limit.** The limit is a ceiling on teams,
 the cap is a ceiling on agents in the project, and host capacity is a third,
