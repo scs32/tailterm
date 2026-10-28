@@ -796,9 +796,10 @@ the refused prepare is the report (bug wi_bbea3ea3ad6068a1, order #49564):
   refuses `no_agent_slot` saves one hold for the project, naming the exact old
   agent and run, the reason, the trigger and the handler revision, and still
   returns the 409. No rotation, request receipt or "Handler rotation prepared"
-  event is saved. A retry for the same run keeps the hold and its first
-  reason; a refusal for another run replaces it. The event "Handler successor
-  seat held" marks a new hold only. Other reasons record nothing: the due rule
+  event is saved. A retry for the same run keeps the hold, except that a
+  manual refusal upgrades a template hold to manual (a template refusal never
+  downgrades a manual one); a refusal for another run replaces it. The event "Handler successor
+  seat held" marks a new hold only; an upgrade adds none. Other reasons record nothing: the due rule
   already holds their seat.
 - **Counted.** With no prepared rotation, the hold holds the successor seat
   for queue admission and automatic handler provisioning while it names the

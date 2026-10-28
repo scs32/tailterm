@@ -475,15 +475,20 @@ func (e successorHeldRefusal) Error() string { return e.refusal.Error() }
 func (e successorHeldRefusal) Unwrap() error { return e.refusal }
 
 // recordSuccessorHold writes the hold for a refused template or manual
-// prepare of the exact old run. A hold for another run is replaced; one for
-// the same run is kept, with its first reason. One event marks a new hold.
+// prepare of the exact old run. A hold for another run is replaced. One for
+// the same run is kept, except that a manual refusal upgrades a template hold
+// to manual, which counts whatever the policy says; a template refusal never
+// downgrades a manual hold. One event marks a new hold; an upgrade adds none.
 func (s *Store) recordSuccessorHold(ctx context.Context, tx *sql.Tx, t api.Task, old api.Agent, req api.HandlerRotationRequest, now time.Time, by api.Caller) error {
 	h, err := successorHoldRow(ctx, tx, t.ID)
 	if err != nil {
 		return err
 	}
 	if h != nil && h.OldAgentID == old.ID && h.OldRunID == old.RunID {
-		return nil
+		if h.Reason == api.HandlerRotationReasonTemplate && req.Reason == api.HandlerRotationReasonManual {
+			_, err = tx.ExecContext(ctx, `UPDATE handler_successor_holds SET reason=?,trigger_kind=? WHERE task_id=?`, req.Reason, req.Trigger, t.ID)
+		}
+		return err
 	}
 	if _, err = tx.ExecContext(ctx, `INSERT OR REPLACE INTO handler_successor_holds(task_id,reason,trigger_kind,old_agent_id,old_run_id,handler_revision,created_at) VALUES(?,?,?,?,?,?,?)`,
 		t.ID, req.Reason, req.Trigger, old.ID, old.RunID, t.HandlerRevision, ts(now)); err != nil {

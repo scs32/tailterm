@@ -3857,6 +3857,44 @@ func TestHandlerRotationManualHoldUntilReleased(t *testing.T) {
 	}
 }
 
+// Review f1: a manual refusal for the same run upgrades a template hold, so
+// the seat stays held with onTemplateChange off; a later template refusal
+// does not downgrade it, and neither adds a held event.
+func TestHandlerRotationManualUpgradesTemplateHold(t *testing.T) {
+	f := newRotationFixture(t)
+	s := f.s
+	ctx := context.Background()
+	f.heldOnFullProject(t, api.HandlerRotationReasonTemplate, api.HandlerRotationTriggerRunner)
+	policy, err := s.HandlerRotationPolicy(ctx, f.task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.SetHandlerRotationPolicy(ctx, f.task.ID, api.HandlerRotationPolicyRequest{ExpectedRevision: policy.Revision, Enabled: true, MaxItems: 10, MaxTotalTokens: 1 << 40, OnTemplateChange: false}); err != nil {
+		t.Fatal(err)
+	}
+	if held := successorSeat(t, s, f.task.ID); held != 0 {
+		t.Fatalf("template hold counted with onTemplateChange off: %d", held)
+	}
+	for _, c := range []struct{ key, reason, trigger string }{
+		{"upgrade-manual", api.HandlerRotationReasonManual, api.HandlerRotationTriggerOwner},
+		{"upgrade-template-again", api.HandlerRotationReasonTemplate, api.HandlerRotationTriggerRunner},
+	} {
+		if _, err := f.prepareFor(t, c.key, c.reason, c.trigger); refusalCode(err) != api.HandlerRotationRefusedNoAgentSlot || !strings.Contains(err.Error(), "seat is held for the successor") {
+			t.Fatalf("%s prepare on a full project: %v", c.reason, err)
+		}
+		h, err := successorHoldRow(ctx, s.db, f.task.ID)
+		if err != nil || h == nil || h.Reason != api.HandlerRotationReasonManual || h.Trigger != api.HandlerRotationTriggerOwner || h.OldRunID != f.old.RunID {
+			t.Fatalf("after the %s refusal: hold %+v %v", c.reason, h, err)
+		}
+		if held := successorSeat(t, s, f.task.ID); held != 1 {
+			t.Fatalf("after the %s refusal: seat held %d", c.reason, held)
+		}
+	}
+	if n, events := f.holdRows(t), countRows(t, s, `SELECT count(*) FROM events WHERE task_id=? AND text='Handler successor seat held'`, f.task.ID); n != 1 || events != 1 {
+		t.Fatalf("hold rows %d, held events %d", n, events)
+	}
+}
+
 // The due list carries the hold of the exact primary run.
 func TestHandlerRotationDueListCarriesHold(t *testing.T) {
 	f := newRotationFixture(t)
