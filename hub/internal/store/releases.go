@@ -233,6 +233,9 @@ func (s *Store) ReleasesPage(ctx context.Context, task string, opts api.ReleaseL
 	if out.EntryHolds, err = releaseEntryHoldsStanding(ctx, tx, task); err != nil {
 		return out, err
 	}
+	if out.Deployer, err = liveDeployerProgress(ctx, tx, task); err != nil {
+		return out, err
+	}
 	rows, err := tx.QueryContext(ctx, `SELECT rowid,id,generation,state FROM release_jobs WHERE task_id=? ORDER BY rowid`, task)
 	if err != nil {
 		return out, err
@@ -3061,11 +3064,19 @@ const (
 	deployerSilentNoticeSubject  = "Deployer has gone silent while release jobs wait"
 	deployerRestartNoticeSubject = "Deployer announced a restart and did not come back"
 	deployerHungNoticeSubject    = "Deployer runner has made no progress while release jobs wait"
+	// deployerStaleCodeNoticeSubject is the sweep's notice for a deployer
+	// whose runner reports a refused code state (wi_63c71acaf4f4f7b5).
+	deployerStaleCodeNoticeSubject = "Deployer refuses releases because its runner code is out of date"
 
-	deployerAlive   = "alive"
-	deployerSilent  = "silent"
-	deployerRestart = "restart"
-	deployerHung    = "hung"
+	// deployerSetupAction is the recovery step of a deployer to re-provision,
+	// the runner's RESTART_ACTION.
+	deployerSetupAction = "Run tt deployment setup for the deployer with its current run as predecessor (docs/project-deployment.md)."
+
+	deployerAlive     = "alive"
+	deployerSilent    = "silent"
+	deployerRestart   = "restart"
+	deployerHung      = "hung"
+	deployerStaleCode = "stale_code"
 
 	deployerLivenessArmed = "armed"
 	deployerLivenessOpen  = "open"
@@ -3148,22 +3159,49 @@ func loadDeployerProgress(ctx context.Context, q queryRower, task, agent, run st
 	return r, nil
 }
 
-// view is the stored report as the API returns it.
+// view is the stored report as the API returns it, with the hub's recovery
+// step for a refused code state.
 func (r deployerProgressRow) view() api.ReleaseProgress {
 	out := api.ReleaseProgress{AgentID: r.agent, RunID: r.run, ReportedAt: r.reportedAt}
 	if r.record != "" {
 		var p api.ReleaseProgress
 		if json.Unmarshal([]byte(r.record), &p) == nil {
-			out.JobID, out.Phase, out.Step, out.Wait = p.JobID, p.Phase, p.Step, p.Wait
+			out.JobID, out.Phase, out.Step, out.Wait, out.Code = p.JobID, p.Phase, p.Step, p.Wait, p.Code
 		}
 	}
+	if out.Code != nil {
+		out.Code.Action = deployerCodeAction(*out.Code)
+	}
 	return out
+}
+
+// liveDeployerProgress is the list page's deployer: the stored report of the
+// project's live deployer run (a deployment agent, not closed or retired,
+// whose run is the row's), or nil with none on record.
+func liveDeployerProgress(ctx context.Context, q queryRower, task string) (*api.ReleaseProgress, error) {
+	var r deployerProgressRow
+	err := q.QueryRowContext(ctx, `SELECT p.agent_id,p.run_id,p.reported_at,p.record_json FROM release_deployer_progress p JOIN agents a ON a.task_id=p.task_id AND a.id=p.agent_id AND a.run_id=p.run_id
+ WHERE p.task_id=? AND p.reported_at<>'' AND a.role=? AND a.status NOT IN (?,?)`, task, api.AgentRoleDeployment, api.AgentClosed, api.AgentRetired).Scan(&r.agent, &r.run, &r.reportedAt, &r.record)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	out := r.view()
+	return &out, nil
 }
 
 var (
 	deployerProgressName  = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,47}$`)
 	deployerProgressJob   = regexp.MustCompile(`^rel_[0-9a-f]{16}$`)
 	deployerProgressWaits = []string{"", "matrix", "inputs", "host_lock", "fence", "owner_hold", "transport"}
+	deployerCodeStates    = []string{"current", "draining", "restart", "refused"}
+	// deployerCodeReasons is the runner's CODE_REASONS
+	// (scripts/release-runner.mjs); TestDeployerProgressCodeReasonsMatchRunner
+	// keeps them in step.
+	deployerCodeReasons = []string{"loaded-unreadable", "published-unreadable", "restart-did-not-refresh", "checkout-dirty", "checkout-failed", "disk-mismatch", "exec-failed", "load-failed"}
+	deployerCodePrefix  = regexp.MustCompile(`^[0-9a-f]{12}$`)
 )
 
 // validDeployerProgress checks a report as the runner sends it: the hub sets
@@ -3172,7 +3210,45 @@ func validDeployerProgress(p api.ReleaseProgress) bool {
 	return p.AgentID == "" && p.RunID == "" && p.ReportedAt == "" &&
 		(p.JobID == "" || deployerProgressJob.MatchString(p.JobID)) &&
 		deployerProgressName.MatchString(p.Phase) && (p.Step == "" || deployerProgressName.MatchString(p.Step)) &&
-		slices.Contains(deployerProgressWaits, p.Wait.Kind) && p.Wait.PID >= 0 && p.Wait.PID <= 1<<31-1
+		slices.Contains(deployerProgressWaits, p.Wait.Kind) && p.Wait.PID >= 0 && p.Wait.PID <= 1<<31-1 &&
+		(p.Code == nil || validDeployerCode(*p.Code))
+}
+
+// validDeployerCode checks a report's code state: a reason for refused only,
+// a checkout for load-failed only, 12-hex prefixes and an RFC 3339 since, and
+// no action, which the hub sets. The since is not compared with the hub
+// clock: a deployer host with a skewed clock keeps its reports.
+func validDeployerCode(c api.ReleaseProgressCode) bool {
+	refused := c.State == "refused"
+	if !slices.Contains(deployerCodeStates, c.State) || refused != (c.Reason != "") || (refused && !slices.Contains(deployerCodeReasons, c.Reason)) {
+		return false
+	}
+	if (c.Reason == "load-failed") != (c.Checkout != "") || (c.Checkout != "" && c.Checkout != "restored" && c.Checkout != "not-restored") {
+		return false
+	}
+	if (c.Loaded != "" && !deployerCodePrefix.MatchString(c.Loaded)) || (c.Published != "" && !deployerCodePrefix.MatchString(c.Published)) {
+		return false
+	}
+	if _, err := time.Parse(time.RFC3339, c.Since); err != nil || len(c.Since) > 64 {
+		return false
+	}
+	return c.Action == ""
+}
+
+// deployerCodeAction is the recovery step for a refused code state, empty for
+// any other: a published runner that does not load is fixed on tasks-hub (and
+// a checkout left on its scripts is not re-provisioned from); every other
+// refusal is re-provisioned, as the runner's own notice says (RESTART_ACTION).
+func deployerCodeAction(c api.ReleaseProgressCode) string {
+	switch {
+	case c.State != "refused":
+		return ""
+	case c.Reason == "load-failed" && c.Checkout == "restored":
+		return "Fix the published scripts on tasks-hub; the deployer restarts itself once a published runner loads (docs/project-deployment.md)."
+	case c.Reason == "load-failed":
+		return "Do not re-provision from this checkout: restore it to the loaded commit or fix the published scripts on tasks-hub (docs/project-deployment.md)."
+	}
+	return deployerSetupAction
 }
 
 // RecordDeployerProgress stores the release runner's progress report for the
@@ -3184,11 +3260,12 @@ func (s *Store) RecordDeployerProgress(ctx context.Context, task, agent, run str
 		return api.ReleaseProgress{}, api.ErrInvalid
 	}
 	raw, err := json.Marshal(struct {
-		JobID string                  `json:"jobId"`
-		Phase string                  `json:"phase"`
-		Step  string                  `json:"step"`
-		Wait  api.ReleaseProgressWait `json:"wait"`
-	}{p.JobID, p.Phase, p.Step, p.Wait})
+		JobID string                   `json:"jobId"`
+		Phase string                   `json:"phase"`
+		Step  string                   `json:"step"`
+		Wait  api.ReleaseProgressWait  `json:"wait"`
+		Code  *api.ReleaseProgressCode `json:"code,omitempty"`
+	}{p.JobID, p.Phase, p.Step, p.Wait, p.Code})
 	if err != nil {
 		return api.ReleaseProgress{}, err
 	}
@@ -3328,6 +3405,22 @@ func (s *Store) DeployerLivenessSweep(ctx context.Context, now time.Time) ([]Dep
 	return posted, firstErr
 }
 
+// deployerCodeSeen is the stale code notice's sentence about the reported
+// code state.
+func deployerCodeSeen(c api.ReleaseProgressCode) string {
+	prefix := func(v string) string {
+		if v == "" {
+			return "none"
+		}
+		return v
+	}
+	seen := " Reason: " + c.Reason
+	if c.Checkout != "" {
+		seen += ", checkout " + c.Checkout
+	}
+	return seen + fmt.Sprintf("; loaded scripts %s, published scripts %s; refused since %s.", prefix(c.Loaded), prefix(c.Published), c.Since)
+}
+
 // deployerProgressSeen is the hung notice's sentence about the last report.
 func deployerProgressSeen(row deployerProgressRow) string {
 	p := row.view()
@@ -3430,7 +3523,10 @@ func (s *Store) sweepDeployerLiveness(ctx context.Context, taskID string, now ti
 	if err := rows.Close(); err != nil {
 		return nil, err
 	}
-	waiting := false
+	// verifiedWaiting is a verified job that stood for the bound: a runner
+	// refusing claims for stale code still runs a job it already owns, so a
+	// claimed or merged job alone is no sign of it.
+	waiting, verifiedWaiting := false, false
 	counts := map[string]int{}
 	for _, j := range jobs {
 		counts[j.state]++
@@ -3443,6 +3539,7 @@ func (s *Store) sweepDeployerLiveness(ctx context.Context, taskID string, now ti
 		delete(seen, j.id)
 		if now.Sub(since) >= bound {
 			waiting = true
+			verifiedWaiting = verifiedWaiting || j.state == "verified"
 		}
 	}
 	for id := range seen {
@@ -3543,6 +3640,13 @@ func (s *Store) sweepDeployerLiveness(ctx context.Context, taskID string, now ti
 	if verdict == deployerAlive && deployerProgressHung(now, progress, parseTS(codeAt), progressBound) {
 		verdict = deployerHung
 	}
+	// Alive and not hung, but its runner's report (of this run, and not from
+	// before its newest code notice, as for hung) says it refuses claims for
+	// stale code while a verified job waits.
+	reported := progress.view()
+	if verdict == deployerAlive && verifiedWaiting && reported.Code != nil && reported.Code.State == "refused" && !parseTS(reported.ReportedAt).Before(parseTS(codeAt)) {
+		verdict = deployerStaleCode
+	}
 
 	save := func() error {
 		_, err := tx.ExecContext(ctx, `INSERT INTO release_deployer_liveness(task_id,agent_id,run_id,state,reason,opened_at,handler_seq,helper_seq) VALUES(?,?,?,?,?,?,?,?)
@@ -3597,6 +3701,12 @@ func (s *Store) sweepDeployerLiveness(ctx context.Context, taskID string, now ti
 		noticeSubject = deployerHungNoticeSubject
 		lead = fmt.Sprintf("Deployer %s (agent %s, run %s, status %s) still heartbeats, but its release runner has reported no progress for %s or more while release jobs wait.%s", d.name, d.id, d.run, d.status, progressBound, deployerProgressSeen(progress))
 	}
+	action := "run tt deployment setup for the deployer with its current run as predecessor (docs/project-deployment.md)."
+	if ep.reason == deployerStaleCode && reported.Code != nil {
+		noticeSubject = deployerStaleCodeNoticeSubject
+		lead = fmt.Sprintf("Deployer %s (agent %s, run %s, status %s) is alive but refuses to claim releases because its runner code is out of date.%s", d.name, d.id, d.run, d.status, deployerCodeSeen(*reported.Code))
+		action = reported.Code.Action
+	}
 	heartbeat, lastNotice := "none", "none"
 	if d.seen != "" {
 		heartbeat = d.seen
@@ -3608,8 +3718,8 @@ func (s *Store) sweepDeployerLiveness(ctx context.Context, taskID string, now ti
 		lastNotice = fmt.Sprintf("#%d at %s, %q", last.seq, last.at, last.subject)
 	}
 	text := fmt.Sprintf("%s Last heartbeat: %s. Last notice: %s. Waiting: %d verified, %d claimed and %d merged release jobs; oldest %s. Bound: %d minutes. "+
-		"Action: run tt deployment setup for the deployer with its current run as predecessor (docs/project-deployment.md). Nothing was restarted or signalled.",
-		lead, heartbeat, lastNotice, counts["verified"], counts["claimed"], counts["merged"], jobs[0].id, int(bound/time.Minute))
+		"Action: %s Nothing was restarted or signalled.",
+		lead, heartbeat, lastNotice, counts["verified"], counts["claimed"], counts["merged"], jobs[0].id, int(bound/time.Minute), action)
 	refs := map[string]string{"activity": "deployer_liveness", "reason": ep.reason, "deployer": d.id, "run": d.run}
 	var posted []int64
 	for _, slot := range []struct {

@@ -76,6 +76,12 @@ func cmdDeployment(e env, args []string) error {
 	wait := fs.String("wait", "", "the wait the poll ended in: matrix, inputs, host_lock, fence, owner_hold or transport (progress)")
 	pid := fs.Int64("pid", 0, "process the wait names, such as the matrix run (progress)")
 	withdraw := fs.Bool("withdraw", false, "withdraw this run's progress report (progress)")
+	codeState := fs.String("code-state", "", "the runner's code state: current, draining, restart or refused (progress)")
+	codeReason := fs.String("code-reason", "", "the refused code state's reason (progress)")
+	codeCheckout := fs.String("code-checkout", "", "restored or not-restored, for code reason load-failed (progress)")
+	codeLoaded := fs.String("code-loaded", "", "12-hex prefix of the loaded scripts digest (progress)")
+	codePublished := fs.String("code-published", "", "12-hex prefix of the published scripts digest (progress)")
+	codeSince := fs.String("code-since", "", "RFC 3339 time the runner first saw this code state (progress)")
 	var restored stringListFlag
 	fs.Var(&restored, "restored", "TARGET=RELEASE the refused job's target runs again; one per target in its receipt (retry, repeatable)")
 	if err := fs.Parse(args[1:]); err != nil {
@@ -183,12 +189,20 @@ func cmdDeployment(e env, args []string) error {
 		// reads: --phase reports, --withdraw (or a bare --request-id, the form
 		// a tt from before this command sends) withdraws, neither reads.
 		req := api.ReleaseRequest{AgentID: e.agent, RunID: e.runID}
+		// The code state rides on a report only: the hub checks its values.
+		code := *codeState != "" || *codeReason != "" || *codeCheckout != "" || *codeLoaded != "" || *codePublished != "" || *codeSince != ""
+		if code && (*codeState == "" || *phase == "" || *withdraw) {
+			return errors.New("progress --code-* flags need --code-state and --phase, without --withdraw")
+		}
 		switch {
 		case *phase != "":
 			if *withdraw {
 				return errors.New("progress takes --phase or --withdraw, not both")
 			}
 			req.Progress = &api.ReleaseProgress{JobID: *job, Phase: *phase, Step: *step, Wait: api.ReleaseProgressWait{Kind: *wait, PID: *pid}}
+			if code {
+				req.Progress.Code = &api.ReleaseProgressCode{State: *codeState, Reason: *codeReason, Checkout: *codeCheckout, Loaded: *codeLoaded, Published: *codePublished, Since: *codeSince}
+			}
 		case *withdraw || *key != "":
 			if req.RequestID = *key; req.RequestID == "" {
 				req.RequestID = "progress-withdraw-" + e.runID

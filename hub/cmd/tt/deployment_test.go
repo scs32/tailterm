@@ -1162,6 +1162,103 @@ func TestDeploymentProgress(t *testing.T) {
 	}
 }
 
+// wi_63c71acaf4f4f7b5 s1: --code-* flags put exactly progress.code on a
+// report, and are refused before any hub call without a code state, with a
+// withdraw or without a phase.
+func TestDeploymentProgressCode(t *testing.T) {
+	task := "tsk_0123456789abcdef"
+	var bodies []string
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(raw))
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(api.ReleaseProgress{})
+	}))
+	defer hub.Close()
+	e := env{hub: hub.URL, task: task, agent: "agt_0123456789abcdef", runID: "run_0123456789abcdef"}
+	run := func(args ...string) error {
+		_, err := captureCLIOutput(t, func() error { return cmdDeployment(e, append([]string{"progress"}, args...)) })
+		return err
+	}
+	if err := run("--phase", "poll", "--code-state", "refused", "--code-reason", "checkout-dirty", "--code-loaded", "0123456789ab", "--code-published", "ba9876543210", "--code-since", "2026-10-27T18:00:00.000Z"); err != nil {
+		t.Fatal(err)
+	}
+	var req struct {
+		Progress map[string]json.RawMessage `json:"progress"`
+	}
+	if err := json.Unmarshal([]byte(bodies[0]), &req); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(req.Progress["code"]); got != `{"state":"refused","reason":"checkout-dirty","loaded":"0123456789ab","published":"ba9876543210","since":"2026-10-27T18:00:00.000Z"}` {
+		t.Fatalf("code sent: %s", got)
+	}
+	if err := run("--phase", "poll", "--code-state", "refused", "--code-reason", "load-failed", "--code-checkout", "not-restored", "--code-since", "2026-10-27T18:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(bodies[1], `"code":{"state":"refused","reason":"load-failed","checkout":"not-restored","since":"2026-10-27T18:00:00Z"}`) {
+		t.Fatalf("load-failed code sent: %s", bodies[1])
+	}
+	// No --code-* flag: no code on the report.
+	if err := run("--phase", "poll"); err != nil || strings.Contains(bodies[2], `"code"`) {
+		t.Fatal(err, bodies[2])
+	}
+	sent := len(bodies)
+	for name, args := range map[string][]string{
+		"code without a state":   {"--phase", "poll", "--code-reason", "checkout-dirty", "--code-since", "2026-10-27T18:00:00Z"},
+		"since without a state":  {"--phase", "poll", "--code-since", "2026-10-27T18:00:00Z"},
+		"code with a withdraw":   {"--withdraw", "--code-state", "current", "--code-since", "2026-10-27T18:00:00Z"},
+		"code without a phase":   {"--code-state", "current", "--code-since", "2026-10-27T18:00:00Z"},
+		"code with a request id": {"--request-id", "progress-withdraw-old", "--code-state", "current"},
+	} {
+		if err := run(args...); err == nil || !strings.Contains(err.Error(), "--code-") {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	if len(bodies) != sent {
+		t.Fatalf("refused calls reached the hub: %d", len(bodies)-sent)
+	}
+}
+
+// wi_63c71acaf4f4f7b5 s2: tt deployment list decodes and prints the page's
+// deployer with its code and action, in both views, and prints none when the
+// page has none.
+func TestDeploymentListShowsDeployerCode(t *testing.T) {
+	task := "tsk_0123456789abcdef"
+	deployer := &api.ReleaseProgress{AgentID: "agt_0123456789abcdef", RunID: "run_0123456789abcdef", ReportedAt: "2026-10-27T18:00:30Z", Phase: "poll",
+		Code: &api.ReleaseProgressCode{State: "refused", Reason: "checkout-dirty", Loaded: "0123456789ab", Published: "ba9876543210", Since: "2026-10-27T18:00:00.000Z", Action: "Run tt deployment setup for the deployer with its current run as predecessor (docs/project-deployment.md)."}}
+	with := true
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		page := api.ReleasePage{Version: 1, Jobs: []api.ReleaseSummary{}, Page: api.ReleasePageInfo{View: r.URL.Query().Get("view"), Limit: 50, Snapshot: strings.Repeat("a", 64)}}
+		if with {
+			page.Deployer = deployer
+		}
+		json.NewEncoder(w).Encode(page)
+	}))
+	defer hub.Close()
+	e := env{hub: hub.URL, task: task, token: "fixture"}
+	for _, view := range []string{"active", "settled"} {
+		output, err := captureCLIOutput(t, func() error { return cmdDeployment(e, []string{"list", "--view", view}) })
+		if err != nil {
+			t.Fatal(view, err)
+		}
+		var page api.ReleasePage
+		if err := json.Unmarshal([]byte(output), &page); err != nil || page.Deployer == nil || page.Deployer.Code == nil || *page.Deployer.Code != *deployer.Code || page.Deployer.AgentID != deployer.AgentID || page.Deployer.RunID != deployer.RunID || page.Deployer.ReportedAt != deployer.ReportedAt {
+			t.Fatalf("%s: %v %s", view, err, output)
+		}
+		for _, part := range []string{`"deployer": {`, `"state": "refused"`, `"reason": "checkout-dirty"`, `"loaded": "0123456789ab"`, `"published": "ba9876543210"`, `"since": "2026-10-27T18:00:00.000Z"`, `"action": "Run tt deployment setup`} {
+			if !strings.Contains(output, part) {
+				t.Fatalf("%s output lacks %s: %s", view, part, output)
+			}
+		}
+	}
+	with = false
+	output, err := captureCLIOutput(t, func() error { return cmdDeployment(e, []string{"list"}) })
+	if err != nil || strings.Contains(output, `"deployer"`) {
+		t.Fatal(output, err)
+	}
+}
+
 // TestDeploymentServeHelperProcess is the disposable tt process the serve
 // test signals: re-exec'd with TT_SERVE_HELPER_DIR set, it serves the fake
 // runner in that checkout and exits as die would. Otherwise it does nothing.

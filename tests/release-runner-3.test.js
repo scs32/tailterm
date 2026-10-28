@@ -5,7 +5,7 @@ import {mkdtempSync,mkdirSync,copyFileSync,writeFileSync,readFileSync,chmodSync,
 import {tmpdir} from "node:os";
 import {join,dirname,resolve} from "node:path";
 import {execFileSync,execFile,spawnSync} from "node:child_process";
-import {refusalText,heldClaimNotice,integrateCandidate,integrateBatch,NO_CHANGE,publishIntegration,revertCommit,moveReleaseRef,runRelease,HostAdapter,serveDeployment,releaseError,compatibilityArgv,dispatchCompatibility,validateNativeRelease,failureReason,failureDetail,matrixWaitNotice,RUNNER_CODE_FILES,LOADED_CODE,CODE_REASONS,codeDigest,diskCode,publishedCode,codeDecision,prepareCode,restoreCode,runnerCodeGate,codeRecord,codeNotice,cliFailureNotice,cliRetry,transportWait,transportWaitNotice,heldRetry,journalIdle,runnerLoads} from "../scripts/release-runner.mjs";
+import {refusalText,heldClaimNotice,integrateCandidate,integrateBatch,NO_CHANGE,publishIntegration,revertCommit,moveReleaseRef,runRelease,HostAdapter,serveDeployment,releaseError,compatibilityArgv,dispatchCompatibility,validateNativeRelease,failureReason,failureDetail,matrixWaitNotice,RUNNER_CODE_FILES,LOADED_CODE,CODE_REASONS,codeDigest,diskCode,publishedCode,codeDecision,prepareCode,restoreCode,runnerCodeGate,codeRecord,codeNotice,progressCode,cliFailureNotice,cliRetry,transportWait,transportWaitNotice,heldRetry,journalIdle,runnerLoads} from "../scripts/release-runner.mjs";
 import {acquireHostLock,readHostState as rawReadHostState,holdersOf} from "../scripts/verify-matrix-host-lock.mjs";
 import {createHash} from "node:crypto";
 import {RELEASE_READ_ATTEMPTS,wranglerBin} from "../scripts/release-inputs.mjs";
@@ -1121,6 +1121,71 @@ test("code a stop during the load check whose checkout cannot be restored record
 // one process of the run, with what the re-exec environment would give it.
 const reexecGate=(from,to,generation,over={})=>codeGate(to,{marker:to.digest,restartedFrom:from.digest,restartGeneration:generation,...over});
 const short12=c=>c.digest.slice(0,12),idFor=(l,c,kind)=>`runner-code-${CODE_RUN}-${short12(l)}-${short12(c)}-${kind}`;
+// The code state on the runner's progress reports (wi_63c71acaf4f4f7b5 s1).
+// The fake hub accepts progress; reports are the progress calls' argv.
+const CODE_PROGRESS_OK=`if(a[1]==='progress'){console.log('{}');process.exit(0);}`,codeReports=h=>h.calls().filter(c=>c.argv[1]==="progress").map(c=>c.argv);
+test("code d1 every progress report after the gate carries its code state: current, draining, refused with reason, load-failed with its checkout",{timeout:60000},async t=>{
+ const since="2026-10-06T06:00:00.000Z",p=d=>d.slice(0,12),counters=mkdtempSync(join(tmpdir(),"release-code-loads-"));t.after(()=>rmSync(counters,{recursive:true,force:true}));
+ const reported=async(name,{r,cwd=r.cwd,gate,jobs,release=async()=>{}},expected)=>{
+  const h=codeHost(t,cwd,CODE_PROGRESS_OK);h.setJobs(jobs);
+  await h.poll(gate,release,{once:true,progress:true});
+  const reports=codeReports(h);assert.deepEqual(reports,expected,name);
+  assert.equal(h.record().checkedAt,since,name);
+  // No report names a path, a full digest or a token.
+  for(const argv of reports)for(const word of argv){assert.ok(!word.includes("/"),name+" "+word);assert.ok(!/[a-f0-9]{13}/.test(word),name+" "+word);assert.match(word,/^[A-Za-z0-9_.:-]+$/,name+" "+word);}
+  return h;
+ };
+ const start=["deployment","progress","--phase","start"];
+ // current: a step report inside the release carries it too.
+ const cur=codeRepo(t),curCode=["--code-state","current","--code-loaded",p(cur.codeB.digest),"--code-published",p(cur.codeB.digest),"--code-since",since];
+ await reported("current",{r:cur,gate:codeGate(cur.codeB).gate,jobs:[verifiedJob()],release:async(c,adapter)=>{adapter.progress({jobId:c.job.id,phase:"claimed",step:"prerequisites"});}},
+  [start,["deployment","progress","--phase","claimed","--job","rel_code","--step","prerequisites",...curCode],["deployment","progress","--phase","poll","--job","rel_code",...curCode]]);
+ // draining: its own claimed job still runs.
+ const dr=codeRepo(t);dr.at(dr.a,dr.b);
+ const own={id:"rel_own",state:"claimed",generation:2,commit:"c".repeat(40),agentId:CODE_AGENT,runId:CODE_RUN};
+ await reported("draining",{r:dr,gate:codeGate(dr.codeA).gate,jobs:[own]},
+  [start,["deployment","progress","--phase","poll","--job","rel_own","--code-state","draining","--code-loaded",p(dr.codeA.digest),"--code-published",p(dr.codeB.digest),"--code-since",since]]);
+ // refused: the poll that withholds the claim reports the reason.
+ const dirty=codeRepo(t);dirty.at(dirty.a,dirty.b);writeFileSync(join(dirty.cwd,"untracked.txt"),"x");
+ await reported("checkout-dirty",{r:dirty,gate:codeGate(dirty.codeA).gate,jobs:[verifiedJob()]},
+  [start,["deployment","progress","--phase","poll","--code-state","refused","--code-reason","checkout-dirty","--code-loaded",p(dirty.codeA.digest),"--code-published",p(dirty.codeB.digest),"--code-since",since]]);
+ // published-unreadable: no published prefix to send.
+ const plain=mkdtempSync(join(tmpdir(),"release-code-plain-"));t.after(()=>rmSync(plain,{recursive:true,force:true}));const unread=codeRepo(t);
+ await reported("published-unreadable",{r:unread,cwd:plain,gate:codeGate(unread.codeA).gate,jobs:[verifiedJob()]},
+  [start,["deployment","progress","--phase","poll","--code-state","refused","--code-reason","published-unreadable","--code-loaded",p(unread.codeA.digest),"--code-since",since]]);
+ // load-failed, with the checkout restored and not restored.
+ const lf=codeRepo(t),lfBad=codeCommit(lf,lf.a,unloadable(join(counters,"restored"),"throw"));lf.at(lf.a,lfBad.commit);
+ await reported("load-failed restored",{r:lf,gate:codeGate(lf.codeA,{loadTimeoutMs:300}).gate,jobs:[verifiedJob()]},
+  [start,["deployment","progress","--phase","poll","--code-state","refused","--code-reason","load-failed","--code-checkout","restored","--code-loaded",p(lf.codeA.digest),"--code-published",p(lfBad.code.digest),"--code-since",since]]);
+ const nr=codeRepo(t),nrBad=codeCommit(nr,nr.a,unloadable(join(counters,"unrestored"),"throw"));nr.at(nr.a,nrBad.commit);
+ const nrGate=codeGate(nr.codeA,{loadTimeoutMs:300}).gate;nrGate.loads=(load=>async function(cwd,signal){const out=await load.call(this,cwd,signal);writeFileSync(join(cwd,"stray.txt"),"x");return out;})(nrGate.loads);
+ await reported("load-failed not restored",{r:nr,gate:nrGate,jobs:[verifiedJob()]},
+  [start,["deployment","progress","--phase","poll","--code-state","refused","--code-reason","load-failed","--code-checkout","not-restored","--code-loaded",p(nr.codeA.digest),"--code-published",p(nrBad.code.digest),"--code-since",since]]);
+ // Both load checks ran and failed.
+ assert.equal(readFileSync(join(counters,"restored"),"utf8"),"x");assert.equal(readFileSync(join(counters,"unrestored"),"utf8"),"x");
+ // With no gate (code off) no report carries a code state.
+ const off=codeRepo(t),h=codeHost(t,off.cwd,CODE_PROGRESS_OK);await h.poll(undefined,async()=>{},{once:true,progress:true});
+ assert.deepEqual(codeReports(h),[start,["deployment","progress","--phase","poll"]]);
+});
+test("code d2 progressCode keeps fixed tokens, 12-hex prefixes and the first-seen time, and nothing for stopped or unknown records",t=>{
+ const r=codeRepo(t),home=mkdtempSync(join(tmpdir(),"release-code-progress-"));t.after(()=>rmSync(home,{recursive:true,force:true}));
+ const at=Date.parse("2026-10-27T18:00:00Z"),since="2026-10-27T18:00:00.000Z",l=r.codeA.digest.slice(0,12),c=r.codeB.digest.slice(0,12);
+ const build=decision=>codeRecord({journalDirectory:home},{loaded:r.codeA,marker:null,restartedFrom:null,now:()=>at},decision,r.codeB);
+ assert.deepEqual(progressCode(build({state:"current"})),{state:"current",loaded:l,published:c,since});
+ assert.deepEqual(progressCode(build({state:"draining"})),{state:"draining",loaded:l,published:c,since});
+ assert.deepEqual(progressCode(build({state:"restart"})),{state:"restart",loaded:l,published:c,since});
+ for(const reason of CODE_REASONS.filter(x=>x!=="load-failed"))assert.deepEqual(progressCode(build({state:"refused",reason})),{state:"refused",reason,loaded:l,published:c,since},reason);
+ assert.deepEqual(progressCode(build({state:"refused",reason:"load-failed",checkout:"restored",loadedCommit:r.a})),{state:"refused",reason:"load-failed",checkout:"restored",loaded:l,published:c,since});
+ assert.deepEqual(progressCode(build({state:"refused",reason:"load-failed",checkout:"not-restored",loadedCommit:r.a})),{state:"refused",reason:"load-failed",checkout:"not-restored",loaded:l,published:c,since});
+ // Missing digests are left out, never sent as values the hub refuses.
+ assert.deepEqual(progressCode({state:"refused",reason:"loaded-unreadable",loaded:null,current:null,checkedAt:since}),{state:"refused",reason:"loaded-unreadable",since});
+ assert.deepEqual(progressCode({state:"current",loaded:{digest:"A".repeat(64)},current:{digest:"short"},checkedAt:since}),{state:"current",since});
+ // A state or reason the hub does not take, or a time that is not RFC 3339, is no code at all.
+ for(const record of [null,undefined,{},build({state:"stopped",reason:"load-unproven",checkout:"not-restored",loadedCommit:r.a}),{state:"refused",reason:"unclassified",checkedAt:since},{state:"refused",checkedAt:since},
+  {state:"restarted",checkedAt:since},{state:"current"},{state:"current",checkedAt:"yesterday"},{state:"current",checkedAt:"2026-10-27 18:00:00"},{state:"current",checkedAt:1}])
+  assert.equal(progressCode(record),null,JSON.stringify(record));
+ for(const reason of CODE_REASONS)assert.ok(!/[a-f0-9]{13}/.test(JSON.stringify(progressCode(build({state:"refused",reason,checkout:"restored"})))),reason);
+});
 test("code c5 each restart in a run has its own request id: A to B to C to B",async t=>{
  const r=codeRepo(t),h=codeHost(t,r.cwd),C=codeCommit(r,r.b,"// release-runner.mjs c\n"),A=r.codeA,B=r.codeB;r.at(r.a,r.b);
  const execs=[];const spy=over=>({...over,execve:(...args)=>{execs.push(args[2].TAILTERM_RUNNER_REEXEC_GEN);}});

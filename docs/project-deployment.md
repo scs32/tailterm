@@ -164,9 +164,15 @@ credential provisioning and any live release remain separately ordered work.
 Terminal states (`released`, `rolled_back`, `refused`, `superseded`) belong to
 explicit settled history; `blocked` remains active. The HTTP endpoint is
 `GET /v1/tasks/{id}/releases`. Its response is
-`{version:1,jobs:[...],page:{view,limit,snapshot,nextAfter},window}`, where
+`{version:1,jobs:[...],page:{view,limit,snapshot,nextAfter},window,deployer}`, where
 `window` is the project's release quiet window with `open` and `until`, absent
-when none is set (see "Release quiet window"). The default limit
+when none is set (see "Release quiet window"), and `deployer` is the last
+progress report of the live deployer run (`agentId`, `runId`, `reportedAt`,
+`jobId`, `phase`, `step`, `wait` and its runner `code`, with the hub's
+`action` for a refused code state; A hung runner, below). `deployer` is
+absent with no report on record, after a withdraw, and when the report's run
+is not the run of a deployment agent that is neither closed nor retired. Both
+views carry it, and it is not part of the snapshot. The default limit
 is 50; `--limit` / `?limit=` accepts 1–200. Summaries identify their job,
 row order (`rowId`), exact commits, state, generation, claim/run, input pins,
 publication and settlement time. Compact terminal receipt and supersession
@@ -874,6 +880,30 @@ It is rewritten only when something other than `checkedAt` changes, so
 journal also records, in `code`, the `loaded` and `current` digests of the
 runner that last ran it.
 
+The hub sees the same state on the runner's progress reports
+(wi_63c71acaf4f4f7b5). After its first code check, every report a reporting
+runner sends carries `--code-state` (`current`, `draining`, `restart` or
+`refused`), `--code-reason` for `refused`, `--code-checkout` (`restored` or
+`not-restored`) for `load-failed`, `--code-loaded` and `--code-published` (the
+12-character prefixes of the loaded and published digests, left out when
+unreadable) and `--code-since`, this record's `checkedAt`. The report before
+the first check carries none, a `stopped` state is never sent, and a record
+whose state or reason the hub does not know sends no code at all. `tt
+deployment list` then shows it as `deployer.code`, and for `refused` its
+`action` names the recovery step:
+
+- `load-failed`, checkout `restored`: "Fix the published scripts on tasks-hub;
+  the deployer restarts itself once a published runner loads
+  (docs/project-deployment.md)."
+- `load-failed`, checkout `not-restored`: "Do not re-provision from this
+  checkout: restore it to the loaded commit or fix the published scripts on
+  tasks-hub (docs/project-deployment.md)."
+- every other reason: "Run tt deployment setup for the deployer with its
+  current run as predecessor (docs/project-deployment.md)."
+
+A deployer refusing claims for stale code while a verified job waits is
+reported by the hub (A silent deployer, below: *Stale code*).
+
 The Board gets one notice per state, loaded digest and published digest. Only
 12-character prefixes of the digests and the commit, names from the watched
 set and the fixed reason tokens reach its text:
@@ -1135,23 +1165,35 @@ both hold:
     heartbeat through such a restart, so the heartbeat does not hide it.
   - *Hung.* It is heard from, but its release runner has reported no progress
     for the progress bound (A hung runner, below).
+  - *Stale code.* It is heard from and its runner reports, but the last report
+    of its current run says its code is `refused` (The runner's own code,
+    above), and a `verified` job has stood for N. A refused runner still runs
+    a job it already owns, so a `claimed` or `merged` job alone never makes
+    this case. A report older than the run's newest code notice does not count,
+    as for a hung runner. A `current` or `draining` code is alive.
 
 The deployer is the project's newest deployment agent that is neither retired
 nor closed. Retiring or closing it is deliberate and is not reported. A deployer
 on a long verification run keeps its heartbeat, and its runner keeps reporting
 at every poll, so it is not reported, however long its claimed job stands.
+Silent comes first, then an unfinished restart, then hung, then stale code, so
+one cause opens one episode.
 
 **Notice.** One directed notice per recipient: the primary database handler,
 unless it is retired, and the owner helper. A directed notice wakes its
 recipient once. The subject is "Deployer has gone silent while release jobs
-wait", "Deployer announced a restart and did not come back" or "Deployer
-runner has made no progress while release jobs wait", with refs
-`activity=deployer_liveness`, `reason=silent`, `reason=restart` or
-`reason=hung`, `deployer=AGENT_ID` and `run=RUN_ID`. The text names the deployer, its agent,
+wait", "Deployer announced a restart and did not come back", "Deployer
+runner has made no progress while release jobs wait" or
+"Deployer refuses releases because its runner code is out of date", with refs
+`activity=deployer_liveness`, `reason=silent`, `reason=restart`,
+`reason=hung` or `reason=stale_code`, `deployer=AGENT_ID` and `run=RUN_ID`. The text names the deployer, its agent,
 run and status, its last heartbeat, its last message (number, time and
 subject), how many jobs are `verified`, `claimed` and `merged` ("Waiting: 1
 verified, 0 claimed and 0 merged release jobs"), the oldest of them, the bound
-and the recovery.
+and the recovery. A stale code notice also names the reported reason, the
+checkout for `load-failed`, the loaded and published prefixes and since when
+the code was refused, and its `Action:` is the code state's action (The
+runner's own code, above) instead of the setup step.
 
 **Once per episode.** An episode opens with the first notice and each
 recipient gets one copy in it, however long the silence lasts. A recipient
@@ -1162,13 +1204,15 @@ second one. A handler rotation inside an episode does not send a second
 handler copy. The episode ends, and the check re-arms, at the first tick that
 finds the deployer alive: a fresh heartbeat or message for a silent deployer,
 "Deployer now runs the published scripts" for a restart, a new progress report
-for a hung runner. A new deployer run also ends it.
+for a hung runner, a report whose code is no longer `refused` for stale code. A
+new deployer run also ends it.
 
 **Recovery.** The hub detects and wakes only. It never restarts, signals,
 replaces or messages the deployer, and it changes no release job. Whoever is
 woken checks the deployer's host and terminal, then runs `tt deployment setup`
 for the deployer with its current run as predecessor (the start of this
-document; the run is in the notice's `run` ref).
+document; the run is in the notice's `run` ref). For stale code it follows the
+notice's `Action:`.
 
 **Setting.** `TAILTERM_DEPLOYER_LIVENESS_MINUTES` in the hub's environment
 sets N, a whole number of minutes from 1 to 1440. Any other value, or none,
@@ -1252,6 +1296,12 @@ A hub rolled back to before this change leaves the table unused and refuses
 the calls; the runner ignores a failed report: it is tried once for at most ten
 seconds and is never recorded, retried or posted.
 
+The code state (wi_63c71acaf4f4f7b5) follows the same rules: a `tt` from before
+it rejects the `--code-*` flags, and a hub from before it refuses a report
+carrying `code`, so in either case the runner withdraws as above. Releasing the
+hub, the bridge and the Mini before the deployer restarts onto the new runner
+avoids both.
+
 **Limit.** A single step that runs longer than the bound without the runner
 getting back to a poll (one command may run ten minutes, the prerequisite
 provisioning fifteen) gives one notice for a healthy runner. Since a `merged`
@@ -1261,10 +1311,18 @@ if that recurs. A hang of the hub's own tick is not covered.
 
 **Command.** `tt deployment progress` prints the stored record: `agentId`,
 `runId`, `reportedAt`, `jobId`, `phase`, `step` and `wait`, all empty with
-nothing on record. A read needs no deployer identity, so the handler and the
+nothing on record, and `code` (`state`, `reason`, `checkout`, `loaded`,
+`published`, `since` and the hub's `action`) when the report carried one. A read needs no deployer identity, so the handler and the
 owner helper can read it. The deployer's run alone may write: `--phase P [--job J] [--step S] [--wait KIND] [--pid N]`
-reports and `--withdraw` withdraws. The hub refuses a write from any other
-agent or run, or with a heartbeat older than 90 seconds.
+with `--code-state STATE [--code-reason R] [--code-checkout C] [--code-loaded HEX12] [--code-published HEX12] --code-since TIME`
+reports and `--withdraw` withdraws. A `--code-*` flag without `--code-state`,
+with `--withdraw` or without `--phase` is refused before any hub call. The hub
+refuses a write from any other agent or run, or with a heartbeat older than 90
+seconds, and refuses the whole report for a code it does not take: an unknown
+state or reason, a reason on a state that is not `refused`, a checkout other
+than for `load-failed` (which needs one), a prefix that is not 12 lowercase
+hex, a `since` that is not RFC 3339 or is over 64 bytes, or an `action`. It
+does not compare `since` with its own clock.
 
 **The manual check.** Until this check has passed its live check after
 release, the owner helper's sweep keeps flagging a release claimed for more
@@ -2694,8 +2752,13 @@ job and confirm the pid it names is gone (above, "Requeue").
 
 **Stale deployer code.** A notice "Deployer is not claiming releases: ..."
 means the deployer runs scripts older than the published ones and could not
-restart itself. Read its `Reason:` and `runner-code.json`, then follow "The
-runner's own code" above. It is the one code notice that wakes the primary
+restart itself. Read `deployer.code` in `tt deployment list` first (its
+`reason`, `since` and `action`), then its `Reason:` and `runner-code.json`, and
+follow "The runner's own code" above. While a verified job waits for the
+bound, the hub also sends
+"Deployer refuses releases because its runner code is out of date"
+(`reason=stale_code`; A silent deployer, above). The runner's refused notice
+is the one code notice that wakes the primary
 database handler and the owner helper. The other code notices are
 `wake=routine` and wake no one (Which notices wake, above); they need no
 action. A restart that is not followed by "Deployer now runs the published

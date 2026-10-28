@@ -1516,12 +1516,16 @@ export class HostAdapter {
   // withdraw, in the form a tt from before the command forwards, so the hub
   // judges this run as one that never reported. A withdraw that fails is sent
   // again after the next rejected report, until one succeeds; after that it is
-  // withdrawn again only after a later report succeeded.
+  // withdrawn again only after a later report succeeded. Once the code gate
+  // has run, every report also carries the runner's code state as the gate
+  // last decided it (progressCode, in progressState.code), so the hub can
+  // tell a deployer refusing claims for stale code from an idle one.
   progress(record){
     if(this.progressOn!==true || typeof record?.phase!=="string")return;
     const cli=this.config.tt||"tt",call=argv=>execFileSync(cli,argv,{cwd:this.config.cwd,encoding:"utf8",stdio:["ignore","pipe","pipe"],timeout:10000});
     try{
-      call(["deployment","progress","--phase",record.phase,...(record.jobId?["--job",record.jobId]:[]),...(record.step?["--step",record.step]:[]),...(record.wait?.kind?["--wait",record.wait.kind]:[]),...(Number.isSafeInteger(record.wait?.pid) && record.wait.pid>0?["--pid",String(record.wait.pid)]:[])]);
+      const code=this.progressState.code,codeArgv=code?["--code-state",code.state,...["reason","checkout","loaded","published"].flatMap(k=>code[k]?["--code-"+k,code[k]]:[]),"--code-since",code.since]:[];
+      call(["deployment","progress","--phase",record.phase,...(record.jobId?["--job",record.jobId]:[]),...(record.step?["--step",record.step]:[]),...(record.wait?.kind?["--wait",record.wait.kind]:[]),...(Number.isSafeInteger(record.wait?.pid) && record.wait.pid>0?["--pid",String(record.wait.pid)]:[]),...codeArgv]);
       this.progressState.withdrawn=false;
     }catch(error){
       try{
@@ -2430,6 +2434,19 @@ export function codeNotice(record,kind=record?.state){
   return {requestId,wake:WAKE.attention,subject:["loaded-unreadable","published-unreadable"].includes(reason)?"Deployer is not claiming releases: it cannot compare its scripts with the published ones":"Deployer is not claiming releases: its scripts are out of date",
     text:`${seen} It could not restart itself and claims no release. Reason: ${reason}. ${RESTART_ACTION}`};
 }
+// The code state a progress report carries (tt deployment progress
+// --code-*): fixed tokens, 12-hex prefixes and checkedAt, the time this state
+// was first seen. null for a state the hub does not take (stopped) or a
+// refusal reason it does not know, so a bad record never costs the run its
+// progress reports: the hub refuses the whole report, and the runner then
+// withdraws it.
+const CODE_STATES=["current","draining","restart","refused"],RFC3339=/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/;
+export function progressCode(record){
+  if(!CODE_STATES.includes(record?.state) || (record.state==="refused" && !CODE_REASONS.includes(record.reason)) || !RFC3339.test(record.checkedAt||""))return null;
+  const loaded=record.loaded?.digest,published=record.current?.digest,refused=record.state==="refused";
+  return {state:record.state,...(refused?{reason:record.reason}:{}),...(refused && record.reason==="load-failed"?{checkout:record.checkout==="restored"?"restored":"not-restored"}:{}),
+    ...(HEX64.test(loaded||"")?{loaded:loaded.slice(0,12)}:{}),...(HEX64.test(published||"")?{published:published.slice(0,12)}:{}),since:record.checkedAt};
+}
 const CODE_LINES={draining:"Deployer code is out of date; no new release is claimed and a restart follows the active work.\n",restart:"Deployer restarting itself onto the published scripts.\n",refused:"Deployer code is out of date and it cannot restart itself; no release is claimed until it is re-provisioned.\n",
   restored:"Deployer code is out of date and the published runner does not load; its checkout is back on the loaded commit and no release is claimed until a published runner loads.\n",
   unrestored:"Deployer code is out of date and the published runner does not load; its checkout could not be restored, so do not re-provision from it: restore it to the loaded commit or fix the published scripts.\n",
@@ -2862,7 +2879,9 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
   // Progress reports (HostAdapter.progress), only when the caller asks: one
   // before the first poll and one at the end of every poll, a held one
   // included, naming the job and the wait the poll ended in. The wait is
-  // information for the hub's notice; the hub decides nothing by it.
+  // information for the hub's notice; the hub decides nothing by it. Each
+  // gate turn puts its code state in progressState.code, so every report
+  // after it carries that state; the first report, before any gate, has none.
   const progressState={withdrawn:false};
   const reporter=progress===true?Object.assign(new HostAdapter(config,{}),{progressOn:true,progressState}):null;
   // The runner's own code, once per poll and before any claim. It restarts
@@ -2934,6 +2953,7 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
     // claim (below), so a poll with nothing to claim stays silent.
     if(codeNow.state==="current"){if(codeNow.restartedFrom)codeNotify(reader,codeNow,"restarted");}
     else if(codeNow.reason!=="published-unreadable")codeNotify(reader,codeNow);
+    progressState.code=progressCode(codeNow);
     return codeNow;
   };
   reporter?.progress({phase:"start"});

@@ -172,6 +172,10 @@ type ReleasePage struct {
 	Window *ReleaseWindowStatus `json:"window,omitempty"`
 	// EntryHolds are the project's standing entry holds, in the order saved.
 	EntryHolds []ReleaseEntryHold `json:"entryHolds,omitempty"`
+	// Deployer is the live deployer run's last progress report, with its
+	// code state, absent when that run has none on record. It is not part
+	// of the snapshot.
+	Deployer *ReleaseProgress `json:"deployer,omitempty"`
 }
 type ReleasePageInfo struct {
 	View      string `json:"view"`
@@ -214,6 +218,7 @@ func decodeReleasePage(raw json.RawMessage, task string, opts ReleaseListOptions
 		} `json:"page"`
 		Window     *ReleaseWindowStatus `json:"window"`
 		EntryHolds []ReleaseEntryHold   `json:"entryHolds"`
+		Deployer   *ReleaseProgress     `json:"deployer"`
 	}
 	err := json.Unmarshal(raw, &wire)
 	if err != nil {
@@ -222,7 +227,7 @@ func decodeReleasePage(raw json.RawMessage, task string, opts ReleaseListOptions
 	if wire.Page == nil || wire.Page.NextAfter == nil {
 		return out, fmt.Errorf("invalid release page metadata")
 	}
-	out = ReleasePage{Version: wire.Version, Jobs: wire.Jobs, Page: ReleasePageInfo{View: wire.Page.View, Limit: wire.Page.Limit, Snapshot: wire.Page.Snapshot, NextAfter: *wire.Page.NextAfter}, Window: wire.Window, EntryHolds: wire.EntryHolds}
+	out = ReleasePage{Version: wire.Version, Jobs: wire.Jobs, Page: ReleasePageInfo{View: wire.Page.View, Limit: wire.Page.Limit, Snapshot: wire.Page.Snapshot, NextAfter: *wire.Page.NextAfter}, Window: wire.Window, EntryHolds: wire.EntryHolds, Deployer: wire.Deployer}
 	view := opts.View
 	if view == "" {
 		view = "active"
@@ -606,17 +611,40 @@ type ReleaseProgressWait struct {
 	PID  int64  `json:"pid,omitempty"`
 }
 
+// ReleaseProgressCode is the release runner's own code state as its last
+// poll decided it (scripts/release-runner.mjs codeDecision, progressCode).
+// Only fixed tokens, 12-hex digest prefixes and a time; Action is set by the
+// hub, and a report naming one is refused.
+type ReleaseProgressCode struct {
+	// State is current, draining, restart or refused.
+	State string `json:"state"`
+	// Reason is the runner's refusal reason, for refused only.
+	Reason string `json:"reason,omitempty"`
+	// Checkout is restored or not-restored, for reason load-failed only.
+	Checkout string `json:"checkout,omitempty"`
+	// Loaded and Published are the 12-hex prefixes of the loaded and the
+	// published scripts digests.
+	Loaded    string `json:"loaded,omitempty"`
+	Published string `json:"published,omitempty"`
+	// Since is when the runner first saw this state (RFC 3339).
+	Since string `json:"since"`
+	// Action is the recovery step for a refused state.
+	Action string `json:"action,omitempty"`
+}
+
 // ReleaseProgress is the release runner's own progress report for one
-// deployer run. A report carries the job, phase, step and wait; the hub sets
-// the agent, the run and the time. All fields are empty with nothing on record.
+// deployer run. A report carries the job, phase, step, wait and, once its
+// code gate has run, its code state; the hub sets the agent, the run and the
+// time. All fields are empty with nothing on record.
 type ReleaseProgress struct {
-	AgentID    string              `json:"agentId"`
-	RunID      string              `json:"runId"`
-	ReportedAt string              `json:"reportedAt"`
-	JobID      string              `json:"jobId"`
-	Phase      string              `json:"phase"`
-	Step       string              `json:"step"`
-	Wait       ReleaseProgressWait `json:"wait"`
+	AgentID    string               `json:"agentId"`
+	RunID      string               `json:"runId"`
+	ReportedAt string               `json:"reportedAt"`
+	JobID      string               `json:"jobId"`
+	Phase      string               `json:"phase"`
+	Step       string               `json:"step"`
+	Wait       ReleaseProgressWait  `json:"wait"`
+	Code       *ReleaseProgressCode `json:"code,omitempty"`
 }
 
 func (c *Client) ReleaseAction(ctx context.Context, task string, req ReleaseRequest) (ReleaseJob, error) {

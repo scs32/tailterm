@@ -8174,3 +8174,341 @@ func TestReleaseEntryHoldMovesWithRequeue(t *testing.T) {
 		t.Fatalf("standing entry holds after acceptance %+v", page.EntryHolds)
 	}
 }
+
+// wi_63c71acaf4f4f7b5 s1-s4: the runner's code state on its progress report.
+var (
+	codeLoaded, codePublished = "0123456789ab", "ba9876543210"
+	refusedCode               = api.ReleaseProgressCode{State: "refused", Reason: "checkout-dirty", Loaded: codeLoaded, Published: codePublished, Since: "2026-10-27T18:00:00.000Z"}
+)
+
+// codeProgress is a poll report carrying code.
+func codeProgress(code api.ReleaseProgressCode) api.ReleaseProgress {
+	return api.ReleaseProgress{Phase: "poll", Code: &code}
+}
+
+// s1: a report's code is stored and read back with the hub's action; every
+// invalid shape is refused and writes nothing; a report without code is as
+// before.
+func TestDeployerProgressCodeRecord(t *testing.T) {
+	f := newLivenessFixture(t)
+	setup := "Run tt deployment setup for the deployer with its current run as predecessor (docs/project-deployment.md)."
+	for _, c := range []struct {
+		code   api.ReleaseProgressCode
+		action string
+	}{
+		{api.ReleaseProgressCode{State: "current", Loaded: codeLoaded, Published: codeLoaded, Since: "2026-10-27T18:00:00Z"}, ""},
+		{api.ReleaseProgressCode{State: "draining", Loaded: codeLoaded, Published: codePublished, Since: "2026-10-27T18:00:00.000Z"}, ""},
+		{api.ReleaseProgressCode{State: "restart", Loaded: codeLoaded, Published: codePublished, Since: "2026-10-27T18:00:00-07:00"}, ""},
+		{refusedCode, setup},
+		{api.ReleaseProgressCode{State: "refused", Reason: "published-unreadable", Loaded: codeLoaded, Since: "2026-10-27T18:00:00Z"}, setup},
+		{api.ReleaseProgressCode{State: "refused", Reason: "load-failed", Checkout: "restored", Loaded: codeLoaded, Published: codePublished, Since: "2026-10-27T18:00:00Z"},
+			"Fix the published scripts on tasks-hub; the deployer restarts itself once a published runner loads (docs/project-deployment.md)."},
+		{api.ReleaseProgressCode{State: "refused", Reason: "load-failed", Checkout: "not-restored", Loaded: codeLoaded, Published: codePublished, Since: "2026-10-27T18:00:00Z"},
+			"Do not re-provision from this checkout: restore it to the loaded commit or fix the published scripts on tasks-hub (docs/project-deployment.md)."},
+	} {
+		want := c.code
+		want.Action = c.action
+		got := f.report(codeProgress(c.code))
+		if got.Code == nil || *got.Code != want || got.Phase != "poll" || got.ReportedAt != ts(f.clock) {
+			t.Fatalf("%+v: report answered %+v %+v", c.code, got, got.Code)
+		}
+		if read, err := f.s.DeployerProgress(f.ctx, f.task.ID); err != nil || read.Code == nil || *read.Code != want {
+			t.Fatalf("%+v: read %+v %v", c.code, read.Code, err)
+		}
+		// The stored record keeps no action: the hub sets it on every read.
+		if row := f.progressRow(); strings.Contains(row.record, "action") {
+			t.Fatalf("stored record has an action: %s", row.record)
+		}
+	}
+	before := f.progressRow()
+	for name, code := range map[string]api.ReleaseProgressCode{
+		"no state":                {Since: refusedCode.Since},
+		"unknown state":           {State: "stopped", Since: refusedCode.Since},
+		"refused without reason":  {State: "refused", Since: refusedCode.Since},
+		"unknown reason":          {State: "refused", Reason: "unclassified", Since: refusedCode.Since},
+		"reason on draining":      {State: "draining", Reason: "checkout-dirty", Since: refusedCode.Since},
+		"checkout without reason": {State: "refused", Reason: "checkout-dirty", Checkout: "restored", Since: refusedCode.Since},
+		"load-failed no checkout": {State: "refused", Reason: "load-failed", Since: refusedCode.Since},
+		"unknown checkout":        {State: "refused", Reason: "load-failed", Checkout: "moved", Since: refusedCode.Since},
+		"short loaded":            {State: "current", Loaded: "0123456789a", Since: refusedCode.Since},
+		"full published digest":   {State: "current", Published: strings.Repeat("a", 64), Since: refusedCode.Since},
+		"upper-case prefix":       {State: "current", Loaded: "0123456789AB", Since: refusedCode.Since},
+		"no since":                {State: "current"},
+		"since not RFC 3339":      {State: "current", Since: "2026-10-27 18:00:00"},
+		"since too long":          {State: "current", Since: "2026-10-27T18:00:00." + strings.Repeat("0", 60) + "Z"},
+		"runner's action":         {State: "refused", Reason: "checkout-dirty", Since: refusedCode.Since, Action: "anything"},
+	} {
+		if _, err := f.s.RecordDeployerProgress(f.ctx, f.task.ID, f.d.ID, f.d.RunID, codeProgress(code)); !errors.Is(err, api.ErrInvalid) {
+			t.Fatalf("%s: %v, want invalid", name, err)
+		}
+	}
+	if after := f.progressRow(); after != before {
+		t.Fatalf("a refused report changed the row: %+v -> %+v", before, after)
+	}
+	// A report without code is stored and read exactly as before.
+	if got := f.report(pollProgress); got.Code != nil || strings.Contains(f.progressRow().record, "code") {
+		t.Fatalf("no-code report: %+v %s", got, f.progressRow().record)
+	}
+}
+
+// s1: the hub's reasons are the runner's.
+func TestDeployerProgressCodeReasonsMatchRunner(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "scripts", "release-runner.mjs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	literal := `export const CODE_REASONS=["` + strings.Join(deployerCodeReasons, `","`) + `"];`
+	if !strings.Contains(string(raw), literal) {
+		t.Fatalf("scripts/release-runner.mjs no longer contains %s", literal)
+	}
+}
+
+// s2: the list page carries the live deployer run's last report with its
+// code, in both views, and nothing for no report, a withdrawn one, or a run
+// that is not the live deployer's; the jobs and snapshot are unchanged.
+func TestReleasesPageShowsDeployerCode(t *testing.T) {
+	f := newLivenessFixture(t)
+	f.enqueue()
+	page := func(view string) api.ReleasePage {
+		t.Helper()
+		p, err := f.s.ReleasesPage(f.ctx, f.task.ID, api.ReleaseListOptions{View: view})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	empty := page("active")
+	if empty.Deployer != nil {
+		t.Fatalf("no report: %+v", empty.Deployer)
+	}
+	f.report(codeProgress(refusedCode))
+	for _, view := range []string{"active", "settled"} {
+		p := page(view)
+		if p.Deployer == nil || p.Deployer.AgentID != f.d.ID || p.Deployer.RunID != f.d.RunID || p.Deployer.ReportedAt != ts(f.clock) || p.Deployer.Code == nil {
+			t.Fatalf("%s: %+v", view, p.Deployer)
+		}
+		want := refusedCode
+		want.Action = "Run tt deployment setup for the deployer with its current run as predecessor (docs/project-deployment.md)."
+		if *p.Deployer.Code != want {
+			t.Fatalf("%s code: %+v", view, *p.Deployer.Code)
+		}
+		raw, _ := json.Marshal(p)
+		if !strings.Contains(string(raw), `"deployer":{"agentId":"`+f.d.ID+`"`) || !strings.Contains(string(raw), `"code":{"state":"refused","reason":"checkout-dirty","loaded":"0123456789ab","published":"ba9876543210","since":"2026-10-27T18:00:00.000Z","action":"Run tt deployment setup`) {
+			t.Fatalf("%s JSON: %s", view, raw)
+		}
+	}
+	if p := page("active"); p.Page.Snapshot != empty.Page.Snapshot || !reflect.DeepEqual(p.Jobs, empty.Jobs) {
+		t.Fatalf("the report changed the page: %+v -> %+v", empty, p)
+	}
+	if _, err := f.s.WithdrawDeployerProgress(f.ctx, f.task.ID, f.d.ID, f.d.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if p := page("active"); p.Deployer != nil {
+		t.Fatalf("withdrawn: %+v", p.Deployer)
+	}
+	f.report(codeProgress(refusedCode))
+	f.exec(`UPDATE agents SET run_id=? WHERE id=?`, api.NewID("run"), f.d.ID)
+	if p := page("active"); p.Deployer != nil {
+		t.Fatalf("another run of the deployer: %+v", p.Deployer)
+	}
+	f.exec(`UPDATE agents SET run_id=? WHERE id=?`, f.d.RunID, f.d.ID)
+	for _, status := range []string{api.AgentRetired, api.AgentClosed} {
+		f.exec(`UPDATE agents SET status=? WHERE id=?`, status, f.d.ID)
+		if p := page("active"); p.Deployer != nil {
+			t.Fatalf("%s deployer: %+v", status, p.Deployer)
+		}
+	}
+	f.exec(`UPDATE agents SET status='running' WHERE id=?`, f.d.ID)
+	if p := page("active"); p.Deployer == nil {
+		t.Fatal("running deployer again: no deployer")
+	}
+}
+
+// reporting advances the clock in broker ticks with a fresh heartbeat and
+// a new report p after each tick's sweep, as a polling runner does.
+func (f *livenessFixture) reporting(p api.ReleaseProgress, d time.Duration) {
+	f.t.Helper()
+	f.live = true
+	for ; d > 0; d -= 30 * time.Second {
+		f.advance(30 * time.Second)
+		f.report(p)
+	}
+}
+
+// s3: a live deployer whose runner reports refused code while a verified job
+// waits gets one stale_code notice per recipient, with its reason, prefixes,
+// since and action; a draining or current one, a claimed or merged job
+// alone, a report from before the run's newest code notice and a job younger
+// than the bound stay quiet; silent, restart and hung keep precedence; a
+// current report re-arms.
+func TestDeployerLivenessStaleCode(t *testing.T) {
+	opened := func(f *livenessFixture, code api.ReleaseProgressCode) {
+		f.t.Helper()
+		f.report(codeProgress(code))
+		f.enqueue()
+		if n := f.sweep(); n != 0 {
+			f.t.Fatalf("first sight posted %d", n)
+		}
+		f.reporting(codeProgress(code), livenessN)
+	}
+	for _, c := range []struct {
+		name   string
+		code   api.ReleaseProgressCode
+		parts  []string
+		action string
+	}{
+		{"checkout-dirty", refusedCode, []string{"Reason: checkout-dirty; loaded scripts 0123456789ab, published scripts ba9876543210; refused since 2026-10-27T18:00:00.000Z."},
+			"Action: Run tt deployment setup for the deployer with its current run as predecessor (docs/project-deployment.md)."},
+		{"load-failed not restored", api.ReleaseProgressCode{State: "refused", Reason: "load-failed", Checkout: "not-restored", Loaded: codeLoaded, Published: codePublished, Since: refusedCode.Since},
+			[]string{"Reason: load-failed, checkout not-restored; loaded scripts 0123456789ab"},
+			"Action: Do not re-provision from this checkout: restore it to the loaded commit or fix the published scripts on tasks-hub (docs/project-deployment.md)."},
+		{"published unreadable", api.ReleaseProgressCode{State: "refused", Reason: "published-unreadable", Loaded: codeLoaded, Since: refusedCode.Since},
+			[]string{"Reason: published-unreadable; loaded scripts 0123456789ab, published scripts none;"}, "Action: Run tt deployment setup"},
+	} {
+		t.Run("posts "+c.name, func(t *testing.T) {
+			f := newLivenessFixture(t)
+			opened(f, c.code)
+			if n := f.sweep(); n != 2 {
+				t.Fatalf("posted %d, want 2", n)
+			}
+			f.want("stale code", 1, 1)
+			for _, to := range []api.Agent{f.h, f.own} {
+				e := f.copies(to)[0]
+				if e.Kind != api.EnvelopeKindNotice || e.To != to.Name || e.Subject != "Deployer refuses releases because its runner code is out of date" {
+					t.Fatalf("%s copy: %+v", to.Name, e)
+				}
+				if e.Refs["activity"] != "deployer_liveness" || e.Refs["reason"] != "stale_code" || e.Refs["deployer"] != f.d.ID || e.Refs["run"] != f.d.RunID {
+					t.Fatalf("%s refs: %v", to.Name, e.Refs)
+				}
+				for _, part := range append([]string{f.d.Name, f.d.ID, f.d.RunID, "is alive but refuses to claim releases because its runner code is out of date.", livenessCounts["verified"], c.action, "Nothing was restarted or signalled."}, c.parts...) {
+					if !strings.Contains(e.Body.Text, part) {
+						t.Fatalf("%s text lacks %q: %s", to.Name, part, e.Body.Text)
+					}
+				}
+			}
+			f.reporting(codeProgress(c.code), 3*livenessN)
+			if n := f.sweep(); n != 0 {
+				t.Fatalf("same episode posted %d", n)
+			}
+		})
+	}
+	for _, state := range []string{"current", "draining"} {
+		t.Run(state+" is quiet", func(t *testing.T) {
+			f := newLivenessFixture(t)
+			opened(f, api.ReleaseProgressCode{State: state, Loaded: codeLoaded, Published: codePublished, Since: refusedCode.Since})
+			f.reporting(codeProgress(api.ReleaseProgressCode{State: state, Loaded: codeLoaded, Published: codePublished, Since: refusedCode.Since}), 2*livenessN)
+			if n := f.sweep(); n != 0 {
+				t.Fatalf("posted %d", n)
+			}
+			f.want(state, 0, 0)
+		})
+	}
+	for _, state := range []string{"claimed", "merged"} {
+		t.Run(state+" job alone is quiet", func(t *testing.T) {
+			f := newLivenessFixture(t)
+			f.live = true
+			j := f.act(f.enqueue(), "claim")
+			if state == "merged" {
+				f.act(j, "merged")
+			}
+			f.report(codeProgress(refusedCode))
+			f.sweep()
+			f.reporting(codeProgress(refusedCode), 3*livenessN)
+			if n := f.sweep(); n != 0 {
+				t.Fatalf("posted %d", n)
+			}
+			f.want(state, 0, 0)
+		})
+	}
+	t.Run("report older than the newest code notice is quiet", func(t *testing.T) {
+		f := newLivenessFixture(t)
+		f.live = true
+		f.report(codeProgress(refusedCode))
+		f.clock = f.clock.Add(time.Second)
+		f.beat()
+		f.say("Deployer now runs the published scripts")
+		f.enqueue()
+		f.sweep()
+		f.advance(3 * livenessN)
+		if n := f.sweep(); n != 0 {
+			t.Fatalf("posted %d", n)
+		}
+		f.want("older report", 0, 0)
+	})
+	t.Run("job younger than the bound is quiet", func(t *testing.T) {
+		f := newLivenessFixture(t)
+		f.report(codeProgress(refusedCode))
+		f.enqueue()
+		f.sweep()
+		f.reporting(codeProgress(refusedCode), livenessN-30*time.Second)
+		if n := f.sweep(); n != 0 {
+			t.Fatalf("posted %d", n)
+		}
+		f.want("young job", 0, 0)
+	})
+	t.Run("silent and hung keep precedence", func(t *testing.T) {
+		silent := newLivenessFixture(t)
+		silent.report(codeProgress(refusedCode))
+		silent.standing(false)
+		if n := silent.sweep(); n != 2 {
+			t.Fatalf("silent posted %d, want 2", n)
+		}
+		if e := silent.copies(silent.own)[0]; e.Refs["reason"] != "silent" || e.Subject != "Deployer has gone silent while release jobs wait" || !strings.Contains(e.Body.Text, "Action: run tt deployment setup for the deployer with its current run as predecessor (docs/project-deployment.md).") {
+			t.Fatalf("silent copy: %+v", e)
+		}
+		hung := newLivenessFixture(t)
+		hung.report(codeProgress(refusedCode))
+		hung.standing(true)
+		if n := hung.sweep(); n != 2 {
+			t.Fatalf("hung posted %d, want 2", n)
+		}
+		if e := hung.copies(hung.own)[0]; e.Refs["reason"] != "hung" || e.Subject != "Deployer runner has made no progress while release jobs wait" {
+			t.Fatalf("hung copy: %+v", e)
+		}
+	})
+	t.Run("restart keeps precedence", func(t *testing.T) {
+		f := newLivenessFixture(t)
+		f.say("Deployer is restarting itself onto the published scripts")
+		f.clock = f.clock.Add(time.Second)
+		f.beat()
+		f.report(codeProgress(refusedCode))
+		f.enqueue()
+		f.sweep()
+		f.reporting(codeProgress(refusedCode), livenessN)
+		if n := f.sweep(); n != 2 {
+			t.Fatalf("posted %d, want 2", n)
+		}
+		if e := f.copies(f.own)[0]; e.Refs["reason"] != "restart" {
+			t.Fatalf("restart copy: %+v", e)
+		}
+	})
+	t.Run("a current report re-arms", func(t *testing.T) {
+		f := newLivenessFixture(t)
+		opened(f, refusedCode)
+		if n := f.sweep(); n != 2 {
+			t.Fatalf("posted %d, want 2", n)
+		}
+		state := func() (st string) {
+			t.Helper()
+			if err := f.s.db.QueryRow(`SELECT state FROM release_deployer_liveness WHERE task_id=?`, f.task.ID).Scan(&st); err != nil {
+				t.Fatal(err)
+			}
+			return st
+		}
+		current := codeProgress(api.ReleaseProgressCode{State: "current", Loaded: codePublished, Published: codePublished, Since: "2026-10-27T18:30:00Z"})
+		f.report(current)
+		if n := f.sweep(); n != 0 || state() != "armed" {
+			t.Fatalf("current report: posted %d, state %s", n, state())
+		}
+		f.reporting(current, livenessN)
+		f.want("re-armed", 1, 1)
+		f.report(codeProgress(refusedCode))
+		if n := f.sweep(); n != 2 {
+			t.Fatalf("second refusal posted %d, want 2", n)
+		}
+		f.want("second episode", 2, 2)
+		if e := f.copies(f.h)[1]; e.Refs["reason"] != "stale_code" {
+			t.Fatalf("second copy: %+v", e)
+		}
+	})
+}
