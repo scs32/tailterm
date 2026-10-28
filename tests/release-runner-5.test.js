@@ -732,6 +732,43 @@ test("R6 an invalid TailOS switch window stops the daemon before any command",as
  assert.equal(existsSync(log),false);
  await serveDeployment({version:1,enabled:true,cwd,journalDirectory:cwd,tt:fakeTT,targets:{tailos:{switchWindowMs:120000}}},{once:true});assert.equal(readFileSync(log,"utf8"),"deployment list --view active --limit 200\ndeployment list --view settled --limit 200 --snapshot "+"a".repeat(64)+"\ndeployment list --view active --limit 200 --snapshot "+"a".repeat(64)+"\n");
 });
+// A window edited invalid in the private config after the deployer started
+// (wi_efe2ded33e581688): the probes read that file at every run, so the
+// deployer reads it again before every claim.
+import {invalidWindow,windowConfigNotice} from "../scripts/release-runner.mjs";
+import {CODE_AGENT,CODE_RUN} from "./release-runner-fixtures.mjs";
+test("R7 a readiness window made invalid after start claims and starts nothing, is told once, and claims again once it is fixed",async t=>{
+ assert.equal(invalidWindow({}),null);assert.equal(invalidWindow({targets:{tailos:{switchWindowMs:0},hub:{readyWindowMs:300000},bridge:{readyWindowMs:0}}}),null);
+ for(const [key,targets] of [["targets.tailos.switchWindowMs",{tailos:{switchWindowMs:-1}}],["targets.hub.readyWindowMs",{hub:{readyWindowMs:"240000"}}],["targets.bridge.readyWindowMs",{bridge:{readyWindowMs:300001}}]])assert.equal(invalidWindow({targets}),key);
+ const cwd=mkdtempSync(join(tmpdir(),"release-window-config-"));t.after(()=>rmSync(cwd,{recursive:true,force:true}));
+ const h=codeHost(t,cwd,`if(a[1]==='progress'){console.log('{}');process.exit(0);}`);h.setJobs([verifiedJob("rel_window")]);
+ const configPath=join(h.home,"deployer.json"),edit=readyWindowMs=>writeFileSync(configPath,JSON.stringify({...h.config,targets:{hub:{readyWindowMs}}}));
+ edit("240000");
+ const started=[],polls=()=>h.calls().filter(c=>c.argv[1]==="progress" && c.argv.includes("poll")).length,told=()=>h.sends().filter(s=>s.subject==="Deployer is not claiming releases: a readiness window in its config is invalid");
+ const saved=[process.env.TAILTERM_AGENT,process.env.TAILTERM_RUN],write=process.stderr.write;let err="";
+ process.env.TAILTERM_AGENT=CODE_AGENT;process.env.TAILTERM_RUN=CODE_RUN;process.stderr.write=(chunk,encoding,done=encoding)=>{err+=chunk;if(typeof done==="function")done();return true;};
+ const controller=new AbortController();t.mock.timers.enable({apis:["setTimeout"]});
+ const settle=async n=>{for(const end=Date.now()+20000;polls()<n;){if(Date.now()>end)assert.fail("timed out waiting for poll "+n);await new Promise(r=>setImmediate(r));}};
+ try{
+  // The config the daemon started with is valid; the file now is not.
+  const serving=serveDeployment(h.config,{signal:controller.signal,configPath,progress:true,release:async c=>{started.push(c.job.id);return {jobId:c.job.id,outcome:"released"};}});
+  await settle(1);
+  assert.equal(h.claims().length,0);assert.deepEqual(started,[]);assert.equal(told().length,1);
+  const notice=windowConfigNotice("targets.hub.readyWindowMs",CODE_RUN,Number(told()[0].requestId.split("-").at(-1)));
+  assert.deepEqual(told()[0],{subject:notice.subject,text:notice.text,requestId:notice.requestId});
+  assert.match(notice.text,/^Deployer run run_c0defixture found targets\.hub\.readyWindowMs in its private config invalid; .* Action: set targets\.hub\.readyWindowMs to an integer from 0 to 300000, or remove it for the default 240000; no restart is needed \(docs\/project-deployment\.md\)\.$/);
+  assert.ok(h.calls().find(c=>c.argv[0]==="send").argv.includes("wake=attention"));
+  // Still invalid, with a release this run already claimed: it is not started, and nothing more is told.
+  h.setJobs([{...verifiedJob("rel_window"),state:"claimed",generation:2,agentId:CODE_AGENT,runId:CODE_RUN}]);t.mock.timers.tick(30000);await settle(2);
+  assert.deepEqual(started,[]);assert.equal(told().length,1);assert.equal(h.claims().length,0);
+  // Fixed: the next poll claims and starts the verified job, with no restart.
+  h.setJobs([verifiedJob("rel_window")]);edit(120000);t.mock.timers.tick(30000);await settle(3);
+  assert.equal(h.claims().length,1);assert.deepEqual(started,["rel_window"]);assert.equal(told().length,1);
+  controller.abort();t.mock.timers.tick(30000);await serving;
+ }finally{t.mock.timers.reset();process.stderr.write=write;for(const [i,k] of ["TAILTERM_AGENT","TAILTERM_RUN"].entries()){if(saved[i]===undefined)delete process.env[k];else process.env[k]=saved[i];}}
+ assert.equal(err.split("\n").filter(l=>l.startsWith("Release claims held:")).length,1);
+ assert.match(err,/Release claims held: targets\.hub\.readyWindowMs in the private config is invalid; nothing is claimed or started until it is valid\./);
+});
 test("m1 a changed matrix binds the integrated plan to its own digest and the newest owner approval of it",async()=>{
  const h=changedMatrixHost([{digest:hash(MATRIX_B),messageSeq:40},{digest:hash(MATRIX_A),messageSeq:99},{digest:hash(MATRIX_B),messageSeq:55},{digest:hash(MATRIX_B),messageSeq:"77"}]);
  assert.equal(await h.verify(h.integrated),false);

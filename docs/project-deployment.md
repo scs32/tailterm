@@ -2056,6 +2056,18 @@ before any `tt deployment list` or claim. Both pinned probe commands carry
 `--config`, so the configured window applies to the automated rollback too, and
 a rollback probe run by hand waits the same window.
 
+Because the probes read the config file at every run, the deployer checks the
+same three windows (`targets.tailos.switchWindowMs`,
+`targets.hub.readyWindowMs`, `targets.bridge.readyWindowMs`) in that file again
+at every poll, before any claim (wi_efe2ded33e581688). A window edited invalid
+while the deployer runs does not stop it: that poll claims nothing and does not
+start or resume a release it already claimed, and the deployer posts one
+attention notice, "Deployer is not claiming releases: a readiness window in its
+config is invalid", naming the key and the fix (an integer from 0 to 300000, or
+remove the key for its default), with one terminal line. Nothing is claimed
+until a poll finds the config valid again; the next poll after the fix claims
+as usual, with no restart. A window made invalid again later is told again.
+
 - Budget: a probe is one runner command with a 600 s timeout, and every command
   the probe runs has its own timeout. At the 300 s cap the worst case is the
   identity reads (3 x 30 s), the window, one last poll that starts as the window
@@ -2452,9 +2464,18 @@ receipt; the marker still holds no output.
 
 **Leftover container.** `--rm` removes the container when the run ends. After
 a timeout, a signal or a failed start the runner also removes it by name, best
-effort. A runner killed mid-rehearsal can leave `tt-rehearsal-ID` behind
-(`container ls -a`); the `started` marker refuses that job, and the container is
-removed by hand with `container delete -f tt-rehearsal-ID`.
+effort. A runner killed mid-rehearsal can leave either container behind
+(`container ls -a`): the run on the copy, `tt-rehearsal-ID`, or the probe,
+`tt-rehearsal-ID-probe`. A job that left `tt-rehearsal-ID` behind is refused by
+its `started` marker. Before every probe the runner deletes a leftover
+`tt-rehearsal-ID-probe` (`container delete -f`, best effort); if the runtime
+still inspects it after a failed delete, the release is refused at `rehearse`
+before the marker is saved, with `Leftover probe container tt-rehearsal-ID-probe;
+run RUNTIME delete -f tt-rehearsal-ID-probe` (`leftoverProbeReason`; RUNTIME is
+the configured runtime or its base name, and the reason is shortened to fit the
+reason limit), so the same job can be retried once it is gone. Anything left is
+removed by hand with `container delete -f tt-rehearsal-ID` or `container delete
+-f tt-rehearsal-ID-probe`.
 
 ### Storage cleanup at the first start (wi_e7748bbeb64236db)
 

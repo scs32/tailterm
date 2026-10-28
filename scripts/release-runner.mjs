@@ -8,7 +8,7 @@ import { join, resolve, dirname, basename, isAbsolute } from "node:path";
 import { digest, canonical, diffPaths, receiptEligible, MAX_CHECK_TIMEOUT_MS, MATRIX_PREREQUISITES, missingPrerequisites, provisionPrerequisites } from "./verify-matrix.mjs";
 import { PRIORITIES, RUN_TIMEOUT_GRACE_MS, holderCapMs, lockPath, readHostState, holdersOf, canonicalResource, pidGone, groupGone } from "./verify-matrix-host-lock.mjs";
 import { selectReleaseTargets, releaseBaselines, schemaChanged } from "./release-targets.mjs";
-import { buildInfo, waitForTailOSCommit, tailosWindow, tailosURL, hostDeps, readyWindow, sanitizeCapture } from "./release-probe.mjs";
+import { buildInfo, waitForTailOSCommit, tailosWindow, tailosURL, hostDeps, readyWindow, sanitizeCapture, TAILOS_SWITCH_WINDOW_MS, TRUENAS_READY_WINDOW_MS } from "./release-probe.mjs";
 
 const fileDigest = fileSHA256;
 const TRUENAS_BASE = "/mnt/deepfreeze/tailterm-hub", PAIR = ["hub", "bridge"];
@@ -2447,6 +2447,24 @@ export function codeNotice(record,kind=record?.state){
   return {requestId,wake:WAKE.attention,subject:["loaded-unreadable","published-unreadable"].includes(reason)?"Deployer is not claiming releases: it cannot compare its scripts with the published ones":"Deployer is not claiming releases: its scripts are out of date",
     text:`${seen} It could not restart itself and claims no release. Reason: ${reason}. ${RESTART_ACTION}`};
 }
+// The config windows the deployer checks at start and again before every
+// claim (wi_efe2ded33e581688): the probes read them from the private config
+// at every run, so one edited invalid after start would make a rollback
+// probe exit 1. The first invalid key, or null.
+const WINDOW_DEFAULTS={"targets.tailos.switchWindowMs":TAILOS_SWITCH_WINDOW_MS,"targets.hub.readyWindowMs":TRUENAS_READY_WINDOW_MS,"targets.bridge.readyWindowMs":TRUENAS_READY_WINDOW_MS};
+export function invalidWindow(config){
+  const checks={"targets.tailos.switchWindowMs":()=>tailosWindow(config),"targets.hub.readyWindowMs":()=>readyWindow(config,"hub"),"targets.bridge.readyWindowMs":()=>readyWindow(config,"bridge")};
+  for(const [key,check] of Object.entries(checks)){try{check();}catch{return key;}}
+  return null;
+}
+// One attention notice per invalid key and first-seen time, so a window made
+// invalid again after a fix is told again.
+export function windowConfigNotice(key,run,since){
+  if(!Object.hasOwn(WINDOW_DEFAULTS,key) || !Number.isSafeInteger(since))return null;
+  const name=NAME(run);
+  return {requestId:`deployer-window-${name}-${key.split(".")[1]}-${since}`,wake:WAKE.attention,subject:"Deployer is not claiming releases: a readiness window in its config is invalid",
+    text:`Deployer run ${name} found ${key} in its private config invalid; a rollback probe, which reads the config at every run, would exit 1 on it. It claims no release, and starts none it already claimed, until the config is valid again; it checks the config before every claim. Action: set ${key} to an integer from 0 to 300000, or remove it for the default ${WINDOW_DEFAULTS[key]}; no restart is needed (docs/project-deployment.md).`};
+}
 // The code state a progress report carries (tt deployment progress
 // --code-*): fixed tokens, 12-hex prefixes and checkedAt, the time this state
 // was first seen. null for a state the hub does not take (stopped) or a
@@ -2814,6 +2832,17 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
   // failure is not told here: it belongs to the transport wait (transportTurn).
   // The transport wait's two notices are sent in the same form, once each.
   const failureSend=(send,reader,notice)=>send(reader,[config.tt||"tt","send","--kind","notice","--subject",notice.subject,"--text",notice.text,"--request-id",notice.requestId,...(notice.jobId?["--ref",`release-job=${notice.jobId}`]:[]),...wakeRef(notice.wake)]);
+  // One notice and one terminal line per invalid window episode (invalid
+  // until a poll finds the config valid again); a failed post is retried by
+  // the next poll under the same request id.
+  let heldWindow=null;
+  const windowHold=(reader,key)=>{
+    if(heldWindow?.key!==key){heldWindow={key,since:Date.now(),told:false};process.stderr.write(`Release claims held: ${key} in the private config is invalid; nothing is claimed or started until it is valid.\n`);}
+    if(heldWindow.told)return;
+    const notice=windowConfigNotice(key,process.env.TAILTERM_RUN,heldWindow.since);
+    try{failureSend(say,reader,notice);heldWindow.told=true;}
+    catch{process.stderr.write("Readiness window notice not posted; the next poll retries.\n");}
+  };
   const sayOnce=(reader,argv)=>reader.command(argv,undefined,{retry:false});
   const cliNotify=(reader,failures)=>{
     for(const failure of [...failures]){
@@ -3028,8 +3057,12 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
     try{pruneJournal(config,jobs,{keepDists:[baselines.tailos]});}catch{process.stderr.write("Journal retention sweep failed; remaining backup copies kept.\n");}
     let codeNow=null;
     if(code){codeNow=await gateTurn(reader,{jobs,details,lock});if(codeNow===STOP)return;}
+    // The windows the probes read, from the same file, before any claim: an
+    // invalid one claims nothing and starts no claimed release this poll.
+    const badWindow=invalidWindow(configPath?JSON.parse(readFileSync(configPath,"utf8")):config);
+    if(badWindow)windowHold(reader,badWindow);else heldWindow=null;
     const skipped=new Set();
-    for (;;) {
+    while (!badWindow) {
       const summary=runnableJob(jobs,process.env.TAILTERM_AGENT,process.env.TAILTERM_RUN,skipped);
       // A verified job behind a skipped one is read here, after this poll's
       // writes (receipts, set-aside archives, notices). A stale snapshot on
