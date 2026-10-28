@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -96,5 +97,96 @@ func TestWorkItemTriageCLI(t *testing.T) {
 	workerEnv.agent, workerEnv.runID = worker.ID, worker.RunID
 	if _, err := captureCLIOutput(t, func() error { return cmdWorkItems(workerEnv, []string{"triage"}) }); err == nil || !strings.Contains(err.Error(), "only the owner or a database handler") {
 		t.Fatalf("worker triage: %v", err)
+	}
+}
+
+// a9, a10 (d5): --commits lists a held review follow-up when a commit on
+// tasks-hub names its review message and finding ID, alone or in a range;
+// a body without the message, an unmerged side-branch commit, and a run
+// without the flag list nothing; a repository with no tasks-hub fails.
+func TestWorkItemTriageCommits(t *testing.T) {
+	f := newTeamFixture(t, true)
+	ctx := context.Background()
+	review, err := f.c.PostMessage(ctx, f.task.ID, api.PostMessageRequest{Text: "fixture review result"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stub := func(id, title string) api.WorkItem {
+		t.Helper()
+		raw, _ := json.Marshal(api.ReviewFinding{ID: id, Title: title, File: "hub/fixture.go", Line: 3})
+		item, err := f.c.CreateWorkItem(ctx, f.task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: title, Description: fmt.Sprintf("Review follow-up from %s, message #%d. Held for triage.\n%s", f.item.ID, review.Seq, raw), SourceMessageSeq: review.Seq, RequestID: "commit-stub-" + id})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return item
+	}
+	named := stub("f1", "Name the fixture retry")
+	ranged := stub("f3", "Range covers this finding")
+	noMessage := stub("f9", "Body names only the finding")
+	unmerged := stub("f5", "Fixed only on a side branch")
+	ten := stub("f10", "Not covered by f1")
+	repo := t.TempDir()
+	cleanupGit(t, repo, "init", "-q", "-b", "tasks-hub")
+	commit := func(subject, body string) string {
+		t.Helper()
+		cleanupGit(t, repo, "commit", "-q", "--allow-empty", "-m", subject, "-m", body)
+		return cleanupGit(t, repo, "rev-parse", "HEAD")
+	}
+	s := fmt.Sprint(review.Seq)
+	one := commit("Fix the retry name", "Closes f1 of #"+s+".")
+	commit("Close the round one follow-ups", "Fixes f2-f4 of review #"+s+".")
+	commit("Mention a finding only", "f9 is handled here.")
+	cleanupGit(t, repo, "checkout", "-q", "-b", "side")
+	commit("Side fix", "Fixes #"+s+" f5.")
+	cleanupGit(t, repo, "checkout", "-q", "tasks-hub")
+	triageJSON := func(args ...string) api.WorkItemTriage {
+		t.Helper()
+		out, err := captureCLIOutput(t, func() error {
+			return cmdWorkItems(f.e, append([]string{"triage", "--project", f.task.ID, "--json"}, args...))
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got api.WorkItemTriage
+		if err := json.Unmarshal([]byte(out), &got); err != nil {
+			t.Fatalf("json %q: %v", out, err)
+		}
+		return got
+	}
+	commits := map[string]string{}
+	for _, r := range triageJSON("--commits", "--repo", repo).AlreadyReleased {
+		if strings.HasPrefix(r.Release, "commit ") {
+			if !r.NamedInRelease {
+				t.Fatalf("not named: %+v", r)
+			}
+			commits[r.Item.ID] = r.Release
+		}
+	}
+	if len(commits) != 2 || commits[named.ID] != "commit "+one[:8]+" Fix the retry name" || !strings.HasSuffix(commits[ranged.ID], " Close the round one follow-ups") {
+		t.Fatalf("commit matches %v", commits)
+	}
+	for _, item := range []api.WorkItem{noMessage, unmerged, ten} {
+		if commits[item.ID] != "" {
+			t.Fatalf("%s listed: %s", item.Title, commits[item.ID])
+		}
+	}
+	for _, r := range triageJSON().AlreadyReleased {
+		if strings.HasPrefix(r.Release, "commit ") {
+			t.Fatalf("listed without --commits: %+v", r)
+		}
+	}
+	text, err := captureCLIOutput(t, func() error {
+		return cmdWorkItems(f.e, []string{"triage", "--project", f.task.ID, "--commits", "--repo", repo})
+	})
+	if err != nil || !strings.Contains(text, named.ID+" \"Name the fixture retry\" is named in commit "+one[:8]+" Fix the retry name") {
+		t.Fatalf("text %q %v", text, err)
+	}
+	bare := t.TempDir()
+	cleanupGit(t, bare, "init", "-q", "-b", "main")
+	cleanupGit(t, bare, "commit", "-q", "--allow-empty", "-m", "Fixes #"+s+" f1")
+	if _, err := captureCLIOutput(t, func() error {
+		return cmdWorkItems(f.e, []string{"triage", "--project", f.task.ID, "--commits", "--repo", bare})
+	}); err == nil || !strings.Contains(err.Error(), "neither origin/tasks-hub nor tasks-hub resolves") {
+		t.Fatalf("no tasks-hub: %v", err)
 	}
 }

@@ -2,11 +2,15 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -683,19 +687,29 @@ func cmdWorkItemDispatch(e env, args []string) error {
 
 // cmdWorkItemTriage prints backlog suggestions for the owner to confirm. It
 // changes nothing. --release-record adds open items that a markdown release
-// record names or describes.
+// record names or describes. --commits adds held review follow-ups that a
+// commit on tasks-hub names by review message and finding ID.
 func cmdWorkItemTriage(e env, args []string) error {
 	fs := flag.NewFlagSet("work-items triage", flag.ContinueOnError)
 	project := fs.String("project", e.task, "project id")
 	staleDays := fs.Int("stale-days", triage.DefaultStaleDays, "days without activity before an open item is listed as stale")
 	var records stringListFlag
 	fs.Var(&records, "release-record", "markdown release record to match open items against (repeatable)")
+	commits := fs.Bool("commits", false, "list held review follow-ups a commit on origin/tasks-hub (else tasks-hub) names by #message and finding ID")
+	repo := fs.String("repo", ".", "repository --commits reads")
 	asJSON := fs.Bool("json", false, "JSON output")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 0 || *staleDays < 1 {
-		return errors.New("usage: tt work-items triage --project tsk_ID [--stale-days N] [--release-record FILE ...] [--json]")
+		return errors.New("usage: tt work-items triage --project tsk_ID [--stale-days N] [--release-record FILE ...] [--commits [--repo DIR]] [--json]")
+	}
+	var history []tasksHubCommit
+	if *commits {
+		var err error
+		if history, err = tasksHubCommits(*repo); err != nil {
+			return err
+		}
 	}
 	task, err := workItemProject(e, *project)
 	if err != nil {
@@ -711,7 +725,7 @@ func cmdWorkItemTriage(e env, args []string) error {
 	if err != nil {
 		return err
 	}
-	if len(records) > 0 {
+	if len(records) > 0 || *commits {
 		var open []api.WorkItem
 		var after int64
 		for {
@@ -736,6 +750,9 @@ func cmdWorkItemTriage(e env, args []string) error {
 			}
 			out.AlreadyReleased = append(out.AlreadyReleased, releaseRecordMatches(open, triage.ReleaseRows(string(data)))...)
 		}
+		if *commits {
+			out.AlreadyReleased = append(out.AlreadyReleased, commitMatches(open, out.HeldForTriage, history)...)
+		}
 	}
 	if *asJSON {
 		printJSON(out)
@@ -751,6 +768,10 @@ func cmdWorkItemTriage(e env, args []string) error {
 		switch {
 		case r.Done != nil:
 			fmt.Printf("  %s %q ~ done %s %q (title %.2f, criteria %.2f)\n", r.Item.ID, r.Item.Title, r.Done.ID, r.Done.Title, r.TitleSimilarity, r.CriteriaSimilarity)
+		case r.NamedInRelease && strings.HasPrefix(r.Release, "commit "):
+			fmt.Printf("  %s %q is named in %s\n", r.Item.ID, r.Item.Title, r.Release)
+		case r.NamedInRelease && strings.HasPrefix(r.Release, "verified fixed "):
+			fmt.Printf("  %s %q was %s\n", r.Item.ID, r.Item.Title, r.Release)
 		case r.NamedInRelease:
 			fmt.Printf("  %s %q is named in release row: %s\n", r.Item.ID, r.Item.Title, r.Release)
 		default:
@@ -768,6 +789,118 @@ func cmdWorkItemTriage(e env, args []string) error {
 		fmt.Printf("  %s %q filed from review message #%d\n", h.Item.ID, h.Item.Title, h.SourceMessageSeq)
 	}
 	return nil
+}
+
+// tasksHubCommit is one commit's full SHA and message.
+type tasksHubCommit struct{ sha, body string }
+
+// tasksHubCommits reads every commit reachable from origin/tasks-hub in repo,
+// or from tasks-hub when there is no remote branch. Commits on other branches
+// are never read.
+func tasksHubCommits(repo string) ([]tasksHubCommit, error) {
+	ref := ""
+	for _, name := range []string{"origin/tasks-hub", "tasks-hub"} {
+		if exec.Command("git", "-C", repo, "rev-parse", "--verify", "--quiet", name+"^{commit}").Run() == nil {
+			ref = name
+			break
+		}
+	}
+	if ref == "" {
+		return nil, fmt.Errorf("--commits: neither origin/tasks-hub nor tasks-hub resolves in %s", repo)
+	}
+	raw, err := exec.Command("git", "-C", repo, "log", "--format=%H%x1f%B%x1e", ref, "--").Output()
+	if err != nil {
+		return nil, fmt.Errorf("--commits: git log %s: %w", ref, err)
+	}
+	var out []tasksHubCommit
+	for _, record := range strings.Split(string(raw), "\x1e") {
+		sha, body, ok := strings.Cut(strings.TrimLeft(record, "\n"), "\x1f")
+		if ok {
+			out = append(out, tasksHubCommit{sha: sha, body: body})
+		}
+	}
+	return out, nil
+}
+
+// commitMatches lists each held review follow-up whose review message (#N)
+// and finding ID the newest matching commit body names. The finding ID counts
+// as a whole word or inside a range of the same prefix, such as f2 in "f1-f6".
+func commitMatches(open []api.WorkItem, held []api.TriageHeld, history []tasksHubCommit) []api.TriageAlreadyDone {
+	descriptions := map[string]string{}
+	for _, item := range open {
+		descriptions[item.ID] = item.Description
+	}
+	var out []api.TriageAlreadyDone
+	for _, h := range held {
+		_, raw, _ := strings.Cut(descriptions[h.Item.ID], "\n")
+		var f api.ReviewFinding
+		if json.Unmarshal([]byte(raw), &f) != nil || f.ID == "" || h.SourceMessageSeq <= 0 {
+			continue
+		}
+		message := "#" + strconv.FormatInt(h.SourceMessageSeq, 10)
+		for _, c := range history {
+			if !namesToken(c.body, message) || !namesFinding(c.body, f.ID) {
+				continue
+			}
+			subject, _, _ := strings.Cut(c.body, "\n")
+			out = append(out, api.TriageAlreadyDone{Item: h.Item, Release: "commit " + c.sha[:min(8, len(c.sha))] + " " + strings.TrimSpace(subject), NamedInRelease: true})
+			break
+		}
+	}
+	return out
+}
+
+// tokenByte reports whether b can be part of a word.
+func tokenByte(b byte) bool {
+	return b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9' || b == '_'
+}
+
+// namesToken reports whether text holds token with no word byte on either side.
+func namesToken(text, token string) bool {
+	for from := 0; ; {
+		i := strings.Index(text[from:], token)
+		if i < 0 {
+			return false
+		}
+		start, end := from+i, from+i+len(token)
+		if (start == 0 || !tokenByte(text[start-1])) && (end == len(text) || !tokenByte(text[end])) {
+			return true
+		}
+		from = start + 1
+	}
+}
+
+var (
+	findingIDShape = regexp.MustCompile(`^([A-Za-z]+)([0-9]+)$`)
+	findingRange   = regexp.MustCompile(`([A-Za-z]+)([0-9]+)\s*(?:-|–)\s*([A-Za-z]*)([0-9]+)`)
+)
+
+// namesFinding reports whether text names the finding ID id as a whole word,
+// or a range such as "f1-f6" or "f1–f6" of the same prefix that covers it.
+func namesFinding(text, id string) bool {
+	if namesToken(text, id) {
+		return true
+	}
+	shape := findingIDShape.FindStringSubmatch(id)
+	if shape == nil {
+		return false
+	}
+	n, _ := strconv.Atoi(shape[2])
+	for _, at := range findingRange.FindAllStringSubmatchIndex(text, -1) {
+		if (at[0] > 0 && tokenByte(text[at[0]-1])) || (at[1] < len(text) && tokenByte(text[at[1]])) {
+			continue
+		}
+		prefix, second := text[at[2]:at[3]], text[at[6]:at[7]]
+		if prefix != shape[1] || (second != "" && second != shape[1]) {
+			continue
+		}
+		lo, _ := strconv.Atoi(text[at[4]:at[5]])
+		hi, _ := strconv.Atoi(text[at[8]:at[9]])
+		if lo <= n && n <= hi {
+			return true
+		}
+	}
+	return false
 }
 
 // releaseRecordMatches lists open items a release row names by ID, or whose

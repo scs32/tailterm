@@ -4804,3 +4804,288 @@ func TestReviewConvergenceAmendedAssignmentRebindsScope(t *testing.T) {
 		})
 	}
 }
+
+// roundOneFollowUps runs round one on candidateA with blocker b1 (a1 failed)
+// and findings f1 and f2 (f2 cites a2, also failed), then opens round two on
+// candidateB. It returns the round-one RESULT, the round-two REVIEW and the
+// stubs the hub filed, by finding ID.
+func roundOneFollowUps(t *testing.T, f *convergenceFixture) (api.Message, api.Message, map[string]api.WorkItem) {
+	t.Helper()
+	r1 := f.review(t, candidateA)
+	meta := api.ReviewMetadata{Mode: "general",
+		Blockers: []api.ReviewFinding{{ID: "b1", Criterion: "a1", Title: "Fixture retry loses state", Command: "fixture retry", Output: "FAIL lost state"}},
+		Findings: []api.ReviewFinding{{ID: "f1", Title: "Explain the fixture retry", Kind: "feature", File: "fixture.go", Line: 3}, {ID: "f2", Criterion: "a2", Title: "Fixture retries skip the receipt", File: "fixture.go", Line: 5}}}
+	m, err := f.post(f.resultEnv(candidateA, map[string]string{"a1": "fail", "a2": "fail"}, meta), "", r1.Seq, f.reviewer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stubs := map[string]api.WorkItem{}
+	for _, follow := range f.state(t).FollowUps {
+		item, err := f.s.GetWorkItem(f.ctx, f.task.ID, follow.ItemID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stubs[follow.Finding.ID] = item
+	}
+	if len(stubs) != 2 || !heldReviewFollowUp(stubs["f1"]) || !heldReviewFollowUp(stubs["f2"]) {
+		t.Fatalf("stubs %+v", stubs)
+	}
+	return m, f.review(t, candidateB), stubs
+}
+
+func (f *convergenceFixture) roundTwoResult(status map[string]string, meta api.ReviewMetadata, reply int64) error {
+	meta.Mode = "general"
+	_, err := f.post(f.resultEnv(candidateB, status, meta), "", reply, f.reviewer)
+	return err
+}
+
+// fixedLine is the line settleFixedFollowUp appends or saves as a note.
+func fixedLine(parent api.WorkItem, candidate, how string, result, review int64, finding string) string {
+	return fmt.Sprintf("Delivered by %s at %s: %s #%d recorded finding %s of review #%d fixed.", parent.ID, candidate, how, result, finding, review)
+}
+
+func latestResultSeq(t *testing.T, f *convergenceFixture) int64 {
+	t.Helper()
+	var seq int64
+	if err := f.s.db.QueryRow(`SELECT max(seq) FROM messages WHERE task_id=?`, f.task.ID).Scan(&seq); err != nil {
+		t.Fatal(err)
+	}
+	return seq
+}
+
+// a3: a round-two RESULT whose blockerIds names round-one follow-ups closes
+// their unchanged stubs in the same transaction; only blocker IDs enter the
+// focused record; each refusal leaves the stubs held.
+func TestReviewFollowUpClosedByRoundTwo(t *testing.T) {
+	f := newConvergenceFixture(t)
+	r1, r2, stubs := roundOneFollowUps(t, f)
+	held := func() {
+		t.Helper()
+		for id, stub := range stubs {
+			got, err := f.s.GetWorkItem(f.ctx, f.task.ID, stub.ID)
+			if err != nil || got.Revision != 1 || got.Status != "open" || got.Description != stub.Description {
+				t.Fatalf("stub %s changed: %+v %v", id, got, err)
+			}
+		}
+	}
+	refusals := []struct {
+		name   string
+		status map[string]string
+		meta   api.ReviewMetadata
+		reason string
+	}{
+		{"unknown ID", passConvergence, api.ReviewMetadata{BlockerIDs: []string{"b1", "f9"}}, "resolved IDs must name distinct prior blockers or round-one follow-ups"},
+		{"named twice", passConvergence, api.ReviewMetadata{BlockerIDs: []string{"b1", "f1", "f1"}}, "resolved IDs must name distinct prior blockers or round-one follow-ups"},
+		{"criterion not passing", map[string]string{"a1": "pass", "a2": "fail"}, api.ReviewMetadata{BlockerIDs: []string{"b1", "f2"}}, "resolved follow-up f2 criterion must pass"},
+		{"also retained as a blocker", passConvergence, api.ReviewMetadata{BlockerIDs: []string{"b1", "f1"}, Blockers: []api.ReviewFinding{{ID: "f1", Regression: true, Baseline: candidateA, Candidate: candidateB, Title: "Fixture regression", File: "fixture.go", Line: 8}}}, "resolved IDs must name distinct prior blockers or round-one follow-ups"},
+		{"also retained as a finding", passConvergence, api.ReviewMetadata{BlockerIDs: []string{"b1", "f1"}, Findings: []api.ReviewFinding{{ID: "f1", Title: "Explain the fixture retry", Kind: "feature", File: "fixture.go", Line: 3}}}, "resolved IDs must name distinct prior blockers or round-one follow-ups"},
+	}
+	for _, tc := range refusals {
+		refusedWith(t, tc.name, f.roundTwoResult(tc.status, tc.meta, r2.Seq), tc.reason)
+		held()
+	}
+	if err := f.roundTwoResult(passConvergence, api.ReviewMetadata{BlockerIDs: []string{"b1", "f1", "f2"}, Fix: "fixed the retry"}, r2.Seq); err != nil {
+		t.Fatal(err)
+	}
+	result := latestResultSeq(t, f)
+	for _, id := range []string{"f1", "f2"} {
+		got, err := f.s.GetWorkItem(f.ctx, f.task.ID, stubs[id].ID)
+		want := stubs[id].Description + "\n\n" + fixedLine(f.item, candidateB, "round-two review", result, r1.Seq, id)
+		if err != nil || got.Status != "dismissed" || got.Revision != 2 || got.Description != want || itemRevisionCount(t, f.s, got.ID) != 2 {
+			t.Fatalf("stub %s not closed: %+v %v", id, got, err)
+		}
+	}
+	var closed int
+	if err := f.s.db.QueryRow(`SELECT count(*) FROM events WHERE task_id=? AND kind='review_follow_up_closed'`, f.task.ID).Scan(&closed); err != nil || closed != 2 {
+		t.Fatalf("closed events %d %v", closed, err)
+	}
+	st := f.state(t)
+	if len(st.Focused) != 1 || !reflect.DeepEqual(st.Focused[0].BlockerIDs, []string{"b1"}) || st.Focused[0].ResultSeq != result {
+		t.Fatalf("focused record holds finding IDs: %+v", st.Focused)
+	}
+	if len(outstanding(st)) != 0 {
+		t.Fatalf("outstanding %+v", outstanding(st))
+	}
+	tri, err := f.s.WorkItemTriage(f.ctx, f.task.ID, 0, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range tri.HeldForTriage {
+		if h.Item.ID == stubs["f1"].ID || h.Item.ID == stubs["f2"].ID {
+			t.Fatalf("closed stub still held: %+v", h)
+		}
+	}
+	acceptCorrectionFixture(t, f, candidateB)
+}
+
+// a3: round two names only follow-ups: no focused record is appended.
+func TestReviewFollowUpClosedByRoundTwoWithoutBlockers(t *testing.T) {
+	f := newConvergenceFixture(t)
+	r1 := f.review(t, candidateA)
+	finding := api.ReviewFinding{ID: "f1", Title: "Explain the fixture retry", Kind: "feature", File: "fixture.go", Line: 3}
+	if _, err := f.post(f.resultEnv(candidateA, passConvergence, api.ReviewMetadata{Mode: "general", Findings: []api.ReviewFinding{finding}}), "", r1.Seq, f.reviewer); err != nil {
+		t.Fatal(err)
+	}
+	stub := f.state(t).FollowUps[0].ItemID
+	r2 := f.review(t, candidateB)
+	if err := f.roundTwoResult(passConvergence, api.ReviewMetadata{BlockerIDs: []string{"f1"}}, r2.Seq); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := f.s.GetWorkItem(f.ctx, f.task.ID, stub); err != nil || got.Status != "dismissed" {
+		t.Fatalf("stub %+v %v", got, err)
+	}
+	if st := f.state(t); len(st.Focused) != 0 {
+		t.Fatalf("focused %+v", st.Focused)
+	}
+}
+
+// a3: round two of a later stage cannot name an earlier stage's follow-up.
+func TestReviewFollowUpEarlierStageRefused(t *testing.T) {
+	f, handler := findingsStage(t)
+	stub := f.state(t).FollowUps[0]
+	f.rescope(t, "Build order one")
+	f.confirmScope(t, handler, f.ownerOrder(t, "build-order"), "build-scope")
+	if err := f.assign(f.criteria, nil); err != nil {
+		t.Fatal(err)
+	}
+	f.generalRound(t, candidateB, passConvergence, api.ReviewMetadata{})
+	r2 := f.review(t, candidateC)
+	_, err := f.post(f.resultEnv(candidateC, passConvergence, api.ReviewMetadata{Mode: "general", BlockerIDs: []string{"f1"}}), "", r2.Seq, f.reviewer)
+	refusedWith(t, "earlier-stage follow-up", err, "resolved IDs must name distinct prior blockers or round-one follow-ups")
+	if got, err := f.s.GetWorkItem(f.ctx, f.task.ID, stub.ItemID); err != nil || got.Revision != 1 || got.Status != "open" {
+		t.Fatalf("earlier-stage stub changed: %+v %v", got, err)
+	}
+}
+
+// a4: a refined follow-up is never closed. An open, unordered one gets one
+// review-fixed evidence note; a queued one gets no note and no row change.
+func TestReviewFollowUpRefinedGetsNote(t *testing.T) {
+	f := newConvergenceFixture(t)
+	r1, r2, stubs := roundOneFollowUps(t, f)
+	refine := func(id, text string) api.WorkItem {
+		t.Helper()
+		item, err := f.s.UpdateWorkItem(f.ctx, f.task.ID, stubs[id].ID, api.UpdateWorkItemRequest{Revision: 1, Description: &text}, f.by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return item
+	}
+	open := refine("f1", "Refined by the handler: explain the fixture retry in fixture.go.")
+	queued := refine("f2", "Refined by the handler: keep the receipt on fixture retries.")
+	order := contextLinkedMessage(t, f.s, f.task, queued, "fixed follow-up order", "fixed-order", nil)
+	if _, err := f.s.TeamQueueAction(f.ctx, f.task.ID, api.TeamQueueRequest{RequestID: "fixed-queue", Operation: "add", ItemID: queued.ID, OrderMessageSeq: order.Seq, Host: "mini", Cwd: "/fixed"}); err != nil {
+		t.Fatal(err)
+	}
+	queued, _ = f.s.GetWorkItem(f.ctx, f.task.ID, queued.ID)
+	queuedRevisions := itemRevisionCount(t, f.s, queued.ID)
+	if err := f.roundTwoResult(passConvergence, api.ReviewMetadata{BlockerIDs: []string{"b1", "f1", "f2"}}, r2.Seq); err != nil {
+		t.Fatal(err)
+	}
+	result := latestResultSeq(t, f)
+	got, err := f.s.GetWorkItem(f.ctx, f.task.ID, open.ID)
+	if err != nil || got.Status != "open" || got.Revision != open.Revision || got.Description != open.Description || !got.UpdatedAt.Equal(open.UpdatedAt) {
+		t.Fatalf("refined item changed: %+v %v", got, err)
+	}
+	notes := foldNotes(t, f.s, open.ID)
+	if len(notes) != 1 || notes[0].namespace != "review-fixed" || notes[0].kind != "note" || notes[0].content != fixedLine(f.item, candidateB, "round-two review", result, r1.Seq, "f1") || !strings.Contains(notes[0].author, f.reviewer.ID) {
+		t.Fatalf("notes %+v", notes)
+	}
+	got, err = f.s.GetWorkItem(f.ctx, f.task.ID, queued.ID)
+	if err != nil || got.Status != "open" || got.Revision != queued.Revision || !got.UpdatedAt.Equal(queued.UpdatedAt) || itemRevisionCount(t, f.s, queued.ID) != queuedRevisions || len(foldNotes(t, f.s, queued.ID)) != 0 {
+		t.Fatalf("queued refined item written: %+v %v", got, err)
+	}
+}
+
+// a5: a passing focused RESULT naming a demoted round-two blocker closes its
+// stub; a failing one writes nothing.
+func TestReviewFollowUpClosedByFocusedPass(t *testing.T) {
+	f := newConvergenceFixture(t)
+	f.generalRound(t, candidateA, passConvergence, api.ReviewMetadata{})
+	r2 := f.review(t, candidateB)
+	b := api.ReviewFinding{ID: "b2", Criterion: "a2", Title: "Retry drops receipt", Command: "fixture retry", Output: "FAIL missing receipt"}
+	m2, err := f.post(f.resultEnv(candidateB, map[string]string{"a1": "pass", "a2": "fail"}, api.ReviewMetadata{Mode: "general", Blockers: []api.ReviewFinding{b}}), "", r2.Seq, f.reviewer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stub, err := f.s.GetWorkItem(f.ctx, f.task.ID, f.state(t).FollowUps[0].ItemID)
+	if err != nil || !heldReviewFollowUp(stub) {
+		t.Fatalf("demoted stub %+v %v", stub, err)
+	}
+	focus := api.ReviewMetadata{Mode: "focused", Candidate: candidateC, Fix: "Restore receipt on retry", BlockerIDs: []string{"b2"}}
+	request := func() api.Message {
+		t.Helper()
+		m, err := f.post(api.Envelope{Kind: "request", Subject: "Verify exactly the demoted receipt failure", Review: &focus, Body: api.EnvelopeBody{Ask: "Verify exact receipt fix"}}, f.reviewer.ID, 0, api.Agent{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	if _, err = f.post(f.resultEnv(candidateC, map[string]string{"b2": "fail"}, focus), "", request().Seq, f.reviewer); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := f.s.GetWorkItem(f.ctx, f.task.ID, stub.ID); err != nil || got.Revision != 1 || got.Status != "open" || itemRevisionCount(t, f.s, stub.ID) != 1 || len(foldNotes(t, f.s, stub.ID)) != 0 {
+		t.Fatalf("failing focused result wrote the stub: %+v %v", got, err)
+	}
+	pass, err := f.post(f.resultEnv(candidateC, map[string]string{"b2": "pass"}, focus), "", request().Seq, f.reviewer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := f.s.GetWorkItem(f.ctx, f.task.ID, stub.ID)
+	if err != nil || got.Status != "dismissed" || got.Revision != 2 || got.Description != stub.Description+"\n\n"+fixedLine(f.item, candidateC, "focused verification", pass.Seq, m2.Seq, "b2") {
+		t.Fatalf("passing focused result did not close the stub: %+v %v", got, err)
+	}
+	acceptCorrectionFixture(t, f, candidateC)
+}
+
+// a7: settling is atomic with the RESULT. A RESULT refused after one stub was
+// closed leaves every stub held, and a replay of the saved RESULT settles
+// nothing twice.
+func TestReviewFollowUpCloseRollback(t *testing.T) {
+	f := newConvergenceFixture(t)
+	_, r2, stubs := roundOneFollowUps(t, f)
+	text := "Refined by the handler: keep the receipt on fixture retries."
+	refined, err := f.s.UpdateWorkItem(f.ctx, f.task.ID, stubs["f2"].ID, api.UpdateWorkItemRequest{Revision: 1, Description: &text}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// f1's stub closes first; f2's note then fails, refusing the whole RESULT.
+	if _, err = f.s.db.Exec(`CREATE TRIGGER refuse_fixed_note BEFORE INSERT ON narrative_artifact_versions BEGIN SELECT RAISE(ABORT,'forced note failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	counts := foldCounts(t, f.s)
+	if err = f.roundTwoResult(passConvergence, api.ReviewMetadata{BlockerIDs: []string{"b1", "f1", "f2"}}, r2.Seq); err == nil || !strings.Contains(err.Error(), "forced note failure") {
+		t.Fatalf("want forced failure, got %v", err)
+	}
+	if got, err := f.s.GetWorkItem(f.ctx, f.task.ID, stubs["f1"].ID); err != nil || got.Revision != 1 || got.Status != "open" || got.Description != stubs["f1"].Description {
+		t.Fatalf("refused RESULT closed a stub: %+v %v", got, err)
+	}
+	if after := foldCounts(t, f.s); after != counts {
+		t.Fatalf("refused RESULT wrote rows: %v -> %v", counts, after)
+	}
+	if st := f.state(t); st.Rounds[1].ResultSeq != 0 || len(st.Focused) != 0 {
+		t.Fatalf("refused RESULT saved the round: %+v", st)
+	}
+	if _, err = f.s.db.Exec(`DROP TRIGGER refuse_fixed_note`); err != nil {
+		t.Fatal(err)
+	}
+	meta := api.ReviewMetadata{Mode: "general", BlockerIDs: []string{"b1", "f1", "f2"}}
+	req := f.req(f.resultEnv(candidateB, passConvergence, meta), "", r2.Seq, f.reviewer)
+	m, err := f.s.PostMessage(f.ctx, f.task.ID, req, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed, _ := f.s.GetWorkItem(f.ctx, f.task.ID, stubs["f1"].ID)
+	counts = foldCounts(t, f.s)
+	if again, err := f.s.PostMessage(f.ctx, f.task.ID, req, f.by); err != nil || again.Seq != m.Seq {
+		t.Fatalf("replay %v %v", again.Seq, err)
+	}
+	if after := foldCounts(t, f.s); after != counts {
+		t.Fatalf("replay wrote rows: %v -> %v", counts, after)
+	}
+	if got, _ := f.s.GetWorkItem(f.ctx, f.task.ID, stubs["f1"].ID); got.Revision != 2 || got.Description != closed.Description || closed.Status != "dismissed" {
+		t.Fatalf("replay changed the closed stub: %+v", got)
+	}
+	if notes := foldNotes(t, f.s, refined.ID); len(notes) != 1 {
+		t.Fatalf("refined notes after replay %+v", notes)
+	}
+}

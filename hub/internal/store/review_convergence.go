@@ -977,6 +977,9 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 		if meta.TreeDiffers {
 			route = "treeDiffers verification"
 		}
+		// A passing focused result settles the follow-ups its blocker IDs name.
+		var fixedFollowUps []api.ReviewFollowUp
+		var fixedCandidate string
 		if e.Kind == "request" {
 			if err = reviewLead(ctx, tx, m.TaskID, item.ID, req.AgentID, req.RunID); err != nil {
 				return err
@@ -1132,6 +1135,17 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 				}
 				f.Passed = passed
 				f.ResultSeq = m.Seq
+				if passed {
+					for _, id := range f.BlockerIDs {
+						for _, follow := range state.FollowUps {
+							if follow.Finding.ID == id && follow.MessageSeq < m.Seq {
+								fixedFollowUps = append(fixedFollowUps, follow)
+								fixedCandidate = f.Candidate
+								break
+							}
+						}
+					}
+				}
 			}
 			if !found {
 				return reviewConflict("no matching focused request")
@@ -1139,7 +1153,15 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 		} else {
 			return reviewConflict("focused path uses REQUEST or RESULT")
 		}
-		return saveReviewStage(ctx, tx, m.TaskID, earlier, state)
+		if err = saveReviewStage(ctx, tx, m.TaskID, earlier, state); err != nil {
+			return err
+		}
+		for _, follow := range fixedFollowUps {
+			if err = s.settleFixedFollowUp(ctx, tx, item, follow, fixedCandidate, "focused verification", m, req, by); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 	if meta.Mode != "general" || e.Kind != "result" {
 		return reviewConflict("invalid review transition")
@@ -1211,21 +1233,47 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 		blockers = append(blockers, b)
 	}
 	scopeResolvedIDs := []string{}
+	// Round two's blockerIds also name round-one follow-ups it found fixed.
+	// Those are settled after the round is saved and never enter a focused
+	// record, which holds blocker IDs only.
+	resolvedBlockers := meta.BlockerIDs
+	var fixedFollowUps []api.ReviewFollowUp
 	// Round two must explicitly resolve or retain EVERY prior blocker, including regressions.
 	if round.Number == 2 {
+		roundOne := map[string]api.ReviewFollowUp{}
+		for _, follow := range state.FollowUps {
+			if follow.MessageSeq == state.Rounds[0].ResultSeq {
+				roundOne[follow.Finding.ID] = follow
+			}
+		}
+		retained := map[string]bool{}
+		for _, f := range findings {
+			retained[f.ID] = true
+		}
+		resolvedBlockers = nil
 		resolved := map[string]bool{}
 		for _, id := range meta.BlockerIDs {
-			if _, ok := prior[id]; !ok || resolved[id] || seen[id] {
-				return reviewConflict("resolved IDs must name distinct prior blockers")
+			_, isBlocker := prior[id]
+			follow, isFollowUp := roundOne[id]
+			if (!isBlocker && !isFollowUp) || resolved[id] || seen[id] || (isFollowUp && retained[id]) {
+				return reviewConflict("resolved IDs must name distinct prior blockers or round-one follow-ups")
 			}
 			resolved[id] = true
+			if isBlocker {
+				resolvedBlockers = append(resolvedBlockers, id)
+				continue
+			}
+			if c := follow.Finding.Criterion; c != "" && e.Body.Status[c] != "pass" {
+				return reviewConflict("resolved follow-up " + reviewFindingIDEcho(id) + " criterion must pass")
+			}
+			fixedFollowUps = append(fixedFollowUps, follow)
 		}
 		for id := range prior {
 			if !seen[id] && !resolved[id] {
 				return reviewConflict("round two must retain or explicitly resolve " + reviewFindingIDEcho(id))
 			}
 		}
-		for id := range resolved {
+		for _, id := range resolvedBlockers {
 			old := prior[id]
 			if old.Criterion != "" && sc.Criteria[old.Criterion] != roundCriteria(&state, state.Rounds[0])[old.Criterion] {
 				if strings.TrimSpace(meta.Fix) == "" || len(e.Evidence) == 0 {
@@ -1303,10 +1351,18 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 	round.Blockers = blockers
 	round.Findings = findings
 	// Explicit resolutions are durable even for regression blockers.
-	if round.Number == 2 && len(meta.BlockerIDs) > 0 {
-		state.Focused = append(state.Focused, api.FocusedReview{RequestSeq: round.RequestSeq, ResultSeq: m.Seq, Candidate: round.Candidate, Fix: "round two blocker verification: " + meta.Fix, BlockerIDs: meta.BlockerIDs, ScopeResolvedIDs: scopeResolvedIDs, ReviewerID: req.AgentID, ReviewerRun: req.RunID, Passed: true})
+	if round.Number == 2 && len(resolvedBlockers) > 0 {
+		state.Focused = append(state.Focused, api.FocusedReview{RequestSeq: round.RequestSeq, ResultSeq: m.Seq, Candidate: round.Candidate, Fix: "round two blocker verification: " + meta.Fix, BlockerIDs: resolvedBlockers, ScopeResolvedIDs: scopeResolvedIDs, ReviewerID: req.AgentID, ReviewerRun: req.RunID, Passed: true})
 	}
-	return saveReviewStage(ctx, tx, m.TaskID, earlier, state)
+	if err = saveReviewStage(ctx, tx, m.TaskID, earlier, state); err != nil {
+		return err
+	}
+	for _, follow := range fixedFollowUps {
+		if err = s.settleFixedFollowUp(ctx, tx, item, follow, round.Candidate, "round-two review", m, req, by); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // reviewFindingIDEcho makes a finding ID safe to return to the client through
@@ -1594,6 +1650,101 @@ func (s *Store) foldReviewFinding(ctx context.Context, tx *sql.Tx, parent api.Wo
 	}
 	out.ItemID = target.ID
 	return out, nil
+}
+
+// reviewFixedNamespace is the narrative namespace of the note that links a
+// refined review follow-up to the RESULT that recorded its finding fixed.
+const reviewFixedNamespace = "review-fixed"
+
+// settleFixedFollowUp settles a follow-up whose finding the RESULT m, a
+// round-two review or a passing focused verification (how), recorded fixed in
+// parent on candidate. It runs in the RESULT's transaction. An unchanged held
+// stub the fold rule allows is dismissed as delivered by parent. Any other item
+// the fold rule allows gets one evidence note and its row is unchanged. An item
+// the fold rule refuses, and a folded finding's target, are not written.
+func (s *Store) settleFixedFollowUp(ctx context.Context, tx *sql.Tx, parent api.WorkItem, follow api.ReviewFollowUp, candidate, how string, m api.Message, req api.PostMessageRequest, by api.Caller) error {
+	if follow.Folded || follow.ItemID == "" {
+		return nil
+	}
+	item, err := getWorkItem(tx, ctx, parent.TaskID, follow.ItemID)
+	if errors.Is(err, api.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	reasons, err := foldIneligible(ctx, tx, parent.TaskID, []string{item.ID})
+	if err != nil || reasons[item.ID] != "" {
+		return err
+	}
+	f := follow.Finding
+	line := fmt.Sprintf("Delivered by %s at %s: %s #%d recorded finding %s of review #%d fixed.", parent.ID, candidate, how, m.Seq, f.ID, follow.MessageSeq)
+	now := s.now()
+	sender := api.Sender{AgentID: m.From.AgentID, Node: by.Node, User: by.User}
+	data := map[string]any{"itemId": item.ID, "reviewParent": parent.ID, "messageSeq": follow.MessageSeq, "findingId": f.ID, "resultSeq": m.Seq, "candidate": candidate}
+	if description := item.Description + "\n\n" + line; heldReviewFollowUp(item) && api.ValidText(description, api.MaxTextLen) {
+		item.Description, item.Status = description, "dismissed"
+		item.Revision++
+		item.ScopeRevision++
+		item.UpdatedBy, item.UpdatedAt = sender, now
+		result, err := tx.ExecContext(ctx, `UPDATE work_items SET description=?,status=?,revision=?,updated_agent=?,updated_node=?,updated_user=?,updated_at=?,narrative_scope_revision=? WHERE task_id=? AND id=? AND revision=?`, item.Description, item.Status, item.Revision, sender.AgentID, sender.Node, sender.User, ts(now), item.ScopeRevision, item.TaskID, item.ID, item.Revision-1)
+		if err != nil {
+			return err
+		}
+		if n, err := result.RowsAffected(); err != nil || n != 1 {
+			if err == nil {
+				err = reviewConflict("follow-up " + item.ID + " changed while it was settled")
+			}
+			return err
+		}
+		fields, _ := json.Marshal(map[string]any{"description": item.Description, "status": item.Status})
+		change, err := tx.ExecContext(ctx, `INSERT INTO work_item_changes(item_id,revision,kind,fields,agent_id,by_node,by_user,created_at) VALUES(?,?,'updated',?,?,?,?,?)`, item.ID, item.Revision, string(fields), sender.AgentID, sender.Node, sender.User, ts(now))
+		if err != nil {
+			return err
+		}
+		seq, _ := change.LastInsertId()
+		if err = insertWorkItemRevision(ctx, tx, revisionFromItem(item, "", "updated", "native", []string{"description", "status"}), seq); err != nil {
+			return err
+		}
+		if err = refreshWorkItemHistoryState(ctx, tx, item, ts(now)); err != nil {
+			return err
+		}
+		if err = s.syncQueueForWorkItem(ctx, tx, item, "", by); err != nil {
+			return err
+		}
+		_, err = s.insertEvent(ctx, tx, parent.TaskID, "review_follow_up_closed", sender.AgentID, item.Title, data, by)
+		return err
+	}
+	// The source ID is the fixing RESULT and the finding ID; an ID that is not
+	// narrative text is replaced by its digest.
+	source := fmt.Sprintf("%d:%s", m.Seq, f.ID)
+	if !validNarrativeText(source, 512, true) {
+		source = fmt.Sprintf("%d:sha256:%s", m.Seq, contentDigest(f.ID))
+	}
+	title := "Review finding " + f.ID + " verified fixed"
+	if !validWorkItemTitle(title) {
+		title = "Review finding verified fixed"
+	}
+	note := api.PutNarrativeArtifactRequest{
+		RequestID: "review-fixed:" + strconv.FormatInt(m.Seq, 10) + ":" + contentDigest(f.ID)[:16], Namespace: reviewFixedNamespace, SourceID: source, SourceVersion: "1", Kind: "note", Title: title,
+		OriginalAuthor: sender, AgentID: req.AgentID, RunID: req.RunID, Provenance: reviewFixedNamespace, CaptureState: "stored-content", Availability: "available",
+		Content: line,
+	}
+	if !m.CreatedAt.IsZero() {
+		at := m.CreatedAt
+		note.SourceTime = &at
+	}
+	if validateArtifactRequest(note) != nil {
+		return nil
+	}
+	if err = validateNarrativeActor(tx, ctx, parent.TaskID, note.AgentID, note.RunID); err != nil {
+		return err
+	}
+	if _, err = insertNarrativeArtifactVersion(ctx, tx, parent.TaskID, item.ID, api.NewID("nart"), 0, note, by, now); err != nil {
+		return err
+	}
+	_, err = s.insertEvent(ctx, tx, parent.TaskID, "review_follow_up_fixed", sender.AgentID, item.Title, data, by)
+	return err
 }
 
 // foldCandidateLimit caps the fold candidates one REVIEW offers.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -275,5 +276,177 @@ func TestTriageHeldJSONShape(t *testing.T) {
 	sort.Strings(keys)
 	if want := []string{"findingId", "foldedAt", "item", "messageSeq", "reviewParent", "title"}; !reflect.DeepEqual(keys, want) {
 		t.Fatalf("fold keys %v, want %v", keys, want)
+	}
+}
+
+// duplicatePairs lists triage's duplicate pairs as "A B" by item ID, and how
+// many times each was listed.
+func duplicatePairs(t *testing.T, f *convergenceFixture) map[string]int {
+	t.Helper()
+	out, err := f.s.WorkItemTriage(f.ctx, f.task.ID, 0, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pairs := map[string]int{}
+	for _, d := range out.Duplicates {
+		ids := []string{d.Items[0].ID, d.Items[1].ID}
+		sort.Strings(ids)
+		pairs[ids[0]+" "+ids[1]]++
+	}
+	return pairs
+}
+
+func pairKey(a, b api.WorkItem) string {
+	ids := []string{a.ID, b.ID}
+	sort.Strings(ids)
+	return ids[0] + " " + ids[1]
+}
+
+// a1, a2 (d2, d3): two open items that share a review message and finding ID
+// are listed as duplicates whatever their titles, once each, with or without
+// the stub; f1 never matches f10, the same ID from another message does not
+// match, and a dismissed copy is not listed.
+func TestTriageDuplicateSameFinding(t *testing.T) {
+	f := newConvergenceFixture(t)
+	r1 := f.review(t, candidateA)
+	findings := []api.ReviewFinding{{ID: "f1", Title: "Explain the fixture retry", Kind: "feature", File: "fixture.go", Line: 3}, {ID: "f10", Title: "Rename the receipt column", Kind: "feature", File: "receipt.go", Line: 9}}
+	m, err := f.post(f.resultEnv(candidateA, passConvergence, api.ReviewMetadata{Mode: "general", Findings: findings}), "", r1.Seq, f.reviewer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stubs := map[string]api.WorkItem{}
+	for _, follow := range f.state(t).FollowUps {
+		stubs[follow.Finding.ID], _ = f.s.GetWorkItem(f.ctx, f.task.ID, follow.ItemID)
+	}
+	other := contextLinkedMessage(t, f.s, f.task, f.item, "unrelated board message", "triage-other-message", nil)
+	file := func(key, title, description string, source int64) api.WorkItem {
+		t.Helper()
+		item, err := f.s.CreateWorkItem(f.ctx, f.task.ID, api.CreateWorkItemRequest{Kind: "feature", Title: title, Description: description, SourceMessageSeq: source, RequestID: "triage-finding-" + key}, f.by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return item
+	}
+	review := fmt.Sprintf("#%d", m.Seq)
+	cited := file("cited", "Document how retries resume", "Refined from review "+review+" finding f1.", 0)
+	sourced := file("sourced", "Write retry notes for operators", "Covers f1 of that review.", m.Seq)
+	similar := file("similar", "Explain the fixture retry", "Refined copy of "+review+" f1.", 0)
+	otherMessage := file("other-message", "Speed up the board scroll", fmt.Sprintf("Finding f1 of #%d.", other.Seq), 0)
+	tenOnly := file("ten", "Rename the receipt table column", "Covers "+review+" f10.", 0)
+	dismissed := file("dismissed", "Retry wording for operators", "Also "+review+" f1.", 0)
+	if _, err = f.s.UpdateWorkItem(f.ctx, f.task.ID, dismissed.ID, api.UpdateWorkItemRequest{Revision: dismissed.Revision, Status: ptr("dismissed")}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	pairs := duplicatePairs(t, f)
+	for _, want := range [][2]api.WorkItem{{stubs["f1"], cited}, {stubs["f1"], sourced}, {stubs["f1"], similar}, {cited, sourced}, {cited, similar}, {sourced, similar}, {stubs["f10"], tenOnly}} {
+		if pairs[pairKey(want[0], want[1])] != 1 {
+			t.Fatalf("pair %s %s listed %d times: %v", want[0].Title, want[1].Title, pairs[pairKey(want[0], want[1])], pairs)
+		}
+	}
+	for _, item := range []api.WorkItem{otherMessage, dismissed} {
+		for pair := range pairs {
+			if strings.Contains(pair, item.ID) {
+				t.Fatalf("%s listed: %s", item.Title, pair)
+			}
+		}
+	}
+	for _, unwanted := range [][2]api.WorkItem{{stubs["f1"], tenOnly}, {stubs["f10"], cited}, {stubs["f1"], stubs["f10"]}, {f.item, stubs["f1"]}} {
+		if pairs[pairKey(unwanted[0], unwanted[1])] != 0 {
+			t.Fatalf("pair %s %s listed: %v", unwanted[0].Title, unwanted[1].Title, pairs)
+		}
+	}
+	// With the stub dismissed, two refined copies still match by finding.
+	if _, err = f.s.UpdateWorkItem(f.ctx, f.task.ID, stubs["f1"].ID, api.UpdateWorkItemRequest{Revision: 1, Status: ptr("dismissed")}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	pairs = duplicatePairs(t, f)
+	if pairs[pairKey(cited, sourced)] != 1 || pairs[pairKey(cited, similar)] != 1 {
+		t.Fatalf("refined copies without the stub: %v", pairs)
+	}
+	// The reviewed item never holds its own review's findings.
+	f.rescope(t, "Retry fix; review "+review+" filed f1 as a follow-up.")
+	if pairs = duplicatePairs(t, f); pairs[pairKey(f.item, cited)] != 0 {
+		t.Fatalf("reviewed item listed with its follow-up: %v", pairs)
+	}
+}
+
+// a6 (d4, d6): every open follow-up a saved round-two or focused RESULT
+// recorded fixed is listed under alreadyReleased with its parent, candidate
+// and fixing RESULT, even when it is queued or ordered; a closed stub and a
+// legacy RESULT with no review metadata are not.
+func TestTriageFollowUpVerifiedFixedListed(t *testing.T) {
+	f := newConvergenceFixture(t)
+	r1, r2, stubs := roundOneFollowUps(t, f)
+	refine := func(id, text string) api.WorkItem {
+		t.Helper()
+		item, err := f.s.UpdateWorkItem(f.ctx, f.task.ID, stubs[id].ID, api.UpdateWorkItemRequest{Revision: 1, Description: &text}, f.by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return item
+	}
+	queued := refine("f1", "Refined: explain the fixture retry.")
+	order := contextLinkedMessage(t, f.s, f.task, queued, "listed follow-up order", "listed-order", nil)
+	if _, err := f.s.TeamQueueAction(f.ctx, f.task.ID, api.TeamQueueRequest{RequestID: "listed-queue", Operation: "add", ItemID: queued.ID, OrderMessageSeq: order.Seq, Host: "mini", Cwd: "/listed"}); err != nil {
+		t.Fatal(err)
+	}
+	ordered := refine("f2", "Refined: keep the receipt on fixture retries.")
+	contextLinkedMessage(t, f.s, f.task, ordered, "ordered follow-up", "listed-ordered", nil)
+	if err := f.roundTwoResult(passConvergence, api.ReviewMetadata{BlockerIDs: []string{"b1", "f1", "f2"}}, r2.Seq); err != nil {
+		t.Fatal(err)
+	}
+	result := latestResultSeq(t, f)
+	// A legacy ledger whose round-two RESULT has no review metadata names
+	// nothing fixed.
+	legacyParent, err := f.s.CreateWorkItem(f.ctx, f.task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Legacy reviewed item", RequestID: "legacy-parent"}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyStub, err := f.s.CreateWorkItem(f.ctx, f.task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Legacy follow-up", RequestID: "legacy-stub"}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain := contextLinkedMessage(t, f.s, f.task, legacyParent, "legacy round two result", "legacy-result", nil)
+	legacy := api.ReviewConvergence{ItemID: legacyParent.ID, History: "recorded", Rounds: []api.ReviewRound{{Number: 1, RequestSeq: 1, ResultSeq: 2, Candidate: candidateA}, {Number: 2, RequestSeq: 3, ResultSeq: plain.Seq, Candidate: candidateB}}, FollowUps: []api.ReviewFollowUp{{Finding: api.ReviewFinding{ID: "f1", Title: "Legacy follow-up"}, ItemID: legacyStub.ID, MessageSeq: 2}}}
+	raw, _ := json.Marshal(legacy)
+	if _, err = f.s.db.Exec(`INSERT INTO review_convergence(task_id,item_id,state_json) VALUES(?,?,?)`, f.task.ID, legacyParent.ID, string(raw)); err != nil {
+		t.Fatal(err)
+	}
+	out, err := f.s.WorkItemTriage(f.ctx, f.task.ID, 0, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed := map[string]api.TriageAlreadyDone{}
+	for _, r := range out.AlreadyReleased {
+		if strings.HasPrefix(r.Release, "verified fixed ") {
+			if _, dup := listed[r.Item.ID]; dup {
+				t.Fatalf("listed twice: %+v", r)
+			}
+			listed[r.Item.ID] = r
+		}
+	}
+	for id, item := range map[string]api.WorkItem{"f1": queued, "f2": ordered} {
+		want := fmt.Sprintf("verified fixed in %s at %s by #%d (finding %s of #%d)", f.item.ID, candidateB, result, id, r1.Seq)
+		if r, ok := listed[item.ID]; !ok || r.Release != want || !r.NamedInRelease || r.Done != nil {
+			t.Fatalf("%s: got %+v want %q", id, r, want)
+		}
+	}
+	if len(listed) != 2 {
+		t.Fatalf("listed %+v", listed)
+	}
+	// A closed stub is not open, so it is not listed.
+	f2 := newConvergenceFixture(t)
+	_, r2b, stubsB := roundOneFollowUps(t, f2)
+	if err := f2.roundTwoResult(passConvergence, api.ReviewMetadata{BlockerIDs: []string{"b1", "f1"}}, r2b.Seq); err != nil {
+		t.Fatal(err)
+	}
+	out, err = f2.s.WorkItemTriage(f2.ctx, f2.task.ID, 0, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range out.AlreadyReleased {
+		if r.Item.ID == stubsB["f1"].ID || r.Item.ID == stubsB["f2"].ID {
+			t.Fatalf("closed or unfixed stub listed: %+v", r)
+		}
 	}
 }
