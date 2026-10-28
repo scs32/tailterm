@@ -1186,6 +1186,32 @@ test("code d2 progressCode keeps fixed tokens, 12-hex prefixes and the first-see
   assert.equal(progressCode(record),null,JSON.stringify(record));
  for(const reason of CODE_REASONS)assert.ok(!/[a-f0-9]{13}/.test(JSON.stringify(progressCode(build({state:"refused",reason,checkout:"restored"})))),reason);
 });
+// A gate turn that throws leaves no code state behind (wi_6df341f6347ca03f).
+test("code d3 a gate turn that throws on an unwritable journal directory leaves no earlier code state on the next report, at either gate",async t=>{
+ const r=codeRepo(t),h=codeHost(t,r.cwd,CODE_PROGRESS_OK+LIST_FAILS),{gate,execs}=codeGate(r.codeA),p=c=>c.digest.slice(0,12),since="2026-10-06T06:00:00.000Z";r.at(r.a,r.a);
+ h.setJobs([{id:"rel_blocked",state:"blocked",generation:3,commit:"d".repeat(40),taskId:"tsk_d3"}]);
+ const C=codeCommit(r,r.b,"// release-runner.mjs c\n"),writable=on=>chmodSync(h.home,on?0o700:0o500);
+ const saved=[process.env.TAILTERM_AGENT,process.env.TAILTERM_RUN],write=process.stderr.write;let err="";
+ process.env.TAILTERM_AGENT=CODE_AGENT;process.env.TAILTERM_RUN=CODE_RUN;process.stderr.write=(chunk,encoding,done=encoding)=>{err+=chunk;if(typeof done==="function")done();return true;};
+ const controller=new AbortController();t.mock.timers.enable({apis:["setTimeout"]});
+ const settle=async n=>{for(let i=0;i<50;i++)await new Promise(r=>setImmediate(r));for(const end=Date.now()+20000;codeReports(h).length<n+1;){if(Date.now()>end)assert.fail("timed out waiting for poll "+n);await new Promise(r=>setImmediate(r));}};
+ // Poll 2 holds at the gate after a ledger read, poll 4 at the gate of a failed one; each changes the code state, so the record is written.
+ // The finally makes the directory writable again before codeHost's cleanup (a later t.after would run after it).
+ const between=[()=>{r.at(r.a,r.b);writable(false);},()=>{writable(true);},()=>{codeJournal(h,"rel_own",{phase:"waiting_inputs"});failList(h);git(r.cwd,"update-ref","refs/heads/tasks-hub",C.commit);writable(false);}];
+ try{
+  const serving=serveDeployment(h.config,{signal:controller.signal,code:gate,release:async()=>{},progress:true});
+  await settle(1);
+  for(const [i,step] of between.entries()){step();t.mock.timers.tick(30000);await settle(i+2);}
+  controller.abort();t.mock.timers.tick(30000);await serving;
+ }finally{writable(true);t.mock.timers.reset();process.stderr.write=write;for(const [i,k] of ["TAILTERM_AGENT","TAILTERM_RUN"].entries()){if(saved[i]===undefined)delete process.env[k];else process.env[k]=saved[i];}}
+ const poll=["deployment","progress","--phase","poll"],blocked=[...poll,"--job","rel_blocked","--wait","fence"];
+ assert.deepEqual(codeReports(h),[["deployment","progress","--phase","start"],
+  [...blocked,"--code-state","current","--code-loaded",p(r.codeA),"--code-published",p(r.codeA),"--code-since",since],poll,
+  [...blocked,"--code-state","draining","--code-loaded",p(r.codeA),"--code-published",p(r.codeB),"--code-since",since],poll]);
+ // Both throwing turns held their polls; the record keeps the last state written, and nothing restarted or claimed.
+ assert.equal(err.split("Deployment poll held (").length-1,2,err);assert.equal(h.record().state,"draining");assert.equal(h.record().current.digest,r.codeB.digest);
+ assert.equal(execs.length,0);assert.equal(r.head(),r.a);assert.equal(h.claims().length,0);
+});
 test("code c5 each restart in a run has its own request id: A to B to C to B",async t=>{
  const r=codeRepo(t),h=codeHost(t,r.cwd),C=codeCommit(r,r.b,"// release-runner.mjs c\n"),A=r.codeA,B=r.codeB;r.at(r.a,r.b);
  const execs=[];const spy=over=>({...over,execve:(...args)=>{execs.push(args[2].TAILTERM_RUNNER_REEXEC_GEN);}});

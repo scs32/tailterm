@@ -2881,7 +2881,8 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
   // included, naming the job and the wait the poll ended in. The wait is
   // information for the hub's notice; the hub decides nothing by it. Each
   // gate turn puts its code state in progressState.code, so every report
-  // after it carries that state; the first report, before any gate, has none.
+  // after it carries that state; the first report, before any gate, has none,
+  // and nor does a report after a gate turn that threw (wi_6df341f6347ca03f).
   const progressState={withdrawn:false};
   const reporter=progress===true?Object.assign(new HostAdapter(config,{}),{progressOn:true,progressState}):null;
   // The runner's own code, once per poll and before any claim. It restarts
@@ -2894,6 +2895,9 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
   // signal arrived, and the caller returns.
   const STOP=Symbol("stop");let lastLock=null;
   const gateTurn=async(reader,ledger)=>{
+    // Cleared first: a turn that throws (runner-code.json unwritable, say)
+    // leaves no earlier poll's state on the reports after it.
+    progressState.code=null;
     let published=null;try{published=code.published(config.cwd);}catch{}
     let idle,held=null;
     if(ledger){
