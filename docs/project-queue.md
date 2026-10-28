@@ -1674,6 +1674,36 @@ cap, the hub answers 409 with
 the second form when R is above zero. `tt team queue list` shows the same text
 as the queued entry's reason, and `--json` carries it as `blockReason`.
 
+**Handler successor seat.** A primary handler rotation needs one free slot
+for its successor ([handler-rotation.md](handler-rotation.md)), and without
+a held seat a busy queue could take every slot a finished team frees (bug
+wi_31ec140ea47e3441). So the claim and the limit raise (and the listed reason)
+count one seat held for the handler successor while either:
+
+- a prepared rotation waits for its successor to register; the hold ends
+  when the successor's agent is registered and so counted as open; or
+- with no rotation prepared, the project's primary rotation is due on the
+  hub's own due rule (the runner's due list, `GET /v1/handler-rotations/due`,
+  without a template digest): its items or tokens limit under an enabled
+  policy, `provider_blocked`, or `dead_primary` with the silence met. A prepare refused `no_agent_slot` saves nothing, so a refused
+  rotation that is still due is held this way.
+
+The rotation's own prepare never counts the held seat, because it is that
+seat; one free slot still prepares it. The attempt check does not count it
+either: admitted members are already reserved. With a held seat the reason
+reads
+
+    project agent cap: N open + 1 seat held for the handler successor + M seats > CAP
+    project agent cap: N open + R reserved + 1 seat held for the handler successor + M seats > CAP
+
+and with none held it is exactly the text above. The seat is held while the
+rotation is due even when the primary is busy with a live lease, so one slot
+can stay empty until the lease ends and the rotation runs. Two cases hold no
+seat: a rotation due only for a template change (the runner computes the
+template digest and the hub does not store it), and a manual rotation until it
+is prepared, since neither is due on the hub's rule. Automatic handler
+provision does not count the held seat either.
+
 **Three check points.**
 
 1. **Claim.** After the slot and host checks and before anything is written,

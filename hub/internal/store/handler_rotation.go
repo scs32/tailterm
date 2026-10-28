@@ -1834,126 +1834,158 @@ func (s *Store) HandlerRotationsDue(ctx context.Context, host, templateDigest st
 		if err != nil {
 			return out, err
 		}
-		// Listed for its limits when the limit policy is enabled, and for a
-		// dead primary whenever that replacement is on; decided below.
-		if !policy.Enabled && policy.DeadSilenceMinutes <= 0 {
-			continue
-		}
-		// A primary whose wrapper reported exited is listed only while it is
-		// busy and the dead primary replacement is on; otherwise the project
-		// is listed for its open primary as before.
-		primary, exited, err := exitedPrimaryHandler(ctx, s.db, t)
+		d, listed, err := primaryRotationDue(ctx, s.db, t, policy, host, templateDigest, s.now())
 		if err != nil {
 			return out, err
 		}
-		// One primary's unreadable activity snapshot must not fail the list
-		// for every project on the host. That project is listed as busy, with
-		// the error as its activity, so the runner neither rotates nor
-		// replaces it; prepare and commit still fail on the same snapshot.
-		var busy handlerBusy
-		var unreadable error
-		if exited {
-			if busy, err = loadHandlerBusy(ctx, s.db, t.ID, primary); unreadableActivity(err) {
-				unreadable = err
-			} else if err != nil {
-				return out, err
-			}
-			exited = policy.DeadSilenceMinutes > 0 && (unreadable != nil || !busy.idle())
+		if listed {
+			out.Entries = append(out.Entries, d)
 		}
-		if !exited {
-			primary, err = primaryHandler(ctx, s.db, t)
-			if errors.Is(err, sql.ErrNoRows) {
-				continue
-			}
-			if err != nil {
-				return out, err
-			}
-			unreadable = nil
-			if busy, err = loadHandlerBusy(ctx, s.db, t.ID, primary); unreadableActivity(err) {
-				unreadable = err
-			} else if err != nil {
-				return out, err
-			}
-		}
-		if primary.Host != host {
-			continue
-		}
-		d := api.HandlerRotationDue{TaskID: t.ID, HandlerRevision: t.HandlerRevision, Agent: primary, Policy: policy, DueReasons: []string{}}
-		if err = s.db.QueryRowContext(ctx, `SELECT count(*) FROM team_queue_entries WHERE task_id=? AND handler_id=? AND handler_run_id=? AND state='finished'`, t.ID, primary.ID, primary.RunID).Scan(&d.FinishedItems); err != nil {
-			return out, err
-		}
-		d.ActivityState, d.PendingTool, d.LiveLeases, d.Idle = busy.state, busy.pendingTool, len(busy.leases), unreadable == nil && busy.idle()
-		now := s.now()
-		d.Online = handlerSeenWithin(primary, now)
-		d.DeadCandidate = policy.DeadSilenceMinutes > 0 && !d.Online && !d.Idle && unreadable == nil
-		// A provider-blocked primary is replaced with the limit policy off
-		// too, and its prepared rotation stays listed so the runner can
-		// resume it after the block clears.
-		blocked := false
-		if !exited && unreadable == nil {
-			if _, blocked, err = providerBlockedPrimary(ctx, s.db, t.ID, policy, primary, busy, now); err != nil {
-				return out, err
-			}
-		}
-		if d.OpenRotation, err = openHandlerRotation(ctx, s.db, t.ID); err != nil {
-			return out, err
-		}
-		blockedRotation := d.OpenRotation != nil && d.OpenRotation.Reason == api.HandlerRotationReasonProviderBlocked
-		if !policy.Enabled && !d.DeadCandidate && !blocked && !blockedRotation && unreadable == nil {
-			continue
-		}
-		if !d.Online {
-			// An exited run's silence starts at its wrapper's exit report; a
-			// report the hub cannot use leaves the decision to prepare.
-			var exit *api.HandlerRotationExit
-			if exited {
-				var refusal *api.HandlerRotationRefusal
-				if exit, err = wrapperExitReport(ctx, s.db, t.ID, primary); err != nil && !errors.As(err, &refusal) {
-					return out, err
-				}
-			}
-			last, ok, err := handlerSilentSince(ctx, s.db, t.ID, primary, exit)
-			if err != nil {
-				return out, err
-			}
-			if ok {
-				d.LastActivityAt = &last
-				d.SilenceMet = d.DeadCandidate && now.Sub(last) >= time.Duration(policy.DeadSilenceMinutes)*time.Minute
-			}
-		}
-		if err = s.loadActivity(ctx, &d.Agent); unreadableActivity(err) {
-			if unreadable == nil {
-				unreadable = err
-			}
-		} else if err != nil {
-			return out, err
-		}
-		if d.Agent.Activity != nil {
-			d.TotalTokens = d.Agent.Activity.Tokens.Total
-		}
-		err = s.db.QueryRowContext(ctx, `SELECT template_digest FROM handler_runs WHERE run_id=? AND agent_id=?`, primary.RunID, primary.ID).Scan(&d.RecordedDigest)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return out, err
-		}
-		d.DigestMatches = templateDigest != "" && d.RecordedDigest == templateDigest
-		// The limits are due only under an enabled limit policy.
-		if policy.Enabled && policy.MaxItems > 0 && d.FinishedItems >= policy.MaxItems {
-			d.DueReasons = append(d.DueReasons, api.HandlerRotationReasonItems)
-		}
-		if policy.Enabled && policy.MaxTotalTokens > 0 && d.TotalTokens >= policy.MaxTotalTokens {
-			d.DueReasons = append(d.DueReasons, api.HandlerRotationReasonTokens)
-		}
-		if policy.Enabled && policy.OnTemplateChange && templateDigest != "" && !d.DigestMatches {
-			d.DueReasons = append(d.DueReasons, api.HandlerRotationReasonTemplate)
-		}
-		if blocked {
-			d.DueReasons = append(d.DueReasons, api.HandlerRotationReasonProviderBlocked)
-		}
-		if unreadable != nil {
-			d.ActivityState = "unreadable: " + unreadable.Error()
-			d.Idle, d.DeadCandidate, d.SilenceMet, d.DueReasons = false, false, false, []string{}
-		}
-		out.Entries = append(out.Entries, d)
 	}
 	return out, nil
+}
+
+// primaryRotationDue is one project's entry in the due list: listed is false
+// where HandlerRotationsDue skips the project. An empty host lists a primary
+// on any host. It reads only q, so queue admission can call it inside its
+// transaction (the store has one connection) and hold a seat on the same
+// rule (handlerSuccessorSeat).
+func primaryRotationDue(ctx context.Context, q queryRower, t api.Task, policy api.HandlerRotationPolicy, host, templateDigest string, now time.Time) (api.HandlerRotationDue, bool, error) {
+	// Listed for its limits when the limit policy is enabled, and for a
+	// dead primary whenever that replacement is on; decided below.
+	if !policy.Enabled && policy.DeadSilenceMinutes <= 0 {
+		return api.HandlerRotationDue{}, false, nil
+	}
+	// A primary whose wrapper reported exited is listed only while it is
+	// busy and the dead primary replacement is on; otherwise the project
+	// is listed for its open primary as before.
+	primary, exited, err := exitedPrimaryHandler(ctx, q, t)
+	if err != nil {
+		return api.HandlerRotationDue{}, false, err
+	}
+	// One primary's unreadable activity snapshot must not fail the list
+	// for every project on the host. That project is listed as busy, with
+	// the error as its activity, so the runner neither rotates nor
+	// replaces it; prepare and commit still fail on the same snapshot.
+	var busy handlerBusy
+	var unreadable error
+	if exited {
+		if busy, err = loadHandlerBusy(ctx, q, t.ID, primary); unreadableActivity(err) {
+			unreadable = err
+		} else if err != nil {
+			return api.HandlerRotationDue{}, false, err
+		}
+		exited = policy.DeadSilenceMinutes > 0 && (unreadable != nil || !busy.idle())
+	}
+	if !exited {
+		primary, err = primaryHandler(ctx, q, t)
+		if errors.Is(err, sql.ErrNoRows) {
+			return api.HandlerRotationDue{}, false, nil
+		}
+		if err != nil {
+			return api.HandlerRotationDue{}, false, err
+		}
+		unreadable = nil
+		if busy, err = loadHandlerBusy(ctx, q, t.ID, primary); unreadableActivity(err) {
+			unreadable = err
+		} else if err != nil {
+			return api.HandlerRotationDue{}, false, err
+		}
+	}
+	if host != "" && primary.Host != host {
+		return api.HandlerRotationDue{}, false, nil
+	}
+	d := api.HandlerRotationDue{TaskID: t.ID, HandlerRevision: t.HandlerRevision, Agent: primary, Policy: policy, DueReasons: []string{}}
+	if err = q.QueryRowContext(ctx, `SELECT count(*) FROM team_queue_entries WHERE task_id=? AND handler_id=? AND handler_run_id=? AND state='finished'`, t.ID, primary.ID, primary.RunID).Scan(&d.FinishedItems); err != nil {
+		return api.HandlerRotationDue{}, false, err
+	}
+	d.ActivityState, d.PendingTool, d.LiveLeases, d.Idle = busy.state, busy.pendingTool, len(busy.leases), unreadable == nil && busy.idle()
+	d.Online = handlerSeenWithin(primary, now)
+	d.DeadCandidate = policy.DeadSilenceMinutes > 0 && !d.Online && !d.Idle && unreadable == nil
+	// A provider-blocked primary is replaced with the limit policy off
+	// too, and its prepared rotation stays listed so the runner can
+	// resume it after the block clears.
+	blocked := false
+	if !exited && unreadable == nil {
+		if _, blocked, err = providerBlockedPrimary(ctx, q, t.ID, policy, primary, busy, now); err != nil {
+			return api.HandlerRotationDue{}, false, err
+		}
+	}
+	if d.OpenRotation, err = openHandlerRotation(ctx, q, t.ID); err != nil {
+		return api.HandlerRotationDue{}, false, err
+	}
+	blockedRotation := d.OpenRotation != nil && d.OpenRotation.Reason == api.HandlerRotationReasonProviderBlocked
+	if !policy.Enabled && !d.DeadCandidate && !blocked && !blockedRotation && unreadable == nil {
+		return api.HandlerRotationDue{}, false, nil
+	}
+	if !d.Online {
+		// An exited run's silence starts at its wrapper's exit report; a
+		// report the hub cannot use leaves the decision to prepare.
+		var exit *api.HandlerRotationExit
+		if exited {
+			var refusal *api.HandlerRotationRefusal
+			if exit, err = wrapperExitReport(ctx, q, t.ID, primary); err != nil && !errors.As(err, &refusal) {
+				return api.HandlerRotationDue{}, false, err
+			}
+		}
+		last, ok, err := handlerSilentSince(ctx, q, t.ID, primary, exit)
+		if err != nil {
+			return api.HandlerRotationDue{}, false, err
+		}
+		if ok {
+			d.LastActivityAt = &last
+			d.SilenceMet = d.DeadCandidate && now.Sub(last) >= time.Duration(policy.DeadSilenceMinutes)*time.Minute
+		}
+	}
+	if err = loadHandlerActivity(ctx, q, &d.Agent); unreadableActivity(err) {
+		if unreadable == nil {
+			unreadable = err
+		}
+	} else if err != nil {
+		return api.HandlerRotationDue{}, false, err
+	}
+	if d.Agent.Activity != nil {
+		d.TotalTokens = d.Agent.Activity.Tokens.Total
+	}
+	err = q.QueryRowContext(ctx, `SELECT template_digest FROM handler_runs WHERE run_id=? AND agent_id=?`, primary.RunID, primary.ID).Scan(&d.RecordedDigest)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return api.HandlerRotationDue{}, false, err
+	}
+	d.DigestMatches = templateDigest != "" && d.RecordedDigest == templateDigest
+	// The limits are due only under an enabled limit policy.
+	if policy.Enabled && policy.MaxItems > 0 && d.FinishedItems >= policy.MaxItems {
+		d.DueReasons = append(d.DueReasons, api.HandlerRotationReasonItems)
+	}
+	if policy.Enabled && policy.MaxTotalTokens > 0 && d.TotalTokens >= policy.MaxTotalTokens {
+		d.DueReasons = append(d.DueReasons, api.HandlerRotationReasonTokens)
+	}
+	if policy.Enabled && policy.OnTemplateChange && templateDigest != "" && !d.DigestMatches {
+		d.DueReasons = append(d.DueReasons, api.HandlerRotationReasonTemplate)
+	}
+	if blocked {
+		d.DueReasons = append(d.DueReasons, api.HandlerRotationReasonProviderBlocked)
+	}
+	if unreadable != nil {
+		d.ActivityState = "unreadable: " + unreadable.Error()
+		d.Idle, d.DeadCandidate, d.SilenceMet, d.DueReasons = false, false, false, []string{}
+	}
+	return d, true, nil
+}
+
+// loadHandlerActivity is Store.loadActivity read through q.
+func loadHandlerActivity(ctx context.Context, q queryRower, a *api.Agent) error {
+	var payload string
+	err := q.QueryRowContext(ctx, `SELECT payload FROM agent_activity WHERE agent_id=? AND run_id=?`, a.ID, a.RunID).Scan(&payload)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var activity api.AgentActivity
+	if err := json.Unmarshal([]byte(payload), &activity); err != nil {
+		return fmt.Errorf("activity snapshot: %w", err)
+	}
+	a.Activity = &activity
+	return nil
 }

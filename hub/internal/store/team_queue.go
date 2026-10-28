@@ -771,7 +771,7 @@ func (s *Store) explainTeamQueue(ctx context.Context, task string, out *api.Team
 	if capacityTx != nil {
 		capReader = capacityTx
 	}
-	var capOpen, capReserved int
+	var capOpen, capReserved, capHeld int
 	capCounted := false
 	for i := range out.Entries {
 		if parallel && out.Entries[i].State == "failed" && out.Entries[i].ReleasedAt == "" {
@@ -796,13 +796,16 @@ func (s *Store) explainTeamQueue(ctx context.Context, task string, out *api.Team
 				if capOpen, capReserved, err = projectAgentCapUsage(ctx, capReader, task); err != nil {
 					return err
 				}
+				if capHeld, err = handlerSuccessorSeat(ctx, capReader, task, s.now()); err != nil {
+					return err
+				}
 				capCounted = true
 			}
 			kind, kindErr := queueItemKind(ctx, capReader, task, out.Entries[i].ItemID)
 			if kindErr != nil {
 				return kindErr
 			}
-			capReason = projectAgentCapReason(capOpen, capReserved, queueTeamSeats(kind, out.Entries[i].Template), s.MaxAgents)
+			capReason = queueAgentCapReason(capOpen, capReserved, capHeld, queueTeamSeats(kind, out.Entries[i].Template), s.MaxAgents)
 		}
 		if queueSlotsFull(out.ConcurrencyLimit, activeCount) {
 			out.Entries[i].BlockReason = "All team slots are reserved"
@@ -1437,7 +1440,7 @@ func (s *Store) teamQueueAction(ctx context.Context, task string, req api.TeamQu
 				}
 				seats = queueTeamSeats(kind, nextTemplate)
 			}
-			if err := checkProjectAgentCap(ctx, tx, task, s.MaxAgents, seats); err != nil {
+			if err := checkProjectAgentCap(ctx, tx, task, s.MaxAgents, seats, s.now()); err != nil {
 				return zero, err
 			}
 		}
@@ -1988,7 +1991,7 @@ func (s *Store) teamQueueAction(ctx context.Context, task string, req api.TeamQu
 			if err != nil {
 				return zero, err
 			}
-			if err := checkProjectAgentCap(ctx, tx, task, s.MaxAgents, queueTeamSeats(kind, e.Template)); err != nil {
+			if err := checkProjectAgentCap(ctx, tx, task, s.MaxAgents, queueTeamSeats(kind, e.Template), s.now()); err != nil {
 				return zero, err
 			}
 			var head string

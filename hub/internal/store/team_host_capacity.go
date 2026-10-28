@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -245,15 +246,80 @@ func projectAgentCapReason(open, reserved, seats, maxAgents int) string {
 	return fmt.Sprintf("%s%d open + %d seats > %d", projectAgentCapPrefix, open, seats, maxAgents)
 }
 
+// handlerSuccessorSeat is the seat queue admission holds for the primary
+// handler's successor (bug wi_31ec140ea47e3441): 1 while a prepared rotation
+// waits for its successor to register, or, with none prepared, while the
+// rotation is due by its items or tokens limit, provider_blocked, or a dead
+// primary whose silence is met; otherwise 0. Due is HandlerRotationsDue's
+// own rule, read through q, without the runner's template digest. A
+// rotation's prepare never counts this seat: it is that seat.
+func handlerSuccessorSeat(ctx context.Context, q queryRower, task string, now time.Time) (int, error) {
+	r, err := openHandlerRotation(ctx, q, task)
+	if err != nil {
+		return 0, err
+	}
+	if r != nil {
+		var registered int
+		if err = q.QueryRowContext(ctx, `SELECT count(*) FROM agents WHERE task_id=? AND id=? AND status NOT IN ('closed','exited')`, task, r.SuccessorAgentID).Scan(&registered); err != nil {
+			return 0, err
+		}
+		if registered > 0 {
+			return 0, nil
+		}
+		return 1, nil
+	}
+	t, err := scanTask(q.QueryRowContext(ctx, `SELECT `+taskCols+` FROM tasks WHERE id=?`, task))
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	if t.Status != api.TaskOpen || t.PauseState != api.ProjectPauseActive {
+		return 0, nil
+	}
+	policy, err := loadHandlerRotationPolicy(ctx, q, task)
+	if err != nil {
+		return 0, err
+	}
+	d, listed, err := primaryRotationDue(ctx, q, t, policy, "", "", now)
+	if err != nil || !listed || (len(d.DueReasons) == 0 && !d.SilenceMet) {
+		return 0, err
+	}
+	return 1, nil
+}
+
+// queueAgentCapReason is projectAgentCapReason for queue admission, which
+// also counts held handler successor seats. With none held its text is
+// projectAgentCapReason's.
+func queueAgentCapReason(open, reserved, held, seats, maxAgents int) string {
+	if held == 0 {
+		return projectAgentCapReason(open, reserved, seats, maxAgents)
+	}
+	if open+reserved+held+seats <= maxAgents {
+		return ""
+	}
+	counts := fmt.Sprintf("%d open", open)
+	if reserved > 0 {
+		counts += fmt.Sprintf(" + %d reserved", reserved)
+	}
+	return fmt.Sprintf("%s%s + %d seat held for the handler successor + %d seats > %d", projectAgentCapPrefix, counts, held, seats, maxAgents)
+}
+
 // checkProjectAgentCap refuses a team that agent registration would refuse
-// partway through its launch (docs/project-queue.md, "Project agent cap").
-// maxAgents is the store's enforced cap, not the compiled default.
-func checkProjectAgentCap(ctx context.Context, q queryRower, task string, maxAgents, seats int) error {
+// partway through its launch, or that would take the seat held for a due
+// handler successor (docs/project-queue.md, "Project agent cap"). maxAgents
+// is the store's enforced cap, not the compiled default.
+func checkProjectAgentCap(ctx context.Context, q queryRower, task string, maxAgents, seats int, now time.Time) error {
 	open, reserved, err := projectAgentCapUsage(ctx, q, task)
 	if err != nil {
 		return err
 	}
-	if reason := projectAgentCapReason(open, reserved, seats, maxAgents); reason != "" {
+	held, err := handlerSuccessorSeat(ctx, q, task, now)
+	if err != nil {
+		return err
+	}
+	if reason := queueAgentCapReason(open, reserved, held, seats, maxAgents); reason != "" {
 		return fmt.Errorf("%w: %s", api.ErrConflict, reason)
 	}
 	return nil

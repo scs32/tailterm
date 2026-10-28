@@ -754,7 +754,11 @@ list. For each listed project:
   agent slot", per exact old run and reason, keyed so a relay restart does
   not repeat it. The notice gives the hub's counts and names, up to ten, the
   done or retired ordinary agents an owner could close; a handler, deployer,
-  steward or owner helper is never named. It closes nothing.
+  steward or owner helper is never named. It closes nothing. Meanwhile queue
+  admission holds one seat for the successor, so the next agent closed frees
+  a slot for the rotation rather than for a new team
+  ([project-queue.md](project-queue.md#project-agent-cap), "Handler successor
+  seat"); a rotation due only for a template change gets no held seat.
 - Due with no saved spec: one board NOTICE per exact handler run, keyed so a
   relay restart does not repeat it. No spawn. Without a spec the host does not
   know the handler's prompt, so it reports a template change only for a legacy
@@ -1012,7 +1016,12 @@ directory are inert without the new CLI.
   reached`, and the rotation follows the
   [resume ceiling](#a-successor-that-never-comes-online) and the
   [automatic abort](#automatic-abort-of-a-stuck-rotation). Queue admission
-  keeps no seat for a successor.
+  holds one seat for a successor while a rotation is prepared and waiting for
+  it, or due on the hub's own rule (limits, `provider_blocked`, or
+  `dead_primary` with the silence met), but registration outside the queue
+  does not honor that seat. A rotation due only for a template change, and a
+  manual rotation before its prepare, hold no seat
+  ([project-queue.md](project-queue.md#project-agent-cap)).
 - The `no_agent_slot` notice is posted once per exact old run and reason. If
   the project fills again later for the same run and reason, no second notice
   is posted.

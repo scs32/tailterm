@@ -3799,3 +3799,346 @@ func TestSummaryClipsOutsideOwnership(t *testing.T) {
 		t.Fatal("summarizing changed the source entry")
 	}
 }
+
+// rotationDueByTokens makes the primary handler's rotation due by its tokens
+// limit: the policy allows 2 tokens and the primary's idle run has used 5. The
+// state differs from the fixture's "idle", which ReportActivity would keep.
+func rotationDueByTokens(t *testing.T, s *Store, task string, primary api.Agent) {
+	t.Helper()
+	ctx := context.Background()
+	policy, err := s.HandlerRotationPolicy(ctx, task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.SetHandlerRotationPolicy(ctx, task, api.HandlerRotationPolicyRequest{ExpectedRevision: policy.Revision, Enabled: true, MaxItems: 10, MaxTotalTokens: 2}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if _, err = s.ReportActivity(ctx, task, primary.ID, api.ActivityReport{RequestID: api.NewID("act"), RunID: primary.RunID, Activity: api.AgentActivity{State: "finished_silent", ObservedAt: now, LastEventAt: now, Tokens: api.TokenTotals{Output: 5, Total: 5}}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func queueCapUsage(t *testing.T, s *Store, task string) (open, reserved int) {
+	t.Helper()
+	open, reserved, err := projectAgentCapUsage(context.Background(), s.db, task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return open, reserved
+}
+
+func successorSeat(t *testing.T, s *Store, task string) int {
+	t.Helper()
+	held, err := handlerSuccessorSeat(context.Background(), s.db, task, s.now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return held
+}
+
+// wi_31ec140ea47e3441 a1, a4, a7(i): at the cap with the primary rotation due,
+// the seats a closed team frees go to the handler successor, not to the next
+// team; the rotation's own prepare still fits in one free slot.
+func TestTeamQueueSuccessorSeatHeldWhileRotationDue(t *testing.T) {
+	f := newRotationFixture(t)
+	s := f.s
+	ctx := context.Background()
+	q, err := s.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "seat-add", Operation: "add", ItemID: f.items[0].ID, OrderMessageSeq: f.orders[0].Seq, Host: "mini", Cwd: "/seat"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotationDueByTokens(t, s, f.task.ID, f.old)
+	open, _ := queueCapUsage(t, s, f.task.ID)
+	s.MaxAgents = open + 6
+	// A finished team's six agents close and free exactly the team's seats.
+	for i := 0; i < 6; i++ {
+		setAgentStatus(t, s, capFiller(t, s, f.task, fmt.Sprintf("finished-%d", i)).ID, "closed")
+	}
+	reason := fmt.Sprintf("project agent cap: %d open + 1 seat held for the handler successor + 6 seats > %d", open, open+6)
+	claim := api.TeamQueueRequest{RequestID: "seat-claim", Operation: "claim", EntryID: q.ID, ExpectedRevision: q.Revision, Host: "mini"}
+	if _, err := s.TeamQueueAction(ctx, f.task.ID, claim); !errors.Is(err, api.ErrConflict) || err.Error() != "conflict: "+reason {
+		t.Fatalf("claim beside a due rotation: %v", err)
+	}
+	held, err := s.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+	if err != nil || held.State != "queued" || held.Revision != q.Revision || held.Failure != "" || held.HandlerID != "" {
+		t.Fatalf("held entry %+v %v", held, err)
+	}
+	if n := countRows(t, s, `SELECT count(*) FROM team_launch_reservations WHERE task_id=?`, f.task.ID); n != 0 {
+		t.Fatalf("refused claim saved %d reservation(s)", n)
+	}
+	if list, err := s.ListTeamQueue(ctx, f.task.ID); err != nil || list.Entries[0].BlockReason != reason {
+		t.Fatalf("list reason %+v %v", list.Entries, err)
+	}
+	// Reserved seats come before the held seat.
+	if _, err = s.db.Exec(`INSERT INTO team_launch_reservations(task_id,entry_id,item_id,token,pause_generation,state,created_at) VALUES(?,'',?,'token',0,'reserved',?)`, f.task.ID, f.items[1].ID, ts(s.now())); err != nil {
+		t.Fatal(err)
+	}
+	reserved := fmt.Sprintf("project agent cap: %d open + 6 reserved + 1 seat held for the handler successor + 6 seats > %d", open, open+6)
+	if list, err := s.ListTeamQueue(ctx, f.task.ID); err != nil || list.Entries[0].BlockReason != reserved {
+		t.Fatalf("list reason with reserved seats %+v %v", list.Entries, err)
+	}
+	// A manual reservation refuses the claim before the cap check; the claim
+	// and the limit raise share this text through checkProjectAgentCap.
+	if got := queueAgentCapReason(open, 6, 1, 6, open+6); got != reserved {
+		t.Fatalf("reserved reason with a held seat %q", got)
+	}
+	if _, err = s.db.Exec(`DELETE FROM team_launch_reservations WHERE task_id=?`, f.task.ID); err != nil {
+		t.Fatal(err)
+	}
+	// The held seat is the rotation's: one free slot prepares it.
+	s.MaxAgents = open + 1
+	r, err := f.prepare(t, "seat-prepare", api.Agent{}, "")
+	if err != nil || r.State != api.HandlerRotationPrepared {
+		t.Fatalf("prepare with one free slot: %+v %v", r, err)
+	}
+	s.MaxAgents = open + 6
+	if _, err := s.TeamQueueAction(ctx, f.task.ID, claim); err == nil || err.Error() != "conflict: "+reason {
+		t.Fatalf("claim while the successor has not registered: %v", err)
+	}
+	f.successor(t, r, api.HandlerArm{Runtime: f.old.Runtime})
+	if held := successorSeat(t, s, f.task.ID); held != 0 {
+		t.Fatalf("seat held after the successor registered: %d", held)
+	}
+}
+
+// wi_31ec140ea47e3441 a2, a7(iii): a prepared rotation holds the seat until its
+// successor registers; then a team that fits under open + reserved + seats
+// claims.
+func TestTeamQueueSuccessorSeatHeldUntilSuccessorRegisters(t *testing.T) {
+	f := newRotationFixture(t)
+	s := f.s
+	ctx := context.Background()
+	q, err := s.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "wait-add", Operation: "add", ItemID: f.items[0].ID, OrderMessageSeq: f.orders[0].Seq, Host: "mini", Cwd: "/wait"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if held := successorSeat(t, s, f.task.ID); held != 0 {
+		t.Fatalf("seat held with no rotation due: %d", held)
+	}
+	r, err := f.prepare(t, "wait-prepare", api.Agent{}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	open, _ := queueCapUsage(t, s, f.task.ID)
+	s.MaxAgents = open + 6
+	reason := fmt.Sprintf("project agent cap: %d open + 1 seat held for the handler successor + 6 seats > %d", open, open+6)
+	if list, err := s.ListTeamQueue(ctx, f.task.ID); err != nil || list.Entries[0].BlockReason != reason {
+		t.Fatalf("list reason while the successor is due to register %+v %v", list.Entries, err)
+	}
+	claim := api.TeamQueueRequest{RequestID: "wait-claim", Operation: "claim", EntryID: q.ID, ExpectedRevision: q.Revision, Host: "mini"}
+	if _, err := s.TeamQueueAction(ctx, f.task.ID, claim); err == nil || err.Error() != "conflict: "+reason {
+		t.Fatalf("claim while the successor has not registered: %v", err)
+	}
+	f.successor(t, r, api.HandlerArm{Runtime: f.old.Runtime})
+	if held := successorSeat(t, s, f.task.ID); held != 0 {
+		t.Fatalf("seat held after the successor registered: %d", held)
+	}
+	if _, err = f.commit(r, "wait-commit"); err != nil {
+		t.Fatal(err)
+	}
+	open, reserved := queueCapUsage(t, s, f.task.ID)
+	s.MaxAgents = open + reserved + 6
+	if list, err := s.ListTeamQueue(ctx, f.task.ID); err != nil || strings.Contains(list.Entries[0].BlockReason, "project agent cap") {
+		t.Fatalf("list reason after the rotation %+v %v", list.Entries, err)
+	}
+	claimed, err := s.TeamQueueAction(ctx, f.task.ID, claim)
+	if err != nil || claimed.State != "launching" {
+		t.Fatalf("claim at exact fit after the successor registered %+v %v", claimed, err)
+	}
+}
+
+// wi_31ec140ea47e3441 a3, a7(ii): with no rotation due, admission and its text
+// are as before: a primary under its limits, and the policy off with the dead
+// primary replacement off.
+func TestTeamQueueSuccessorSeatNotHeldWithoutDueRotation(t *testing.T) {
+	for _, off := range []bool{false, true} {
+		f := newRotationFixture(t)
+		s := f.s
+		ctx := context.Background()
+		if off {
+			policy, err := s.HandlerRotationPolicy(ctx, f.task.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			zero := int64(0)
+			if _, err = s.SetHandlerRotationPolicy(ctx, f.task.ID, api.HandlerRotationPolicyRequest{ExpectedRevision: policy.Revision, Enabled: false, DeadSilenceMinutes: &zero}); err != nil {
+				t.Fatal(err)
+			}
+			// The tokens would be over a limit, but no limit applies.
+			rotationDueByTokensActivity(t, f)
+		}
+		q, err := s.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "plain-add", Operation: "add", ItemID: f.items[0].ID, OrderMessageSeq: f.orders[0].Seq, Host: "mini", Cwd: "/plain"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if held := successorSeat(t, s, f.task.ID); held != 0 {
+			t.Fatalf("off=%v: seat held with no rotation due: %d", off, held)
+		}
+		open, _ := queueCapUsage(t, s, f.task.ID)
+		s.MaxAgents = open + 5
+		reason := fmt.Sprintf("project agent cap: %d open + 6 seats > %d", open, open+5)
+		claim := api.TeamQueueRequest{RequestID: "plain-claim", Operation: "claim", EntryID: q.ID, ExpectedRevision: q.Revision, Host: "mini"}
+		if _, err := s.TeamQueueAction(ctx, f.task.ID, claim); err == nil || err.Error() != "conflict: "+reason {
+			t.Fatalf("off=%v: claim one seat over: %v", off, err)
+		}
+		if list, err := s.ListTeamQueue(ctx, f.task.ID); err != nil || list.Entries[0].BlockReason != reason {
+			t.Fatalf("off=%v: list reason %+v %v", off, list.Entries, err)
+		}
+		s.MaxAgents = open + 6
+		if claimed, err := s.TeamQueueAction(ctx, f.task.ID, claim); err != nil || claimed.State != "launching" {
+			t.Fatalf("off=%v: claim at exact fit %+v %v", off, claimed, err)
+		}
+	}
+	if got := queueAgentCapReason(3, 0, 0, 6, 8); got != projectAgentCapReason(3, 0, 6, 8) || got != "project agent cap: 3 open + 6 seats > 8" {
+		t.Fatalf("no held seat reason %q", got)
+	}
+	if got := queueAgentCapReason(2, 1, 0, 6, 8); got != "project agent cap: 2 open + 1 reserved + 6 seats > 8" {
+		t.Fatalf("no held seat reserved reason %q", got)
+	}
+	if got := queueAgentCapReason(1, 0, 1, 6, 8); got != "" {
+		t.Fatalf("fit with a held seat %q", got)
+	}
+}
+
+// wi_31ec140ea47e3441 a5, a7(iv): a limit raise counts the held seat; lowering
+// is not checked.
+func TestTeamQueueSuccessorSeatCountsInLimitRaise(t *testing.T) {
+	s, task, items, orders := sharedCheckoutFixture(t, 2)
+	ctx := context.Background()
+	addCheckoutEntry(t, s, task, items[0], orders[0], "/a", "src/a")
+	agents, err := s.ListAgents(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var primary api.Agent
+	for _, a := range agents {
+		if a.Name == "database" {
+			primary = a
+		}
+	}
+	rotationDueByTokens(t, s, task.ID, primary)
+	open, _ := queueCapUsage(t, s, task.ID)
+	s.MaxAgents = open + 6
+	raise := func(key string, n int) error {
+		t.Helper()
+		syntheticHostUsage(t, s, task.ID, "mini")
+		_, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: key, Operation: "set_limit", Host: "mini", ConcurrencyLimit: n})
+		return err
+	}
+	want := fmt.Sprintf("conflict: project agent cap: %d open + 1 seat held for the handler successor + 6 seats > %d", open, open+6)
+	if err := raise("seat-raise", 3); !errors.Is(err, api.ErrConflict) || err.Error() != want {
+		t.Fatalf("raise beside a due rotation: %v", err)
+	}
+	if list, err := s.ListTeamQueue(ctx, task.ID); err != nil || list.ConcurrencyLimit != 2 {
+		t.Fatalf("refused raise changed the limit %+v %v", list.ConcurrencyLimit, err)
+	}
+	if err := raise("seat-lower", 1); err != nil {
+		t.Fatalf("lowering beside a due rotation: %v", err)
+	}
+	s.MaxAgents = open + 7
+	if err := raise("seat-raise-fits", 3); err != nil {
+		t.Fatalf("raise with room for the held seat: %v", err)
+	}
+}
+
+// wi_31ec140ea47e3441 a6: admission holds the seat exactly when the host's due
+// list, without a template digest, names the project with a due reason or
+// met silence, or a prepared rotation waits for its successor.
+func TestTeamQueueSuccessorSeatMatchesDueList(t *testing.T) {
+	check := func(t *testing.T, name string, s *Store, task string, want int) {
+		t.Helper()
+		list, err := s.HandlerRotationsDue(context.Background(), "mini", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		fromList := 0
+		for _, d := range list.Entries {
+			if d.TaskID != task {
+				continue
+			}
+			if d.OpenRotation != nil {
+				if n := countRows(t, s, `SELECT count(*) FROM agents WHERE id=? AND status NOT IN ('closed','exited')`, d.OpenRotation.SuccessorAgentID); n == 0 {
+					fromList = 1
+				}
+			} else if len(d.DueReasons) > 0 || d.SilenceMet {
+				fromList = 1
+			}
+		}
+		if held := successorSeat(t, s, task); held != want || fromList != want {
+			t.Fatalf("%s: held %d, due list %d, want %d", name, held, fromList, want)
+		}
+	}
+	t.Run("limits", func(t *testing.T) {
+		f := newRotationFixture(t)
+		check(t, "under the default limits", f.s, f.task.ID, 0)
+		rotationDueByTokens(t, f.s, f.task.ID, f.old)
+		check(t, "tokens", f.s, f.task.ID, 1)
+		r, err := f.prepare(t, "parity-prepare", api.Agent{}, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		check(t, "prepared, successor not registered", f.s, f.task.ID, 1)
+		f.successor(t, r, api.HandlerArm{Runtime: f.old.Runtime})
+		check(t, "prepared, successor registered", f.s, f.task.ID, 0)
+	})
+	t.Run("items", func(t *testing.T) {
+		f := newRotationFixture(t)
+		ctx := context.Background()
+		q, err := f.s.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "items-add", Operation: "add", ItemID: f.items[0].ID, OrderMessageSeq: f.orders[0].Seq, Host: "mini", Cwd: "/items"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		policy, err := f.s.HandlerRotationPolicy(ctx, f.task.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = f.s.SetHandlerRotationPolicy(ctx, f.task.ID, api.HandlerRotationPolicyRequest{ExpectedRevision: policy.Revision, Enabled: true, MaxItems: 1, MaxTotalTokens: 1 << 40}); err != nil {
+			t.Fatal(err)
+		}
+		check(t, "no finished item", f.s, f.task.ID, 0)
+		if _, err = f.s.db.Exec(`UPDATE team_queue_entries SET state='finished',released_at=?,handler_id=?,handler_run_id=? WHERE id=?`, ts(f.s.now()), f.old.ID, f.old.RunID, q.ID); err != nil {
+			t.Fatal(err)
+		}
+		check(t, "items", f.s, f.task.ID, 1)
+	})
+	t.Run("policy off", func(t *testing.T) {
+		f := newRotationFixture(t)
+		ctx := context.Background()
+		policy, err := f.s.HandlerRotationPolicy(ctx, f.task.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		zero := int64(0)
+		if _, err = f.s.SetHandlerRotationPolicy(ctx, f.task.ID, api.HandlerRotationPolicyRequest{ExpectedRevision: policy.Revision, Enabled: false, MaxItems: 1, MaxTotalTokens: 1, DeadSilenceMinutes: &zero}); err != nil {
+			t.Fatal(err)
+		}
+		rotationDueByTokensActivity(t, f)
+		check(t, "policy off", f.s, f.task.ID, 0)
+	})
+	t.Run("dead primary", func(t *testing.T) {
+		f := newDeadPrimaryFixture(t)
+		check(t, "online and busy", f.s, f.task.ID, 0)
+		f.advance(5 * time.Minute)
+		check(t, "offline, not silent long enough", f.s, f.task.ID, 0)
+		f.advance(5 * time.Minute)
+		check(t, "offline and silent", f.s, f.task.ID, 1)
+	})
+	t.Run("provider blocked", func(t *testing.T) {
+		f := newBlockedFixture(t, api.ProviderBlockRateLimited, api.DefaultHandlerDeadSilenceMinutes)
+		f.at(t, api.HandlerProviderBlockedAfter-time.Second)
+		check(t, "blocked, not long enough", f.s, f.task.ID, 0)
+		f.at(t, api.HandlerProviderBlockedAfter)
+		check(t, "provider blocked", f.s, f.task.ID, 1)
+	})
+}
+
+// rotationDueByTokensActivity reports tokens far over any limit on the
+// primary's idle run, leaving the policy as it is (see rotationDueByTokens).
+func rotationDueByTokensActivity(t *testing.T, f *rotationFixture) {
+	t.Helper()
+	now := time.Now().UTC()
+	if _, err := f.s.ReportActivity(context.Background(), f.task.ID, f.old.ID, api.ActivityReport{RequestID: api.NewID("act"), RunID: f.old.RunID, Activity: api.AgentActivity{State: "finished_silent", ObservedAt: now, LastEventAt: now, Tokens: api.TokenTotals{Output: 1 << 40, Total: 1 << 40}}}); err != nil {
+		t.Fatal(err)
+	}
+}
