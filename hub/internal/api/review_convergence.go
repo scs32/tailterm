@@ -19,6 +19,10 @@ type ReviewMetadata struct {
 	Fix                string                  `json:"fix,omitempty"`
 	VerificationItemID string                  `json:"verificationItemId,omitempty"`
 	Disposition        string                  `json:"disposition,omitempty"`
+	// FixedFollowUpIDs, on a lead disposition, names round-one follow-ups of
+	// this review stage that the item fixed; the hub settles them as round
+	// two would.
+	FixedFollowUpIDs []string `json:"fixedFollowUpIds,omitempty"`
 }
 
 type ReviewFinding struct {

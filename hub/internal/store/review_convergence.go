@@ -803,6 +803,9 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 			return reviewConflict("current sender run required")
 		}
 	}
+	if meta != nil && len(meta.FixedFollowUpIDs) > 0 && meta.Mode != "disposition" {
+		return reviewConflict("fixedFollowUpIds is for a lead disposition")
+	}
 	if e.Kind == "assign" {
 		if err = reviewLead(ctx, tx, m.TaskID, item.ID, req.AgentID, req.RunID); err != nil {
 			return err
@@ -934,6 +937,38 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 		if state.Disposition != nil && !ownerAccept {
 			return reviewConflict("disposition already recorded")
 		}
+		// fixedFollowUpIds names round-one follow-ups the item fixed. An ID
+		// that a saved blocker of this stage reuses names that blocker and is
+		// skipped, as in focused verification.
+		if ownerAccept && len(meta.FixedFollowUpIDs) > 0 {
+			return reviewConflict("owner-accept names no fixed follow-ups")
+		}
+		var fixedFollowUps []api.ReviewFollowUp
+		if len(meta.FixedFollowUpIDs) > 0 {
+			roundOne := map[string]api.ReviewFollowUp{}
+			for _, follow := range state.FollowUps {
+				if follow.MessageSeq == state.Rounds[0].ResultSeq {
+					roundOne[follow.Finding.ID] = follow
+				}
+			}
+			blockers := stageBlockerIDs(state.Rounds)
+			verdicts := state.Rounds[len(state.Rounds)-1].Verdicts
+			named := map[string]bool{}
+			for _, id := range meta.FixedFollowUpIDs {
+				follow, ok := roundOne[id]
+				if !ok || named[id] {
+					return reviewConflict("fixedFollowUpIds must name distinct round-one follow-ups")
+				}
+				named[id] = true
+				if blockers[id] {
+					continue
+				}
+				if c := follow.Finding.Criterion; c != "" && meta.Disposition != "accept" && verdicts[c] != "pass" {
+					return reviewConflict("fixed follow-up " + reviewFindingIDEcho(id) + " criterion must pass")
+				}
+				fixedFollowUps = append(fixedFollowUps, follow)
+			}
+		}
 		if meta.Disposition == "accept" {
 			if err = verificationReady(ctx, tx, item, meta.Candidate); err != nil {
 				return err
@@ -951,7 +986,10 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 		}
 		state.Disposition = &api.ReviewDisposition{Kind: meta.Disposition, Candidate: meta.Candidate, MessageSeq: m.Seq, AgentID: req.AgentID, RunID: req.RunID}
 		state.Dispositions = append(state.Dispositions, *state.Disposition)
-		return saveReviewStage(ctx, tx, m.TaskID, earlier, state)
+		if err = saveReviewStage(ctx, tx, m.TaskID, earlier, state); err != nil {
+			return err
+		}
+		return s.settleFixedFollowUps(ctx, tx, item, fixedFollowUps, meta.Candidate, "lead disposition", m, req, by)
 	}
 	sc := scopeFor(&state, item.ScopeRevision)
 	if meta.Mode == "focused" {

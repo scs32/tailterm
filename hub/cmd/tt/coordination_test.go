@@ -1293,3 +1293,30 @@ func TestPrimaryHandlerGuidanceRecordsEvidenceAsNotes(t *testing.T) {
 		}
 	}
 }
+
+// t1, t3: the handler steward line, the planned lead and the reviewer say
+// where a review RESULT's findings and fixed round-one follow-ups go.
+func TestHandlerBriefingCitesHeldReviewStub(t *testing.T) {
+	line := stewardBriefing{Active: "backlog-steward"}.handlerLine()
+	if n := strings.Count(line, handlerReviewStubRule); n != 1 || !strings.HasSuffix(line, handlerReviewStubRule) {
+		t.Fatalf("handler steward line states the stub rule %d times: %q", n, line)
+	}
+	if got := (stewardBriefing{}).handlerLine(); got != "" {
+		t.Fatalf("no steward changed the handler briefing: %q", got)
+	}
+	if strings.Contains(primaryHandlerGuidance, handlerReviewStubRule) {
+		t.Fatal("stub rule moved into the handler template digest")
+	}
+	const lead = "The hub files each review RESULT finding as a held stub: to refine or cite one, name its finding ID and source RESULT message, and send the steward only findings from outside a review RESULT. Name round-one follow-ups fixed in this item in the disposition's fixedFollowUpIds; the hub closes or notes each."
+	const reviewer = "In round two, a round-one follow-up fixed in this item also goes into blockerIds. In focused verification, repeat the requested blockerIds exactly and tell lead of any round-one follow-up you found fixed, for the disposition's fixedFollowUpIds."
+	for _, path := range []string{"../../../client/team-examples.js", "../../internal/teamplan/plan.mjs", "../../../docs/team-examples.md"} {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(raw)
+		if strings.Count(text, lead) != 1 || strings.Count(text, reviewer) != 1 || strings.Contains(text, "Follow-ups are filed and held for triage.") {
+			t.Fatalf("%s: lead %d, reviewer %d, old lead sentence %v", path, strings.Count(text, lead), strings.Count(text, reviewer), strings.Contains(text, "Follow-ups are filed and held for triage."))
+		}
+	}
+}

@@ -701,6 +701,17 @@ obligations, follow-ups and
 ledger atomically. Reassignment preserves a round's original request and changes
 its active request/reviewer run; it never refunds a round.
 
+A lead disposition may name `fixedFollowUpIds`: round-one follow-ups of this
+review stage that the item fixed. In the NOTICE's transaction the hub settles
+each the way round two's `blockerIds` does. An unchanged held stub is dismissed
+as delivered. A refined item the fold rule allows gets one `review-fixed` note
+and keeps its row. Any other item is not written. An ID that a saved blocker of
+the stage reuses names that blocker and is skipped. The NOTICE is refused for an
+ID that is not a round-one follow-up of the stage, an ID named twice, a
+follow-up whose criterion did not pass in the latest round (except on
+`accept`), the field on `owner-accept`, or the field outside a disposition. A
+disposition without the field records exactly as before.
+
 `GET /v1/tasks/{id}/review-convergence`, `tt message-checks --summary`, and the
 Projects Delivery projection expose lifetime rounds and linked follow-ups.
 Unrecorded legacy history is explicitly unknown, never inferred zero.

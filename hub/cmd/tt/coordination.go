@@ -382,6 +382,10 @@ func (s stewardBriefing) agentLine() string {
 	return fmt.Sprintf("\nThis project's Backlog steward is %s. Send new bug/feature intake and follow-ups you find outside your bound item to it with tt send --to role:backlog_steward. Scope changes to your bound item stay with your handler.", s.Active)
 }
 
+// handlerReviewStubRule keeps a review RESULT's findings out of steward intake:
+// the hub already filed each as a held stub.
+const handlerReviewStubRule = "A finding from a review RESULT is already a hub-filed held stub: refine or cite that stub by finding ID and source message instead of recording it again, and forward to the steward only findings from outside a review RESULT."
+
 // handlerLine tells the primary handler how intake flows through the active
 // steward. It is outside the handler template digest, so a steward's arrival
 // never rotates live handlers.
@@ -389,7 +393,7 @@ func (s stewardBriefing) handlerLine() string {
 	if s.Active == "" {
 		return ""
 	}
-	return fmt.Sprintf("\nThis project's Backlog steward is %s. Forward raw bug/feature intake to it with tt send --to role:backlog_steward. Record the steward's drafted items as normal intake, with the original owner message as --source-seq and a stable --request-id, and accept its refine and dismiss requests for held follow-ups as ordinary updates.", s.Active)
+	return fmt.Sprintf("\nThis project's Backlog steward is %s. Forward raw bug/feature intake to it with tt send --to role:backlog_steward. Record the steward's drafted items as normal intake, with the original owner message as --source-seq and a stable --request-id, and accept its refine and dismiss requests for held follow-ups as ordinary updates. "+handlerReviewStubRule, s.Active)
 }
 
 func cmdBrief(e env) error {
