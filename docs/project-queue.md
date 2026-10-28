@@ -601,7 +601,9 @@ handlers are below the limit (with `--limit none`: below the active teams
 plus one), no other provision is pending, the saved spec's runtime, model,
 reasoning and prompt template digest equal the wanted ones exactly, and the
 handler and the waiting team both fit under the project agent cap (`open +
-reserved + team seats + 1 <= cap`). The hub then posts one Board notice,
+reserved + held successor seat + team seats + 1 <= cap`, with the
+[handler successor seat](#project-agent-cap) counted while it is held). The
+hub then posts one Board notice,
 `Automatic handler provision`; it is not an owner intervention. A reserved
 handler that is not online after 10 minutes is abandoned, and the runner's
 next pass reserves and starts a new one, with a new notice. Handlers are never
