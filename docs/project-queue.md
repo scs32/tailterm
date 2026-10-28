@@ -1635,8 +1635,10 @@ SELECT item_id FROM team_queue_entries GROUP BY task_id,item_id HAVING count(*)>
 An older tt on the new hub lacks the two commands, and an older queue runner
 still fails a queued entry whose item changed; update the relay hosts' tt with
 the hub. Entries in JSON now carry `attempt`, and `retryOf` and `rebinds` when
-set; older clients ignore them. The audit export does not yet include the two
-rebind tables, and the Board does not yet show attempts or rebinds.
+set; older clients ignore them. Audit export format 3 includes the team queue
+rebind history, as the streams `teamQueueRebinds` and `teamQueueRebindBindings`
+(only the project's own rebinds, in the entry history reader's order); format 2
+is unchanged. The Board does not yet show attempts or rebinds.
 
 Not covered: release follow-through for a done item with a pending or failed
 release (`wi_1a0349b7bf5dce22`), rebinding a launching entry in place, and

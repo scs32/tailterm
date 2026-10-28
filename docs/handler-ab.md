@@ -185,10 +185,13 @@ added. A project with no handler at all is not covered here
 - the queue has a free slot and the drawn arm is not at a provider limit;
 - `handlers` is below the queue limit (with `--limit none`: below the active
   teams plus one), so handlers of the wanted settings never exceed the limit;
-- the new handler and the waiting team both fit under the project agent cap:
-  `open + reserved + team seats + 1 <= cap`, with the counts of
-  [project-queue.md](project-queue.md), "Project agent cap". A provision is
-  therefore never what pushes the team over the cap;
+- the new handler and the waiting team both fit under the project agent cap
+  beside the seat held for the handler successor:
+  `open + reserved + held successor seat + team seats + 1 <= cap`, with the
+  counts and the held seat of
+  [project-queue.md](project-queue.md#project-agent-cap), "Project agent cap".
+  A provision is therefore never what pushes the team over the cap or takes
+  the successor's seat;
 - no other provision of the project is pending;
 - the host's saved spec was not refused for this entry.
 
