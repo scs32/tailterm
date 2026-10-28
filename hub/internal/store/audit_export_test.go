@@ -532,3 +532,121 @@ func TestAuditExportReadyCountLimit(t *testing.T) {
 		t.Fatalf("limit err=%v", err)
 	}
 }
+
+// TestAuditExportV3IncludesTeamQueueRebindHistory holds the team queue rebind
+// streams (wi_7d70cbb1af63d5b8): format 3 exports the project's rebind and the
+// bindings it moved, in the entry history reader's order, with named columns.
+// Another project's rebind stays out, and format 2 is unchanged.
+func TestAuditExportV3IncludesTeamQueueRebindHistory(t *testing.T) {
+	f := newRebindFixture(t, true)
+	updated, source := f.amend(t, "export")
+	f.confirm(t, updated)
+	rebound, err := f.s.TeamQueueAction(f.ctx, f.task.ID, f.rebind(updated, source))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rebound.Rebinds) != 1 || len(rebound.Rebinds[0].Bindings) != 2 {
+		t.Fatalf("rebind history %+v", rebound.Rebinds)
+	}
+	history := rebound.Rebinds[0]
+	other, err := f.s.CreateTask(f.ctx, api.CreateTaskRequest{Name: "rebind export other"}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.s.db.ExecContext(f.ctx, `INSERT INTO team_queue_rebinds(id,task_id,entry_id,item_id,from_item_revision,to_item_revision,from_scope_revision,to_scope_revision,order_seq,source_message_seq,entry_state,created_at) VALUES('tqr_foreign',?,'tqe_foreign','wi_foreign',1,2,1,2,1,2,'queued',?);
+INSERT INTO team_queue_rebind_bindings(rebind_id,agent_id,run_id,from_item_revision,to_item_revision,context_digest) VALUES('tqr_foreign','agt_foreign','run_foreign',1,2,'digest');`, other.ID, history.CreatedAt); err != nil {
+		t.Fatal(err)
+	}
+	v2, err := f.s.CreateAuditExport(f.ctx, f.task.ID, api.CreateAuditExportRequest{RequestID: "rebind-v2", FormatVersion: 2}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v3, err := f.s.CreateAuditExport(f.ctx, f.task.ID, api.CreateAuditExportRequest{RequestID: "rebind-v3", FormatVersion: 3}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	read := func(meta api.AuditExport) []byte {
+		t.Helper()
+		var content []byte
+		for offset := int64(0); ; {
+			chunk, chunkErr := f.s.GetAuditExportChunk(f.ctx, f.task.ID, meta.ID, offset, 31, f.by)
+			if chunkErr != nil {
+				t.Fatal(chunkErr)
+			}
+			content = append(content, chunk.Data...)
+			offset = chunk.NextOffset
+			if chunk.Complete {
+				return content
+			}
+		}
+	}
+	var v2Document, v3Document struct {
+		FormatVersion int                         `json:"formatVersion"`
+		Streams       map[string][]map[string]any `json:"streams"`
+		Cutoffs       map[string]any              `json:"streamCutoffs"`
+	}
+	if err = json.Unmarshal(read(v2), &v2Document); err != nil {
+		t.Fatal(err)
+	}
+	if err = json.Unmarshal(read(v3), &v3Document); err != nil {
+		t.Fatal(err)
+	}
+	if v2Document.FormatVersion != 2 || len(v2Document.Streams) != len(exportQueries) {
+		t.Fatalf("v2 streams %d want %d", len(v2Document.Streams), len(exportQueries))
+	}
+	for _, q := range exportQueries {
+		if _, ok := v2Document.Streams[q.name]; !ok {
+			t.Fatalf("v2 lacks stream %s", q.name)
+		}
+	}
+	for _, name := range []string{"teamQueueRebinds", "teamQueueRebindBindings"} {
+		_, stream := v2Document.Streams[name]
+		_, cutoff := v2Document.Cutoffs[name]
+		if stream || cutoff || v2.StreamCutoffs[name] != nil {
+			t.Fatalf("v2 claimed %s: stream=%v cutoff=%v", name, stream, cutoff)
+		}
+	}
+	if v3Document.FormatVersion != 3 {
+		t.Fatalf("v3 format %d", v3Document.FormatVersion)
+	}
+	rebinds := v3Document.Streams["teamQueueRebinds"]
+	if len(rebinds) != 1 || len(rebinds[0]) != 19 {
+		t.Fatalf("v3 teamQueueRebinds %v", rebinds)
+	}
+	want := map[string]any{
+		"id": history.ID, "task_id": f.task.ID, "entry_id": f.entry.ID, "item_id": f.item.ID,
+		"from_item_revision": float64(history.FromItemRevision), "to_item_revision": float64(updated.Revision),
+		"from_scope_revision": float64(history.FromScopeRevision), "to_scope_revision": float64(updated.ScopeRevision),
+		"order_seq": float64(f.order.Seq), "source_message_seq": float64(source.Seq),
+		"amended_agent": history.AmendedBy.AgentID, "amended_node": history.AmendedBy.Node, "amended_user": history.AmendedBy.User,
+		"approved_agent": f.handler.ID, "approved_run": f.handler.RunID, "approved_node": "handler-node", "approved_user": "approver",
+		"entry_state": "running", "created_at": history.CreatedAt,
+	}
+	for key, value := range want {
+		if rebinds[0][key] != value {
+			t.Fatalf("rebind row %s=%v want %v", key, rebinds[0][key], value)
+		}
+	}
+	bindings := v3Document.Streams["teamQueueRebindBindings"]
+	if len(bindings) != len(history.Bindings) {
+		t.Fatalf("v3 teamQueueRebindBindings %v", bindings)
+	}
+	for index, row := range bindings {
+		b := history.Bindings[index]
+		wantBinding := map[string]any{"rebind_id": history.ID, "agent_id": b.AgentID, "run_id": b.RunID, "from_item_revision": float64(b.FromItemRevision), "to_item_revision": float64(b.ToItemRevision), "context_digest": b.ContextDigest}
+		if len(row) != len(wantBinding) {
+			t.Fatalf("binding row %d keys=%v", index, row)
+		}
+		for key, value := range wantBinding {
+			if row[key] != value {
+				t.Fatalf("binding row %d %s=%v want %v", index, key, row[key], value)
+			}
+		}
+	}
+	if bindings[0]["agent_id"].(string) >= bindings[1]["agent_id"].(string) {
+		t.Fatalf("binding rows out of order: %v then %v", bindings[0]["agent_id"], bindings[1]["agent_id"])
+	}
+	if v3.StreamCutoffs["teamQueueRebinds"] != 1 || v3.StreamCutoffs["teamQueueRebindBindings"] != 2 || v3Document.Cutoffs["teamQueueRebinds"] != float64(1) || v3Document.Cutoffs["teamQueueRebindBindings"] != float64(2) {
+		t.Fatalf("v3 rebind cutoffs meta=%v document=%v", v3.StreamCutoffs, v3Document.Cutoffs)
+	}
+}

@@ -92,6 +92,12 @@ var queueExportQueries = []exportQuery{
 	{"queueDispatchLinks", `SELECT l.* FROM queue_dispatch_links l JOIN queue_entries e ON e.id=l.entry_id WHERE e.target_task_id=? OR e.source_task_id=? ORDER BY l.event_seq,l.dispatch_id`, twoArgs},
 	{"queueReceipts", `SELECT r.* FROM queue_requests r JOIN queue_entries e ON e.id=r.entry_id WHERE e.target_task_id=? OR e.source_task_id=? ORDER BY r.created_at,r.receipt_id`, twoArgs},
 	{"queueNotifications", `SELECT n.* FROM queue_notifications n JOIN queue_entries e ON e.id=n.entry_id WHERE e.target_task_id=? OR e.source_task_id=? ORDER BY n.event_seq,n.recipient_generation`, twoArgs},
+	// Team queue rebind history: who moved an entry to which revision, and
+	// the bindings that moved with it. The team queue is keyed by the
+	// project's own task_id, so bindings are scoped through their rebind.
+	// Columns are named, and the order is the entry history reader's.
+	{"teamQueueRebinds", `SELECT id,task_id,entry_id,item_id,from_item_revision,to_item_revision,from_scope_revision,to_scope_revision,order_seq,source_message_seq,amended_agent,amended_node,amended_user,approved_agent,approved_run,approved_node,approved_user,entry_state,created_at FROM team_queue_rebinds WHERE task_id=? ORDER BY created_at,rowid`, oneArg},
+	{"teamQueueRebindBindings", `SELECT b.rebind_id,b.agent_id,b.run_id,b.from_item_revision,b.to_item_revision,b.context_digest FROM team_queue_rebind_bindings b JOIN team_queue_rebinds r ON r.id=b.rebind_id WHERE r.task_id=? ORDER BY r.created_at,r.rowid,b.agent_id,b.run_id`, oneArg},
 }
 
 // allocationIntentExportQueries is deliberately NOT part of the shared
