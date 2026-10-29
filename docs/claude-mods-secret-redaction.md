@@ -242,7 +242,10 @@ probe's own wording. First count them with `grep -c` on the same two phrases;
 the count should match what the probe printed.
 
 ```
-grep -v -e 'Reply with the token in this queued note' -e 'Reply with only the key= line from my pasted config' ~/.claude/history.jsonl > ~/.claude/history.jsonl.new && mv ~/.claude/history.jsonl.new ~/.claude/history.jsonl
+(umask 077 && grep -v -e 'Reply with the token in this queued note' -e 'Reply with only the key= line from my pasted config' ~/.claude/history.jsonl > ~/.claude/history.jsonl.new && chmod 600 ~/.claude/history.jsonl.new && mv ~/.claude/history.jsonl.new ~/.claude/history.jsonl)
 ```
+
+The command keeps the file private: the rewritten copy is created owner-only
+(mode 600) before it replaces the original.
 
 The design probe of 10-29 used the same wording, so this also removes its lines.
