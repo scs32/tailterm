@@ -303,7 +303,8 @@ that no matching owned session remains, and sends the exact frozen agent and
 run identities for a final hub recheck. If it cannot verify absence, release
 refuses. Release never restarts the failed item. The queue runner makes the
 same absence check itself before it fails an unregistered attempt, so a
-failed entry here had a local trace or an unreadable session list.
+failed entry here had a local trace, an unreadable session list or an
+unreadable relay state directory.
 If a manual launch stops, `abandon --item --order` releases its exact reservation
 with a retry receipt. After lead selection, first clear the lead and resolve
 every member through the saved journal: registered runs need close and cleanup
