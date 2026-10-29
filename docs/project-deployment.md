@@ -359,10 +359,15 @@ matrix, when `git diff --name-only PLAN_BASE..TIP` touches none of the
 candidate's owned paths; a team may also re-plan the same candidate on the same
 base after an environment-only failed receipt. The runner's cherry-pick and
 integrated run then verify the candidate together with everything that landed
-after its plan base. A cherry-pick that conflicts is refused with
-`integration-conflict: PATHS` and the tip is left unchanged; like an owned-path
-overlap, it needs a rebase, the rebase verification route and one new plan
+after its plan base. Before acceptance, a lead who finds an owned-path overlap
+or a cherry-pick that would conflict rebases, and the rebase verification route
+and one new plan apply
 ([Freeze, run and import](objective-verification.md#freeze-run-and-import)).
+After acceptance, a cherry-pick that conflicts at release is refused with
+`integration-conflict: PATHS` (or a path count when not every path can be
+named) and the tip is left unchanged; the refusal notice routes it to a
+follow-through item that re-applies the candidate on the current tasks-hub and
+re-reviews the new commit.
 
 - **Prerequisites.** The five files `verify-matrix.mjs` requires are
   `node_modules/.package-lock.json`, `wasm/tailserve.wasm`, `.build/test.wasm`,
