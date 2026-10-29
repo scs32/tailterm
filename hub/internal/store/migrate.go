@@ -77,6 +77,7 @@ func migrate(db *sql.DB) error {
 		{"tasks", "handler_revision", "INTEGER NOT NULL DEFAULT 1"},
 		{"messages", "broadcast", "INTEGER NOT NULL DEFAULT 0"},
 		{"messages", "envelope", "TEXT NOT NULL DEFAULT ''"},
+		{"owner_interventions", "actor", "TEXT NOT NULL DEFAULT 'unknown' CHECK(actor IN ('owner','helper','unknown'))"},
 	} {
 		var n int
 		if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info(?) WHERE name=?`, c.table, c.name).Scan(&n); err != nil {

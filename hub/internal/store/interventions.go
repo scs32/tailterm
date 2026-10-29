@@ -17,7 +17,9 @@ import (
 var ErrInterventionForbidden = errors.New("only the owner can record an owner intervention")
 
 // Interventions are insert-only. The triggers keep them that way even for
-// code that bypasses the store's methods.
+// code that bypasses the store's methods. The actor column is last because
+// migrate adds it to older databases with ADD COLUMN; rows recorded before it
+// existed read 'unknown' from its default, and no row is ever rewritten.
 const ownerInterventionsSchema = `
 CREATE TABLE IF NOT EXISTS owner_interventions (
   message_seq INTEGER PRIMARY KEY,
@@ -28,6 +30,7 @@ CREATE TABLE IF NOT EXISTS owner_interventions (
   product_task_id TEXT NOT NULL DEFAULT '',
   product_item_id TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
+  actor TEXT NOT NULL DEFAULT 'unknown' CHECK(actor IN ('owner','helper','unknown')),
   UNIQUE(task_id,message_seq),
   FOREIGN KEY(task_id,message_seq) REFERENCES messages(task_id,seq)
 );
@@ -39,9 +42,9 @@ BEGIN SELECT RAISE(ABORT,'owner interventions are immutable'); END;`
 
 func insertIntervention(ctx context.Context, tx *sql.Tx, message *api.Message, record api.Intervention) error {
 	if _, err := tx.ExecContext(ctx, `INSERT INTO owner_interventions
-(message_seq,task_id,kind,item_task_id,item_id,product_task_id,product_item_id,created_at)
-VALUES(?,?,?,?,?,?,?,?)`, message.Seq, message.TaskID, record.Kind, record.ItemTaskID, record.ItemID,
-		record.ProductTaskID, record.ProductItemID, ts(message.CreatedAt)); err != nil {
+(message_seq,task_id,kind,item_task_id,item_id,product_task_id,product_item_id,created_at,actor)
+VALUES(?,?,?,?,?,?,?,?,?)`, message.Seq, message.TaskID, record.Kind, record.ItemTaskID, record.ItemID,
+		record.ProductTaskID, record.ProductItemID, ts(message.CreatedAt), record.Actor); err != nil {
 		return err
 	}
 	copy := record
@@ -86,7 +89,10 @@ func (s *Store) CreateIntervention(ctx context.Context, taskID string, req api.C
 	if err != nil {
 		return api.Message{}, err
 	}
-	record := api.Intervention{Kind: req.Kind, ItemTaskID: item.TaskID, ItemID: item.ID}
+	record := api.Intervention{Kind: req.Kind, ItemTaskID: item.TaskID, ItemID: item.ID, Actor: req.Actor}
+	if record.Actor == "" {
+		record.Actor = api.InterventionActorUnknown
+	}
 	// The product item usually lives in the product's home project.
 	if req.ProductItemID != "" {
 		err = tx.QueryRowContext(ctx, `SELECT task_id FROM work_items WHERE id=?`, req.ProductItemID).Scan(&record.ProductTaskID)
@@ -199,8 +205,16 @@ WHERE task_id=? AND message_seq>? ORDER BY message_seq LIMIT ?`, taskID, after, 
 }
 
 func (s *Store) interventionSummary(ctx context.Context, taskID string, loc *time.Location) (api.InterventionSummary, error) {
-	summary := api.InterventionSummary{TimeZone: loc.String(), ByKind: map[string]int{}, Days: []api.InterventionDay{}, Unlinked: []api.InterventionRef{}}
-	rows, err := s.db.QueryContext(ctx, `SELECT message_seq,kind,item_id,product_item_id,created_at
+	summary := api.InterventionSummary{TimeZone: loc.String(), ByKind: map[string]int{}, ByActor: map[string]int{},
+		Windows: make([]api.InterventionWindow, len(api.InterventionWindowHours)), Days: []api.InterventionDay{}, Unlinked: []api.InterventionRef{}}
+	// A window holds the rows recorded strictly after now minus its hours.
+	now := s.now()
+	since := make([]time.Time, len(api.InterventionWindowHours))
+	for i, hours := range api.InterventionWindowHours {
+		summary.Windows[i] = api.InterventionWindow{Hours: hours, ByActor: map[string]int{}}
+		since[i] = now.Add(-time.Duration(hours) * time.Hour)
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT message_seq,kind,item_id,product_item_id,actor,created_at
 FROM owner_interventions WHERE task_id=? ORDER BY message_seq DESC`, taskID)
 	if err != nil {
 		return summary, err
@@ -210,19 +224,28 @@ FROM owner_interventions WHERE task_id=? ORDER BY message_seq DESC`, taskID)
 	for rows.Next() {
 		var ref api.InterventionRef
 		var created string
-		if err := rows.Scan(&ref.Seq, &ref.Kind, &ref.ItemID, &ref.ProductItemID, &created); err != nil {
+		if err := rows.Scan(&ref.Seq, &ref.Kind, &ref.ItemID, &ref.ProductItemID, &ref.Actor, &created); err != nil {
 			return summary, err
 		}
-		ref.Day = parseTS(created).In(loc).Format("2006-01-02")
+		at := parseTS(created)
+		ref.Day = at.In(loc).Format("2006-01-02")
 		day := days[ref.Day]
 		if day == nil {
-			day = &api.InterventionDay{Day: ref.Day, ByKind: map[string]int{}}
+			day = &api.InterventionDay{Day: ref.Day, ByKind: map[string]int{}, ByActor: map[string]int{}}
 			days[ref.Day] = day
 		}
 		summary.Total++
 		day.Total++
 		summary.ByKind[ref.Kind]++
 		day.ByKind[ref.Kind]++
+		summary.ByActor[ref.Actor]++
+		day.ByActor[ref.Actor]++
+		for i := range summary.Windows {
+			if at.After(since[i]) {
+				summary.Windows[i].Total++
+				summary.Windows[i].ByActor[ref.Actor]++
+			}
+		}
 		if ref.ProductItemID != "" {
 			summary.Linked++
 			day.Linked++

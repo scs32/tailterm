@@ -99,7 +99,16 @@ func TestOwnerIDValidationDoesNotWidenSharedValidID(t *testing.T) {
 	}
 }
 
+// plainTerminal clears the runtime session variables: the tests themselves
+// usually run inside Claude Code or Codex.
+func plainTerminal(t *testing.T) {
+	t.Helper()
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "")
+	t.Setenv("CODEX_THREAD_ID", "")
+}
+
 func TestOwnerInterveneRecordsAndListsInterventions(t *testing.T) {
+	plainTerminal(t)
 	e, c, task, _ := cliWorkItemFixture(t)
 	e.agent, e.agentName = "", "" // the owner CLI has no agent identity
 	ctx := context.Background()
@@ -118,7 +127,7 @@ func TestOwnerInterveneRecordsAndListsInterventions(t *testing.T) {
 	out, err := captureCLIOutput(t, func() error {
 		return cmdOwner(e, []string{"intervene", "--kind", "nudge", "--item", item.ID, "--product-item", product.ID, "--text", "Nudged the stalled builder"})
 	})
-	if err != nil || !strings.HasPrefix(out, "intervention #") || !strings.Contains(out, "nudge on "+item.ID+" (product fix "+product.ID+")") {
+	if err != nil || !strings.HasPrefix(out, "intervention #") || !strings.Contains(out, "nudge on "+item.ID+" by owner (product fix "+product.ID+")") {
 		t.Fatalf("intervene output %q: %v", out, err)
 	}
 	messages, err := c.ListMessages(ctx, task.ID, 0, "", 50)
@@ -126,7 +135,7 @@ func TestOwnerInterveneRecordsAndListsInterventions(t *testing.T) {
 		t.Fatalf("board: %+v %v", messages, err)
 	}
 	m := messages[0]
-	want := api.Intervention{Kind: "nudge", ItemTaskID: task.ID, ItemID: item.ID, ProductTaskID: home.ID, ProductItemID: product.ID}
+	want := api.Intervention{Kind: "nudge", ItemTaskID: task.ID, ItemID: item.ID, ProductTaskID: home.ID, ProductItemID: product.ID, Actor: "owner"}
 	wantLinks := []api.MessageWorkItem{{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, Relationship: "primary"}}
 	if m.Intervention == nil || *m.Intervention != want || !reflect.DeepEqual(m.WorkItems, wantLinks) || m.From.AgentID != "" || m.From.User != "owner" {
 		t.Fatalf("recorded message: %+v", m)
@@ -143,7 +152,7 @@ func TestOwnerInterveneRecordsAndListsInterventions(t *testing.T) {
 		t.Fatal(err)
 	}
 	out, err = captureCLIOutput(t, func() error { return cmdOwner(e, []string{"interventions", "--tz", "UTC"}) })
-	if err != nil || !strings.Contains(out, "2 interventions (UTC); 1 of 2 linked to a product item") || !strings.Contains(out, "by kind: release 1, nudge 1") || !strings.Contains(out, "unlinked:") || !strings.Contains(out, "release  "+item.ID) {
+	if err != nil || !strings.Contains(out, "2 interventions (UTC); 1 of 2 linked to a product item") || !strings.Contains(out, "by kind: release 1, nudge 1") || !strings.Contains(out, "unlinked:") || !strings.Contains(out, "owner  release  "+item.ID) || !strings.Contains(out, "by actor: owner 2, helper 0, unknown 0") {
 		t.Fatalf("interventions output %q: %v", out, err)
 	}
 	if err = cmdOwner(e, []string{"interventions", "--tz", "Mars/Olympus"}); err == nil {
@@ -152,6 +161,7 @@ func TestOwnerInterveneRecordsAndListsInterventions(t *testing.T) {
 }
 
 func TestOwnerInterveneRefusesAgentsAndBadInputBeforeAnyRequest(t *testing.T) {
+	plainTerminal(t)
 	var requests atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests.Add(1)
@@ -185,6 +195,7 @@ func TestOwnerInterveneRefusesAgentsAndBadInputBeforeAnyRequest(t *testing.T) {
 
 // The owner's shell has no TAILTERM_TASK, so the usage must name --task.
 func TestOwnerInterventionUsageNamesTaskWhenNoProjectIsSet(t *testing.T) {
+	plainTerminal(t)
 	var requests atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests.Add(1)
@@ -212,5 +223,133 @@ func TestOwnerInterventionUsageNamesTaskWhenNoProjectIsSet(t *testing.T) {
 	// With --task the same command reaches the hub.
 	if err := cmdOwner(owner, []string{"interventions", "--task", "tsk_0000000000000001", "--tz", "UTC"}); err == nil || requests.Load() != 1 {
 		t.Fatalf("explicit --task: err=%v requests=%d", err, requests.Load())
+	}
+}
+
+// A plain terminal is the owner in person; a Claude Code or Codex session must
+// say whether it records the owner's act or its own.
+func TestOwnerInterveneActorFollowsSession(t *testing.T) {
+	plainTerminal(t)
+	var requests atomic.Int32
+	refusing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		http.Error(w, "unexpected request", http.StatusTeapot)
+	}))
+	t.Cleanup(refusing.Close)
+	offline := env{hub: refusing.URL, task: "tsk_0000000000000001"}
+	args := func(extra ...string) []string {
+		return append([]string{"intervene", "--kind", "decision-on-behalf", "--item", "wi_0000000000000001", "--text", "Chose the release window"}, extra...)
+	}
+	refuse := func(name string, a []string, want string) {
+		t.Helper()
+		if err := cmdOwner(offline, a); err == nil || !strings.Contains(err.Error(), want) || !strings.Contains(err.Error(), "usage: tt owner intervene") {
+			t.Fatalf("%s: err=%v, want %q", name, err, want)
+		}
+	}
+	refuse("plain terminal claims helper", args("--actor", "helper"), "a plain terminal records the owner in person")
+	refuse("bogus actor", args("--actor", "bogus"), "--actor must be owner or helper")
+	refuse("explicit unknown", args("--actor", "unknown"), "--actor must be owner or helper")
+	for _, v := range []string{"CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"} {
+		t.Setenv(v, "session-under-test")
+		refuse(v+" without --actor", args(), "pass --actor owner when recording what the owner did in person, or --actor helper")
+		refuse(v+" bogus actor", args("--actor", "bogus"), "--actor must be owner or helper")
+		t.Setenv(v, "")
+	}
+	if n := requests.Load(); n != 0 {
+		t.Fatalf("refused commands sent %d requests", n)
+	}
+
+	e, c, task, _ := cliWorkItemFixture(t)
+	e.agent, e.agentName = "", ""
+	ctx := context.Background()
+	item, err := c.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "feature", Title: "Actor item", RequestID: "cli-actor-item"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Derived request IDs are per minute; start clear of a minute boundary.
+	if d := time.Until(time.Now().Truncate(time.Minute).Add(time.Minute)); d < 10*time.Second {
+		time.Sleep(d)
+	}
+	record := func(want string, extra ...string) {
+		t.Helper()
+		a := append([]string{"intervene", "--kind", "decision-on-behalf", "--item", item.ID, "--text", "Chose the release window"}, extra...)
+		out, err := captureCLIOutput(t, func() error { return cmdOwner(e, a) })
+		if err != nil || !strings.Contains(out, "decision-on-behalf on "+item.ID+" by "+want+" (no product item)") {
+			t.Fatalf("record %v: %q %v", extra, out, err)
+		}
+	}
+	record("owner")                     // plain terminal, no flag
+	record("owner", "--actor", "owner") // same minute, same actor: a retry, not a record
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "session-under-test")
+	record("helper", "--actor", "helper") // same text and minute, other actor: a new record
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "")
+	t.Setenv("CODEX_THREAD_ID", "session-under-test")
+	record("owner", "--actor", "owner")
+	messages, err := c.ListMessages(ctx, task.ID, 0, "", 50)
+	if err != nil || len(messages) != 2 {
+		t.Fatalf("board: %d messages %v", len(messages), err)
+	}
+	var actors []string
+	for _, m := range messages {
+		actors = append(actors, m.Intervention.Actor)
+	}
+	if !reflect.DeepEqual(actors, []string{"owner", "helper"}) {
+		t.Fatalf("recorded actors = %v", actors)
+	}
+}
+
+func TestOwnerInterventionsPrintsActorSplit(t *testing.T) {
+	plainTerminal(t)
+	e, c, task, _ := cliWorkItemFixture(t)
+	e.agent, e.agentName = "", ""
+	ctx := context.Background()
+	item, err := c.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "feature", Title: "Split item", RequestID: "cli-split-item"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = c.CreateIntervention(ctx, task.ID, api.CreateInterventionRequest{Kind: "nudge", ItemID: item.ID, Text: "Owner nudge", RequestID: "split-owner", Actor: "owner"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = c.CreateIntervention(ctx, task.ID, api.CreateInterventionRequest{Kind: "cleanup", ItemID: item.ID, Text: "Helper cleanup", RequestID: "split-helper", Actor: "helper"}); err != nil {
+		t.Fatal(err)
+	}
+	out, err := captureCLIOutput(t, func() error { return cmdOwner(e, []string{"interventions", "--task", task.ID, "--tz", "UTC"}) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"by actor: owner 1, helper 1, unknown 0\n",
+		"last 6 h: 2 (owner 1, helper 1, unknown 0)\n",
+		"last 24 h: 2 (owner 1, helper 1, unknown 0)\n",
+		"  2  linked 0  owner 1  helper 1  unknown 0  nudge 1, cleanup 1\n",
+		"  helper  cleanup  " + item.ID,
+		"  owner  nudge  " + item.ID,
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("output lacks %q:\n%s", want, out)
+		}
+	}
+}
+
+// A hub older than the actor sends no byActor or windows: the split is
+// unavailable, never shown as zeros.
+func TestOwnerInterventionsSaysActorSplitUnavailableOnOlderHub(t *testing.T) {
+	plainTerminal(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"interventions":[],"summary":{"timeZone":"UTC","total":1,"linked":0,"byKind":{"nudge":1},` +
+			`"days":[{"day":"2026-10-28","total":1,"linked":0,"byKind":{"nudge":1}}],` +
+			`"unlinked":[{"seq":7,"kind":"nudge","itemId":"wi_0000000000000001","day":"2026-10-28"}]}}`))
+	}))
+	t.Cleanup(srv.Close)
+	out, err := captureCLIOutput(t, func() error {
+		return cmdOwner(env{hub: srv.URL}, []string{"interventions", "--task", "tsk_0000000000000001", "--tz", "UTC"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "by actor: unavailable") || strings.Contains(out, "owner 0") || strings.Contains(out, "last 6 h") ||
+		!strings.Contains(out, "2026-10-28    1  linked 0  nudge 1\n") || !strings.Contains(out, "  #7  2026-10-28  nudge  wi_0000000000000001\n") {
+		t.Fatalf("older hub output:\n%s", out)
 	}
 }

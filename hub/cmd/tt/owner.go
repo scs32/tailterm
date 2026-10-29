@@ -35,7 +35,7 @@ func cmdOwner(e env, args []string) error {
 	if len(args) > 0 && args[0] == "delegation" {
 		return cmdOwnerDelegation(e, args[1:])
 	}
-	usage := errors.New("usage: tt owner extend OBLIGATION_ID --for 30m [--reason T] | answer OBLIGATION_ID (--text T | --approve) [--session S | --rationale R] | delegation open|close|list ... | delegate OBLIGATION_ID --session S --authorization REF [--agent ID --run ID] | cancel OBLIGATION_ID --reason T | intervene --task ID --kind KIND --item ID [--product-item ID] --text T | interventions --task ID [--tz ZONE]")
+	usage := errors.New("usage: tt owner extend OBLIGATION_ID --for 30m [--reason T] | answer OBLIGATION_ID (--text T | --approve) [--session S | --rationale R] | delegation open|close|list ... | delegate OBLIGATION_ID --session S --authorization REF [--agent ID --run ID] | cancel OBLIGATION_ID --reason T | intervene --task ID --kind KIND --item ID [--product-item ID] --text T [--actor owner|helper] | interventions --task ID [--tz ZONE]")
 	if len(args) < 2 {
 		return usage
 	}
@@ -106,7 +106,7 @@ func cmdOwner(e env, args []string) error {
 	return nil
 }
 
-const interventionUsage = "usage: tt owner intervene --task ID --kind KIND --item ID [--product-item ID] --text T [--request-id R] [--json]\n  --task is the project ID; required unless TAILTERM_TASK is set\n  KIND is one of "
+const interventionUsage = "usage: tt owner intervene --task ID --kind KIND --item ID [--product-item ID] --text T [--actor owner|helper] [--request-id R] [--json]\n  --task is the project ID; required unless TAILTERM_TASK is set\n  --actor is who performed the act: required inside a Claude Code or Codex session, owner otherwise\n  KIND is one of "
 
 // cmdOwnerIntervene records one owner-side intervention on the Board.
 func cmdOwnerIntervene(e env, args []string) error {
@@ -117,6 +117,7 @@ func cmdOwnerIntervene(e env, args []string) error {
 	item := fs.String("item", "", "the work item the intervention concerns (this project)")
 	product := fs.String("product-item", "", "the product item expected to remove this intervention (any project)")
 	text := fs.String("text", "", "what the owner did and why")
+	actor := fs.String("actor", "", "who performed the act: owner or helper; required inside a Claude Code or Codex session")
 	requestID := fs.String("request-id", "", "stable retry key (default: derived per minute)")
 	asJSON := fs.Bool("json", false, "print the recorded message as JSON")
 	if err := fs.Parse(args); err != nil {
@@ -125,13 +126,17 @@ func cmdOwnerIntervene(e env, args []string) error {
 	if fs.NArg() != 0 || *task == "" {
 		return usage
 	}
-	req := api.CreateInterventionRequest{Kind: *kind, ItemID: *item, ProductItemID: *product, Text: *text, RequestID: *requestID}
+	who, err := interventionActor(*actor)
+	if err != nil {
+		return fmt.Errorf("%v\n%v", err, usage)
+	}
+	req := api.CreateInterventionRequest{Kind: *kind, ItemID: *item, ProductItemID: *product, Text: *text, RequestID: *requestID, Actor: who}
 	if err := api.ValidateIntervention(req); err != nil {
 		return fmt.Errorf("%v\n%v", err, usage)
 	}
 	if req.RequestID == "" {
 		scope := time.Now().UTC().Truncate(time.Minute).Format(time.RFC3339)
-		digest := sha256.Sum256([]byte(req.Kind + "\x00" + req.ItemID + "\x00" + req.ProductItemID + "\x00" + req.Text + "\x00" + scope))
+		digest := sha256.Sum256([]byte(req.Kind + "\x00" + req.ItemID + "\x00" + req.ProductItemID + "\x00" + req.Text + "\x00" + req.Actor + "\x00" + scope))
 		req.RequestID = fmt.Sprintf("owner-intervene-%x", digest[:12])
 	}
 	c, err := e.client(10 * time.Second)
@@ -152,11 +157,36 @@ func cmdOwnerIntervene(e env, args []string) error {
 	if m.Intervention != nil && m.Intervention.ProductItemID != "" {
 		link = "product fix " + m.Intervention.ProductItemID
 	}
-	fmt.Printf("intervention #%d recorded: %s on %s (%s)\n", m.Seq, req.Kind, req.ItemID, link)
+	recorded := req.Actor
+	if m.Intervention != nil && m.Intervention.Actor != "" {
+		recorded = m.Intervention.Actor
+	}
+	fmt.Printf("intervention #%d recorded: %s on %s by %s (%s)\n", m.Seq, req.Kind, req.ItemID, recorded, link)
 	return nil
 }
 
-// cmdOwnerInterventions prints the project's per-day and per-kind counts.
+// interventionActor resolves who performed the act being recorded. A plain
+// terminal is the owner in person and may not claim helper. A Claude Code or
+// Codex session records both its own acts and the owner's own orders, so it
+// must say which; defaulting to helper would undercount the owner. The flag
+// is a self-declared label checked against the session class, not proof.
+func interventionActor(flagValue string) (string, error) {
+	if flagValue != "" && !api.ValidInterventionActor(flagValue) {
+		return "", errors.New("--actor must be owner or helper")
+	}
+	if os.Getenv("CLAUDE_CODE_SESSION_ID") == "" && os.Getenv("CODEX_THREAD_ID") == "" {
+		if flagValue == "helper" {
+			return "", errors.New("--actor helper needs a Claude Code or Codex session; a plain terminal records the owner in person")
+		}
+		return "owner", nil
+	}
+	if flagValue == "" {
+		return "", errors.New("this is a Claude Code or Codex session: pass --actor owner when recording what the owner did in person, or --actor helper for what this session did")
+	}
+	return flagValue, nil
+}
+
+// cmdOwnerInterventions prints the project's per-day, per-kind and per-actor counts.
 func cmdOwnerInterventions(e env, args []string) error {
 	fs := flag.NewFlagSet("owner interventions", flag.ContinueOnError)
 	task := fs.String("task", e.task, "project id")
@@ -197,16 +227,44 @@ func cmdOwnerInterventions(e env, args []string) error {
 		return nil
 	}
 	fmt.Printf("by kind: %s\n", formatKindCounts(s.ByKind))
+	// A hub older than the actor sends no byActor; its split is unknown, not zero.
+	split := s.ByActor != nil
+	if split {
+		fmt.Printf("by actor: %s\n", formatActorCounts(s.ByActor, ", "))
+		for _, w := range s.Windows {
+			fmt.Printf("last %d h: %d (%s)\n", w.Hours, w.Total, formatActorCounts(w.ByActor, ", "))
+		}
+	} else {
+		fmt.Println("by actor: unavailable (this hub does not record who acted)")
+	}
 	for _, day := range s.Days {
-		fmt.Printf("%s  %3d  linked %d  %s\n", day.Day, day.Total, day.Linked, formatKindCounts(day.ByKind))
+		actors := ""
+		if split {
+			actors = formatActorCounts(day.ByActor, "  ") + "  "
+		}
+		fmt.Printf("%s  %3d  linked %d  %s%s\n", day.Day, day.Total, day.Linked, actors, formatKindCounts(day.ByKind))
 	}
 	if len(s.Unlinked) > 0 {
 		fmt.Println("unlinked:")
 		for _, ref := range s.Unlinked {
-			fmt.Printf("  #%d  %s  %s  %s\n", ref.Seq, ref.Day, ref.Kind, ref.ItemID)
+			if split {
+				fmt.Printf("  #%d  %s  %s  %s  %s\n", ref.Seq, ref.Day, ref.Actor, ref.Kind, ref.ItemID)
+			} else {
+				fmt.Printf("  #%d  %s  %s  %s\n", ref.Seq, ref.Day, ref.Kind, ref.ItemID)
+			}
 		}
 	}
 	return nil
+}
+
+// formatActorCounts lists every actor, zeros included, owner first.
+func formatActorCounts(counts map[string]int, sep string) string {
+	actors := append(append([]string{}, api.InterventionActors...), api.InterventionActorUnknown)
+	parts := make([]string, 0, len(actors))
+	for _, actor := range actors {
+		parts = append(parts, fmt.Sprintf("%s %d", actor, counts[actor]))
+	}
+	return strings.Join(parts, sep)
 }
 
 // formatKindCounts lists kinds in the fixed vocabulary order.

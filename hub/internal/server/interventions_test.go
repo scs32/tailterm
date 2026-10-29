@@ -32,7 +32,7 @@ func TestInterventionHTTPCreateReplayAndRejections(t *testing.T) {
 	if code := c.do("POST", path, req, &created); code != 201 || created.Intervention == nil || created.PostReceipt == nil {
 		t.Fatalf("create = %d %+v", code, created)
 	}
-	want := api.Intervention{Kind: "nudge", ItemTaskID: task.ID, ItemID: item.ID, ProductTaskID: home.ID, ProductItemID: product.ID}
+	want := api.Intervention{Kind: "nudge", ItemTaskID: task.ID, ItemID: item.ID, ProductTaskID: home.ID, ProductItemID: product.ID, Actor: "unknown"}
 	wantLinks := []api.MessageWorkItem{{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, Relationship: "primary"}}
 	if *created.Intervention != want || created.From != (api.Sender{Node: c.who.Node, User: c.who.User}) || !reflect.DeepEqual(created.WorkItems, wantLinks) {
 		t.Fatalf("created = %+v", created)
@@ -61,6 +61,8 @@ func TestInterventionHTTPCreateReplayAndRejections(t *testing.T) {
 		{"other project item", func(r *api.CreateInterventionRequest) { r.ItemID = otherItem.ID }, 404},
 		{"unknown product item", func(r *api.CreateInterventionRequest) { r.ProductItemID = "wi_0000000000000001" }, 404},
 		{"agent identity", func(r *api.CreateInterventionRequest) { r.AgentID = "agt_0000000000000001" }, 403},
+		{"unknown actor", func(r *api.CreateInterventionRequest) { r.Actor = "robot" }, 400},
+		{"requested unknown actor", func(r *api.CreateInterventionRequest) { r.Actor = "unknown" }, 400},
 	} {
 		bad := req
 		bad.RequestID = "http-reject-" + strings.ReplaceAll(tc.name, " ", "-")
@@ -74,6 +76,18 @@ func TestInterventionHTTPCreateReplayAndRejections(t *testing.T) {
 	}
 	board = api.MessageList{}
 	if code := c.do("GET", "/v1/tasks/"+task.ID+"/messages", nil, &board); code != 200 || len(board.Messages) != 1 {
+		t.Fatalf("rejections wrote messages: %d %+v", code, board)
+	}
+
+	// The actor round-trips on create and on the Board read.
+	helper := req
+	helper.RequestID, helper.Actor = "http-helper", "helper"
+	var byHelper api.Message
+	if code := c.do("POST", path, helper, &byHelper); code != 201 || byHelper.Intervention == nil || byHelper.Intervention.Actor != "helper" {
+		t.Fatalf("helper create = %d %+v", code, byHelper.Intervention)
+	}
+	board = api.MessageList{}
+	if code := c.do("GET", "/v1/tasks/"+task.ID+"/messages", nil, &board); code != 200 || len(board.Messages) != 2 || board.Messages[1].Intervention == nil || board.Messages[1].Intervention.Actor != "helper" {
 		t.Fatalf("rejections wrote messages: %d %+v", code, board)
 	}
 

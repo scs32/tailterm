@@ -16,6 +16,18 @@ import (
 // InterventionKinds is the fixed vocabulary shared by the CLI, hub and UI.
 var InterventionKinds = []string{"release", "nudge", "decision-on-behalf", "gate-fix", "cleanup", "diagnosis", "status", "other"}
 
+// InterventionActors are the actors a request may name: the owner in person,
+// or the owner helper or another session acting for the owner. Rows recorded
+// before the actor existed, and requests that name none, read
+// InterventionActorUnknown.
+var InterventionActors = []string{"owner", "helper"}
+
+const InterventionActorUnknown = "unknown"
+
+// InterventionWindowHours are the trailing windows the summary counts, measured
+// back from the hub's clock at read time.
+var InterventionWindowHours = []int{6, 24}
+
 // MaxInterventionPage bounds one page of intervention messages.
 const MaxInterventionPage = 100
 
@@ -28,10 +40,13 @@ type Intervention struct {
 	ItemID        string `json:"itemId"`
 	ProductTaskID string `json:"productTaskId,omitempty"`
 	ProductItemID string `json:"productItemId,omitempty"`
+	Actor         string `json:"actor,omitempty"`
 }
 
 // CreateInterventionRequest is owner-only: a request that carries an agent
-// identity is refused rather than recorded.
+// identity is refused rather than recorded. Actor is owner or helper; empty
+// records unknown. It is omitted when empty so a request recorded before the
+// field existed keeps its payload hash and still replays.
 type CreateInterventionRequest struct {
 	Kind          string `json:"kind"`
 	ItemID        string `json:"itemId"`
@@ -39,6 +54,7 @@ type CreateInterventionRequest struct {
 	Text          string `json:"text"`
 	RequestID     string `json:"requestId"`
 	AgentID       string `json:"agentId,omitempty"`
+	Actor         string `json:"actor,omitempty"`
 }
 
 // InterventionRef identifies one intervention without its full message.
@@ -47,27 +63,40 @@ type InterventionRef struct {
 	Kind          string `json:"kind"`
 	ItemID        string `json:"itemId"`
 	ProductItemID string `json:"productItemId,omitempty"`
+	Actor         string `json:"actor"`
 	Day           string `json:"day"`
 }
 
 // InterventionDay counts one local calendar day in the summary's time zone.
 type InterventionDay struct {
-	Day    string         `json:"day"`
-	Total  int            `json:"total"`
-	Linked int            `json:"linked"`
-	ByKind map[string]int `json:"byKind"`
+	Day     string         `json:"day"`
+	Total   int            `json:"total"`
+	Linked  int            `json:"linked"`
+	ByKind  map[string]int `json:"byKind"`
+	ByActor map[string]int `json:"byActor"`
+}
+
+// InterventionWindow counts the interventions recorded in the last Hours hours.
+type InterventionWindow struct {
+	Hours   int            `json:"hours"`
+	Total   int            `json:"total"`
+	ByActor map[string]int `json:"byActor"`
 }
 
 // InterventionSummary always covers every intervention in the project, not
-// only the returned page. Days are newest first. Unlinked lists the newest
-// interventions without a product item, up to MaxInterventionPage.
+// only the returned page. Days are newest first. Windows follow
+// InterventionWindowHours. Unlinked lists the newest interventions without a
+// product item, up to MaxInterventionPage. A hub older than the actor sends
+// no ByActor or Windows.
 type InterventionSummary struct {
-	TimeZone string            `json:"timeZone"`
-	Total    int               `json:"total"`
-	Linked   int               `json:"linked"`
-	ByKind   map[string]int    `json:"byKind"`
-	Days     []InterventionDay `json:"days"`
-	Unlinked []InterventionRef `json:"unlinked"`
+	TimeZone string               `json:"timeZone"`
+	Total    int                  `json:"total"`
+	Linked   int                  `json:"linked"`
+	ByKind   map[string]int       `json:"byKind"`
+	ByActor  map[string]int       `json:"byActor"`
+	Windows  []InterventionWindow `json:"windows"`
+	Days     []InterventionDay    `json:"days"`
+	Unlinked []InterventionRef    `json:"unlinked"`
 }
 
 type InterventionList struct {
@@ -85,11 +114,25 @@ func ValidInterventionKind(kind string) bool {
 	return false
 }
 
+// ValidInterventionActor accepts the actors a request may name; unknown is
+// only ever stored, never requested.
+func ValidInterventionActor(actor string) bool {
+	for _, known := range InterventionActors {
+		if actor == known {
+			return true
+		}
+	}
+	return false
+}
+
 // ValidateIntervention checks the request shape shared by CLI and hub. It does
 // not check that the items exist; the store does that inside its transaction.
 func ValidateIntervention(req CreateInterventionRequest) error {
 	if !ValidInterventionKind(req.Kind) {
 		return fmt.Errorf("%w: kind must be one of %s", ErrInvalid, strings.Join(InterventionKinds, ", "))
+	}
+	if req.Actor != "" && !ValidInterventionActor(req.Actor) {
+		return fmt.Errorf("%w: actor must be %s", ErrInvalid, strings.Join(InterventionActors, " or "))
 	}
 	if !ValidID(req.ItemID, "wi") {
 		return fmt.Errorf("%w: item must be a work item ID", ErrInvalid)

@@ -17,7 +17,7 @@ COALESCE(dr.question,''),COALESCE(dr.options,''),COALESCE(dr.recommended_option_
 COALESCE(da.request_seq,0),COALESCE(da.option_id,''),COALESCE(da.text,''),
 COALESCE(m.system_notice_kind,''),COALESCE(m.system_notice_id,''),m.envelope,
 COALESCE(ms.kind,''),COALESCE(ms.source_id,''),COALESCE(ms.user_id,''),
-COALESCE(oi.kind,''),COALESCE(oi.item_task_id,''),COALESCE(oi.item_id,''),COALESCE(oi.product_task_id,''),COALESCE(oi.product_item_id,'')`
+COALESCE(oi.kind,''),COALESCE(oi.item_task_id,''),COALESCE(oi.item_id,''),COALESCE(oi.product_task_id,''),COALESCE(oi.product_item_id,''),COALESCE(oi.actor,'')`
 
 const messageSelectJoins = `
 LEFT JOIN message_work_item_links l ON l.message_seq=m.seq
@@ -54,7 +54,7 @@ func scanMessage(row rowScanner) (api.Message, error) {
 		&decisionAnswer.RequestSeq, &decisionAnswer.OptionID, &decisionAnswer.Text,
 		&systemNoticeKind, &systemNoticeID, &envelope,
 		&source.Kind, &source.ID, &source.UserID,
-		&intervention.Kind, &intervention.ItemTaskID, &intervention.ItemID, &intervention.ProductTaskID, &intervention.ProductItemID,
+		&intervention.Kind, &intervention.ItemTaskID, &intervention.ItemID, &intervention.ProductTaskID, &intervention.ProductItemID, &intervention.Actor,
 	)
 	if err != nil {
 		return message, err
