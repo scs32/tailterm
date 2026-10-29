@@ -1,6 +1,7 @@
 package main
 
 import (
+	"github.com/scs32/tailterm/hub/internal/spawn"
 	"strings"
 	"testing"
 )
@@ -36,13 +37,17 @@ func TestPermissionModesPreserveDefaultsAndBoundExplicitModes(t *testing.T) {
 	}
 }
 
-func TestClaudeLaunchesDisallowInteractiveQuestions(t *testing.T) {
-	const rule = "'--disallowedTools=AskUserQuestion'"
+func TestClaudeLaunchesDisallowTerminalDialogs(t *testing.T) {
+	const rule = "'--disallowedTools=AskUserQuestion,EnterPlanMode,ExitPlanMode'"
 	for _, mode := range []string{"", "acceptEdits", "auto", "dontAsk", "bypassPermissions"} {
 		for _, allowed := range [][]string{nil, {"Read", "Bash(tt *)"}} {
 			got, e := permissionCommand("claude", "claude", mode, "/work", allowed)
-			if e != nil || strings.Count(got, rule) != 1 {
+			if e != nil || strings.Count(got, rule) != 1 || strings.Count(got, "disallowedTools") != 1 || !strings.HasSuffix(got, " "+rule) {
 				t.Fatalf("mode %q allowed %v: %q %v", mode, allowed, got, e)
+			}
+			// The briefing follows a self-contained token, never a bare variadic flag.
+			if cmd := got + " " + spawn.ShellQuote("brief me"); !strings.HasSuffix(cmd, rule+" 'brief me'") {
+				t.Fatalf("mode %q allowed %v: briefing not positional: %q", mode, allowed, cmd)
 			}
 		}
 	}

@@ -9,9 +9,10 @@ import (
 )
 
 // Nobody reads a spawned agent's terminal, so agents ask the owner with tt ask
-// and teammates with tt send --kind question (wi_2c46d9d964b335da). The single
+// and teammates with tt send --kind question (wi_2c46d9d964b335da), and a
+// plan-approval dialog would wait for ever (wi_eb3bf0540db3421b). The single
 // token keeps Claude's variadic flag from consuming the positional briefing.
-const claudeDisallowQuestions = "--disallowedTools=AskUserQuestion"
+const claudeDisallowDialogs = "--disallowedTools=AskUserQuestion,EnterPlanMode,ExitPlanMode"
 
 var permissionFlag = regexp.MustCompile(`(^|\s)(--sandbox|--ask-for-approval|--permission-mode|--dangerously-bypass-approvals-and-sandbox|--dangerously-skip-permissions|-s|-a)(=|\s|$)`)
 
@@ -98,7 +99,7 @@ func permissionCommand(command, runtime, mode, cwd string, allowed []string, ind
 		for _, rule := range allowed {
 			args = append(args, "--allowedTools", rule)
 		}
-		args = append(args, claudeDisallowQuestions)
+		args = append(args, claudeDisallowDialogs)
 	default:
 		if mode != "" || approvalMode != "" || sandboxMode != "" {
 			return "", fmt.Errorf("permission presets are supported for Codex and Claude Code only")
