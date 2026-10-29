@@ -34,7 +34,7 @@ const teamQueueUsage = "usage: tt team queue add|list|policy|limit|provision|sco
 
 // teamQueueWaitUsage is the shared-path wait command (docs/project-queue.md,
 // "Team queue shared-path waits").
-const teamQueueWaitUsage = "usage: tt team queue wait set --entry tqe_WAITING --on tqe_PREDECESSOR --owns PATH [--owns PATH...] --until accepted|done|released\n       tt team queue wait set --entry tqe_WAITING --on tqe_PREDECESSOR --reason TEXT --until accepted|done|released\n       tt team queue wait clear --entry tqe_WAITING --on tqe_PREDECESSOR [--reason TEXT]"
+const teamQueueWaitUsage = "usage: tt team queue wait set --entry tqe_WAITING --on tqe_PREDECESSOR --owns PATH [--owns PATH...] --until accepted|done|released [--resume handler]\n       tt team queue wait set --entry tqe_WAITING --on tqe_PREDECESSOR --reason TEXT --until accepted|done|released [--resume handler]\n       tt team queue wait clear --entry tqe_WAITING --on tqe_PREDECESSOR [--reason TEXT]"
 
 // parseQueueLimit reads --limit: none (no fixed cap, stored as 0) or N >= 1.
 func parseQueueLimit(raw string) (int, bool) {
@@ -260,6 +260,7 @@ func cmdTeamQueue(e env, args []string) error {
 	reason := fs.String("reason", "", "fail: why the owner is failing this entry; wait set: why a wait that shares no path pauses; wait clear: why the wait is cleared")
 	waitOn := fs.String("on", "", "wait: the predecessor queue entry ID")
 	waitUntil := fs.String("until", "", "wait set: the condition, accepted, done or released")
+	waitResume := fs.String("resume", "", "wait set: handler, when the team stays paused until the database handler resumes it; omit for an automatic resume")
 	source := fs.Int64("source", 0, "rebind: the amendment's message sequence")
 	policyVersion := fs.Int64("policy-version", 0, "owner host policy version")
 	policyExpires := fs.String("expires", "", "host policy expiry in RFC3339")
@@ -280,6 +281,9 @@ func cmdTeamQueue(e env, args []string) error {
 	if sub != "wait" && (*waitOn != "" || *waitUntil != "") {
 		return errors.New("--on and --until apply only to tt team queue wait")
 	}
+	if sub != "wait" && *waitResume != "" {
+		return errors.New("--resume applies only to tt team queue wait set")
+	}
 	if sub == "wait" {
 		// Checked before any hub call, so a mistyped command costs nothing.
 		ok := validTeamQueueEntryID(*entry) && validTeamQueueEntryID(*waitOn)
@@ -289,9 +293,9 @@ func cmdTeamQueue(e env, args []string) error {
 			if (len(ownership) > 0) == (strings.TrimSpace(*reason) != "") {
 				return errors.New("wait set needs --owns PATH for a shared path, or --reason TEXT for a pause that shares no path, not both\n" + teamQueueWaitUsage)
 			}
-			ok = ok && api.ValidTeamQueueWaitUntil(*waitUntil)
+			ok = ok && api.ValidTeamQueueWaitUntil(*waitUntil) && api.ValidTeamQueueWaitResume(*waitResume)
 		} else {
-			ok = ok && len(ownership) == 0 && *waitUntil == ""
+			ok = ok && len(ownership) == 0 && *waitUntil == "" && *waitResume == ""
 		}
 		if !ok {
 			return errors.New(teamQueueWaitUsage)
@@ -580,7 +584,7 @@ func cmdTeamQueue(e env, args []string) error {
 		// wait is its own record.
 		req.Operation, req.EntryID, req.WaitOnEntryID = "wait_"+waitVerb, *entry, *waitOn
 		if waitVerb == "set" {
-			req.WaitPaths, req.WaitUntil, req.WaitReason = ownership, *waitUntil, *reason
+			req.WaitPaths, req.WaitUntil, req.WaitReason, req.WaitResume = ownership, *waitUntil, *reason, *waitResume
 		} else {
 			req.WaitReason = *reason
 		}

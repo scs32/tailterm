@@ -10,7 +10,10 @@ package store
 // trigger only: it holds no entry out of admission and changes no ownership
 // check. A listing shows waits and never evaluates them. A wait may name a
 // reason instead of paths, for a requested pause that shares no path, such as
-// a quiet host while the predecessor's release runs.
+// a quiet host while the predecessor's release runs. A wait set with resume
+// "handler" keeps its team paused after the met notice: the notice is
+// evidence of the condition only, and the database handler's explicit resume
+// is what restarts the team.
 
 import (
 	"context"
@@ -43,11 +46,31 @@ const teamQueueWaitsSQL = `CREATE TABLE IF NOT EXISTS team_queue_waits(
  met_at TEXT NOT NULL DEFAULT '', met_commit TEXT NOT NULL DEFAULT '', notice_seq INTEGER NOT NULL DEFAULT 0,
  helper_seq INTEGER NOT NULL DEFAULT 0, handler_seq INTEGER NOT NULL DEFAULT 0,
  reason TEXT NOT NULL DEFAULT '', closed_at TEXT NOT NULL DEFAULT '',
+ resume TEXT NOT NULL DEFAULT '' CHECK(resume IN ('','handler')),
  PRIMARY KEY(task_id,entry_id,on_entry_id));
  CREATE INDEX IF NOT EXISTS team_queue_waits_open ON team_queue_waits(task_id) WHERE state IN ('waiting','met','orphaned');`
 
+// migrateTeamQueueWaits creates the wait table and adds the resume column
+// to one created before it. An older row reads as an automatic wait.
+func migrateTeamQueueWaits(tx *sql.Tx) error {
+	if _, err := tx.Exec(teamQueueWaitsSQL); err != nil {
+		return err
+	}
+	var resumeColumn int
+	if err := tx.QueryRow(`SELECT count(*) FROM pragma_table_info('team_queue_waits') WHERE name='resume'`).Scan(&resumeColumn); err != nil {
+		return err
+	}
+	if resumeColumn == 0 {
+		if _, err := tx.Exec(`ALTER TABLE team_queue_waits ADD COLUMN resume TEXT NOT NULL DEFAULT '' CHECK(resume IN ('','handler'))`); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 const (
 	queueWaitMetSubject      = "A shared path this team waited on is now free"
+	queueWaitGatedSubject    = "A queue wait condition is met but the handler must still resume this team"
 	queueWaitOrphanedSubject = "A shared path wait needs a handler decision"
 	queueWaitOverdueSubject  = "A team is idle after its shared path wait was met"
 
@@ -77,6 +100,10 @@ func queueWaitPathsText(paths []string) string {
 // pathless reports a wait that names a reason instead of paths: a requested
 // pause that shares no path.
 func (w queueWaitRow) pathless() bool { return len(w.paths) == 0 }
+
+// gated reports a wait whose team stays paused after the met notice until
+// the database handler resumes it.
+func (w queueWaitRow) gated() bool { return w.resume == api.TeamQueueWaitResumeHandler }
 
 // waitedFor is what a notice says the wait holds: its paths, or a pathless
 // wait's reason.
@@ -146,16 +173,16 @@ func (s *Store) teamQueueWaitAction(ctx context.Context, tx *sql.Tx, t api.Task,
 	if err != nil {
 		return zero, err
 	}
-	var state, until, pathsJSON, savedReason string
-	err = tx.QueryRowContext(ctx, `SELECT state,until,paths_json,reason FROM team_queue_waits WHERE task_id=? AND entry_id=? AND on_entry_id=?`, t.ID, req.EntryID, req.WaitOnEntryID).Scan(&state, &until, &pathsJSON, &savedReason)
+	var state, until, pathsJSON, savedReason, savedResume string
+	err = tx.QueryRowContext(ctx, `SELECT state,until,paths_json,reason,resume FROM team_queue_waits WHERE task_id=? AND entry_id=? AND on_entry_id=?`, t.ID, req.EntryID, req.WaitOnEntryID).Scan(&state, &until, &pathsJSON, &savedReason, &savedResume)
 	exists := err == nil
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return zero, err
 	}
 	switch req.Operation {
 	case "wait_clear":
-		if len(req.WaitPaths) != 0 || req.WaitUntil != "" {
-			return zero, fmt.Errorf("%w: wait clear takes no paths and no condition", api.ErrInvalid)
+		if len(req.WaitPaths) != 0 || req.WaitUntil != "" || req.WaitResume != "" {
+			return zero, fmt.Errorf("%w: wait clear takes no paths, no condition and no resume", api.ErrInvalid)
 		}
 		if len(req.WaitReason) > queueWaitMaxReason || strings.ContainsFunc(req.WaitReason, unicode.IsControl) {
 			return zero, fmt.Errorf("%w: a wait clear reason is one line of at most %d bytes", api.ErrInvalid, queueWaitMaxReason)
@@ -174,6 +201,9 @@ func (s *Store) teamQueueWaitAction(ctx context.Context, tx *sql.Tx, t api.Task,
 		reason := strings.TrimSpace(req.WaitReason)
 		if !api.ValidTeamQueueWaitUntil(req.WaitUntil) {
 			return zero, fmt.Errorf("%w: a wait's condition is accepted, done or released", api.ErrInvalid)
+		}
+		if !api.ValidTeamQueueWaitResume(req.WaitResume) {
+			return zero, fmt.Errorf("%w: a wait's resume is handler, or omitted for an automatic resume", api.ErrInvalid)
 		}
 		paths, err := canonicalQueueOwnership(req.WaitPaths)
 		if err != nil {
@@ -204,7 +234,7 @@ func (s *Store) teamQueueWaitAction(ctx context.Context, tx *sql.Tx, t api.Task,
 		if exists && state != api.TeamQueueWaitCleared {
 			var saved []string
 			_ = json.Unmarshal([]byte(pathsJSON), &saved)
-			if state != api.TeamQueueWaitWaiting || until != req.WaitUntil || !sameQueueWaitPaths(saved, paths) || savedReason != reason {
+			if state != api.TeamQueueWaitWaiting || until != req.WaitUntil || !sameQueueWaitPaths(saved, paths) || savedReason != reason || savedResume != req.WaitResume {
 				return zero, fmt.Errorf("%w: entry %s already has a %s wait on %s; clear it first: tt team queue wait clear --task %s --entry %s --on %s", api.ErrConflict, e.ID, state, req.WaitOnEntryID, t.ID, e.ID, req.WaitOnEntryID)
 			}
 			break // the identical wait is already recorded
@@ -213,8 +243,8 @@ func (s *Store) teamQueueWaitAction(ctx context.Context, tx *sql.Tx, t api.Task,
 		if _, err := tx.ExecContext(ctx, `DELETE FROM team_queue_waits WHERE task_id=? AND entry_id=? AND on_entry_id=?`, t.ID, e.ID, req.WaitOnEntryID); err != nil {
 			return zero, err
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO team_queue_waits(task_id,entry_id,item_id,on_entry_id,on_item_id,paths_json,until,state,set_by,set_at,reason) VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
-			t.ID, e.ID, e.ItemID, req.WaitOnEntryID, onItem, string(encoded), req.WaitUntil, api.TeamQueueWaitWaiting, by, now, reason); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO team_queue_waits(task_id,entry_id,item_id,on_entry_id,on_item_id,paths_json,until,state,set_by,set_at,reason,resume) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
+			t.ID, e.ID, e.ItemID, req.WaitOnEntryID, onItem, string(encoded), req.WaitUntil, api.TeamQueueWaitWaiting, by, now, reason, req.WaitResume); err != nil {
 			return zero, err
 		}
 	default:
@@ -232,7 +262,7 @@ func (s *Store) teamQueueWaitAction(ctx context.Context, tx *sql.Tx, t api.Task,
 // entry is not empty, by waiting entry, oldest first. It is one read of the
 // partial index.
 func openQueueWaits(ctx context.Context, q queryRower, task, entry string) (map[string][]api.TeamQueueWait, error) {
-	rows, err := q.QueryContext(ctx, `SELECT entry_id,on_item_id,on_entry_id,paths_json,until,state,set_at,met_at,met_commit,notice_seq,reason FROM team_queue_waits
+	rows, err := q.QueryContext(ctx, `SELECT entry_id,on_item_id,on_entry_id,paths_json,until,state,set_at,met_at,met_commit,notice_seq,reason,resume FROM team_queue_waits
  WHERE task_id=? AND state IN ('waiting','met','orphaned') AND (?='' OR entry_id=?) ORDER BY set_at,on_entry_id`, task, entry, entry)
 	if err != nil {
 		return nil, err
@@ -242,7 +272,7 @@ func openQueueWaits(ctx context.Context, q queryRower, task, entry string) (map[
 	for rows.Next() {
 		var id, paths string
 		var w api.TeamQueueWait
-		if err := rows.Scan(&id, &w.OnItemID, &w.OnEntryID, &paths, &w.Until, &w.State, &w.SetAt, &w.MetAt, &w.MetCommit, &w.NoticeSeq, &w.Reason); err != nil {
+		if err := rows.Scan(&id, &w.OnItemID, &w.OnEntryID, &paths, &w.Until, &w.State, &w.SetAt, &w.MetAt, &w.MetCommit, &w.NoticeSeq, &w.Reason, &w.Resume); err != nil {
 			return nil, err
 		}
 		if err := json.Unmarshal([]byte(paths), &w.Paths); err != nil {
@@ -291,7 +321,7 @@ type QueueWaitStep struct {
 type queueWaitRow struct {
 	task, entry, item, onEntry, onItem string
 	paths                              []string
-	until, state, reason               string
+	until, state, reason, resume       string
 	metAt, metCommit                   string
 	noticeSeq                          int64
 	// The waiting entry; waitingState is empty when its row is gone.
@@ -392,7 +422,7 @@ func (w queueWaitRow) orphaned() string {
 // retried tick and a restarted hub read the durable state and post nothing
 // twice.
 func (s *Store) QueueWaitSweep(ctx context.Context, now time.Time) ([]QueueWaitStep, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT w.task_id,w.entry_id,w.item_id,w.on_entry_id,w.on_item_id,w.paths_json,w.until,w.state,w.reason,w.met_at,w.met_commit,w.notice_seq,
+	rows, err := s.db.QueryContext(ctx, `SELECT w.task_id,w.entry_id,w.item_id,w.on_entry_id,w.on_item_id,w.paths_json,w.until,w.state,w.reason,w.resume,w.met_at,w.met_commit,w.notice_seq,
  COALESCE(we.state,''),COALESCE(we.released_at,''),COALESCE(we.owner_integration_json,''),la.id IS NOT NULL,
  pe.id IS NOT NULL,COALESCE(pe.state,''),COALESCE(pe.released_at,''),COALESCE(pe.acceptance_json,''),COALESCE(pe.owner_integration_json,''),
  COALESCE(pi.status,''),COALESCE(rj.state,''),COALESCE(rj.record_json,'')
@@ -413,7 +443,7 @@ func (s *Store) QueueWaitSweep(ctx context.Context, now time.Time) ([]QueueWaitS
 	for rows.Next() {
 		var w queueWaitRow
 		var paths string
-		if err := rows.Scan(&w.task, &w.entry, &w.item, &w.onEntry, &w.onItem, &paths, &w.until, &w.state, &w.reason, &w.metAt, &w.metCommit, &w.noticeSeq,
+		if err := rows.Scan(&w.task, &w.entry, &w.item, &w.onEntry, &w.onItem, &paths, &w.until, &w.state, &w.reason, &w.resume, &w.metAt, &w.metCommit, &w.noticeSeq,
 			&w.waitingState, &w.waitingReleased, &w.waitingOwner, &w.hasLead,
 			&w.predExists, &w.predState, &w.predReleased, &w.predAcceptance, &w.predOwner, &w.itemStatus, &w.jobState, &w.jobRecord); err != nil {
 			rows.Close()
@@ -581,12 +611,33 @@ func (s *Store) queueWaitMet(ctx context.Context, w queueWaitRow, commit, kind s
 			text = fmt.Sprintf("Queue entry %s (item %s) waited on item %s (entry %s) until it was %s. That condition is now met. Commit: %s. Paused for: %s. Resume the paused work.",
 				w.entry, w.item, w.onItem, w.onEntry, w.until, shown, w.reason)
 		}
+		subject := queueWaitMetSubject
+		if w.gated() {
+			// The condition is evidence only: the team stays paused until
+			// the handler's explicit resume, so nothing here says to start.
+			subject = queueWaitGatedSubject
+			then := "Once the handler resumes this team, rebase onto the integrated branch before editing these paths."
+			if commit != "" {
+				then = "Once the handler resumes this team, rebase onto that commit before editing these paths."
+			}
+			text = fmt.Sprintf("Queue entry %s (item %s) waited on item %s (entry %s) until it was %s. That condition is now met. Commit: %s. Paths now free: %s. "+
+				"This wait also needs an explicit resume from the database handler: do not start on this notice. %s",
+				w.entry, w.item, w.onItem, w.onEntry, w.until, shown, queueWaitPathsText(w.paths), then)
+			if w.pathless() {
+				text = fmt.Sprintf("Queue entry %s (item %s) waited on item %s (entry %s) until it was %s. That condition is now met. Commit: %s. Paused for: %s. "+
+					"This wait also needs an explicit resume from the database handler: stay paused and do not start on this notice; the handler sends the resume after its own checks.",
+					w.entry, w.item, w.onItem, w.onEntry, w.until, shown, w.reason)
+			}
+		}
 		refs := w.refs("queue_wait")
 		refs["commit"] = queueWaitNoCommit
 		if commit != "" {
 			refs["commit"] = commit
 		}
-		seq, err := s.postQueueWaitNotice(ctx, tx, task, lead, queueWaitMetSubject, text, refs)
+		if w.gated() {
+			refs["resume"] = api.TeamQueueWaitResumeHandler
+		}
+		seq, err := s.postQueueWaitNotice(ctx, tx, task, lead, subject, text, refs)
 		if err != nil {
 			return false, err
 		}
@@ -728,11 +779,18 @@ func (s *Store) queueWaitIdle(ctx context.Context, w queueWaitRow, now time.Time
 		if w.pathless() {
 			held = "Paused for"
 		}
+		action := "Action: wake or message the waiting lead, or find out why the team has not resumed."
+		if w.gated() {
+			action = "Action: this wait needs the database handler's explicit resume: run the gate's checks and send the resume to the waiting lead, or clear the wait."
+		}
 		text := fmt.Sprintf("Queue entry %s (item %s) was told in message %d at %s that its wait on item %s (entry %s) was met (%s, commit %s), and its team has been idle for %d minutes or more since. "+
-			"%s: %s. Action: wake or message the waiting lead, or find out why the team has not resumed. Nothing was restarted or signalled.",
-			w.entry, w.item, w.noticeSeq, w.metAt, w.onItem, w.onEntry, w.until, commit, int(bound/time.Minute), held, w.waitedFor())
+			"%s: %s. %s Nothing was restarted or signalled.",
+			w.entry, w.item, w.noticeSeq, w.metAt, w.onItem, w.onEntry, w.until, commit, int(bound/time.Minute), held, w.waitedFor(), action)
 		refs := w.refs("queue_wait_overdue")
 		refs["notice"] = strconv.FormatInt(w.noticeSeq, 10)
+		if w.gated() {
+			refs["resume"] = api.TeamQueueWaitResumeHandler
+		}
 		var helperSeq, handlerSeq int64
 		if helper.ID != "" {
 			if helperSeq, err = s.postQueueWaitNotice(ctx, tx, task, helper, queueWaitOverdueSubject, text, refs); err != nil {

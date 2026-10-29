@@ -333,7 +333,7 @@ func migrateTeamQueue(db *sql.DB) error {
 			return err
 		}
 	}
-	if _, err := tx.Exec(teamQueueWaitsSQL); err != nil {
+	if err := migrateTeamQueueWaits(tx); err != nil {
 		return err
 	}
 	return tx.Commit()

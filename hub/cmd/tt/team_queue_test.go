@@ -2821,3 +2821,94 @@ func TestTeamQueueCLIRequeueChecksCopiedDirectoryWithoutRepository(t *testing.T)
 		t.Fatalf("attempts after the requeue: %d", n)
 	}
 }
+
+// wi_99ce2fa485c23648 a1: --resume handler records a wait whose team stays
+// paused until the database handler resumes it, shown in the list and its
+// JSON. An unknown value, --resume on clear and --resume outside wait are
+// refused before any hub call.
+func TestTeamQueueWaitCLIHandlerResume(t *testing.T) {
+	f := newTeamFixture(t, true)
+	ctx := context.Background()
+	repo, head := queueGitRepo(t)
+	parallelCLIProject(t, f, "none")
+	second, secondOrder := queueFixtureItem(t, f, "gated-behind")
+	add := func(key, item string, order int64) api.TeamQueueEntry {
+		t.Helper()
+		q, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: key, Operation: "add", ItemID: item, OrderMessageSeq: order, Host: spawn.Host(), Cwd: repo, Repository: filepath.Join(repo, ".git"), BaseCommit: head, Serial: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return q
+	}
+	pred, waiting := add("gate-pred", f.item.ID, f.order), add("gate-waiting", second.ID, secondOrder)
+	run := func(e env, args ...string) (string, error) {
+		t.Helper()
+		return captureCLIOutput(t, func() error { return cmdTeamQueue(e, args) })
+	}
+	// No hub listens here: a refusal that reached it would be a connection error.
+	offline := f.e
+	offline.hub = "http://127.0.0.1:1"
+	for name, c := range map[string]struct {
+		args []string
+		text string
+	}{
+		"an unknown resume":   {[]string{"wait", "set", "--entry", waiting.ID, "--on", pred.ID, "--reason", "quiet host", "--until", "accepted", "--resume", "manual"}, teamQueueWaitUsage},
+		"an empty-ish resume": {[]string{"wait", "set", "--entry", waiting.ID, "--on", pred.ID, "--owns", "hub/a.go", "--until", "accepted", "--resume", "Handler"}, teamQueueWaitUsage},
+		"a resume on clear":   {[]string{"wait", "clear", "--entry", waiting.ID, "--on", pred.ID, "--resume", "handler"}, teamQueueWaitUsage},
+		"a resume on list":    {[]string{"list", "--resume", "handler"}, "--resume applies only to tt team queue wait set"},
+	} {
+		if _, err := run(offline, c.args...); err == nil || !strings.Contains(err.Error(), c.text) {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	if !strings.Contains(teamQueueWaitUsage, "--reason TEXT --until accepted|done|released [--resume handler]") || !strings.Contains(teamQueueWaitUsage, "--owns PATH [--owns PATH...] --until accepted|done|released [--resume handler]") {
+		t.Fatalf("the usage does not name --resume handler: %s", teamQueueWaitUsage)
+	}
+	if got, _ := f.c.GetTeamQueueEntry(ctx, f.task.ID, waiting.ID); len(got.Waits) != 0 {
+		t.Fatalf("a refused set stored a wait: %+v", got.Waits)
+	}
+
+	const gate = "matrix host busy; start on the handler resume"
+	sentence := fmt.Sprintf("waits on %s for %s until accepted, then a handler resume", f.item.ID, gate)
+	handlerEnv := f.e
+	handlerEnv.agent, handlerEnv.runID = f.handler.ID, f.handler.RunID
+	out, err := run(handlerEnv, "wait", "set", "--entry", waiting.ID, "--on", pred.ID, "--reason", gate, "--until", "accepted", "--resume", "handler")
+	if err != nil || out != fmt.Sprintf("wait set %s %s: %s\n", waiting.ID, second.ID, sentence) {
+		t.Fatalf("handler gated wait set: %q %v", out, err)
+	}
+	list, err := run(f.e, "list")
+	if err != nil || !strings.Contains(list, "\n  "+sentence+"\n") {
+		t.Fatalf("list does not print the gated wait: %v\n%s", err, list)
+	}
+	jsonList, err := run(f.e, "list", "--json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded api.TeamQueueList
+	if err := json.Unmarshal([]byte(jsonList), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, q := range decoded.Entries {
+		if q.ID == waiting.ID {
+			found = len(q.Waits) == 1 && q.Waits[0].Resume == "handler" && q.Waits[0].Reason == gate && q.Waits[0].Until == "accepted"
+		}
+	}
+	if !found || !strings.Contains(jsonList, `"resume": "handler"`) {
+		t.Fatalf("json does not carry the resume:\n%s", jsonList)
+	}
+	// The same pair without --resume is a different wait: the hub's conflict.
+	if _, err := run(f.e, "wait", "set", "--entry", waiting.ID, "--on", pred.ID, "--reason", gate, "--until", "accepted"); err == nil || !strings.Contains(err.Error(), "tt team queue wait clear") {
+		t.Fatalf("an automatic repeat of a gated wait: %v", err)
+	}
+	if _, err := run(handlerEnv, "wait", "clear", "--entry", waiting.ID, "--on", pred.ID); err != nil {
+		t.Fatal(err)
+	}
+	// Without --resume the wait is automatic and its JSON has no resume.
+	if _, err := run(f.e, "wait", "set", "--entry", waiting.ID, "--on", pred.ID, "--owns", "hub/a.go", "--until", "done"); err != nil {
+		t.Fatal(err)
+	}
+	if jsonList, err = run(f.e, "list", "--json"); err != nil || strings.Contains(jsonList, `"resume"`) {
+		t.Fatalf("an automatic wait carries a resume: %v\n%s", err, jsonList)
+	}
+}

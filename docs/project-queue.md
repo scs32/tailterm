@@ -755,9 +755,9 @@ of, the note:
 
 ```sh
 tt team queue wait set --entry tqe_WAITING --on tqe_PREDECESSOR \
-  --owns PATH [--owns PATH...] --until accepted|done|released
+  --owns PATH [--owns PATH...] --until accepted|done|released [--resume handler]
 tt team queue wait set --entry tqe_WAITING --on tqe_PREDECESSOR \
-  --reason TEXT --until accepted|done|released
+  --reason TEXT --until accepted|done|released [--resume handler]
 tt team queue wait clear --entry tqe_WAITING --on tqe_PREDECESSOR [--reason TEXT]
 ```
 
@@ -781,19 +781,54 @@ is refused and asks the handler. `--until` names the resume condition:
 
 The hub refuses a wait of an entry on itself, a predecessor that is not an
 entry of this project, a condition outside the three, neither a path nor a
-reason (or both), a reason longer than 500 bytes or of more than one line, and
-a waiting entry that is finished or released. The predecessor's item is read
-from its entry. Setting the identical wait again (same condition, paths and
-reason) changes nothing; a different wait on the same pair of entries is a
-conflict that names `wait clear`. Neither command reads or moves the waiting
-entry's revision.
+reason (or both), a reason longer than 500 bytes or of more than one line, a
+`--resume` other than `handler`, a resume on `wait clear`, and a waiting entry
+that is finished or released. The predecessor's item is read from its entry.
+Setting the identical wait again (same condition, paths, reason and resume)
+changes nothing; a different wait on the same pair of entries is a conflict
+that names `wait clear`. Neither command reads or moves the waiting entry's
+revision.
 
 A wait is a record and a notice trigger only. It does not hold a queued entry
 out of admission and changes no ownership check.
 
+### Handler-gated waits
+
+By default a wait resumes automatically: its met notice tells the lead to
+rebase or to resume the paused work. When the team must not start until the
+handler has made its own checks, such as a fresh matrix host, release ledger
+and latest plan check before a gated admission, the handler sets the wait with
+`--resume handler` (path or pathless alike). The record keeps
+`resume=handler`, so the gate is a typed field rather than words in the reason.
+
+The met condition of a gated wait is evidence only. Its notice to the lead has
+its own subject, names the condition, the commit and the reason or paths, and
+says the wait still needs an explicit resume from the database handler: stay
+paused and do not start on the notice. It never says to resume the paused
+work. The handler resumes the team with its own message after its checks, or
+clears the wait.
+
+These are separate pieces of evidence, and none stands in for another: the
+predecessor's acceptance, done save or release (the condition), a physical
+host's departure or free memory (the handler's own check), the wait's clear,
+and the handler's explicit resume message. An automatic wait-met notice is
+condition evidence only and is never a handler resume. The wait's `resumed`
+state records team activity after the notice, not a handler resume.
+
+Provenance (incident I-50483, `wi_99ce2fa485c23648`): a handler recorded a
+pathless physical matrix-host wait with `--until accepted` as a bookkeeping
+fallback, while keeping a lead-only explicit handler resume. When the
+condition was met, the automatic notice (broker message 50483) repeated the
+reason but ended `Resume the paused work.`. The lead reported treating that as
+sufficient (message 50486) and the matrix run started at 04:41:41Z on
+2026-10-29; no handler resume had been issued. Those messages and that start
+stay as recorded; nothing here makes them authorized prestart evidence. The
+`resume` field exists so the notice no longer contradicts such a gate.
+
 `tt team queue list` prints each open wait under its waiting entry, the JSON
 listing carries it as `waits[]` (`onItemId`, `onEntryId`, `paths`, `until`,
-`state`, `reason`), and the same sentence is appended to the entry's
+`state`, `reason`, and `resume` `"handler"` on a gated wait, left out on an
+automatic one), and the same sentence is appended to the entry's
 `blockReason`, which the queue view shows:
 
 - `waits on ITEM for PATHS until CONDITION` while it waits;
@@ -807,6 +842,12 @@ A pathless wait names its reason where a path wait names its paths:
 commit SHA): resume the work paused for REASON`. The sentence cuts a reason
 to about 300 bytes with `...`; `waits[].reason` keeps it whole and
 `waits[].paths` is `[]`.
+
+A gated wait names the handler resume it still needs: `waits on ITEM for
+HELD until CONDITION, then a handler resume`, then `wait on ITEM met
+(CONDITION, commit SHA): still paused for REASON until the database handler
+resumes it`, or for paths `wait on ITEM met (CONDITION, commit SHA): the
+database handler resumes the team before it edits PATHS`.
 
 The sentence names the first path and then whole paths up to about 300 bytes,
 then `and N more`, so a wait with many paths keeps `blockReason` small (a stall
@@ -830,7 +871,12 @@ a repeated tick or a restarted hub posts nothing twice.
   never the project orchestrator in its place: a waiting entry with no live
   lead yet (it is still queued) keeps waiting and is told once it has one.
   For a pathless wait the notice says `Paused for: REASON` and to resume the
-  paused work, in place of the paths and the rebase.
+  paused work, in place of the paths and the rebase. A gated wait's notice
+  goes to the same lead once, with the subject `A queue wait condition is met
+  but the handler must still resume this team` and refs `resume=handler`; it
+  says the wait also needs an explicit resume from the database handler and
+  not to start on the notice, and a path wait rebases only once the handler
+  resumes the team. It has no resume imperative.
 - **Idle after met.** If no member of the waiting team posts after that
   notice and every live member is done or idle for the bound, with none
   waiting for or holding the matrix host (the stall check's member rule), the
@@ -839,7 +885,10 @@ a repeated tick or a restarted hub posts nothing twice.
   `TAILTERM_QUEUE_WAIT_IDLE_MINUTES` (1 to 1440) in the hub's environment. A
   team that shows activity once ends the wait as resumed and is never
   reported for it. A pathless wait's report says `Paused for: REASON` where a
-  path wait's says `Paths free`.
+  path wait's says `Paths free`. A gated wait's report, with refs
+  `resume=handler`, says the wait needs the database handler's explicit
+  resume: run the gate's checks and send the resume to the waiting lead, or
+  clear the wait.
 - **Needs a handler decision.** When the predecessor can no longer meet the
   condition, the primary handler gets one NOTICE, `A shared path wait needs a
   handler decision`, with the reason and both commands. A pathless wait's
@@ -873,7 +922,12 @@ new request: the notices use the ordinary delivery obligation and wake.
 The table `team_queue_waits` is new and no existing table changes, so an older
 hub ignores it and a rollback needs no migration. A pathless wait uses the
 same columns (`paths_json` `[]`, the set reason in `reason`); an older hub
-still notifies it once but lists it with an empty path list.
+still notifies it once but lists it with an empty path list. The `resume`
+column is added to an existing table on open with an empty default, so a wait
+recorded before it is automatic. An older hub ignores the column: after a
+rollback a gated wait notifies as an automatic one, with the resume or rebase
+sentence, so the handler then tells the waiting lead that notice is not its
+resume.
 
 ## Team queue listing
 

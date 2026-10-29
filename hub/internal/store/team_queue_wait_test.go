@@ -1464,3 +1464,332 @@ func TestTeamQueueWaitPathlessSentenceIsBounded(t *testing.T) {
 		t.Fatalf("sentence %d bytes: %q", len(text), text)
 	}
 }
+
+// waitGate is a handler-gated pause reason like incident I-50483's: a
+// physical host wait whose start needs the handler's explicit resume.
+const waitGate = "matrix host held by another run; start only on the database handler's explicit resume after its host, ledger and plan checks"
+
+// setGated is a wait with resume handler: pathless with a reason, or on paths.
+func (f *waitFixture) setGated(t *testing.T, until, reason string, paths ...string) api.TeamQueueEntry {
+	t.Helper()
+	req := f.setPause(until, reason)
+	if len(paths) > 0 {
+		req = f.setRequest(until, paths...)
+	}
+	req.WaitResume = api.TeamQueueWaitResumeHandler
+	req.HandlerAgentID, req.HandlerRunID = f.handler.ID, f.handler.RunID
+	q, err := f.s.TeamQueueAction(f.ctx, f.task.ID, req)
+	if err != nil {
+		t.Fatalf("gated wait set: %v", err)
+	}
+	return q
+}
+
+func (f *waitFixture) resume(t *testing.T) string {
+	t.Helper()
+	var resume string
+	if err := f.s.db.QueryRow(`SELECT resume FROM team_queue_waits WHERE task_id=? AND entry_id=? AND on_entry_id=?`, f.task.ID, f.waiting.ID, f.pred.ID).Scan(&resume); err != nil {
+		t.Fatal(err)
+	}
+	return resume
+}
+
+// wi_99ce2fa485c23648 a1: resume handler is a typed field of the wait. The
+// owner or a live handler stores it and the listing shows it; an omitted
+// resume is automatic and left out of the JSON. Any other value, a resume on
+// clear and an item lead are refused; an identical repeat changes nothing
+// and a different resume on the same pair is a conflict naming wait clear.
+func TestQueueWaitHandlerResumeSetAndRefusals(t *testing.T) {
+	f := newWaitFixture(t)
+	f.team(t)
+	for name, c := range map[string]struct {
+		edit func(*api.TeamQueueRequest)
+		kind error
+		text string
+	}{
+		"an unknown resume": {func(r *api.TeamQueueRequest) { r.WaitResume = "manual" }, api.ErrInvalid, "a wait's resume is handler, or omitted for an automatic resume"},
+		"a resume in caps":  {func(r *api.TeamQueueRequest) { r.WaitResume = "Handler" }, api.ErrInvalid, "a wait's resume is handler"},
+		"an item lead":      {func(r *api.TeamQueueRequest) { r.LeadAgentID, r.LeadRunID = f.lead.ID, f.lead.RunID }, api.ErrConflict, "only the owner or a database handler"},
+	} {
+		req := f.setPause(api.TeamQueueWaitAccepted, waitGate)
+		req.WaitResume = api.TeamQueueWaitResumeHandler
+		c.edit(&req)
+		if _, err := f.s.TeamQueueAction(f.ctx, f.task.ID, req); !errors.Is(err, c.kind) || !strings.Contains(err.Error(), c.text) {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	var rows int
+	if err := f.s.db.QueryRow(`SELECT count(*) FROM team_queue_waits`).Scan(&rows); err != nil || rows != 0 {
+		t.Fatalf("refused waits stored %d rows %v", rows, err)
+	}
+
+	q := f.setGated(t, api.TeamQueueWaitAccepted, waitGate)
+	if len(q.Waits) != 1 || q.Waits[0].Resume != api.TeamQueueWaitResumeHandler || q.Waits[0].Reason != waitGate {
+		t.Fatalf("gated set %+v", q.Waits)
+	}
+	var by, setAt string
+	if err := f.s.db.QueryRow(`SELECT set_by,set_at FROM team_queue_waits`).Scan(&by, &setAt); err != nil || by != f.handler.ID || f.resume(t) != api.TeamQueueWaitResumeHandler {
+		t.Fatalf("row by %q resume %q %v", by, f.resume(t), err)
+	}
+	listed := f.waitingEntry(t)
+	encoded, _ := json.Marshal(listed.Waits)
+	sentence := fmt.Sprintf("waits on %s for %s until accepted, then a handler resume", f.items[0].ID, waitGate)
+	if len(listed.Waits) != 1 || listed.Waits[0].Resume != api.TeamQueueWaitResumeHandler || !strings.Contains(string(encoded), `"resume":"handler"`) ||
+		listed.Waits[0].Text() != sentence || !strings.HasSuffix(listed.BlockReason, sentence) {
+		t.Fatalf("listed %s %q", encoded, listed.BlockReason)
+	}
+
+	// The owner repeats the identical wait: nothing changes.
+	f.clock = f.clock.Add(time.Minute)
+	same := f.setPause(api.TeamQueueWaitAccepted, waitGate)
+	same.WaitResume = api.TeamQueueWaitResumeHandler
+	if again, err := f.s.TeamQueueAction(f.ctx, f.task.ID, same); err != nil || len(again.Waits) != 1 || again.Waits[0].SetAt != setAt || again.Waits[0].Resume != api.TeamQueueWaitResumeHandler {
+		t.Fatalf("identical repeat changed the wait: %+v %v", again.Waits, err)
+	}
+	// The same pair as an automatic wait is a different wait.
+	clearCommand := fmt.Sprintf("tt team queue wait clear --task %s --entry %s --on %s", f.task.ID, f.waiting.ID, f.pred.ID)
+	if _, err := f.s.TeamQueueAction(f.ctx, f.task.ID, f.setPause(api.TeamQueueWaitAccepted, waitGate)); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), clearCommand) {
+		t.Fatalf("an automatic repeat of a gated wait: %v", err)
+	}
+	if f.resume(t) != api.TeamQueueWaitResumeHandler {
+		t.Fatalf("a refused repeat changed the resume to %q", f.resume(t))
+	}
+	// wait clear takes no resume.
+	clearResume := api.TeamQueueRequest{RequestID: api.NewID("req"), Operation: "wait_clear", EntryID: f.waiting.ID, WaitOnEntryID: f.pred.ID, WaitResume: api.TeamQueueWaitResumeHandler}
+	if _, err := f.s.TeamQueueAction(f.ctx, f.task.ID, clearResume); !errors.Is(err, api.ErrInvalid) || !strings.Contains(err.Error(), "no resume") {
+		t.Fatalf("clear with a resume: %v", err)
+	}
+	if f.state(t) != api.TeamQueueWaitWaiting {
+		t.Fatalf("a refused clear changed the state to %s", f.state(t))
+	}
+	f.clear(t)
+
+	// An omitted resume is automatic: stored empty and left out of the JSON.
+	if q, err := f.s.TeamQueueAction(f.ctx, f.task.ID, f.setPause(api.TeamQueueWaitAccepted, waitGate)); err != nil || len(q.Waits) != 1 || q.Waits[0].Resume != "" {
+		t.Fatalf("automatic set %+v %v", q, err)
+	}
+	listed = f.waitingEntry(t)
+	encoded, _ = json.Marshal(listed.Waits)
+	if f.resume(t) != "" || strings.Contains(string(encoded), `"resume"`) || listed.Waits[0].Text() != fmt.Sprintf("waits on %s for %s until accepted", f.items[0].ID, waitGate) {
+		t.Fatalf("automatic wait %q %s", f.resume(t), encoded)
+	}
+	// The same pair as a gated wait is again a conflict.
+	gated := f.setPause(api.TeamQueueWaitAccepted, waitGate)
+	gated.WaitResume = api.TeamQueueWaitResumeHandler
+	if _, err := f.s.TeamQueueAction(f.ctx, f.task.ID, gated); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), clearCommand) {
+		t.Fatalf("a gated repeat of an automatic wait: %v", err)
+	}
+}
+
+// wi_99ce2fa485c23648 a2, incident I-50483 reproduced: a pathless wait until
+// accepted whose team must wait for the handler's explicit resume. Once the
+// predecessor is accepted the lead alone gets exactly one notice that names
+// the condition, the whole reason and the outstanding handler resume, and
+// never says to resume the paused work. More sweeps and a reopen post nothing.
+func TestQueueWaitHandlerResumeMetNamesTheGate(t *testing.T) {
+	f := newWaitFixture(t)
+	f.team(t)
+	f.setGated(t, api.TeamQueueWaitAccepted, waitGate)
+	before := f.messageCount(t)
+	if steps := f.sweep(t); len(steps) != 0 || f.messageCount(t) != before {
+		t.Fatalf("steps before acceptance: %v", steps)
+	}
+	f.clock = f.clock.Add(time.Minute)
+	f.meet(t, api.TeamQueueWaitAccepted)
+	if steps := f.sweep(t); len(steps) != 1 || steps[0] != "wait-met" {
+		t.Fatalf("steps at acceptance: %v", steps)
+	}
+	if posted := f.messageCount(t) - before; posted != 1 {
+		t.Fatalf("%d messages posted at acceptance", posted)
+	}
+	if got := f.notices(t, f.lead, queueWaitMetSubject); len(got) != 0 {
+		t.Fatalf("a gated wait sent the automatic notice: %s", got[0].Envelope.Body.Text)
+	}
+	got := f.notices(t, f.lead, queueWaitGatedSubject)
+	if len(got) != 1 {
+		t.Fatalf("%d gated notices to the lead", len(got))
+	}
+	text, refs := got[0].Envelope.Body.Text, got[0].Envelope.Refs
+	for _, want := range []string{f.waiting.ID, f.items[1].ID, f.items[0].ID, f.pred.ID, "until it was accepted", "That condition is now met", "accepted commit " + waitAccepted,
+		"Paused for: " + waitGate + ".", "needs an explicit resume from the database handler", "do not start on this notice"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("notice lacks %q: %s", want, text)
+		}
+	}
+	for _, unwanted := range []string{"Resume the paused work", queueWaitMetSubject, "Paths now free"} {
+		if strings.Contains(text, unwanted) {
+			t.Fatalf("notice says %q: %s", unwanted, text)
+		}
+	}
+	if refs["resume"] != api.TeamQueueWaitResumeHandler || refs["activity"] != "queue_wait" || refs["condition"] != api.TeamQueueWaitAccepted || refs["commit"] != waitAccepted ||
+		refs["entry"] != f.waiting.ID || refs["predecessorEntry"] != f.pred.ID {
+		t.Fatalf("refs %v", refs)
+	}
+	sentence := fmt.Sprintf("wait on %s met (accepted, commit %s): still paused for %s until the database handler resumes it", f.items[0].ID, waitAccepted, waitGate)
+	listed := f.waitingEntry(t)
+	if len(listed.Waits) != 1 || listed.Waits[0].State != api.TeamQueueWaitMet || listed.Waits[0].NoticeSeq != got[0].Seq || listed.Waits[0].Resume != api.TeamQueueWaitResumeHandler ||
+		listed.Waits[0].Text() != sentence || !strings.HasSuffix(listed.BlockReason, sentence) || strings.Contains(listed.BlockReason, "resume the work paused") {
+		t.Fatalf("listed %+v %q", listed.Waits, listed.BlockReason)
+	}
+	after := f.messageCount(t)
+	for i := 0; i < 3; i++ {
+		f.clock = f.clock.Add(30 * time.Second)
+		if steps := f.sweep(t); len(steps) != 0 {
+			t.Fatalf("sweep %d repeated: %v", i, steps)
+		}
+	}
+	f.reopen(t)
+	f.clock = f.clock.Add(30 * time.Second)
+	if steps := f.sweep(t); len(steps) != 0 {
+		t.Fatalf("sweep after reopen repeated: %v", steps)
+	}
+	if got := f.notices(t, f.lead, queueWaitGatedSubject); len(got) != 1 || f.messageCount(t) != after {
+		t.Fatalf("%d gated notices and %d more messages after sweeps and a reopen", len(got), f.messageCount(t)-after)
+	}
+}
+
+// wi_99ce2fa485c23648 a2: a gated wait on paths gets one notice naming the
+// free paths and the handler resume, with the rebase only after that resume,
+// and it fits the envelope with many paths.
+func TestQueueWaitHandlerResumePathWaitNamesTheGate(t *testing.T) {
+	var many []string
+	for i := 0; i < 200; i++ {
+		many = append(many, fmt.Sprintf("hub/internal/store/a_rather_long_generated_file_name_%03d_test.go", i))
+	}
+	for _, c := range []struct {
+		name, until, shown, then string
+		paths                    []string
+	}{
+		{"released", api.TeamQueueWaitReleased, "released commit " + waitReleased, "Once the handler resumes this team, rebase onto that commit before editing these paths.", []string{waitPath}},
+		{"done without a commit", api.TeamQueueWaitDone, "Commit: none recorded", "Once the handler resumes this team, rebase onto the integrated branch before editing these paths.", []string{waitPath}},
+		{"many paths", api.TeamQueueWaitAccepted, "accepted commit " + waitAccepted, "Once the handler resumes this team, rebase onto that commit before editing these paths.", many},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newWaitFixture(t)
+			f.team(t)
+			f.setGated(t, c.until, "", c.paths...)
+			f.meet(t, c.until)
+			if steps := f.sweep(t); len(steps) != 1 || steps[0] != "wait-met" {
+				t.Fatalf("steps %v", steps)
+			}
+			got := f.notices(t, f.lead, queueWaitGatedSubject)
+			if len(got) != 1 || len(f.notices(t, f.lead, queueWaitMetSubject)) != 0 {
+				t.Fatalf("%d gated notices", len(got))
+			}
+			text, refs := got[0].Envelope.Body.Text, got[0].Envelope.Refs
+			for _, want := range []string{c.shown, "Paths now free: " + c.paths[0], "needs an explicit resume from the database handler: do not start on this notice", c.then} {
+				if !strings.Contains(text, want) {
+					t.Fatalf("notice lacks %q: %s", want, text)
+				}
+			}
+			// No unconditional rebase: the only rebase follows the resume.
+			if strings.Count(text, "ebase") != 1 || strings.Contains(text, "Resume the paused work") || len(text) > api.MaxEnvelopeBodyBytes || refs["resume"] != api.TeamQueueWaitResumeHandler {
+				t.Fatalf("notice %d bytes %v: %s", len(text), refs, text)
+			}
+			listed := f.waitingEntry(t)
+			if len(listed.Waits) != 1 || !strings.Contains(listed.Waits[0].Text(), "): the database handler resumes the team before it edits "+c.paths[0]) || strings.Contains(listed.BlockReason, "rebase before editing") {
+				t.Fatalf("listed %+v %q", listed.Waits, listed.BlockReason)
+			}
+			for i := 0; i < 3; i++ {
+				f.clock = f.clock.Add(30 * time.Second)
+				if steps := f.sweep(t); len(steps) != 0 {
+					t.Fatalf("sweep %d repeated: %v", i, steps)
+				}
+			}
+		})
+	}
+}
+
+// wi_99ce2fa485c23648 a3: a gated met wait whose team stays idle is reported
+// once to the owner helper and once to the handler, naming the handler
+// resume still owed rather than asking them to wake the lead. The met record
+// holds the condition only.
+func TestQueueWaitHandlerResumeOverdueNamesTheGate(t *testing.T) {
+	f := newWaitFixture(t)
+	f.team(t)
+	helper := f.helper(t)
+	f.setGated(t, api.TeamQueueWaitAccepted, waitGate)
+	f.meet(t, api.TeamQueueWaitAccepted)
+	if steps := f.sweep(t); len(steps) != 1 {
+		t.Fatalf("steps at acceptance: %v", steps)
+	}
+	var metAt, metCommit string
+	if err := f.s.db.QueryRow(`SELECT met_at,met_commit FROM team_queue_waits`).Scan(&metAt, &metCommit); err != nil || metAt != ts(f.clock) || metCommit != waitAccepted || f.state(t) != api.TeamQueueWaitMet {
+		t.Fatalf("met record %q %q %s %v", metAt, metCommit, f.state(t), err)
+	}
+	f.clock = f.clock.Add(queueWaitIdleBound())
+	if steps := f.sweep(t); len(steps) != 1 || steps[0] != "wait-overdue" {
+		t.Fatalf("at the bound: %v", steps)
+	}
+	notice := f.notices(t, f.lead, queueWaitGatedSubject)[0]
+	for _, to := range []api.Agent{helper, f.handler} {
+		got := f.notices(t, to, queueWaitOverdueSubject)
+		if len(got) != 1 {
+			t.Fatalf("%d overdue notices to %s", len(got), to.Name)
+		}
+		text, refs := got[0].Envelope.Body.Text, got[0].Envelope.Refs
+		for _, want := range []string{f.waiting.ID, "Paused for: " + waitGate + ".", "this wait needs the database handler's explicit resume", "send the resume to the waiting lead, or clear the wait", "Nothing was restarted or signalled."} {
+			if !strings.Contains(text, want) {
+				t.Fatalf("overdue notice lacks %q: %s", want, text)
+			}
+		}
+		if strings.Contains(text, "wake or message the waiting lead") || refs["resume"] != api.TeamQueueWaitResumeHandler || refs["notice"] != fmt.Sprint(notice.Seq) {
+			t.Fatalf("overdue notice %v: %s", refs, text)
+		}
+	}
+	if got := f.notices(t, f.lead, queueWaitOverdueSubject); len(got) != 0 {
+		t.Fatalf("the waiting lead got the overdue report")
+	}
+	for i := 0; i < 3; i++ {
+		f.clock = f.clock.Add(time.Minute)
+		if steps := f.sweep(t); len(steps) != 0 {
+			t.Fatalf("sweep %d reported again: %v", i, steps)
+		}
+	}
+}
+
+// wi_99ce2fa485c23648 a4: a store whose wait table predates resume gains the
+// column with an empty default on open, its waiting row is swept as an
+// automatic wait, and a second open changes nothing.
+func TestQueueWaitResumeColumnMigrates(t *testing.T) {
+	f := newWaitFixture(t)
+	f.team(t)
+	old := strings.Replace(teamQueueWaitsSQL, "\n resume TEXT NOT NULL DEFAULT '' CHECK(resume IN ('','handler')),", "", 1)
+	if old == teamQueueWaitsSQL {
+		t.Fatal("the old table text still has resume")
+	}
+	columns := func() int {
+		t.Helper()
+		var n int
+		if err := f.s.db.QueryRow(`SELECT count(*) FROM pragma_table_info('team_queue_waits') WHERE name='resume'`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	f.exec(t, `DROP TABLE team_queue_waits`)
+	f.exec(t, old)
+	if columns() != 0 {
+		t.Fatal("the old table has resume")
+	}
+	f.exec(t, `INSERT INTO team_queue_waits(task_id,entry_id,item_id,on_entry_id,on_item_id,paths_json,until,state,set_by,set_at,reason) VALUES(?,?,?,?,?,'[]','accepted','waiting','owner',?,?)`,
+		f.task.ID, f.waiting.ID, f.items[1].ID, f.pred.ID, f.items[0].ID, ts(f.clock), waitPause)
+	f.reopen(t)
+	if columns() != 1 || f.resume(t) != "" {
+		t.Fatalf("migrated %d resume columns, resume %q", columns(), f.resume(t))
+	}
+	if listed := f.waitingEntry(t); len(listed.Waits) != 1 || listed.Waits[0].Resume != "" || listed.Waits[0].Reason != waitPause {
+		t.Fatalf("listed %+v", listed.Waits)
+	}
+	f.meet(t, api.TeamQueueWaitAccepted)
+	if steps := f.sweep(t); len(steps) != 1 || steps[0] != "wait-met" {
+		t.Fatalf("steps %v", steps)
+	}
+	got := f.notices(t, f.lead, queueWaitMetSubject)
+	if len(got) != 1 || !strings.HasSuffix(got[0].Envelope.Body.Text, "Paused for: "+waitPause+". Resume the paused work.") || len(f.notices(t, f.lead, queueWaitGatedSubject)) != 0 {
+		t.Fatalf("notices %+v", got)
+	}
+	f.reopen(t)
+	if columns() != 1 || f.state(t) != api.TeamQueueWaitMet {
+		t.Fatalf("second open: %d resume columns, state %s", columns(), f.state(t))
+	}
+}

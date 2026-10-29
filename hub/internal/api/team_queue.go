@@ -130,7 +130,18 @@ const (
 	TeamQueueWaitOverdue  = "overdue"
 	TeamQueueWaitOrphaned = "orphaned"
 	TeamQueueWaitCleared  = "cleared"
+
+	// TeamQueueWaitResumeHandler marks a wait whose met condition is evidence
+	// only: the team stays paused until the database handler's explicit
+	// resume. An empty resume is automatic: the met notice resumes the team.
+	TeamQueueWaitResumeHandler = "handler"
 )
+
+// ValidTeamQueueWaitResume reports whether resume is automatic ("") or
+// "handler".
+func ValidTeamQueueWaitResume(resume string) bool {
+	return resume == "" || resume == TeamQueueWaitResumeHandler
+}
 
 // ValidTeamQueueWaitUntil reports whether until is one of the three conditions.
 func ValidTeamQueueWaitUntil(until string) bool {
@@ -140,7 +151,8 @@ func ValidTeamQueueWaitUntil(until string) bool {
 // TeamQueueWait is one entry's recorded wait for paths another entry owns.
 // The broker tick moves it from waiting to met and tells the waiting lead
 // once; orphaned means the predecessor can no longer meet the condition and
-// a handler must decide.
+// a handler must decide. Resume "handler" keeps the team paused after the
+// notice until the database handler resumes it.
 type TeamQueueWait struct {
 	OnItemID  string   `json:"onItemId"`
 	OnEntryID string   `json:"onEntryId"`
@@ -152,6 +164,7 @@ type TeamQueueWait struct {
 	MetCommit string   `json:"metCommit,omitempty"`
 	NoticeSeq int64    `json:"noticeSeq,omitempty"`
 	Reason    string   `json:"reason,omitempty"`
+	Resume    string   `json:"resume,omitempty"`
 }
 
 // TeamQueueWaitTextPathBytes caps the path list in a wait's sentence. The
@@ -191,7 +204,8 @@ func teamQueueWaitReasonText(reason string) string {
 
 // Text is the wait's one sentence in a listing and in BlockReason, with a
 // long path list cut short. A pathless wait names its reason where a path
-// wait names its paths; an orphaned wait's Reason is why it was orphaned.
+// wait names its paths; an orphaned wait's Reason is why it was orphaned. A
+// handler-gated wait names the handler resume it still needs.
 func (w TeamQueueWait) Text() string {
 	// held is what the wait holds: its paths, or a pathless wait's reason.
 	held := TeamQueueWaitPaths(w.Paths, TeamQueueWaitTextPathBytes)
@@ -199,11 +213,18 @@ func (w TeamQueueWait) Text() string {
 	if pathless {
 		held = teamQueueWaitReasonText(w.Reason)
 	}
+	gated := w.Resume == TeamQueueWaitResumeHandler
 	switch w.State {
 	case TeamQueueWaitMet:
 		commit := w.MetCommit
 		if commit == "" {
 			commit = "none recorded"
+		}
+		if gated && pathless {
+			return fmt.Sprintf("wait on %s met (%s, commit %s): still paused for %s until the database handler resumes it", w.OnItemID, w.Until, commit, held)
+		}
+		if gated {
+			return fmt.Sprintf("wait on %s met (%s, commit %s): the database handler resumes the team before it edits %s", w.OnItemID, w.Until, commit, held)
 		}
 		if pathless {
 			return fmt.Sprintf("wait on %s met (%s, commit %s): resume the work paused for %s", w.OnItemID, w.Until, commit, held)
@@ -211,6 +232,9 @@ func (w TeamQueueWait) Text() string {
 		return fmt.Sprintf("wait on %s met (%s, commit %s): rebase before editing %s", w.OnItemID, w.Until, commit, held)
 	case TeamQueueWaitOrphaned:
 		return fmt.Sprintf("wait on %s needs a handler decision: %s", w.OnItemID, w.Reason)
+	}
+	if gated {
+		return fmt.Sprintf("waits on %s for %s until %s, then a handler resume", w.OnItemID, held, w.Until)
 	}
 	return fmt.Sprintf("waits on %s for %s until %s", w.OnItemID, held, w.Until)
 }
@@ -507,11 +531,14 @@ type TeamQueueRequest struct {
 	// wait_set and wait_clear: EntryID is the waiting entry, WaitOnEntryID
 	// the predecessor entry. WaitPaths and WaitUntil (accepted, done or
 	// released) belong to wait_set; WaitReason is wait_set's reason for a
-	// wait that names no path, and wait_clear's optional why.
+	// wait that names no path, and wait_clear's optional why. WaitResume is
+	// wait_set's resume mode: "handler" when the team stays paused until the
+	// database handler resumes it, empty for an automatic resume.
 	WaitOnEntryID string   `json:"waitOnEntryId,omitempty"`
 	WaitPaths     []string `json:"waitPaths,omitempty"`
 	WaitUntil     string   `json:"waitUntil,omitempty"`
 	WaitReason    string   `json:"waitReason,omitempty"`
+	WaitResume    string   `json:"waitResume,omitempty"`
 	// AgentID is the agent a budget_continue caller names itself as; the hub
 	// accepts only the project's owner helper. No other operation reads it.
 	AgentID string `json:"agentId,omitempty"`
