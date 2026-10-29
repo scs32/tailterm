@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -1794,4 +1795,262 @@ func TestToolRedactDecode(t *testing.T) {
 	if want := []string{`"v1"`, `"v2"`, `"v\"3"`, `"v4"`, `"v5"`, `"v6"`}; !reflect.DeepEqual(found, want) {
 		t.Errorf("string values found: %q, want %q", found, want)
 	}
+}
+
+// ---- `tt hook redact`, the secret redaction mod's handler (feature
+// wi_627ff8a50b091502). Every value below is generated at random for the run.
+
+// redactModInput is the mod's stdin for one row.
+func redactModInput(t *testing.T, door, tool string, texts ...string) string {
+	t.Helper()
+	data, err := json.Marshal(map[string]any{"v": 1, "door": door, "tool": tool, "texts": texts})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
+// redactModAnswer decodes what the handler printed: exactly one object with
+// v 1 and a texts array of strings.
+func redactModAnswer(t *testing.T, out string) []string {
+	t.Helper()
+	dec := json.NewDecoder(strings.NewReader(out))
+	dec.DisallowUnknownFields()
+	var answer struct {
+		V     int       `json:"v"`
+		Texts *[]string `json:"texts"`
+	}
+	if err := dec.Decode(&answer); err != nil || answer.V != 1 || answer.Texts == nil || dec.More() || !strings.HasSuffix(out, "}\n") {
+		t.Fatalf("the answer is not one {\"v\":1,\"texts\":[...]} object (%d bytes): %v", len(out), err)
+	}
+	return *answer.Texts
+}
+
+// a1: off, a missing setting and a malformed one print nothing and write no row.
+func TestToolRedactModOff(t *testing.T) {
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second)
+	c := redactShapeCases[0]
+	for name, content := range map[string]string{"missing": "", "off": `{"claudeSecretRedaction":"off"}`, "malformed": `{"claudeSecretRedaction":"redact"`, "other value": `{"claudeSecretRedaction":"on"}`} {
+		t.Run(name, func(t *testing.T) {
+			e, root := redactSandbox(t, "")
+			if content != "" {
+				if err := os.WriteFile(os.Getenv("TAILTERM_REDACT_SETTING_FILE"), []byte(content), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			r := runToolHook(t, e, "redact", redactModInput(t, "prompt", "", "note "+c.make(t, c.n)), nil)
+			if r.err != nil || r.out != "" {
+				t.Fatalf("err %v, %d bytes out", r.err, len(r.out))
+			}
+			if _, err := os.Stat(root); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("the ledger root exists: %v", err)
+			}
+		})
+	}
+}
+
+// a2: with no identity the handler prints nothing, leaves stdin unread and the
+// ledger root untouched, in every setting value. The owner helper registered
+// from this Claude session is an identity, as for the tool ledger.
+func TestToolRedactModIdentity(t *testing.T) {
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second)
+	c := redactShapeCases[0]
+	const otherThread = "22222222-2222-4222-8222-222222222222"
+	setting := func(t *testing.T, mode string) {
+		path := filepath.Join(t.TempDir(), "relay.json")
+		if mode != "" {
+			data, _ := json.Marshal(map[string]string{"claudeSecretRedaction": mode})
+			if err := os.WriteFile(path, data, 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		t.Setenv("TAILTERM_REDACT_SETTING_FILE", path)
+	}
+	for _, mode := range []string{"", toolRedactOff, toolRedactReport, toolRedactRedact} {
+		for name, prepare := range map[string]func(t *testing.T){
+			"no helper file":      func(t *testing.T) { t.Setenv("CLAUDE_CODE_SESSION_ID", helperLedgerThread) },
+			"no session variable": func(t *testing.T) { writeHelperLedgerFile(t, helperLedgerFile()) },
+			"another session's file": func(t *testing.T) {
+				writeHelperLedgerFile(t, helperLedgerFile())
+				t.Setenv("CLAUDE_CODE_SESSION_ID", otherThread)
+			},
+		} {
+			t.Run(name+" setting "+mode, func(t *testing.T) {
+				root, _ := helperLedgerSandbox(t)
+				setting(t, mode)
+				prepare(t)
+				payload := redactModInput(t, "prompt", "", "note "+c.make(t, c.n))
+				r, w, err := os.Pipe()
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer r.Close()
+				if _, err := w.WriteString(payload); err != nil {
+					t.Fatal(err)
+				}
+				w.Close()
+				run := runToolHook(t, helperLedgerEnv(t), "redact", "", r)
+				if run.err != nil || run.out != "" {
+					t.Fatalf("err %v, %d bytes out", run.err, len(run.out))
+				}
+				left, _ := io.ReadAll(r)
+				if string(left) != payload {
+					t.Fatalf("stdin was read: %d of %d bytes left", len(left), len(payload))
+				}
+				if _, err := os.Stat(root); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("the ledger root exists: %v", err)
+				}
+			})
+		}
+	}
+	t.Run("owner helper of this session", func(t *testing.T) {
+		root, _ := helperLedgerSandbox(t)
+		setting(t, toolRedactRedact)
+		writeHelperLedgerFile(t, helperLedgerFile())
+		t.Setenv("CLAUDE_CODE_SESSION_ID", helperLedgerThread)
+		value := c.make(t, c.n)
+		run := runToolHook(t, helperLedgerEnv(t), "redact", redactModInput(t, "prompt", "", "note "+value), nil)
+		if texts := redactModAnswer(t, run.out); run.err != nil || len(texts) != 1 || texts[0] != "note [tt-redacted:github-token]" {
+			t.Fatalf("err %v, answer %d texts", run.err, len(texts))
+		}
+		rows := toolLedgerRows(t, root, helperLedgerAgent)
+		if len(rows) != 1 || rows[0]["task"] != helperLedgerTask || rows[0]["run"] != helperLedgerRun || rows[0]["outcome"] != "mod_scan" || rows[0]["redactMode"] != "redact" {
+			t.Fatalf("helper rows = %v", rows)
+		}
+		requireNoValueInLedger(t, root, helperLedgerAgent, value)
+	})
+}
+
+// a3: report mode prints nothing and appends one mod_scan row of counts and
+// pattern names, tagged with the door, holding no text.
+func TestToolRedactModReport(t *testing.T) {
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second)
+	setToolLedger(t, &toolRedactScanBudget, 30*time.Second)
+	e, root := redactSandbox(t, toolRedactReport)
+	setToolLedger(t, &toolRedactRewrite, func([]byte, []string, time.Time) ([]byte, bool) {
+		t.Error("report mode called the rewrite")
+		return nil, false
+	})
+	host := redactRandomFrom(t, redactAlnum, 30)
+	e.token = host
+	gh, aws := redactShapeCases[0], redactShapeCases[9]
+	texts := []string{"pasted\nline " + gh.make(t, gh.n) + "\nmore", "key " + aws.make(t, aws.n) + " and " + host, "Authorization: Bearer " + redactRandomFrom(t, redactAlnum, 30)}
+	for _, door := range []string{"prompt", "delivery", "queue", "attachment", "tool-result"} {
+		tool := ""
+		if door == "tool-result" {
+			tool = "Bash"
+		}
+		before := len(toolLedgerRows(t, root, e.agent))
+		r := runToolHook(t, e, "redact", redactModInput(t, door, tool, texts...), nil)
+		rows := toolLedgerRows(t, root, e.agent)
+		if r.err != nil || r.out != "" || len(rows) != before+1 {
+			t.Fatalf("%s: err %v, %d bytes out, %d new rows", door, r.err, len(r.out), len(rows)-before)
+		}
+		row := rows[len(rows)-1]
+		want := map[string]any{"github-token": float64(1), "aws-access-key": float64(1), "host-credential": float64(1), "bearer": float64(1)}
+		if row["outcome"] != "mod_scan" || row["reportTag"] != door || row["tool"] != tool || row["redactMode"] != "report" || row["redactCount"] != float64(4) || !reflect.DeepEqual(row["redactKinds"], want) || row["redactSkip"] != nil {
+			t.Fatalf("%s: row %v", door, row)
+		}
+	}
+	// Nothing matched: a zero count and no kinds.
+	r := runToolHook(t, e, "redact", redactModInput(t, "prompt", "", "nothing here"), nil)
+	rows := toolLedgerRows(t, root, e.agent)
+	if _, has := rows[len(rows)-1]["redactKinds"]; r.out != "" || rows[len(rows)-1]["redactCount"] != float64(0) || has {
+		t.Fatalf("clean text: %d bytes out, row %v", len(r.out), rows[len(rows)-1])
+	}
+	requireNoValueInLedger(t, root, e.agent, append([]string{host}, texts...)...)
+}
+
+// a4: redact mode prints the same number of strings, each group A or B match
+// replaced and every other byte unchanged; group C is counted, not replaced.
+func TestToolRedactModRedact(t *testing.T) {
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second)
+	setToolLedger(t, &toolRedactScanBudget, 30*time.Second)
+	e, root := redactSandbox(t, toolRedactRedact)
+	host := redactRandomFrom(t, redactAlnum, 30)
+	e.token = host
+	var texts, want []string
+	add := func(before, value, name, after string) {
+		texts = append(texts, before+value+after)
+		want = append(want, before+"[tt-redacted:"+name+"]"+after)
+	}
+	for _, c := range redactShapeCases {
+		add("é \"quoted\"\t<tag> & ", c.make(t, c.n), c.name, "\n\\tail ✓")
+	}
+	add("host ", host, "host-credential", "")
+	key := "-----BEGIN " + "PRIVATE KEY-----\n" + redactRandomFrom(t, redactAlnum, 64) + "\n-----END " + "PRIVATE KEY-----"
+	add("pasted\n", key, "private-key", "\nafter")
+	bearer := "Authorization: Bearer " + redactRandomFrom(t, redactAlnum, 30)
+	texts, want = append(texts, bearer, "", "plain"), append(want, bearer, "", "plain")
+	r := runToolHook(t, e, "redact", redactModInput(t, "tool-result", "Bash", texts...), nil)
+	got := redactModAnswer(t, r.out)
+	if r.err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("err %v; the answer differs from the input with each match replaced (%d texts, want %d)", r.err, len(got), len(want))
+	}
+	rows := toolLedgerRows(t, root, e.agent)
+	row := rows[len(rows)-1]
+	if row["outcome"] != "mod_scan" || row["reportTag"] != "tool-result" || row["tool"] != "Bash" || row["redactMode"] != "redact" || row["redactCount"] != float64(len(redactShapeCases)+3) || row["redactSkip"] != nil {
+		t.Fatalf("row %v", row)
+	}
+	// Group C alone: counted, nothing printed.
+	r = runToolHook(t, e, "redact", redactModInput(t, "prompt", "", bearer), nil)
+	rows = toolLedgerRows(t, root, e.agent)
+	if r.out != "" || rows[len(rows)-1]["redactCount"] != float64(1) {
+		t.Fatalf("group C only: %d bytes out, row %v", len(r.out), rows[len(rows)-1])
+	}
+	// Input the mod never sends: nothing printed, an unreadable row.
+	c := redactShapeCases[0]
+	value := c.make(t, c.n)
+	for name, input := range map[string]string{
+		"not JSON":      "note " + value,
+		"wrong version": `{"v":2,"door":"prompt","texts":["` + value + `"]}`,
+		"unknown door":  `{"v":1,"door":"response","texts":["` + value + `"]}`,
+		"no texts":      `{"v":1,"door":"prompt"}`,
+		"a non-string":  `{"v":1,"door":"prompt","texts":["` + value + `",1]}`,
+		"texts object":  `{"v":1,"door":"prompt","texts":{"a":"` + value + `"}}`,
+	} {
+		r := runToolHook(t, e, "redact", input, nil)
+		rows := toolLedgerRows(t, root, e.agent)
+		if r.out != "" || rows[len(rows)-1]["redactSkip"] != "unreadable" || rows[len(rows)-1]["reportTag"] != nil {
+			t.Fatalf("%s: %d bytes out, row %v", name, len(r.out), rows[len(rows)-1])
+		}
+	}
+	requireNoValueInLedger(t, root, e.agent, append([]string{host, value}, texts[:len(texts)-2]...)...)
+}
+
+// a5: the size cap, the scan budget and a held stdin.
+func TestToolRedactModBounds(t *testing.T) {
+	c := redactShapeCases[0]
+	t.Run("oversize", func(t *testing.T) {
+		setToolLedger(t, &toolLedgerDeadline, 30*time.Second)
+		e, root := redactSandbox(t, toolRedactRedact)
+		setToolLedger(t, &toolRedactMaxBytes, 256)
+		r := runToolHook(t, e, "redact", redactModInput(t, "prompt", "", c.make(t, c.n)+strings.Repeat(" ", 256)), nil)
+		rows := toolLedgerRows(t, root, e.agent)
+		if r.err != nil || r.out != "" || len(rows) != 1 || rows[0]["redactSkip"] != "oversize" || rows[0]["redactCount"] != nil {
+			t.Fatalf("err %v, %d bytes out, rows %v", r.err, len(r.out), rows)
+		}
+	})
+	t.Run("scan past its budget", func(t *testing.T) {
+		setToolLedger(t, &toolLedgerDeadline, 30*time.Second)
+		setToolLedger(t, &toolRedactScanBudget, 0)
+		e, root := redactSandbox(t, toolRedactRedact)
+		r := runToolHook(t, e, "redact", redactModInput(t, "prompt", "", c.make(t, c.n)), nil)
+		rows := toolLedgerRows(t, root, e.agent)
+		if r.err != nil || r.out != "" || len(rows) != 1 || rows[0]["redactSkip"] != "timeout" || rows[0]["redactMode"] != "redact" {
+			t.Fatalf("err %v, %d bytes out, rows %v", r.err, len(r.out), rows)
+		}
+	})
+	t.Run("stdin held open", func(t *testing.T) {
+		e, _ := redactSandbox(t, toolRedactRedact)
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer r.Close()
+		defer w.Close()
+		if run := runToolHook(t, e, "redact", "", r); run.err != nil || run.out != "" || run.elapsed > 200*time.Millisecond {
+			t.Fatalf("held stdin: err %v, %d bytes out, %s", run.err, len(run.out), run.elapsed)
+		}
+	})
 }

@@ -1,0 +1,6 @@
+{
+  "name": "secret-redaction",
+  "version": "0.1.0",
+  "description": "Has tt replace tokens and keys in prompts, queued prompts, file attachments and failed tool output before they are stored or sent.",
+  "author": { "name": "Tailterm" }
+}

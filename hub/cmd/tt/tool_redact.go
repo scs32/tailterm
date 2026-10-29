@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -24,6 +25,14 @@ import (
 // ledger's one deadline, and whenever it is slow, unsure or broken the
 // original output passes unchanged. Nothing matched, nor any part, length,
 // position or hash of it, is written anywhere. See docs/claude-wake.md.
+//
+// `tt hook redact` (feature wi_627ff8a50b091502) is the same scan for the
+// Claude Code secret redaction mod, which covers the rows a settings hook
+// cannot rewrite: prompts, queued prompts, file attachments and the output of
+// failed tool calls. The mod keeps no pattern and no setting; it hands tt the
+// row's texts and uses the answer only when it is exactly the expected one.
+
+func init() { hookHandlers["redact"] = toolRedactHook }
 
 const (
 	toolRedactOff    = "off"
@@ -843,4 +852,120 @@ func redactNotice(n int) string {
 		values = strconv.Itoa(n) + " values"
 	}
 	return "Tailterm replaced " + values + " in this tool output with a [tt-redacted:…] placeholder because it looked like a token or key. The real value is unchanged where it lives. Do not write a placeholder into any file: an edit or a whole-file write that includes it would replace the real value."
+}
+
+// toolRedactDoors are the mod's covered rows, by their session.append door.
+// Only these are stored as a mod_scan row's reportTag.
+var toolRedactDoors = map[string]bool{"prompt": true, "delivery": true, "queue": true, "attachment": true, "tool-result": true}
+
+// toolRedactHook is `tt hook redact`. Its input is one JSON object,
+// {"v":1,"door":"...","tool":"...","texts":["..."]}. In redact mode, with a
+// group A or B match and time left, it prints {"v":1,"texts":[...]}: the same
+// strings with each match replaced by its placeholder. It prints nothing in
+// every other case. It has the tool ledger's scope, deadline and setting: no
+// identity leaves stdin unread and the disk alone, off reads and writes
+// nothing, and report and redact append one mod_scan row of counts and
+// pattern names to the identity's ledger. It never writes stderr and cannot
+// make tt exit non-zero.
+func toolRedactHook(e env, _ []string) {
+	root := toolLedgerRoot()
+	if root == "" || e.agent != "" && (e.task == "" || e.hub == "" || !toolLedgerAgentOK(e.agent)) {
+		return
+	}
+	l := toolLedger{
+		started: time.Now(), deadline: toolLedgerDeadline, maxBytes: toolLedgerMaxBytes, lockWait: toolLedgerLockWait,
+		now: toolLedgerNow, write: toolLedgerWrite,
+		token: e.token, redactBudget: toolRedactScanBudget, redactMax: toolRedactMaxBytes, stdout: os.Stdout,
+	}
+	in := os.Stdin
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer func() { _ = recover() }()
+		if e.agent == "" {
+			helper, ok := offlineOwnerHelper()
+			if !ok || e.task != "" && e.task != helper.Task || e.runID != "" && e.runID != helper.Run {
+				return
+			}
+			e.task, e.agent, e.runID = helper.Task, helper.Agent, helper.Run
+			if time.Since(l.started) >= l.deadline {
+				return
+			}
+		}
+		l.dir, l.task, l.agent, l.run = filepath.Join(root, e.agent), toolLedgerCut(e.task), e.agent, toolLedgerCut(e.runID)
+		if l.redactMode = toolRedactMode(); l.redactMode != toolRedactOff {
+			l.redactTexts(in)
+		}
+	}()
+	timer := time.NewTimer(l.deadline)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+	}
+}
+
+// redactTexts scans the mod's texts, answers in redact mode, then appends the
+// row. As in the PostToolUse step, the answer goes out before the row.
+func (l toolLedger) redactTexts(in io.Reader) {
+	data, err := io.ReadAll(io.LimitReader(in, int64(l.redactMax)+1))
+	if time.Since(l.started) >= l.deadline {
+		return // the handler has already returned; write nothing late
+	}
+	row := toolLedgerRow{Outcome: "mod_scan", RedactMode: l.redactMode}
+	defer func() { l.append(row) }()
+	if len(data) > l.redactMax {
+		row.RedactSkip = "oversize"
+		return
+	}
+	var p struct {
+		V     int             `json:"v"`
+		Door  string          `json:"door"`
+		Tool  string          `json:"tool"`
+		Texts json.RawMessage `json:"texts"`
+	}
+	var texts []string
+	if err != nil || json.Unmarshal(data, &p) != nil || p.V != 1 || !toolRedactDoors[p.Door] || json.Unmarshal(p.Texts, &texts) != nil || texts == nil {
+		row.RedactSkip = "unreadable"
+		return
+	}
+	row.ReportTag, row.Tool = p.Door, toolLedgerCut(p.Tool)
+	deadline := l.started.Add(l.redactBudget)
+	if !time.Now().Before(deadline) {
+		row.RedactSkip = "timeout"
+		return
+	}
+	exact := toolRedactExact(l.token)
+	found := redactCountRaw(p.Texts, exact, deadline)
+	if found.timeout {
+		row.RedactSkip = "timeout"
+		return
+	}
+	count := found.count()
+	row.RedactCount = &count
+	if count > 0 {
+		row.RedactKinds = found.kinds
+	}
+	if l.redactMode != toolRedactRedact || found.rewrite == 0 {
+		return
+	}
+	updated, ok := toolRedactRewrite(p.Texts, exact, deadline)
+	if !ok {
+		row.RedactSkip = "timeout"
+		return
+	}
+	if !redactSameShapeRaw(p.Texts, updated) {
+		row.RedactSkip = "shape"
+		return
+	}
+	if !time.Now().Before(deadline) {
+		row.RedactSkip = "timeout"
+		return
+	}
+	var out bytes.Buffer
+	out.Grow(len(updated) + 16)
+	out.WriteString(`{"v":1,"texts":`)
+	out.Write(updated)
+	out.WriteString("}\n")
+	_, _ = l.stdout.Write(out.Bytes())
 }
