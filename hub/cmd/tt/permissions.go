@@ -10,9 +10,11 @@ import (
 
 // Nobody reads a spawned agent's terminal, so agents ask the owner with tt ask
 // and teammates with tt send --kind question (wi_2c46d9d964b335da), and a
-// plan-approval dialog would wait for ever (wi_eb3bf0540db3421b). The single
-// token keeps Claude's variadic flag from consuming the positional briefing.
-const claudeDisallowDialogs = "--disallowedTools=AskUserQuestion,EnterPlanMode,ExitPlanMode"
+// plan-approval dialog would wait for ever (wi_eb3bf0540db3421b), as would the
+// onboarding role picker, Chrome setup offer and plugin publish confirmation
+// (wi_050de9afbb3ed967). The single token keeps Claude's variadic flag from
+// consuming the positional briefing.
+const claudeDisallowDialogs = "--disallowedTools=AskUserQuestion,EnterPlanMode,ExitPlanMode,ShowOnboardingRolePicker,OfferChromeSetup,PublishPlugin"
 
 var permissionFlag = regexp.MustCompile(`(^|\s)(--sandbox|--ask-for-approval|--permission-mode|--dangerously-bypass-approvals-and-sandbox|--dangerously-skip-permissions|-s|-a)(=|\s|$)`)
 

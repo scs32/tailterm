@@ -92,9 +92,11 @@ there (wi_2c46d9d964b335da).
 
 - Every Claude Code agent that `tt spawn` starts (item team members, database
   handlers, the backlog steward, the deployment agent and helpers) runs with
-  AskUserQuestion, EnterPlanMode and ExitPlanMode disallowed
-  (`--disallowedTools=AskUserQuestion,EnterPlanMode,ExitPlanMode`), so neither
-  a question nor a plan-approval dialog can wait in its pane.
+  AskUserQuestion, EnterPlanMode, ExitPlanMode, ShowOnboardingRolePicker,
+  OfferChromeSetup and PublishPlugin disallowed
+  (`--disallowedTools=AskUserQuestion,EnterPlanMode,ExitPlanMode,ShowOnboardingRolePicker,OfferChromeSetup,PublishPlugin`),
+  so no question, plan-approval, onboarding, Chrome-setup or plugin-publish
+  dialog can wait in its pane.
 - Agents ask the owner with `tt ask` (a Board decision) and a teammate with
   `tt send --kind question`. Every role template says so.
 - The owner session helper is the owner's own session. `tt` does not spawn it,

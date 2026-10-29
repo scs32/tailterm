@@ -38,12 +38,17 @@ func TestPermissionModesPreserveDefaultsAndBoundExplicitModes(t *testing.T) {
 }
 
 func TestClaudeLaunchesDisallowTerminalDialogs(t *testing.T) {
-	const rule = "'--disallowedTools=AskUserQuestion,EnterPlanMode,ExitPlanMode'"
+	const rule = "'--disallowedTools=AskUserQuestion,EnterPlanMode,ExitPlanMode,ShowOnboardingRolePicker,OfferChromeSetup,PublishPlugin'"
 	for _, mode := range []string{"", "acceptEdits", "auto", "dontAsk", "bypassPermissions"} {
 		for _, allowed := range [][]string{nil, {"Read", "Bash(tt *)"}} {
 			got, e := permissionCommand("claude", "claude", mode, "/work", allowed)
 			if e != nil || strings.Count(got, rule) != 1 || strings.Count(got, "disallowedTools") != 1 || !strings.HasSuffix(got, " "+rule) {
 				t.Fatalf("mode %q allowed %v: %q %v", mode, allowed, got, e)
+			}
+			for _, name := range []string{"AskUserQuestion", "EnterPlanMode", "ExitPlanMode", "ShowOnboardingRolePicker", "OfferChromeSetup", "PublishPlugin"} {
+				if strings.Count(got, name) != 1 {
+					t.Fatalf("mode %q allowed %v: %s not denied once: %q", mode, allowed, name, got)
+				}
 			}
 			// The briefing follows a self-contained token, never a bare variadic flag.
 			if cmd := got + " " + spawn.ShellQuote("brief me"); !strings.HasSuffix(cmd, rule+" 'brief me'") {
