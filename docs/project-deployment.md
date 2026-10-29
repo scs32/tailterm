@@ -352,6 +352,18 @@ plan` then `run` in the deployer's checkout, then an import request to the
 handler. Three things make that run succeed or fail for a named reason
 (incident #15749; the host waitlist is `wi_c5cb667695c3614c`).
 
+That run is also the check on combined code for a team accepted on an older
+plan base. Under owner decision #50024 (wi_25bf79a0bf7d24c5), a lead whose
+final receipt passed accepts on the plan base, with no rebase and no new full
+matrix, when `git diff --name-only PLAN_BASE..TIP` touches none of the
+candidate's owned paths; a team may also re-plan the same candidate on the same
+base after an environment-only failed receipt. The runner's cherry-pick and
+integrated run then verify the candidate together with everything that landed
+after its plan base. A cherry-pick that conflicts is refused with
+`integration-conflict: PATHS` and the tip is left unchanged; like an owned-path
+overlap, it needs a rebase, the rebase verification route and one new plan
+([Freeze, run and import](objective-verification.md#freeze-run-and-import)).
+
 - **Prerequisites.** The five files `verify-matrix.mjs` requires are
   `node_modules/.package-lock.json`, `wasm/tailserve.wasm`, `.build/test.wasm`,
   `.build/speech-fixture.wav` and `.build/go-modules.txt`; the deployer needs

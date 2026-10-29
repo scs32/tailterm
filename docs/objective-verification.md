@@ -1048,7 +1048,24 @@ acceptance base, so a candidate built on an older base is refused with "not a
 fast-forward of the recorded base". Items without a plan keep the queue entry's
 base. The team rebases onto the current tasks-hub tip before the item lead or
 the database handler freezes the final plan, so the verified commit is exactly
-what merges.
+what merges when tasks-hub has not moved since.
+
+Owner decision #50024 (wi_25bf79a0bf7d24c5) settles a later tip move. Once the
+final plan is frozen and its receipt passes, a tasks-hub move needs no rebase
+and no new full matrix when the newly landed commits touch none of the
+candidate's owned paths: the lead runs `git diff --name-only PLAN_BASE..TIP`,
+intersects it with the owned paths and, when that is empty, accepts on the plan
+base. The deployer then cherry-picks the candidate onto the tip, and its
+[integrated verification](project-deployment.md#integrated-commit-verification-wi_5b03fe47520b7c4f)
+checks the combined code. A rebase is required only when that intersection is
+non-empty or the cherry-pick would conflict; then the existing rebase
+verification route and one new plan apply. After an environment-only failed
+receipt, where only checks the candidate does not touch failed, the lead may
+freeze a new plan for the same candidate on the same base, with no rebase; a
+failure in a check the candidate touches follows the normal fix path. The lead
+decides within this policy. The hub computes none of this: acceptance checks
+only the plan commit and plan base, and a new plan checks only that its base is
+an ancestor of the commit.
 
 ## Store race shards
 
