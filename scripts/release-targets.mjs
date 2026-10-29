@@ -107,7 +107,8 @@ export function selectReleaseTargets(cwd, baselines, commit) {
 // is no times. Anything else (not a plain object, a key that is not a target,
 // a value that is not RFC3339 with a zone, or a time more than five minutes
 // after now, such as a mistyped year that would pin a target for good) throws.
-const BASELINE_TIME = /^(\d{4})-(\d\d)-(\d\d)T\d\d:\d\d:\d\d(?:\.\d{1,9})?(?:Z|[+-]\d\d:\d\d)$/;
+// Hours 00-23: Date.parse takes T24:00:00 as the next midnight.
+const BASELINE_TIME = /^(\d{4})-(\d\d)-(\d\d)T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d{1,9})?(?:Z|[+-]\d\d:\d\d)$/;
 export const BASELINE_FUTURE_MS = 5 * 60 * 1000;
 export function configuredBaselineTimes(value, now = Date.now()) {
   if (value === undefined) return {};
