@@ -147,7 +147,8 @@ export function bookendReleaseLedger(read, snapshot, head) {
 // The underlying baseline reader orders Date milliseconds, then array order.
 // Supply exact RFC3339 nanosecond order first so fractional times within the
 // same millisecond remain correct. Equal times preserve ledger row order.
-export function deploymentBaselines(configured, jobs) {
+// configuredAt is the private config's baselinesAt (releaseBaselines).
+export function deploymentBaselines(configured, jobs, configuredAt) {
   const time = j => {
     if (!j.settledAt) return null;
     const m = /^(.*T\d\d:\d\d:\d\d)(?:\.(\d{1,9}))?(Z|[+-]\d\d:\d\d)$/.exec(j.settledAt);
@@ -156,7 +157,7 @@ export function deploymentBaselines(configured, jobs) {
     return BigInt(ms)*1000000n + BigInt((m[2] || "").padEnd(9,"0"));
   };
   const ordered = jobs.map((job,index)=>({job,index,at:time(job)})).sort((a,b)=> a.at === b.at ? a.index-b.index : a.at === null ? -1 : b.at === null ? 1 : a.at < b.at ? -1 : 1).map(x=>x.job);
-  return releaseBaselines(configured, ordered);
+  return releaseBaselines(configured, ordered, configuredAt);
 }
 
 export async function buildInputs(config, jobId, { dryRun = false, deps }) {
@@ -172,7 +173,7 @@ export async function buildInputs(config, jobId, { dryRun = false, deps }) {
   const commit = job.integratedCommit || job.commit;
   if (!Number.isSafeInteger(job.generation) || job.generation < 1 || !sha(commit) || !sha(job.commit) || !/^[a-f0-9]{64}$/.test(job.verificationDigest || "")) throw new Error("Exact job binding required");
   deps.git(["cat-file", "-e", `${commit}^{commit}`]);
-  const baselines = deploymentBaselines(config.baselines, jobs), selected = selectReleaseTargets(config.cwd, baselines, commit);
+  const baselines = deploymentBaselines(config.baselines, jobs, config.baselinesAt), selected = selectReleaseTargets(config.cwd, baselines, commit);
   const schema = schemaChanged(config.cwd, baselines.hub, commit);
   // One key per generation names every file and remote identity of this
   // attempt. The attempt is the count of set-asides and requeues so far.

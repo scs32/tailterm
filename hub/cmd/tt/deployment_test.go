@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"github.com/scs32/tailterm/hub/internal/api"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -17,6 +18,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -113,7 +115,7 @@ func TestSupersedeCoverage(t *testing.T) {
 		return j
 	}
 	t.Run("ancestor accepted", func(t *testing.T) {
-		if err := supersedeCoverage(dir, job("rel_plain"), picked); err != nil {
+		if _, err := supersedeCoverage(dir, job("rel_plain"), picked); err != nil {
 			t.Fatal(err)
 		}
 	})
@@ -122,23 +124,23 @@ func TestSupersedeCoverage(t *testing.T) {
 		if exec.Command("git", "-C", dir, "merge-base", "--is-ancestor", c2, picked).Run() == nil {
 			t.Fatal("fixture: candidate must not be an ancestor of the hand release")
 		}
-		if err := supersedeCoverage(dir, job("rel_picked"), picked); err != nil {
+		if _, err := supersedeCoverage(dir, job("rel_picked"), picked); err != nil {
 			t.Fatal(err)
 		}
 	})
 	t.Run("missing patch refused and named", func(t *testing.T) {
-		if err := supersedeCoverage(dir, job("rel_picked"), partial); err == nil || !strings.Contains(err.Error(), c2) || strings.Contains(err.Error(), c1) {
+		if _, err := supersedeCoverage(dir, job("rel_picked"), partial); err == nil || !strings.Contains(err.Error(), c2) || strings.Contains(err.Error(), c1) {
 			t.Fatal(err)
 		}
 	})
 	t.Run("released commit not on tasks-hub refused", func(t *testing.T) {
-		if err := supersedeCoverage(dir, job("rel_picked"), c2); err == nil || !strings.Contains(err.Error(), "refs/heads/tasks-hub") {
+		if _, err := supersedeCoverage(dir, job("rel_picked"), c2); err == nil || !strings.Contains(err.Error(), "refs/heads/tasks-hub") {
 			t.Fatal(err)
 		}
 	})
 	// A merge in the range needs ancestry: git cherry skips merges.
 	t.Run("merge in range without ancestry refused", func(t *testing.T) {
-		if err := supersedeCoverage(dir, job("rel_merge"), pickedMerge); err == nil || !strings.Contains(err.Error(), "merge") {
+		if _, err := supersedeCoverage(dir, job("rel_merge"), pickedMerge); err == nil || !strings.Contains(err.Error(), "merge") {
 			t.Fatal(err)
 		}
 	})
@@ -150,10 +152,10 @@ func TestSupersedeCoverage(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "written")
 	noRepo := filepath.Join(t.TempDir(), "no-repo")
 	for _, bad := range []string{"--output=" + marker, picked[:12], strings.ToUpper(picked), ""} {
-		if err := supersedeCoverage(noRepo, job("rel_picked"), bad); err == nil || !strings.Contains(err.Error(), "40-hex") {
+		if _, err := supersedeCoverage(noRepo, job("rel_picked"), bad); err == nil || !strings.Contains(err.Error(), "40-hex") {
 			t.Fatalf("%q: %v", bad, err)
 		}
-		if err := supersedeCoverage(noRepo, api.ReleaseJob{ID: "rel_bad", BaseCommit: bad, Commit: c2}, picked); err == nil || !strings.Contains(err.Error(), "full commit") {
+		if _, err := supersedeCoverage(noRepo, api.ReleaseJob{ID: "rel_bad", BaseCommit: bad, Commit: c2}, picked); err == nil || !strings.Contains(err.Error(), "full commit") {
 			t.Fatalf("base %q: %v", bad, err)
 		}
 	}
@@ -173,6 +175,9 @@ func TestSupersedeAndHandReleaseGuardBeforeHub(t *testing.T) {
 	var posts []api.ReleaseRequest
 	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		if serveSettledPage(w, r, nil) {
+			return
+		}
 		if r.Method == "GET" && strings.HasSuffix(r.URL.Path, "/releases") {
 			if r.URL.Query().Get("job") != jobs[0].ID {
 				t.Error("expected exact detail read", r.URL.String())
@@ -275,6 +280,7 @@ func TestHandReleaseRequiresRetainedTailOSCopy(t *testing.T) {
 		switch {
 		case r.URL.Path == "/release.json":
 			_, _ = w.Write(manifest(liveCommit, assets))
+		case serveSettledPage(w, r, nil):
 		case r.Method == "GET" && strings.HasSuffix(r.URL.Path, "/releases"):
 			if r.URL.Query().Get("job") != jobs[0].ID {
 				t.Error("expected exact detail read", r.URL.String())
@@ -399,6 +405,382 @@ func TestHandReleaseRequiresRetainedTailOSCopy(t *testing.T) {
 	}
 	if entries, _ := os.ReadDir(journal); len(posts) != 4 || !reflect.DeepEqual(posts[3].HandRelease.Targets, []string{"hub"}) || len(entries) != 1 {
 		t.Fatalf("non-tailos hand release %+v", posts)
+	}
+}
+
+// serveSettledPage answers a settled-view release list with these summaries
+// as one page, and reports whether the request was one.
+func serveSettledPage(w http.ResponseWriter, r *http.Request, jobs []api.ReleaseSummary) bool {
+	if r.Method != "GET" || !strings.HasSuffix(r.URL.Path, "/releases") || r.URL.Query().Get("view") != "settled" {
+		return false
+	}
+	if jobs == nil {
+		jobs = []api.ReleaseSummary{}
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"version": 1, "jobs": jobs, "page": map[string]any{"view": "settled", "limit": 200, "snapshot": strings.Repeat("ab", 32), "nextAfter": ""}})
+	return true
+}
+
+// handReleaseHub is a fake hub for tt deployment hand-release and supersede:
+// exact job reads, the settled ledger in pages of two under one snapshot, the
+// live TailOS release.json (after slow) and the record or supersede request.
+type handReleaseHub struct {
+	server  *httptest.Server
+	task    string
+	jobs    []api.ReleaseJob
+	settled []api.ReleaseSummary
+	live    []byte
+	slow    time.Duration
+	mu      sync.Mutex
+	posts   []api.ReleaseRequest
+	pages   []string
+}
+
+func newHandReleaseHub(t *testing.T, jobs ...api.ReleaseJob) *handReleaseHub {
+	t.Helper()
+	h := &handReleaseHub{task: "tsk_0123456789abcdef", jobs: jobs}
+	snapshot := strings.Repeat("cd", 32)
+	h.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		q := r.URL.Query()
+		switch {
+		case r.URL.Path == "/release.json":
+			time.Sleep(h.slow)
+			_, _ = w.Write(h.live)
+		case r.Method == "GET" && q.Get("view") == "settled":
+			h.mu.Lock()
+			h.pages = append(h.pages, r.URL.RawQuery)
+			h.mu.Unlock()
+			start := 0
+			if q.Get("after") != "" {
+				if q.Get("snapshot") != snapshot {
+					t.Error("later settled page without the first page's snapshot", r.URL.RawQuery)
+				}
+				start, _ = strconv.Atoi(q.Get("after"))
+			}
+			end, next := min(start+2, len(h.settled)), ""
+			if end < len(h.settled) {
+				next = strconv.Itoa(end)
+			}
+			jobs := append([]api.ReleaseSummary{}, h.settled[start:end]...)
+			_ = json.NewEncoder(w).Encode(map[string]any{"version": 1, "jobs": jobs, "page": map[string]any{"view": "settled", "limit": 200, "snapshot": snapshot, "nextAfter": next}})
+		case r.Method == "GET":
+			j, err := findReleaseJob(h.jobs, q.Get("job"))
+			if err != nil {
+				t.Error("unexpected read", r.URL.String())
+			}
+			j.TaskID = h.task
+			_ = json.NewEncoder(w).Encode(j)
+		default:
+			var req api.ReleaseRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			h.mu.Lock()
+			h.posts = append(h.posts, req)
+			h.mu.Unlock()
+			w.WriteHeader(http.StatusCreated)
+			if req.Operation == "hand_release" {
+				_ = json.NewEncoder(w).Encode(api.HandRelease{ID: "hrl_0123456789abcdef"})
+				return
+			}
+			j := h.jobs[0]
+			j.TaskID = h.task
+			_ = json.NewEncoder(w).Encode(j)
+		}
+	}))
+	t.Cleanup(h.server.Close)
+	return h
+}
+
+func (h *handReleaseHub) recorded() []api.ReleaseRequest {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]api.ReleaseRequest{}, h.posts...)
+}
+
+// settledRelease is a settled summary: a released receipt for its targets, or
+// with state superseded a supersession naming them.
+func settledRelease(task string, row int64, id, state, settledAt, commit string, targets ...string) api.ReleaseSummary {
+	s := api.ReleaseSummary{Summary: true, RowID: row, ID: id, TaskID: task, State: state, SettledAt: settledAt}
+	if state == "superseded" {
+		s.Supersession = &api.ReleaseSummarySupersession{ReleasedCommit: commit, Targets: targets}
+		return s
+	}
+	s.Receipt = &api.ReleaseSummaryReceipt{Outcome: "released", Commit: commit}
+	for _, target := range targets {
+		s.Receipt.Targets = append(s.Receipt.Targets, api.ReleaseSummaryTarget{Target: target, Outcome: "released"})
+	}
+	return s
+}
+
+// tailosHandRelease gives a deploy config whose journal is a temp directory
+// and whose TailOS URL is the fake hub's release.json for released, plus a
+// matching dist-static build.
+func tailosHandRelease(t *testing.T, h *handReleaseHub, released string) (config, journal, dist string) {
+	t.Helper()
+	assets := map[string]string{"index.html": "<html>home</html>", "assets/app.js": "console.log(1)"}
+	m := map[string]any{"schema": 1, "commit": released, "files": map[string]any{}}
+	for name, text := range assets {
+		sum := sha256.Sum256([]byte(text))
+		m["files"].(map[string]any)[name] = map[string]any{"size": len(text), "sha256": hex.EncodeToString(sum[:])}
+	}
+	h.live, _ = json.Marshal(m)
+	journal = filepath.Join(t.TempDir(), "journal")
+	if err := os.Mkdir(journal, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config = filepath.Join(t.TempDir(), "deploy.json")
+	doc, _ := json.Marshal(map[string]any{"version": 1, "journalDirectory": journal, "targets": map[string]any{"tailos": map[string]any{"url": h.server.URL + "/release.json"}}})
+	if err := os.WriteFile(config, doc, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dist = t.TempDir()
+	assets["release.json"] = string(h.live)
+	for name, text := range assets {
+		path := filepath.Join(dist, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(text), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return config, journal, dist
+}
+
+// wi_d305 (a5): a hand release recorded after the ledger already released a
+// newer commit to a target would settle later and move that target's baseline
+// back, so it is refused before any retain or record, naming target, job and
+// commit. Equal, older and other-target ledger commits record as before.
+func TestHandReleaseRefusesTargetWithNewerRelease(t *testing.T) {
+	dir, c := coverageFixture(t)
+	released := c["picked"] // pickedMerge descends from it, partial and moved are its ancestors
+	h := newHandReleaseHub(t, api.ReleaseJob{ID: "rel_picked", BaseCommit: c["base"], Commit: c["c2"], State: "refused", Generation: 3})
+	task := h.task
+	h.settled = []api.ReleaseSummary{
+		settledRelease(task, 1, "rel_legacy", "released", "", c["pickedMerge"], "bridge"),
+		settledRelease(task, 2, "rel_newer", "released", "2026-10-28T10:00:00Z", c["pickedMerge"], "hub"),
+		// Listed later but settled earlier: rel_newer stays the hub's latest.
+		settledRelease(task, 3, "rel_early", "released", "2026-10-28T09:00:00.5Z", c["moved"], "hub"),
+		settledRelease(task, 4, "rel_older", "released", "2026-10-28T11:00:00Z", c["partial"], "mini"),
+		settledRelease(task, 5, "rel_same", "superseded", "2026-10-28T08:00:00Z", released, "tailos"),
+		// A timed event is newer than every untimed one: bridge's latest is moved.
+		settledRelease(task, 6, "rel_bridge", "released", "2026-10-28T07:00:00Z", c["moved"], "bridge"),
+	}
+	config, journal, dist := tailosHandRelease(t, h, released)
+	owner := env{hub: h.server.URL, task: task}
+	record := func(key string, targets ...string) error {
+		args := []string{"hand-release", "--intervention", "7", "--released-commit", released, "--release", "20261028-hand", "--job", "rel_picked", "--repo", dir, "--request-id", key}
+		for _, target := range targets {
+			args = append(args, "--target", target)
+			if target == "tailos" {
+				args = append(args, "--deploy-config", config, "--dist", dist)
+			}
+		}
+		_, err := captureRelayOutput(t, false, func() error { return cmdDeployment(owner, args) })
+		return err
+	}
+	unchanged := func(label string, posts int) {
+		t.Helper()
+		if entries, _ := os.ReadDir(journal); len(entries) != 0 || len(h.recorded()) != posts {
+			t.Fatalf("%s retained %d entries or recorded %+v", label, len(entries), h.recorded())
+		}
+	}
+	err := record("hand-1", "hub", "tailos")
+	if err == nil || !strings.Contains(err.Error(), "hub: release rel_newer shipped "+c["pickedMerge"]+" at 2026-10-28T10:00:00Z") || !strings.Contains(err.Error(), "Record it without --target hub;") || strings.Contains(err.Error(), "Every target") || strings.Contains(err.Error(), "tailos:") {
+		t.Fatal("one target behind the ledger", err)
+	}
+	unchanged("hub behind", 0)
+	if err = record("hand-2", "hub"); err == nil || !strings.Contains(err.Error(), "rel_newer") || !strings.Contains(err.Error(), "Every target is newer in the ledger") {
+		t.Fatal("every target behind the ledger", err)
+	}
+	unchanged("only hub", 0)
+	// The whole ledger was read, under the first page's snapshot.
+	if pages := h.pages; len(pages) != 6 || strings.Contains(pages[0], "after=") || !strings.Contains(pages[1], "after=2") || !strings.Contains(pages[2], "after=4") {
+		t.Fatal("settled pages", pages)
+	}
+	// An older ledger commit (mini), an equal one (tailos) and an untimed
+	// newer one (bridge) are recorded as before.
+	if err = record("hand-3", "mini", "tailos", "bridge"); err != nil {
+		t.Fatal(err)
+	}
+	if posts := h.recorded(); len(posts) != 1 || posts[0].HandRelease == nil || !reflect.DeepEqual(posts[0].HandRelease.Targets, []string{"mini", "tailos", "bridge"}) {
+		t.Fatalf("recorded %+v", posts)
+	}
+	if entries, _ := os.ReadDir(journal); len(entries) != 1 {
+		t.Fatal("retained copy", entries)
+	}
+	// A ledger commit this checkout does not have cannot be compared.
+	h.settled = append(h.settled, settledRelease(task, 7, "rel_unknown", "released", "2026-10-28T12:00:00Z", strings.Repeat("f", 40), "mini"))
+	if err = record("hand-4", "mini"); err == nil || !strings.Contains(err.Error(), "cannot compare") || !strings.Contains(err.Error(), "rel_unknown") || len(h.recorded()) != 1 {
+		t.Fatal("unknown ledger commit", err)
+	}
+}
+
+// wi_01d8 (a6): an empty commit carries no patch, and cherry-picking a range
+// drops it, so coverage ignores it and names it (short SHA and subject); a
+// dropped commit that changes something is still missing.
+func TestHandReleaseCoverageSkipsEmptyCommits(t *testing.T) {
+	dir := t.TempDir()
+	run := func(args ...string) string {
+		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1", "GIT_AUTHOR_NAME=F", "GIT_AUTHOR_EMAIL=f@example.invalid", "GIT_COMMITTER_NAME=F", "GIT_COMMITTER_EMAIL=f@example.invalid")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatal(args, string(out))
+		}
+		return strings.TrimSpace(string(out))
+	}
+	commit := func(file, subject string) string {
+		if file == "" {
+			run("commit", "--allow-empty", "-m", subject)
+		} else {
+			if err := os.WriteFile(filepath.Join(dir, file), []byte(subject), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			run("add", file)
+			run("commit", "-m", subject)
+		}
+		return run("rev-parse", "HEAD")
+	}
+	named := func(c string) string { return run("log", "-1", "--format=%h %s", c) }
+	run("init", "-b", "tasks-hub")
+	base := commit("base.txt", "base")
+	run("checkout", "-b", "feat")
+	e1 := commit("", "empty one")
+	p := commit("p.txt", "change p")
+	e2 := commit("", "empty two")
+	run("checkout", "-b", "two", base)
+	q1 := commit("q1.txt", "change q1")
+	q2 := commit("q2.txt", "change q2")
+	run("checkout", "-b", "blank", base)
+	b1 := commit("", "blank one")
+	b2 := commit("", "blank two")
+	run("checkout", "tasks-hub")
+	moved := commit("other.txt", "moved")
+	run("cherry-pick", p)
+	rel := run("rev-parse", "HEAD")
+	run("cherry-pick", q1)
+	relQ := run("rev-parse", "HEAD")
+	if exec.Command("git", "-C", dir, "merge-base", "--is-ancestor", e2, rel).Run() == nil {
+		t.Fatal("fixture: the job must not be an ancestor of the hand release")
+	}
+	cases := []struct {
+		name     string
+		job      api.ReleaseJob
+		released string
+		ignored  []string
+		missing  string
+	}{
+		{"cherry-pick dropped the range's empty commits", api.ReleaseJob{ID: "rel_feat", BaseCommit: base, Commit: e2}, rel, []string{named(e1), named(e2)}, ""},
+		{"a range of only empty commits", api.ReleaseJob{ID: "rel_blank", BaseCommit: base, Commit: b2}, rel, []string{named(b1), named(b2)}, ""},
+		{"an empty job range", api.ReleaseJob{ID: "rel_none", BaseCommit: base, Commit: base}, rel, nil, ""},
+		{"an empty range off the hand release's line", api.ReleaseJob{ID: "rel_off", BaseCommit: b2, Commit: b2}, rel, nil, ""},
+		{"a dropped non-empty commit is missing", api.ReleaseJob{ID: "rel_two", BaseCommit: base, Commit: q2}, relQ, nil, q2},
+		{"empty commits are named even when a change is missing", api.ReleaseJob{ID: "rel_feat", BaseCommit: base, Commit: e2}, moved, []string{named(e1), named(e2)}, p},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ignored, err := supersedeCoverage(dir, tc.job, tc.released)
+			if !reflect.DeepEqual(ignored, tc.ignored) {
+				t.Fatalf("ignored %q, want %q", ignored, tc.ignored)
+			}
+			if tc.missing == "" && err != nil {
+				t.Fatal(err)
+			}
+			if tc.missing != "" && (err == nil || !strings.Contains(err.Error(), "missing patches") || !strings.Contains(err.Error(), tc.missing) || strings.Contains(err.Error(), q1) || strings.Contains(err.Error(), e1)) {
+				t.Fatal(err)
+			}
+		})
+	}
+	// Both commands that prove coverage name what they ignored on stderr.
+	h := newHandReleaseHub(t, api.ReleaseJob{ID: "rel_feat", BaseCommit: base, Commit: e2, State: "refused", Generation: 3})
+	owner := env{hub: h.server.URL, task: h.task}
+	agent := env{hub: h.server.URL, task: h.task, agent: "agt_0123456789abcdef", runID: "run_0123456789abcdef"}
+	want := []string{"coverage of rel_feat: ignored empty commit " + named(e1) + "\n", "coverage of rel_feat: ignored empty commit " + named(e2) + "\n"}
+	for _, cmd := range []struct {
+		as   env
+		args []string
+	}{
+		{owner, []string{"hand-release", "--intervention", "7", "--released-commit", rel, "--release", "20261028-hand", "--target", "hub", "--job", "rel_feat", "--repo", dir, "--request-id", "hand-empty"}},
+		{agent, []string{"supersede", "--job", "rel_feat", "--generation", "3", "--request-id", "sup-empty", "--released-commit", rel, "--hand-release", "hrl_0123456789abcdef", "--repo", dir}},
+	} {
+		stderr, err := captureRelayOutput(t, true, func() error {
+			_, err := captureRelayOutput(t, false, func() error { return cmdDeployment(cmd.as, cmd.args) })
+			return err
+		})
+		if err != nil || stderr != strings.Join(want, "") {
+			t.Fatalf("%s: stderr %q, err %v", cmd.args[0], stderr, err)
+		}
+	}
+	if posts := h.recorded(); len(posts) != 2 || posts[0].Operation != "hand_release" || posts[1].Operation != "supersede" {
+		t.Fatalf("posts %+v", posts)
+	}
+}
+
+// wi_4e59 (a8): a failed retain copy names the copy by its config key and the
+// failed step, never the private journal path, and records nothing.
+func TestHandReleaseRetainErrorHidesJournalPath(t *testing.T) {
+	dir, c := coverageFixture(t)
+	released := c["picked"]
+	h := newHandReleaseHub(t, api.ReleaseJob{ID: "rel_picked", BaseCommit: c["base"], Commit: c["c2"], State: "refused", Generation: 3})
+	config, journal, dist := tailosHandRelease(t, h, released)
+	if err := os.Chmod(journal, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(journal, 0o700) })
+	args := []string{"hand-release", "--intervention", "7", "--released-commit", released, "--release", "20261028-hand", "--target", "tailos", "--job", "rel_picked", "--repo", dir, "--request-id", "hand-ro", "--deploy-config", config, "--dist", dist}
+	out, err := captureRelayOutput(t, false, func() error { return cmdDeployment(env{hub: h.server.URL, task: h.task}, args) })
+	if err == nil || !strings.Contains(err.Error(), "retaining --dist as journalDirectory/tailos-dist-"+released+" failed at copy: permission denied; nothing was recorded") {
+		t.Fatal(err)
+	}
+	if strings.Contains(err.Error()+out, journal) || strings.Contains(err.Error(), filepath.Dir(journal)) {
+		t.Fatalf("the private journal path was printed: %v %q", err, out)
+	}
+	if len(h.recorded()) != 0 {
+		t.Fatalf("recorded %+v", h.recorded())
+	}
+	// Each later step's path-carrying error keeps only its cause.
+	tmp := filepath.Join(journal, "tailos-dist-"+released+".tmp")
+	for _, tc := range []struct {
+		step string
+		err  error
+		want string
+	}{
+		{"permissions", &fs.PathError{Op: "chmod", Path: tmp, Err: syscall.EPERM}, "operation not permitted"},
+		{"rename", &os.LinkError{Op: "rename", Old: tmp, New: strings.TrimSuffix(tmp, ".tmp"), Err: syscall.ENOTEMPTY}, "directory not empty"},
+		{"verify", fmt.Errorf("wrapped: %w", &fs.PathError{Op: "open", Path: tmp, Err: syscall.EACCES}), "permission denied"},
+		{"verify", errors.New("missing: index.html"), "missing: index.html"},
+	} {
+		got := retainError(released, tc.step, tc.err).Error()
+		if got != "retaining --dist as journalDirectory/tailos-dist-"+released+" failed at "+tc.step+": "+tc.want+"; nothing was recorded" || strings.Contains(got, journal) {
+			t.Fatal(tc.step, got)
+		}
+	}
+}
+
+// wi_e7a1 (a9): the record request has its own deadline, so a slow
+// release.json read and the copy before it cannot use up the record's time.
+func TestHandReleaseRecordGetsItsOwnDeadline(t *testing.T) {
+	dir, c := coverageFixture(t)
+	released := c["picked"]
+	h := newHandReleaseHub(t, api.ReleaseJob{ID: "rel_picked", BaseCommit: c["base"], Commit: c["c2"], State: "refused", Generation: 3})
+	config, _, dist := tailosHandRelease(t, h, released)
+	// TestMain raised the command timeout floor for the package; use the
+	// shipped floor so the shortened deadline applies.
+	previous, floor := handReleaseTimeout, minCommandTimeout
+	handReleaseTimeout, minCommandTimeout = time.Second, productionMinCommandTimeout
+	t.Cleanup(func() { handReleaseTimeout, minCommandTimeout = previous, floor })
+	h.slow = 3 * handReleaseTimeout / 2
+	args := []string{"hand-release", "--intervention", "7", "--released-commit", released, "--release", "20261028-hand", "--target", "tailos", "--job", "rel_picked", "--repo", dir, "--request-id", "hand-slow", "--deploy-config", config, "--dist", dist}
+	started := time.Now()
+	if _, err := captureRelayOutput(t, false, func() error { return cmdDeployment(env{hub: h.server.URL, task: h.task}, args) }); err != nil {
+		t.Fatal(err)
+	}
+	if took := time.Since(started); took < h.slow {
+		t.Fatalf("release.json was not slower than the deadline: %v", took)
+	}
+	if posts := h.recorded(); len(posts) != 1 || posts[0].Operation != "hand_release" {
+		t.Fatalf("recorded %+v", posts)
 	}
 }
 

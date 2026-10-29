@@ -78,7 +78,8 @@ builds, verifies and invokes Wrangler explicitly for project `tailos`.
 
 Private host activation configuration is version 1 with `enabled: true`, dedicated
 `cwd`, `journalDirectory`, installed `tt` path, all four last-successful
-`baselines`, and stable target host/probe references. Release names are derived
+`baselines` (with optional `baselinesAt` times), and stable target host/probe
+references. Release names are derived
 from job ID, integrated SHA and target; static release/backup/rollback fields in
 persistent configuration are not consumed. Each handler-pinned per-job target
 record supplies fresh backup identity/hash, plan/receipt paths and external pin,
@@ -1386,7 +1387,12 @@ missing and none extra, `release.json` itself excluded; the directory's own
 - With `--dist PATH`, it verifies PATH the same way and retains it as the runner
   does (copy to `.tmp`, mode 0700, rename). A mismatch retains and records
   nothing. An existing valid directory is kept; an existing one that does not
-  match is refused: remove it and rerun with `--dist`.
+  match is refused: remove it and rerun with `--dist`. A retain step that fails
+  is named with its cause and never the private path: `retaining --dist as
+  journalDirectory/tailos-dist-COMMIT failed at STEP: CAUSE; nothing was
+  recorded`, STEP being `copy`, `permissions`, `verify` or `rename` (for
+  example `failed at copy: permission denied` when the journal directory is not
+  writable).
 
 To build the copy, check out the released commit in a clean worktree and build it
 as the runner does (`npm ci`, then `npm run build:static`, which writes
@@ -1402,6 +1408,23 @@ tt deployment hand-release --intervention SEQ --released-commit SHA \
 Other targets take neither flag and behave as before; `--dist` without a tailos
 target is refused.
 
+**A hand release older than the ledger is refused.** Before any retain or
+record, the command reads the whole settled release ledger (one snapshot) and,
+for each `--target`, finds the latest released receipt or superseded job that
+shipped it, in the order the baselines use (`settledAt` as time, untimed jobs
+first, then ledger order). When that job's commit differs from the hand release
+and descends from it, the record would settle later and move the target back,
+so the command refuses, naming the target, job, commit and time: `hand release
+R is older than what the ledger already released (T: release J shipped C at S);
+... Record it without --target T; nothing was retained or recorded`. When every
+target is refused, the covered jobs' change already shipped in the ledger:
+ask the database handler to settle those jobs another way. A ledger commit equal
+to the hand release, or one the hand release is not an ancestor of (older, or
+on another line), records as before. A ledger commit the checkout does not have
+is refused until tasks-hub is fetched. The job reads, the ledger read, the
+`release.json` read and the copy share one 20-second deadline; the record
+request then gets a fresh 20 seconds of its own.
+
 The handler, with its own agent identity, then supersedes each covered job:
 
 ```
@@ -1414,7 +1437,10 @@ is an ancestor of the local `refs/heads/tasks-hub`, and that every patch of the
 job's range `baseCommit..commit` is in the released commit: by ancestry, or else
 by patch equivalence (`git cherry RELEASED COMMIT BASE` with no `+` line), so a
 hand release integrated by cherry-pick onto a moved tasks-hub qualifies. A
-missing patch is refused and named. A range that contains a merge needs ancestry,
+commit in the range with an empty diff carries no patch, and a cherry-pick drops
+it, so it is covered: each one is named on stderr as `coverage of JOB: ignored
+empty commit SHORT SUBJECT`, whatever the outcome. A missing patch is refused
+and named. A range that contains a merge needs ancestry,
 because `git cherry` skips merge commits. Patch equivalence does not see a patch
 that a later tasks-hub commit reverted.
 
@@ -2263,6 +2289,7 @@ cwd              dedicated detached tasks-hub worktree
 journalDirectory 0700 directory for journals, manifests, receipts, retained artifacts
 tt               installed tt path
 baselines        {hub, bridge, mini, tailos}: probed live commits at provisioning
+baselinesAt      optional {hub, bridge, mini, tailos} (any subset): RFC3339 time with zone when that baseline went live
 targets.hub      {host: "truenas", liveProbe: [...], readyWindowMs (optional, 0-300000, default 240000)}
 targets.bridge   {host: "truenas", liveProbe: [...], readyWindowMs (optional, 0-300000, default 240000)}
 targets.mini     {installPath, relayRestart: [...], relayLog, relayLabel, liveProbe: [...], hostSetup, hostRollback (both optional argv; default: tt host setup)}
@@ -2931,21 +2958,38 @@ no target the hand release already shipped. Only then resume the deployer.
 
 The order matters because a superseded job settles at its record's time. Resumed
 before the record exists, the deployer selects against the old baselines and
-redeploys the hand-released targets; and a record made after a newer deployer
-receipt settles later, so its older commit would win that target's baseline.
+redeploys the hand-released targets. A record made after a newer deployer
+receipt would settle later and put its older commit back on that target, so
+`tt deployment hand-release` refuses that target (above).
 
-_Fallback: a config baseline edit._ Only for a hand release that no job carries,
-or whose job cannot be superseded (requeued after a claim, or refused with
-effects that are not restored): for each target
-released by hand, run `node scripts/release-probe.mjs live TARGET --config
-PRIVATE` (`live tailos` for TailOS) and set `baselines.TARGET` in the private
-config to the printed `commit`. The running deployer re-reads `baselines` from
-the private config at every poll (about every 30 seconds), so the edit applies to
-its next pass with no restart; an unreadable file or a baseline that is not a full
-commit holds the poll before any claim. Other config keys are read only when the
-process starts. Limit: config baselines carry no time, and every released receipt
-or superseded job overlays them, so a target that has any deployer receipt keeps
-that receipt's commit and the edit has no effect for it.
+_Fallback: a config baseline edit._ With hand releases recorded in the hub, a
+manual edit is still needed only for a hand release that no job carries, or
+whose job cannot be superseded (requeued after a claim, or refused with effects
+that are not restored): for each target released by hand, run `node
+scripts/release-probe.mjs live TARGET --config PRIVATE` (`live tailos` for
+TailOS), set `baselines.TARGET` in the private config to the printed `commit`,
+and set `baselinesAt.TARGET` to when it went live, as an RFC3339 time with a
+zone:
+
+```
+"baselines":   {"hub": "<40-hex>", "bridge": "<40-hex>", "mini": "<40-hex>", "tailos": "<40-hex>"},
+"baselinesAt": {"mini": "2026-10-28T20:15:00-07:00"}
+```
+
+The deployer and the handler's input builder treat a timed baseline as one more
+release event at that time: it wins over every released receipt and superseded
+job of that target settled before it, and loses to any settled after it (a tie
+to the millisecond goes to the job). A baseline with no `baselinesAt` entry is
+older than every receipt, as before this key existed, so an existing config needs
+no change, but its edit has no effect on a target that has any deployer
+receipt. `baselinesAt` that is not an object, names another key, holds a value
+that is not RFC3339 with a zone (or a day the month does not have), or a time
+more than five minutes after the deployer's clock holds the poll before any
+claim with `Invalid configured baseline time`. The running deployer re-reads
+`baselines` and `baselinesAt` from the private config at every poll (about every
+30 seconds), so the edit applies to its next pass with no restart; an unreadable
+file or a baseline that is not a full commit holds the poll before any claim.
+Other config keys are read only when the process starts.
 
 **Detached main checkout (#15223).** The deployer's checkout is a detached
 worktree (`git worktree add --detach PATH tasks-hub`) that shares objects with the

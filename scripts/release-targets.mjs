@@ -69,7 +69,9 @@ process.stdout.write(JSON.stringify(JSON.parse(input).map(p => { try { return { 
 // answers null for every path asked: the path stays unknown. A child still
 // running at timeoutMs is killed with SIGKILL, which it cannot trap.
 export function candidateKnown(cwd, commit, { timeoutMs = 20000 } = {}) {
-  const answers = new Map(), git = (...args) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+  // An inherited GIT_DIR, GIT_INDEX_FILE or GIT_WORK_TREE would point git away from cwd.
+  const gitEnv = Object.fromEntries(Object.entries(process.env).filter(([k]) => !["GIT_DIR", "GIT_INDEX_FILE", "GIT_WORK_TREE"].includes(k)));
+  const answers = new Map(), git = (...args) => execFileSync("git", args, { cwd, env: gitEnv, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
   let usable;
   const ask = paths => {
     try {
@@ -100,6 +102,28 @@ export function selectReleaseTargets(cwd, baselines, commit) {
     return targetsForPaths(diffPaths(cwd, baselines[t], commit), known).includes(t);
   });
 }
+// When each configured baseline went live, from the private config's optional
+// baselinesAt: target to an RFC3339 time with a zone, as milliseconds. Absent
+// is no times. Anything else (not a plain object, a key that is not a target,
+// a value that is not RFC3339 with a zone, or a time more than five minutes
+// after now, such as a mistyped year that would pin a target for good) throws.
+const BASELINE_TIME = /^(\d{4})-(\d\d)-(\d\d)T\d\d:\d\d:\d\d(?:\.\d{1,9})?(?:Z|[+-]\d\d:\d\d)$/;
+export const BASELINE_FUTURE_MS = 5 * 60 * 1000;
+export function configuredBaselineTimes(value, now = Date.now()) {
+  if (value === undefined) return {};
+  const invalid = () => tagged("Invalid configured baseline time");
+  if (!value || typeof value !== "object" || Array.isArray(value) || ![Object.prototype, null].includes(Object.getPrototypeOf(value))) throw invalid();
+  const out = {};
+  for (const [target, at] of Object.entries(value)) {
+    const m = typeof at === "string" ? BASELINE_TIME.exec(at) : null;
+    if (!targets.includes(target) || !m) throw invalid();
+    // Date.parse rolls a day past the month's end over (February 30 is March 2).
+    const ms = Date.parse(at), [, y, mo, d] = m.map(Number);
+    if (Number.isNaN(ms) || d < 1 || d > new Date(Date.UTC(y, mo, 0)).getUTCDate() || ms > now + BASELINE_FUTURE_MS) throw invalid();
+    out[target] = ms;
+  }
+  return out;
+}
 // The last successful commit per target: the configured baselines overlaid
 // with every released receipt and every superseded job that cites a recorded
 // hand release (its released commit, for the targets that record shipped), so
@@ -107,10 +131,14 @@ export function selectReleaseTargets(cwd, baselines, commit) {
 // job. Events apply in settledAt order, later winning; legacy events without
 // settledAt apply first, in list order, and a legacy superseded job without
 // targets is ignored. settledAt is RFC3339Nano with trimmed zeros, which does
-// not sort as text, so it is compared as time.
-export function releaseBaselines(baselines, jobs) {
+// not sort as text, so it is compared as time. A configured baseline with a
+// time in configuredAt (baselinesAt) is an event at that time too, listed
+// before every job (index -1), so a job event of the same millisecond wins the
+// tie; one without a time is older than every event.
+export function releaseBaselines(baselines, jobs, configuredAt, now = Date.now()) {
   const out = { ...baselines };
   const events = [];
+  for (const [target, at] of Object.entries(configuredBaselineTimes(configuredAt, now))) events.push({at, index: -1, commit: baselines[target], targets: [target]});
   jobs.forEach((job, index) => {
     const at = job.settledAt ? Date.parse(job.settledAt) : null;
     if (job.settledAt && Number.isNaN(at)) throw new Error("Invalid release settledAt");

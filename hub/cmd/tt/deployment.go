@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"github.com/scs32/tailterm/hub/internal/api"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"os/exec"
@@ -241,7 +242,7 @@ func cmdDeployment(e env, args []string) error {
 		if *handRelease == "" {
 			return errors.New("supersede needs --hand-release naming a recorded hand release")
 		}
-		if err = supersedeCoverage(*repo, j, *released); err != nil {
+		if err = reportedCoverage(*repo, j, *released); err != nil {
 			return err
 		}
 		req.Supersession = &api.ReleaseSupersession{ReleasedCommit: *released, Release: *releaseName, HandReleaseID: *handRelease}
@@ -623,7 +624,7 @@ func cmdHandRelease(e env, args []string) error {
 	if err != nil {
 		return err
 	}
-	ctx, cancel := ctxTimeout(20 * time.Second)
+	ctx, cancel := ctxTimeout(handReleaseTimeout)
 	defer cancel()
 	if args[0] == "hand-releases" {
 		out, err := c.HandReleases(ctx, e.task)
@@ -648,10 +649,13 @@ func cmdHandRelease(e env, args []string) error {
 		if err != nil {
 			return err
 		}
-		if err = supersedeCoverage(*repo, j, *released); err != nil {
+		if err = reportedCoverage(*repo, j, *released); err != nil {
 			return err
 		}
 		commits = append(commits, j.Commit)
+	}
+	if err = handReleaseNotBehindLedger(ctx, c, e.task, *repo, *released, targets); err != nil {
+		return err
 	}
 	if tailos {
 		if err = retainedTailOSCopy(*deployConfig, *released, *dist); err != nil {
@@ -659,7 +663,11 @@ func cmdHandRelease(e env, args []string) error {
 		}
 	}
 	record := &api.HandRelease{InterventionSeq: *intervention, ReleasedCommit: *released, Release: *releaseName, Targets: targets, Commits: commits}
-	out, err := c.RecordHandRelease(ctx, e.task, api.ReleaseRequest{RequestID: *key, AgentID: e.agent, RunID: e.runID, HandRelease: record})
+	// The record gets its own deadline: the job reads, the ledger read, the
+	// release.json read and the copy above must not use up its time.
+	recordCtx, recordCancel := ctxTimeout(handReleaseTimeout)
+	defer recordCancel()
+	out, err := c.RecordHandRelease(recordCtx, e.task, api.ReleaseRequest{RequestID: *key, AgentID: e.agent, RunID: e.runID, HandRelease: record})
 	if err == nil {
 		printJSON(out)
 	} else if e.agent != "" || e.runID != "" {
@@ -667,6 +675,116 @@ func cmdHandRelease(e env, args []string) error {
 		err = fmt.Errorf("%w; this shell carries an agent identity: record the hand release as the owner from a shell without it, e.g. env -u TAILTERM_AGENT -u TAILTERM_RUN tt deployment hand-release ...", err)
 	}
 	return err
+}
+
+// handReleaseTimeout bounds the reads and checks before a hand release is
+// recorded, and separately the record request itself. A test shortens it.
+var handReleaseTimeout = 20 * time.Second
+
+// handReleaseNotBehindLedger refuses a hand release that the ledger has
+// already moved past for any target it names: when the target's latest
+// released or superseded job (the order scripts/release-targets.mjs
+// releaseBaselines uses: settledAt as time, untimed first, then list order)
+// carries a different commit that descends from the hand release, recording
+// it would settle later and move that target's baseline back to an older
+// commit. A hand release equal to or newer than the ledger's commit, or one
+// git shows is not its ancestor, is recorded as before.
+func handReleaseNotBehindLedger(ctx context.Context, c *api.Client, task, repo, released string, targets []string) error {
+	if len(targets) == 0 {
+		return nil
+	}
+	if !fullCommit(released) {
+		return errors.New("hand-release needs --released-commit as a full 40-hex commit")
+	}
+	type event struct {
+		job, commit, at string
+		time            time.Time
+		timed           bool
+		index           int
+	}
+	latest := map[string]event{}
+	later := func(a, b event) bool { // b applies after a
+		if a.timed != b.timed {
+			return b.timed
+		}
+		if a.timed && !a.time.Equal(b.time) {
+			return b.time.After(a.time)
+		}
+		return b.index > a.index
+	}
+	opts := api.ReleaseListOptions{View: "settled", Limit: 200}
+	index := 0
+	for {
+		page, err := c.ReleasesPage(ctx, task, opts)
+		if err != nil {
+			return fmt.Errorf("cannot read the settled release ledger to check the hand release against it: %w; nothing was retained or recorded", err)
+		}
+		for _, j := range page.Jobs {
+			index++
+			e := event{job: j.ID, at: j.SettledAt, index: index}
+			if j.SettledAt != "" {
+				t, err := time.Parse(time.RFC3339Nano, j.SettledAt)
+				if err != nil {
+					return fmt.Errorf("release %s has an invalid settledAt; nothing was retained or recorded", j.ID)
+				}
+				e.time, e.timed = t, true
+			}
+			var shipped []string
+			switch {
+			case j.Receipt != nil && j.Receipt.Outcome == "released":
+				e.commit = j.Receipt.Commit
+				for _, t := range j.Receipt.Targets {
+					if t.Outcome == "released" {
+						shipped = append(shipped, t.Target)
+					}
+				}
+			case j.State == "superseded" && j.Supersession != nil:
+				e.commit, shipped = j.Supersession.ReleasedCommit, j.Supersession.Targets
+			}
+			for _, t := range shipped {
+				if prev, ok := latest[t]; !ok || later(prev, e) {
+					latest[t] = e
+				}
+			}
+		}
+		if page.Page.NextAfter == "" {
+			break
+		}
+		opts.After, opts.Snapshot = page.Page.NextAfter, page.Page.Snapshot
+	}
+	var behind, refused []string
+	for _, t := range targets {
+		e, ok := latest[t]
+		if !ok || e.commit == released {
+			continue
+		}
+		if !fullCommit(e.commit) {
+			return fmt.Errorf("release %s carries no full commit for %s; nothing was retained or recorded", e.job, t)
+		}
+		cmd := exec.Command("git", "-C", repo, "merge-base", "--is-ancestor", released, e.commit)
+		err := cmd.Run()
+		var exit *exec.ExitError
+		if errors.As(err, &exit) && exit.ExitCode() == 1 {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("cannot compare hand release %s with %s that release %s shipped to %s in %s: fetch tasks-hub and rerun; nothing was retained or recorded", released, e.commit, e.job, t, repo)
+		}
+		at := e.at
+		if at == "" {
+			at = "an unrecorded time"
+		}
+		behind = append(behind, fmt.Sprintf("%s: release %s shipped %s at %s", t, e.job, e.commit, at))
+		refused = append(refused, t)
+	}
+	if len(behind) == 0 {
+		return nil
+	}
+	msg := fmt.Sprintf("hand release %s is older than what the ledger already released (%s); recording it would move those baselines back. Record it without --target %s; nothing was retained or recorded", released, strings.Join(behind, "; "), strings.Join(refused, ", --target "))
+	if len(refused) == len(targets) {
+		msg += ". Every target is newer in the ledger: the covered jobs' change already shipped there, so ask the database handler to settle those jobs another way"
+	}
+	return errors.New(msg)
 }
 
 const releaseWindowUsage = "usage: tt deployment window [set --zone IANA_ZONE --start HH:MM --end HH:MM --targets hub,bridge,mini|hub,bridge,mini,tailos|tailos --reason TEXT --request-id KEY | clear --reason TEXT --request-id KEY]"
@@ -808,24 +926,40 @@ func retainedTailOSCopy(configPath, released, dist string) error {
 		return fmt.Errorf("no retained TailOS rollback copy %s%s: the next release could not roll TailOS back; build that commit's dist-static and rerun with --dist PATH", name, released)
 	}
 	tmp := retained + ".tmp"
+	step := "copy"
 	if err = os.RemoveAll(tmp); err == nil {
 		err = copyTree(dist, tmp)
 	}
 	if err == nil {
-		err = os.Chmod(tmp, 0o700)
+		step, err = "permissions", os.Chmod(tmp, 0o700)
 	}
 	if err == nil {
 		// The copy, not the source, is what a rollback deploys.
-		err = matchesTailOSRelease(tmp, released, live)
+		step, err = "verify", matchesTailOSRelease(tmp, released, live)
 	}
 	if err == nil {
-		err = os.Rename(tmp, retained)
+		step, err = "rename", os.Rename(tmp, retained)
 	}
 	if err != nil {
 		_ = os.RemoveAll(tmp)
-		return fmt.Errorf("retaining --dist as %s%s failed: %w; nothing was recorded", name, released, err)
+		return retainError(released, step, err)
 	}
 	return nil
+}
+
+// retainError names the failed retain step and the copy by its config key,
+// never by path: the path a *fs.PathError or *os.LinkError carries is under
+// the private journal directory, so only its cause is kept.
+func retainError(released, step string, err error) error {
+	reason := err.Error()
+	var pathErr *fs.PathError
+	var linkErr *os.LinkError
+	if errors.As(err, &pathErr) {
+		reason = pathErr.Err.Error()
+	} else if errors.As(err, &linkErr) {
+		reason = linkErr.Err.Error()
+	}
+	return fmt.Errorf("retaining --dist as journalDirectory/tailos-dist-%s failed at %s: %s; nothing was recorded", released, step, reason)
 }
 
 type tailosFile struct {
@@ -984,49 +1118,77 @@ func findReleaseJob(jobs []api.ReleaseJob, id string) (api.ReleaseJob, error) {
 	return api.ReleaseJob{}, errors.New("release job not found")
 }
 
+// reportedCoverage runs supersedeCoverage and names on stderr each empty
+// commit the check ignored, whatever its outcome.
+func reportedCoverage(repo string, job api.ReleaseJob, released string) error {
+	ignored, err := supersedeCoverage(repo, job, released)
+	for _, c := range ignored {
+		fmt.Fprintf(os.Stderr, "coverage of %s: ignored empty commit %s\n", job.ID, c)
+	}
+	return err
+}
+
 // supersedeCoverage proves the job's accepted change shipped by hand. The
 // released commit must be on the current local tasks-hub, and every patch of
 // the job's range base..commit must be in it: by ancestry, or else by patch
-// equivalence (git cherry), which a merge in the range cannot use.
-func supersedeCoverage(repo string, job api.ReleaseJob, released string) error {
+// equivalence (git cherry), which a merge in the range cannot use. A commit
+// with an empty diff carries no patch, and a cherry-pick drops it, so it is
+// covered; it is returned as "SHORT SUBJECT" in ignored, and never missing.
+func supersedeCoverage(repo string, job api.ReleaseJob, released string) (ignored []string, err error) {
 	// Validated before any git call: an argument such as --output=PATH must
 	// never reach git as an option.
 	if !fullCommit(released) {
-		return errors.New("supersede needs --released-commit as a full 40-hex commit")
+		return nil, errors.New("supersede needs --released-commit as a full 40-hex commit")
 	}
 	if !fullCommit(job.Commit) || !fullCommit(job.BaseCommit) {
-		return errors.New("release job has no full commit and base commit")
+		return nil, errors.New("release job has no full commit and base commit")
 	}
 	git := func(args ...string) ([]byte, error) {
 		return exec.Command("git", append([]string{"-C", repo}, args...)...).Output()
 	}
 	if _, err := git("merge-base", "--is-ancestor", released, "refs/heads/tasks-hub"); err != nil {
-		return fmt.Errorf("supersede needs %s to be an ancestor of refs/heads/tasks-hub in %s", released, repo)
+		return nil, fmt.Errorf("supersede needs %s to be an ancestor of refs/heads/tasks-hub in %s", released, repo)
 	}
 	if _, err := git("merge-base", "--is-ancestor", job.Commit, released); err == nil {
-		return nil
+		return nil, nil
 	}
 	merges, err := git("rev-list", "--merges", job.BaseCommit+".."+job.Commit)
 	if err != nil {
-		return fmt.Errorf("cannot list %s..%s in %s", job.BaseCommit, job.Commit, repo)
+		return nil, fmt.Errorf("cannot list %s..%s in %s", job.BaseCommit, job.Commit, repo)
 	}
 	if len(strings.TrimSpace(string(merges))) > 0 {
-		return fmt.Errorf("supersede needs %s to be an ancestor of %s: its range has a merge, which patch equivalence cannot check", job.Commit, released)
+		return nil, fmt.Errorf("supersede needs %s to be an ancestor of %s: its range has a merge, which patch equivalence cannot check", job.Commit, released)
 	}
 	out, err := git("cherry", released, job.Commit, job.BaseCommit)
 	if err != nil {
-		return fmt.Errorf("git cherry %s %s %s failed in %s", released, job.Commit, job.BaseCommit, repo)
+		return nil, fmt.Errorf("git cherry %s %s %s failed in %s", released, job.Commit, job.BaseCommit, repo)
 	}
 	missing := []string{}
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		if strings.HasPrefix(line, "+ ") {
-			missing = append(missing, strings.TrimPrefix(line, "+ "))
+		if !strings.HasPrefix(line, "+ ") {
+			continue
 		}
+		c := strings.TrimPrefix(line, "+ ")
+		if !fullCommit(c) {
+			return ignored, fmt.Errorf("git cherry printed an unexpected line in %s", repo)
+		}
+		// The range has no merges, so every commit in it has one parent.
+		if _, err := git("diff", "--quiet", c+"^", c); err == nil {
+			named, err := git("log", "-1", "--format=%h %s", c)
+			if err != nil {
+				return ignored, fmt.Errorf("cannot read commit %s in %s", c, repo)
+			}
+			ignored = append(ignored, strings.TrimSpace(string(named)))
+			continue
+		} else if exit := (*exec.ExitError)(nil); !errors.As(err, &exit) || exit.ExitCode() != 1 {
+			return ignored, fmt.Errorf("cannot diff commit %s in %s", c, repo)
+		}
+		missing = append(missing, c)
 	}
 	if len(missing) > 0 {
-		return fmt.Errorf("hand release %s is missing patches of %s: %s", released, job.ID, strings.Join(missing, ", "))
+		return ignored, fmt.Errorf("hand release %s is missing patches of %s: %s", released, job.ID, strings.Join(missing, ", "))
 	}
-	return nil
+	return ignored, nil
 }
 
 func fullCommit(s string) bool {

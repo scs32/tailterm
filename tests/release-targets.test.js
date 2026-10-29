@@ -1,13 +1,24 @@
-import test from "node:test";
+import test, {after} from "node:test";
 import assert from "node:assert/strict";
 import {execFileSync} from "node:child_process";
-import {mkdirSync, mkdtempSync, writeFileSync} from "node:fs";
+import {chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync} from "node:fs";
 import {tmpdir} from "node:os";
 import {join} from "node:path";
 import {fileURLToPath} from "node:url";
-import {candidateKnown, releaseBaselines, selectReleaseTargets, targetsForPaths} from "../scripts/release-targets.mjs";
+import {candidateKnown, configuredBaselineTimes, releaseBaselines, selectReleaseTargets, targetsForPaths} from "../scripts/release-targets.mjs";
+import {buildInputs, deploymentBaselines} from "../scripts/release-inputs.mjs";
+import {readBaselines, serveDeployment} from "../scripts/release-runner.mjs";
+import {releaseReply, releaseReplySource} from "./release-runner-fixtures.mjs";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
+// Fixture repositories and the code under test must use their own working
+// directory, never a repository a caller's GIT_DIR, GIT_INDEX_FILE or
+// GIT_WORK_TREE names (a git hook sets them), and every temp directory made
+// here is removed when the file ends.
+for (const k of ["GIT_DIR", "GIT_INDEX_FILE", "GIT_WORK_TREE"]) delete process.env[k];
+const temps = [];
+const tempDir = prefix => { const dir = mkdtempSync(join(tmpdir(), prefix)); temps.push(dir); return dir; };
+after(() => { for (const dir of temps) rmSync(dir, {recursive: true, force: true}); });
 
 test("paths that ship or build map to the targets that consume them", () => {
   const table = {
@@ -68,7 +79,7 @@ test("non-ASCII and spaced paths map or refuse by the same rules as ASCII paths"
   for (const p of unknown) assert.throws(() => targetsForPaths([p]), /Unknown release path/, p);
 
   // The same paths, tracked in a real repository and read back the way the tree test reads them.
-  const cwd = mkdtempSync(join(tmpdir(), "release-targets-paths-"));
+  const cwd = tempDir("release-targets-paths-");
   execFileSync("git", ["init", "-q"], {cwd});
   const all = [...Object.keys(table), ...unknown];
   for (const p of all) { mkdirSync(join(cwd, p, ".."), {recursive: true}); writeFileSync(join(cwd, p), p); }
@@ -91,7 +102,7 @@ test("b1 a superseded job advances exactly the targets its hand release shipped"
 // A temporary repository: base, then a hand-released CLI change, then a next
 // candidate that changes only the TailOS client.
 function handReleaseRepo() {
-  const cwd = mkdtempSync(join(tmpdir(), "release-targets-"));
+  const cwd = tempDir("release-targets-");
   const git = (...args) => execFileSync("git", args, {cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"]}).trim();
   const commit = (file, text) => { mkdirSync(join(cwd, file, ".."), {recursive: true}); writeFileSync(join(cwd, file), text); git("add", "."); git("commit", "-m", file); return git("rev-parse", "HEAD"); };
   git("init", "-b", "tasks-hub"); git("config", "user.email", "fixture@example.invalid"); git("config", "user.name", "Fixture");
@@ -134,6 +145,116 @@ test("b2 legacy rows keep today's baselines", () => {
   assert.equal(releaseBaselines(all(sha("0")), [superseded(sha("s"), ["hub"], "2026-09-30T10:00:00Z"), ...legacy]).hub, sha("s"));
 });
 
+// c1 (wi_bc1fadbb4a501919): a configured baseline with a baselinesAt time is
+// an event at that time, ordered with receipts and superseded jobs.
+const NOW = Date.parse("2026-10-28T20:00:00Z");
+const timed = (baselines, jobs, at) => releaseBaselines(baselines, jobs, at, NOW);
+
+test("c1 a timed config baseline newer than a receipt wins", () => {
+  const jobs = [receipt(sha("r"), ["hub"], "2026-10-28T10:00:00Z")];
+  assert.equal(timed(all(sha("c")), jobs, {hub: "2026-10-28T11:00:00Z"}).hub, sha("c"), "newer than a receipt");
+  assert.equal(timed(all(sha("c")), jobs, {hub: "2026-10-28T03:30:00-07:00"}).hub, sha("c"), "a zone offset is the same instant as 10:30Z");
+  const hand = [superseded(sha("s"), ["mini"], "2026-10-28T10:00:00Z")];
+  assert.equal(timed(all(sha("c")), hand, {mini: "2026-10-28T10:00:01Z"}).mini, sha("c"), "newer than a superseded job");
+  // The config event sits among the job events by time, wherever they are listed.
+  const around = [receipt(sha("1"), ["hub"], "2026-10-28T09:00:00Z"), receipt(sha("2"), ["hub"], "2026-10-28T12:00:00Z")];
+  assert.equal(timed(all(sha("c")), around, {hub: "2026-10-28T10:00:00Z"}).hub, sha("2"));
+  assert.equal(timed(all(sha("c")), [around[1], around[0]], {hub: "2026-10-28T13:00:00Z"}).hub, sha("c"));
+});
+
+test("c1 an older timed config baseline loses", () => {
+  assert.equal(timed(all(sha("c")), [receipt(sha("r"), ["hub"], "2026-10-28T10:00:00Z")], {hub: "2026-10-28T09:59:59Z"}).hub, sha("r"), "older than a receipt");
+  assert.equal(timed(all(sha("c")), [superseded(sha("s"), ["hub"], "2026-10-28T10:00:00Z")], {hub: "2026-10-28T09:00:00Z"}).hub, sha("s"), "older than a superseded job");
+  // A tie to the millisecond goes to the job event, wherever it is listed.
+  assert.equal(timed(all(sha("c")), [receipt(sha("r"), ["hub"], "2026-10-28T10:00:00.250Z")], {hub: "2026-10-28T10:00:00.250Z"}).hub, sha("r"), "tie goes to the receipt");
+  assert.equal(timed(all(sha("c")), [superseded(sha("s"), ["hub"], "2026-10-28T10:00:00Z")], {hub: "2026-10-28T10:00:00.000Z"}).hub, sha("s"), "tie goes to the superseded job");
+  // A timed config event is newer than every legacy (untimed) event.
+  assert.equal(timed(all(sha("c")), [receipt(sha("l"), ["hub"])], {hub: "2020-01-01T00:00:00Z"}).hub, sha("c"), "a legacy receipt has no time");
+});
+
+test("c1 mixed targets and an untimed target", () => {
+  const jobs = [receipt(sha("r"), ["hub", "bridge", "mini", "tailos"], "2026-10-28T10:00:00Z")];
+  const config = {hub: sha("a"), bridge: sha("b"), mini: sha("c"), tailos: sha("d")};
+  // hub newer wins, bridge older loses, mini and tailos have no time and lose.
+  assert.deepEqual(timed(config, jobs, {hub: "2026-10-28T11:00:00Z", bridge: "2026-10-28T09:00:00Z"}), {hub: sha("a"), bridge: sha("r"), mini: sha("r"), tailos: sha("r")});
+  // Without baselinesAt every target loses to the receipt, as before.
+  assert.deepEqual(timed(config, jobs, undefined), all(sha("r")));
+  assert.deepEqual(timed(config, jobs, {}), all(sha("r")));
+  // A timed target with no job event keeps its configured commit.
+  assert.deepEqual(timed(config, [receipt(sha("r"), ["hub"], "2026-10-28T10:00:00Z")], {mini: "2026-10-28T09:00:00Z"}), {...config, hub: sha("r")});
+});
+
+test("c1 invalid or future baseline times are refused", () => {
+  const refused = at => assert.equal(reasonOf(() => timed(all(sha("c")), [], at)), "Invalid configured baseline time", String(JSON.stringify(at)));
+  for (const at of [null, [], "2026-10-28T10:00:00Z", 5, new Map(), new Date(NOW)]) refused(at);
+  refused({prod: "2026-10-28T10:00:00Z"});
+  refused({Hub: "2026-10-28T10:00:00Z"});
+  for (const time of ["2026-10-28", "2026-10-28T10:00:00", "2026-10-28 10:00:00Z", "2026-10-28T10:00Z", "2026-10-28T10:00:00+0700", "2026-13-01T00:00:00Z", "2026-02-30T00:00:00Z", "2026-10-28T25:00:00Z", "Oct 28 2026", "", 1761645600000, null])
+    refused({hub: time});
+  refused({hub: "2026-10-28T20:05:00.001Z"});
+  refused({hub: "2027-10-28T10:00:00Z"});
+  // Up to five minutes ahead is allowed: a clock slightly behind the editor's.
+  assert.equal(timed(all(sha("c")), [receipt(sha("r"), ["hub"], "2026-10-28T19:00:00Z")], {hub: "2026-10-28T20:05:00Z"}).hub, sha("c"));
+  assert.deepEqual(configuredBaselineTimes({tailos: "2024-02-29T12:00:00.123456789+01:00"}, NOW), {tailos: Date.parse("2024-02-29T11:00:00.123Z")});
+  assert.deepEqual(configuredBaselineTimes(Object.assign(Object.create(null), {hub: "2026-10-28T10:00:00Z"}), NOW), {hub: Date.parse("2026-10-28T10:00:00Z")});
+});
+
+test("c1 the runner and input builder apply baselinesAt", () => {
+  const jobs = [receipt(sha("r"), ["hub", "mini"], "2026-10-28T10:00:00.000000500Z"), superseded(sha("s"), ["tailos"], "2026-10-28T10:00:00Z")];
+  const config = {hub: sha("a"), bridge: sha("b"), mini: sha("c"), tailos: sha("d")};
+  const at = {hub: "2026-10-28T11:00:00Z", mini: "2026-10-28T09:00:00Z", tailos: "2026-10-28T10:30:00Z"};
+  const want = {hub: sha("a"), bridge: sha("b"), mini: sha("r"), tailos: sha("d")};
+  assert.deepEqual(releaseBaselines(config, jobs, at), want);
+  assert.deepEqual(deploymentBaselines(config, jobs, at), want, "the handler input builder and the deployer poll");
+  assert.deepEqual(deploymentBaselines(config, jobs), releaseBaselines(config, jobs), "no baselinesAt");
+  // The deployer's poll reads the private config file each time, so an edit
+  // that adds or changes baselinesAt applies at the next poll.
+  const dir = tempDir("release-targets-config-"), path = join(dir, "deploy.json");
+  const poll = () => { const {baselines, at: configured} = readBaselines(path); return deploymentBaselines(baselines, jobs, configured); };
+  writeFileSync(path, JSON.stringify({version: 1, baselines: config}));
+  assert.deepEqual(poll(), releaseBaselines(config, jobs), "an old-format config");
+  assert.deepEqual(poll(), {...all(sha("r")), bridge: sha("b"), tailos: sha("s")});
+  writeFileSync(path, JSON.stringify({version: 1, baselines: config, baselinesAt: at}));
+  assert.deepEqual(poll(), want, "after an edit adds baselinesAt");
+  writeFileSync(path, JSON.stringify({version: 1, baselines: config, baselinesAt: {...at, mini: "2026-10-28T12:00:00Z"}}));
+  assert.deepEqual(poll(), {...want, mini: sha("c")}, "after an edit changes one time");
+  for (const bad of [{hub: "soon"}, {prod: "2026-10-28T11:00:00Z"}, [], null, {hub: "2999-01-01T00:00:00Z"}]) {
+    writeFileSync(path, JSON.stringify({version: 1, baselines: config, baselinesAt: bad}));
+    assert.equal(reasonOf(() => readBaselines(path)), "Invalid configured baseline time", JSON.stringify(bad));
+  }
+});
+
+test("c1 the deployer poll applies a baselinesAt edit at the next poll, with no restart", async () => {
+  const home = tempDir("release-targets-poll-"), configPath = join(home, "deploy.json"), fakeTT = join(home, "tt");
+  const config = {version: 1, enabled: true, cwd: home, journalDirectory: home, tt: fakeTT, baselines: all(sha("a"))};
+  const shipped = {id: "rel_done", state: "released", generation: 2, settledAt: "2026-10-28T10:00:00.5Z", receipt: {outcome: "released", commit: sha("r"), targets: ["hub", "mini"].map(target => ({target, outcome: "released"}))}};
+  const verified = {id: "rel_next", state: "verified", generation: 1, commit: sha("n")};
+  writeFileSync(fakeTT, "#!" + process.execPath + "\n" + releaseReplySource + `const a=process.argv.slice(2);if(['list','get'].includes(a[1]))console.log(JSON.stringify(releaseReply(${JSON.stringify([shipped, verified])},a)));else if(a[1]==='claim')console.log(JSON.stringify(${JSON.stringify({...verified, state: "claimed", generation: 2, agentId: process.env.TAILTERM_AGENT, runId: process.env.TAILTERM_RUN})}));else process.exit(2);`);
+  chmodSync(fakeTT, 0o755);
+  const seen = [], release = async c => { seen.push(c.baselines); };
+  writeFileSync(configPath, JSON.stringify(config));
+  await serveDeployment(config, {once: true, configPath, release});
+  // The daemon keeps the config it started with; only the file is edited.
+  writeFileSync(configPath, JSON.stringify({...config, baselinesAt: {hub: "2026-10-28T11:00:00Z", mini: "2026-10-28T10:00:00.4Z"}}));
+  await serveDeployment(config, {once: true, configPath, release});
+  assert.deepEqual(seen, [{...all(sha("a")), hub: sha("r"), mini: sha("r")}, {...all(sha("a")), mini: sha("r")}]);
+});
+
+test("c1 the handler input builder selects targets from baselinesAt", async () => {
+  // mini was hand-released at r.hand after an older receipt for r.base; the
+  // next job changes only the client, so a timed config edit ships TailOS only.
+  const r = handReleaseRepo();
+  const job = {id: "rel_0123abcd", state: "claimed", generation: 4, commit: r.next, verificationDigest: "d".repeat(64), itemId: "wi_fixture"};
+  const older = {id: "rel_older", state: "released", generation: 2, settledAt: "2026-10-28T10:00:00Z", receipt: {outcome: "released", commit: r.base, targets: [{target: "mini", outcome: "released"}]}};
+  const deps = {tt: argv => JSON.stringify(releaseReply([job, older], argv)), git: argv => execFileSync("git", argv, {cwd: r.cwd, encoding: "utf8"})};
+  const config = {version: 1, enabled: true, cwd: r.cwd, journalDirectory: tempDir("release-targets-inputs-"), tt: "tt", baselines: {...all(r.base), mini: r.hand}};
+  const targetsOf = async c => Object.keys((await buildInputs(c, job.id, {dryRun: true, deps})).targets);
+  assert.deepEqual(await targetsOf(config), ["mini", "tailos"], "an untimed edit loses to the older receipt");
+  assert.deepEqual(await targetsOf({...config, baselinesAt: {mini: "2026-10-28T11:00:00Z"}}), ["tailos"]);
+  assert.deepEqual(await targetsOf({...config, baselinesAt: {mini: "2026-10-28T09:00:00Z"}}), ["mini", "tailos"], "an older timed edit loses");
+  await assert.rejects(targetsOf({...config, baselinesAt: {mini: "yesterday"}}), /Invalid configured baseline time/);
+});
+
 // The unknown-path refusal and the candidate's own map (wi_fd1a6890a531e2c1).
 const REASON = /^[A-Za-z0-9 ,.:;()_\/-]{1,160}$/;
 const reasonOf = fn => { try { fn(); } catch (error) { assert.equal(error.message, error.releaseReason); return error.releaseReason; } assert.fail("did not throw"); };
@@ -161,7 +282,7 @@ const NEW_FILE = "tools/newthing/a.js", NEW_REASON = "Unknown release path: tool
 // A temporary repository whose HEAD is a candidate adding the given files on
 // a base that holds one client file.
 function candidateRepo(files) {
-  const cwd = mkdtempSync(join(tmpdir(), "release-targets-candidate-"));
+  const cwd = tempDir("release-targets-candidate-");
   const git = (...args) => execFileSync("git", args, {cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"]}).trim();
   const commit = added => { for (const [file, text] of Object.entries(added)) { mkdirSync(join(cwd, file, ".."), {recursive: true}); writeFileSync(join(cwd, file), text); } git("add", "."); git("commit", "-m", "commit"); return git("rev-parse", "HEAD"); };
   git("init", "-b", "tasks-hub"); git("config", "user.email", "fixture@example.invalid"); git("config", "user.name", "Fixture");
@@ -197,6 +318,16 @@ test("t2 a path the running map does not know is accepted only when the candidat
   const strict = candidateRepo({[NEW_FILE]: "a", "scripts/release-targets.mjs": standIn(`throw new Error("Unknown release path");`)});
   writeFileSync(join(strict.cwd, "scripts/release-targets.mjs"), KNOWS_FOLDER);
   assert.equal(reasonOf(() => selectReleaseTargets(strict.cwd, all(strict.base), strict.candidate)), NEW_REASON, "an uncommitted edit to the map");
+});
+
+test("fixtures run without inherited git environment", () => {
+  // A hook's GIT_DIR, GIT_INDEX_FILE and GIT_WORK_TREE would send the
+  // candidate map's git calls to another repository; candidateKnown drops them.
+  const a = candidateRepo({[NEW_FILE]: "a", "scripts/release-targets.mjs": KNOWS_FOLDER});
+  const inherited = {GIT_DIR: "/nonexistent/tt-git", GIT_INDEX_FILE: "/nonexistent/tt-index", GIT_WORK_TREE: "/nonexistent/tt-tree"};
+  Object.assign(process.env, inherited);
+  try { assert.deepEqual(targetsForPaths([NEW_FILE], candidateKnown(a.cwd, a.candidate)), []); }
+  finally { for (const k of Object.keys(inherited)) delete process.env[k]; }
 });
 
 test("t2 a candidate map that traps SIGTERM and never exits is killed at the timeout and leaves the path unknown", () => {

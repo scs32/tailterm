@@ -7,7 +7,7 @@ import { openSync, closeSync, fsyncSync, writeFileSync, readFileSync, renameSync
 import { join, resolve, dirname, basename, isAbsolute } from "node:path";
 import { digest, canonical, diffPaths, receiptEligible, MAX_CHECK_TIMEOUT_MS, MATRIX_PREREQUISITES, missingPrerequisites, provisionPrerequisites } from "./verify-matrix.mjs";
 import { PRIORITIES, RUN_TIMEOUT_GRACE_MS, holderCapMs, lockPath, readHostState, holdersOf, canonicalResource, pidGone, groupGone } from "./verify-matrix-host-lock.mjs";
-import { selectReleaseTargets, releaseBaselines, schemaChanged } from "./release-targets.mjs";
+import { selectReleaseTargets, releaseBaselines, schemaChanged, configuredBaselineTimes } from "./release-targets.mjs";
 import { buildInfo, waitForTailOSCommit, tailosWindow, tailosURL, hostDeps, readyWindow, sanitizeCapture, TAILOS_SWITCH_WINDOW_MS, TRUENAS_READY_WINDOW_MS } from "./release-probe.mjs";
 
 const fileDigest = fileSHA256;
@@ -2738,15 +2738,18 @@ export function pruneJournal(config,jobs,{now=()=>Date.now(),keepDists=[]}={}){
     return bytes;
   }
 }
-// The four configured baselines, read from the private config at every poll
-// without restarting the daemon. A recorded hand release advances baselines
-// by itself through its superseded job (releaseBaselines); a config edit is
-// the fallback for a hand release no job carries. Only baselines are re-read:
-// cwd, journal and host references stay those the daemon started with.
+// The four configured baselines and their optional baselinesAt times, read
+// from the private config at every poll without restarting the daemon. A
+// recorded hand release advances baselines by itself through its superseded
+// job (releaseBaselines); a config edit is the fallback for a hand release no
+// job carries, and its time lets it win over older receipts. Only baselines
+// and their times are re-read: cwd, journal and host references stay those the
+// daemon started with.
 export function readBaselines(configPath){
-  const b=JSON.parse(readFileSync(configPath,"utf8")).baselines,targets=["hub","bridge","mini","tailos"];
+  const doc=JSON.parse(readFileSync(configPath,"utf8")),b=doc.baselines,targets=["hub","bridge","mini","tailos"];
   if(!targets.every(t=>sha(b?.[t])))throw releaseError("Four last-successful baselines required");
-  return Object.fromEntries(targets.map(t=>[t,b[t]]));
+  configuredBaselineTimes(doc.baselinesAt);
+  return {baselines:Object.fromEntries(targets.map(t=>[t,b[t]])),at:doc.baselinesAt};
 }
 export async function serveDeployment(config,{once=false,signal,configPath,release=runRelease,code,progress=false}={}) {
   if(config.version!==1 || config.enabled!==true || !config.cwd || !config.journalDirectory)throw releaseError("Explicit private activation config required");
@@ -3008,7 +3011,7 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
     waitOpen=readTransportWait(config.journalDirectory)!==null;
     try {
     // An unreadable or invalid edit holds the whole poll, before any claim.
-    const configured=configPath?readBaselines(configPath):config.baselines;
+    const {baselines:configured,at:configuredAt}=configPath?readBaselines(configPath):{baselines:config.baselines,at:config.baselinesAt};
     reader=new HostAdapter(config,{});
     const read=argv=>reader.command([config.tt||"tt",...argv]);
     // The poll's ledger read writes nothing, so a stale snapshot refused on a
@@ -3022,7 +3025,7 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
         const mark=reader.cliFailures.length;
         const jobs=readReleaseSummaries(read);reader.cliFailures.splice(mark);
         // Validate complete baseline history before any recovery write, pruning or claim.
-        const baselines=deploymentBaselines(configured,jobs);
+        const baselines=deploymentBaselines(configured,jobs,configuredAt);
         // Fetch every locally relevant recovery record and the selected/held job
         // before any write, deletion or claim. Any other failed detail read holds the poll.
         const selected=runnableJob(jobs,process.env.TAILTERM_AGENT,process.env.TAILTERM_RUN);
