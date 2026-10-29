@@ -573,7 +573,7 @@ func explainArmWaits(ctx context.Context, q queryRower, list *api.TeamQueueList,
 				e.BlockReason = "Every handler arm is at a provider limit"
 				continue
 			case d.wait != "":
-				e.BlockReason = "Waiting for a free handler of arm " + d.drawn
+				e.BlockReason = armWaitReason(d.drawn)
 				drawn = d.drawn
 			default:
 				if e.BlockReason == noFreeHandlerReason {
@@ -1645,6 +1645,12 @@ func handlerABComparisons(arms []api.HandlerABArm, items []api.HandlerABItem) []
 // spec. The store decides the exact match of that spec itself.
 
 const noFreeHandlerReason = "No free database handler"
+
+// armWaitReason is the reason of a queued entry that waits only for a free
+// handler of its drawn arm, before any handler need is appended.
+func armWaitReason(arm string) string {
+	return "Waiting for a free handler of arm " + arm
+}
 
 // handlerProvisionAbandonAfter is how long a reserved handler may take to
 // register online before its reservation stops holding the next one.

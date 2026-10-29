@@ -85,6 +85,19 @@ func (f *armStallQueue) report(t *testing.T, a api.Agent, activity api.AgentActi
 	}
 }
 
+// rotatingS registers a second online arm-S handler held by an open rotation,
+// so arm S already has the handlers the uncapped queue wants for one team and
+// the one that waits: the drawn arm's need adds nothing to the plain wait.
+func (f *armStallQueue) rotatingS(t *testing.T) {
+	t.Helper()
+	h := f.armHandler(t, "handler-s2", armS)
+	now := ts(time.Now())
+	if _, err := f.s.db.Exec(`INSERT INTO handler_rotations(id,task_id,request_id,payload_hash,state,reason,trigger_kind,handler_revision,old_agent_id,old_run_id,old_name,successor_agent_id,successor_name,created_at,updated_at) VALUES('hrot_fixture',?,'rotate','hash','prepared','fixture','owner',1,?,?,?,'agt_successor','successor',?,?)`,
+		f.task.ID, h.ID, h.RunID, h.Name, now, now); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // stallNoticeText posts the entry's stall notice and returns its text.
 func stallNoticeText(t *testing.T, s *Store, task, id string) string {
 	t.Helper()
@@ -111,14 +124,16 @@ func stallNoticeText(t *testing.T, s *Store, task, id string) string {
 
 const armSWait = ". It waits for a free handler of arm S"
 
-// wi_376dfb3ee857ffcd a1, a2: arm S's only handler is leased by an entry with
-// nothing running and arm O's handler is free. The queued entry drawn to S
-// cannot lease O without a fallback, so it is stalled behind the holder, and
-// the list and the notice name the arm.
+// wi_376dfb3ee857ffcd a1, a2: arm S's free handler is leased by an entry with
+// nothing running, its other one is rotating, and arm O's handler is free. The
+// queued entry drawn to S cannot lease O without a fallback, and no handler of
+// S is added, so it is stalled behind the holder, and the list and the notice
+// name the arm.
 func TestQueueStallArmWaitBlockerHoldsDrawnArm(t *testing.T) {
 	f := newArmStallQueue(t, 2)
 	a, b := f.add(t, 0, "src/a"), f.add(t, 1, "src/b")
 	f.policy(t, true, map[string]string{a.ID: "S", b.ID: "S"})
+	f.rotatingS(t)
 	a = f.run(t, a)
 	if a.HandlerID != f.hS.ID {
 		t.Fatalf("holder leased %s, want handler-s", a.HandlerID)
@@ -138,7 +153,9 @@ func TestQueueStallArmWaitBlockerHoldsDrawnArm(t *testing.T) {
 }
 
 // wi_376dfb3ee857ffcd a2: no arm stall when the drawn arm is free, when it is
-// held by a working team, or when every arm is at a provider limit.
+// held by a working team, or when every arm is at a provider limit. A drawn
+// arm whose handler need says how it gets one (here the runner adds one)
+// keeps that need's reason, as before arm stalls (verifier finding #50081).
 func TestQueueStallArmWaitNoStall(t *testing.T) {
 	t.Run("drawn arm free", func(t *testing.T) {
 		f := newArmStallQueue(t, 2)
@@ -162,10 +179,23 @@ func TestQueueStallArmWaitNoStall(t *testing.T) {
 			t.Fatalf("ordinary arm wait %q", got.BlockReason)
 		}
 	})
+	t.Run("drawn arm gets a handler from its need", func(t *testing.T) {
+		f := newArmStallQueue(t, 2)
+		a, b := f.add(t, 0, "src/a"), f.add(t, 1, "src/b")
+		f.policy(t, true, map[string]string{a.ID: "S", b.ID: "S"})
+		f.run(t, a)
+		f.advance(6 * time.Minute)
+		assertNoStall(t, f.choresQueue, b.ID, "the runner adds a handler of the drawn arm")
+		got := listedEntry(t, f.s, f.task.ID, b.ID)
+		if got.HandlerNeed == nil || !got.HandlerNeed.Provision || got.BlockReason != "Waiting for a free handler of arm S: 1 of 1 leased, limit none; the runner is adding one" {
+			t.Fatalf("need %+v reason %q", got.HandlerNeed, got.BlockReason)
+		}
+	})
 	t.Run("every arm limited", func(t *testing.T) {
 		f := newArmStallQueue(t, 2)
 		a, b := f.add(t, 0, "src/a"), f.add(t, 1, "src/b")
 		f.policy(t, true, map[string]string{a.ID: "S", b.ID: "S"})
+		f.rotatingS(t)
 		f.run(t, a)
 		f.advance(6 * time.Minute)
 		assertStall(t, f.choresQueue, b.ID, api.StallNothingRunning, a.ID)

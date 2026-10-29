@@ -354,7 +354,12 @@ func (s *Store) explainQueueStalls(ctx context.Context, q queryRower, capacity *
 			// freeWithout says whether releasing one blocker's lease frees
 			// a handler for e.
 			freeWithout := func(a api.TeamQueueEntry) (bool, error) { return a.HandlerID != "", nil }
-			if policy.Enabled {
+			// A handler need that says how the drawn arm gets a handler (the
+			// runner adds one, or a fix or ceiling a person acts on) owns the
+			// wait, as it did before arm stalls; only a plain wait for a busy
+			// handler of the arm is judged by its draw here.
+			needOwns := e.HandlerNeed != nil && e.BlockReason != armWaitReason(e.HandlerNeed.Arm)
+			if policy.Enabled && !needOwns {
 				free, drawn, limited, err := armFree(*e, active)
 				if err != nil {
 					return nil, err

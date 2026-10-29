@@ -594,7 +594,11 @@ even while a handler of another arm is free. The reason is the usual
 `Stalled:` reason naming that entry and its fix, ending with
 `. It waits for a free handler of arm S`, and the stall notice carries the same
 text. An arm wait behind working teams, or with every arm at a provider limit,
-is ordinary waiting (`wi_376dfb3ee857ffcd`).
+is ordinary waiting (`wi_376dfb3ee857ffcd`). So is an arm wait whose handler
+need says how the drawn arm gets a handler: the runner adding one, the
+provision ceiling, the project agent cap, an offline handler or provisioning
+off. It keeps the need's reason and fix; only a plain wait for a busy handler of
+the arm becomes the stall.
 
 ## Handlers and the limit
 
