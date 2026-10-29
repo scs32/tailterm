@@ -544,7 +544,7 @@ mismatch fails the run with no receipt:
 `WASM prerequisite changed during verification: <path>`. It runs every selected
 check and retains failures. The approved matrix records a default ten-minute
 per-check timeout, with explicit overrides in `checkTimeoutMs` (go-race: fifty
-minutes; go-test: twenty minutes; npm-unit: eight minutes; the two static
+minutes; go-test: thirty minutes; npm-unit: eight minutes; the two static
 checks: two minutes).
 Each planned check carries `VERIFICATION_TIMEOUT_MS` in its recorded environment.
 A timeout sends SIGTERM, then SIGKILL after 250 ms, only to that check's newly
@@ -918,15 +918,25 @@ go-test kept the ten-minute default until `hub/cmd/tt` outgrew it. On
 with `hub/cmd/tt` still running, and the retry passed in 473660 ms with every
 other package cached and `hub/cmd/tt` taking 467.4 s alone (#30899, #30901).
 That left about 126 s of margin on a warm cache and none on a cold one, and
-each team verifies in a fresh worktree. So `checkTimeoutMs` now gives go-test
+each team verifies in a fresh worktree. So `checkTimeoutMs` gave go-test
 1200000 ms (20 minutes): twice the killed cold attempt, rounded down to the
-minute, which is 2.53 times the warm run and 726340 ms above it. The cold
-total is not known, because that attempt never finished, and no new cold
-timing was run beside other matrix work; if a receipt's go-test passes 15
-minutes, measure it alone and raise the limit. `goTestFlags` is unchanged:
-go-test already carries `-timeout=45m`, so go test's 600 s package default
-cannot trip under the 20-minute check limit. This matrix change also needed a
-new owner approval of the digest.
+minute, with the rule that if a receipt's go-test passes 15 minutes, it is
+measured alone and the limit raised. That rule was met by 2026-10-24 (bug
+`wi_0dee84ce706a3bd8`): a wi_6a36 candidate's go-test used 87% of the limit
+(#45551), and a release go-test that overlapped another matrix on the host
+timed out and refused the release. Measured alone, `go test ./cmd/tt` passed
+in 1016 s and 1176 s, and the matrix argv `go test -timeout=45m ./...` passed
+in 1171 s with `hub/cmd/tt` taking 1135 s (#45583); no hang reproduced. That
+left about 24 s of margin. So `checkTimeoutMs` now gives go-test 1800000 ms
+(30 minutes), approved by the owner (#50027): 1.53 times the slowest alone
+run and 624 s above it, still under go test's own `-timeout=45m`. A real hang
+now holds the verification host lock for up to 30 minutes instead of 20. The
+rule stands against the new limit: if a receipt's go-test passes 22.5 minutes
+(three quarters of it, as 15 was of 20), measure it alone and raise the limit
+or shard the package. `goTestFlags` is unchanged: go-test already carries
+`-timeout=45m`, so go test's 600 s package default cannot trip under the
+30-minute check limit. Each of these matrix changes needed a new owner
+approval of the digest.
 
 **npm-unit file budget.** npm-unit is `npm test`: after
 `node scripts/build-team-plan.mjs --check` it runs
@@ -1590,11 +1600,23 @@ any other request (bug `wi_87ffcc0183401161`).
 **Exclusive holds.** Bug `wi_6be7e47bd2358699`, order #36061. A normal holder
 shares the host: a second run, a release run included, can start beside it at
 any time. `exec --exclusive` holds the host alone. Use it only for checks whose
-result depends on a quiet host: a live-session check, or a timing-sensitive
-test. Keep the command short with a small `--timeout-minutes`, because every
-team run and the deployer wait while it holds, and give it a short
+result depends on a quiet host (a live-session check, or a timing-sensitive
+test) and for an exec that deliberately generates load, below. Keep the
+command short with a small `--timeout-minutes`, because every team run and the
+deployer wait while it holds, and give it a short
 `--host-wait-minutes`, because it waits for every holder to leave. `run` and
-`targeted` have no exclusive mode.
+`targeted` have no exclusive mode. A host-lock exec that deliberately
+generates load (busy loops, stress, or N parallel copies of a test) must use
+`exec --exclusive` with a short `--timeout-minutes`: a normal hold shares the
+host, so its load lands on whatever matrix runs beside it. To run loaded
+repeats, put the repeats and their synthetic load together inside one
+`exec --exclusive`, bounded at 10 minutes, or run the repeats under a normal
+hold with no synthetic load, so that the matrix beside them is the load. The
+reason is FINDING #45911 (bug `wi_0dee84ce706a3bd8`, refinement #45913): the
+lock admitted a matrix beside an exec running a busy loop per core, and that
+matrix's go-test timed out on all three attempts. The load is the attributed
+cause, not a proven one: the third attempt began after the reported end of
+the load.
 
 - *Admission.* An exclusive request is granted only when no holder is live. It
   never takes over an overdue holder, which may still be running; it waits until
@@ -1784,7 +1806,11 @@ be killed under memory pressure, and the hub refuses a self-addressed message
 with `a directed message to yourself wakes nobody; the hub sends you a notice
 when your matrix run ends, and to wait for anything else run tt inbox --unread
 --wait 9m in your turn or ask a teammate to message you`. The notice names the
-item and the run's start time and carries no path and no result: read
+item and the run's start time and carries no path and no result. The hub
+cannot tell a host-lock exec from a matrix run, so the notice says that a
+host-lock exec writes no receipt; its command's exit status and the
+`host-lock.json` you gave it (`outcome`, `acquiredAt`, `releasedAt`) are the
+outcome (`wi_ac01454ba2e35fe6`). For a matrix or targeted run, read
 `receipt.json` (`targeted-receipt.json` for a targeted run) in the log
 directory you gave the run, and with no receipt read `runner.json` and
 `host-lock.log` there and record why the run stopped before anything else. It
