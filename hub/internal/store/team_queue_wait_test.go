@@ -1793,3 +1793,79 @@ func TestQueueWaitResumeColumnMigrates(t *testing.T) {
 		t.Fatalf("second open: %d resume columns, state %s", columns(), f.state(t))
 	}
 }
+
+// wi_99ce2fa485c23648 review 50961 f2: team activity after a gated met
+// notice never ends the wait as resumed. It stays met with its gate sentence
+// and no further notice until the handler clears it; a team that posted is
+// never reported idle, and one that only worked and went idle past the bound
+// gets the one overdue report naming the gate.
+func TestQueueWaitHandlerResumeActivityKeepsTheGate(t *testing.T) {
+	for name, c := range map[string]struct {
+		act     func(*testing.T, *waitFixture)
+		overdue int
+	}{
+		"a member posts": {func(t *testing.T, f *waitFixture) {
+			if _, err := f.s.PostMessage(f.ctx, f.task.ID, api.PostMessageRequest{AgentID: f.member.ID, Text: "condition seen, waiting for the handler", RequestID: api.NewID("req")}, f.by); err != nil {
+				t.Fatal(err)
+			}
+		}, 0},
+		"a member is working": {func(t *testing.T, f *waitFixture) {
+			f.exec(t, `UPDATE agents SET status='running' WHERE id=?`, f.lead.ID)
+		}, 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newWaitFixture(t)
+			f.team(t)
+			helper := f.helper(t)
+			f.setGated(t, api.TeamQueueWaitAccepted, waitGate)
+			f.meet(t, api.TeamQueueWaitAccepted)
+			if steps := f.sweep(t); len(steps) != 1 {
+				t.Fatalf("steps at acceptance: %v", steps)
+			}
+			f.clock = f.clock.Add(time.Minute)
+			c.act(t, f)
+			after := f.messageCount(t)
+			sentence := fmt.Sprintf("wait on %s met (accepted, commit %s): still paused for %s until the database handler resumes it", f.items[0].ID, waitAccepted, waitGate)
+			for i := 0; i < 3; i++ {
+				f.clock = f.clock.Add(30 * time.Second)
+				if steps := f.sweep(t); len(steps) != 0 || f.state(t) != api.TeamQueueWaitMet {
+					t.Fatalf("sweep %d after activity: %v, state %s", i, steps, f.state(t))
+				}
+			}
+			listed := f.waitingEntry(t)
+			if len(listed.Waits) != 1 || listed.Waits[0].Text() != sentence || !strings.HasSuffix(listed.BlockReason, sentence) || f.messageCount(t) != after {
+				t.Fatalf("listed %+v %q, %d more messages", listed.Waits, listed.BlockReason, f.messageCount(t)-after)
+			}
+			// Idle again, long past the bound.
+			f.exec(t, `UPDATE agents SET status='done' WHERE id=?`, f.lead.ID)
+			f.clock = f.clock.Add(time.Hour)
+			f.sweep(t)
+			for _, to := range []api.Agent{helper, f.handler} {
+				got := f.notices(t, to, queueWaitOverdueSubject)
+				if len(got) != c.overdue || (c.overdue == 1 && !strings.Contains(got[0].Envelope.Body.Text, "this wait needs the database handler's explicit resume")) {
+					t.Fatalf("%d overdue notices to %s, want %d", len(got), to.Name, c.overdue)
+				}
+			}
+			if c.overdue == 0 && f.state(t) != api.TeamQueueWaitMet {
+				t.Fatalf("an active gated wait left met: %s", f.state(t))
+			}
+			if n := len(f.notices(t, f.lead, queueWaitGatedSubject)) + len(f.notices(t, f.lead, queueWaitMetSubject)); n != 1 {
+				t.Fatalf("%d wait notices to the lead", n)
+			}
+			// The handler ends the wait with wait clear, alongside its resume.
+			clear := api.TeamQueueRequest{RequestID: api.NewID("req"), Operation: "wait_clear", EntryID: f.waiting.ID, WaitOnEntryID: f.pred.ID, WaitReason: "handler resumed the team",
+				HandlerAgentID: f.handler.ID, HandlerRunID: f.handler.RunID}
+			if q, err := f.s.TeamQueueAction(f.ctx, f.task.ID, clear); err != nil || len(q.Waits) != 0 || f.state(t) != api.TeamQueueWaitCleared {
+				t.Fatalf("handler clear %+v %v, state %s", q.Waits, err, f.state(t))
+			}
+			if listed := f.waitingEntry(t); len(listed.Waits) != 0 || strings.Contains(listed.BlockReason, "handler resumes") {
+				t.Fatalf("cleared gate still listed: %+v %q", listed.Waits, listed.BlockReason)
+			}
+			cleared := f.messageCount(t)
+			f.clock = f.clock.Add(time.Minute)
+			if steps := f.sweep(t); len(steps) != 0 || f.messageCount(t) != cleared {
+				t.Fatalf("sweep after clear: %v", steps)
+			}
+		})
+	}
+}

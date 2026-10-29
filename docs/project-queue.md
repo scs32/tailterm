@@ -805,15 +805,20 @@ The met condition of a gated wait is evidence only. Its notice to the lead has
 its own subject, names the condition, the commit and the reason or paths, and
 says the wait still needs an explicit resume from the database handler: stay
 paused and do not start on the notice. It never says to resume the paused
-work. The handler resumes the team with its own message after its checks, or
-clears the wait.
+work. After its checks the handler sends its own resume message to the lead
+and ends the wait with `wait clear`. Team activity never ends a gated wait: it
+stays met, and the listing keeps saying `until the database handler resumes
+it`, until the handler clears it. An open wait also keeps the stall watch from
+reporting the team as quiet, so the handler clears the wait when it resumes
+the team.
 
 These are separate pieces of evidence, and none stands in for another: the
 predecessor's acceptance, done save or release (the condition), a physical
 host's departure or free memory (the handler's own check), the wait's clear,
 and the handler's explicit resume message. An automatic wait-met notice is
 condition evidence only and is never a handler resume. The wait's `resumed`
-state records team activity after the notice, not a handler resume.
+state belongs to automatic waits only and records team activity after the
+notice, never a handler resume.
 
 Provenance (incident I-50483, `wi_99ce2fa485c23648`): a handler recorded a
 pathless physical matrix-host wait with `--until accepted` as a bookkeeping
@@ -883,8 +888,9 @@ a repeated tick or a restarted hub posts nothing twice.
   owner helper and the primary handler each get one NOTICE, `A team is idle
   after its shared path wait was met`. The bound is 15 minutes, or
   `TAILTERM_QUEUE_WAIT_IDLE_MINUTES` (1 to 1440) in the hub's environment. A
-  team that shows activity once ends the wait as resumed and is never
-  reported for it. A pathless wait's report says `Paused for: REASON` where a
+  team that shows activity once ends an automatic wait as resumed and is never
+  reported for it; a gated wait stays met until the handler clears it, and its
+  active team is not reported either. A pathless wait's report says `Paused for: REASON` where a
   path wait's says `Paths free`. A gated wait's report, with refs
   `resume=handler`, says the wait needs the database handler's explicit
   resume: run the gate's checks and send the resume to the waiting lead, or
@@ -915,7 +921,8 @@ condition whose entry has no lead yet is seen in that one read, and a wait to
 report while the project has no primary handler costs two more reads per
 project per tick. Each wait that changes state costs one write transaction,
 at most three times in its life. A met wait costs two more reads per tick
-until it resumes or the bound passes. A listing
+until it resumes or the bound passes; a gated met wait whose team is active
+costs one read per tick until the handler clears it. A listing
 adds one indexed read for the project, not one per entry. The relay makes no
 new request: the notices use the ordinary delivery obligation and wake.
 

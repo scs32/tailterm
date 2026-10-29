@@ -742,11 +742,16 @@ func (s *Store) queueWaitTeamIdle(ctx context.Context, w queueWaitRow, now time.
 
 // queueWaitIdle follows a met wait: a team that shows activity ends it as
 // resumed; a team idle for the bound is reported once to the owner helper
-// and the primary handler. With neither to tell, the wait stays met.
+// and the primary handler. With neither to tell, the wait stays met. A gated
+// wait is never ended by activity: it stays met, naming its gate, until the
+// handler clears it.
 func (s *Store) queueWaitIdle(ctx context.Context, w queueWaitRow, now time.Time) (*QueueWaitStep, error) {
 	idle, err := s.queueWaitTeamIdle(ctx, w, now)
 	if err != nil {
 		return nil, err
+	}
+	if !idle && w.gated() {
+		return nil, nil
 	}
 	if !idle {
 		return nil, s.queueWaitTx(ctx, w, func(tx *sql.Tx, _ api.Task) (bool, error) {
