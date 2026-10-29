@@ -239,3 +239,25 @@ test("t5 verify-release refuses notices without an entry for every listed module
   assert.match(unlisted.stderr, /Missing \.build\/go-modules\.txt/);
 });
 
+
+// wi_2ee62670a765ceb0 / order #50444: the container build packages the same
+// copied texts, so its web stage takes both from the wasm stage before it
+// builds.
+test("t6 Dockerfile.static copies the module list and licence texts into the web stage before build:static", () => {
+  const lines = readFileSync(join(repo, "Dockerfile.static"), "utf8").split("\n");
+  const start = lines.findIndex((line) => /^FROM \S+ AS web$/.test(line));
+  assert.notEqual(start, -1, "no web stage");
+  let end = lines.findIndex((line, i) => i > start && /^FROM /.test(line));
+  if (end === -1) end = lines.length;
+  const stage = lines.slice(start + 1, end);
+  const at = (text) => stage.indexOf(text);
+  const build = at("RUN npm run build:static");
+  assert.notEqual(build, -1, "no build:static in the web stage");
+  for (const copy of [
+    "COPY --from=wasm /app/.build/go-modules.txt .build/go-modules.txt",
+    "COPY --from=wasm /app/.build/go-licenses .build/go-licenses",
+  ]) {
+    assert.notEqual(at(copy), -1, `web stage lacks: ${copy}`);
+    assert.ok(at(copy) < build, `after build:static: ${copy}`);
+  }
+});

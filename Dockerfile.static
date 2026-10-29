@@ -15,6 +15,7 @@ COPY --from=wasm /app/wasm/tailserve.wasm wasm/tailserve.wasm
 COPY --from=wasm /app/wasm/wasm_exec.js wasm/wasm_exec.js
 COPY --from=wasm /app/wasm/LICENSE.go wasm/LICENSE.go
 COPY --from=wasm /app/.build/go-modules.txt .build/go-modules.txt
+COPY --from=wasm /app/.build/go-licenses .build/go-licenses
 ARG TAILTERM_SOURCE_COMMIT=unknown
 ENV TAILTERM_SOURCE_COMMIT=$TAILTERM_SOURCE_COMMIT
 RUN npm run build:static
