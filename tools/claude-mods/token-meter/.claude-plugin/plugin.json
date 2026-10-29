@@ -1,0 +1,7 @@
+{
+  "name": "token-meter",
+  "version": "0.1.0",
+  "description": "Observe-only: shows the last turn's tokens and this session's running total; /token-meter breaks them down.",
+  "author": { "name": "Tailterm" },
+  "types": "./types/index.d.ts"
+}
