@@ -1036,9 +1036,18 @@ longer fail the entry:
   differs fails the entry under the never-respawn rule. If the read-back itself
   meets a hub fault, the relay remembers the member in memory and reconciles it
   after the backoff; after a relay restart that record is gone, so the member
-  stays `uncertain` and is never respawned. A context read the hub refused, a
-  lost registration response and every other spawn error still fail the entry
-  at once.
+  stays `uncertain` and is never respawned. A spawn whose hub call got no
+  answer, such as a registration refused in transport while the hub restarts
+  or a lost registration response, leaves the member `uncertain` and backs off
+  as above without failing the entry. After the backoff the runner reads the
+  member back. An exact registration with its owned session is started; one
+  without its session fails the entry. Read back as not found, the runner
+  checks this host for a tmux session tagged with the member's agent or run
+  and for relay state naming either. With neither, `unattempt` returns the
+  member to `unstarted` with the same identity and the launch backs off before
+  spawning it again; a trace, or a check that cannot read them, fails the entry
+  under the never-respawn rule. A context read the hub refused and every other
+  spawn error still fail the entry at once.
 - **Lead claim.** A serial launch names its lead as the project orchestrator
   before the first spawn. When that write gets no response, the entry stays
   `launching` and backs off as above. The claim may have landed, so the next
@@ -1774,8 +1783,10 @@ The entry is not failed, no `Team queue failed and requires owner action`
 notice is posted, and members already started are kept and not spawned again.
 N is the runner's own roster count, and its text always says 32 even on a hub
 with a lower cap; the hub's reasons use the enforced value. If the `unattempt`
-write itself is lost, the member stays `uncertain` and the next launch fails
-the entry under the unchanged never-respawn rule.
+write itself is lost, the member stays `uncertain`. The next launch reads it
+back as not found and takes it back again when this host has no session or
+relay state for it (see "Team queue launch errors"); a trace fails the entry
+under the unchanged never-respawn rule.
 
 A partly launched team that is held this way keeps its slot, handler lease
 and ownership until seats free. While the project has no seat for its next

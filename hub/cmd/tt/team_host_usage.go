@@ -118,6 +118,29 @@ func diskReserveState(free *int64, reserve int64) int {
 	return 0
 }
 
+// hostCensusReuse is how long an unchanged census is reused rather than
+// posted again.
+const hostCensusReuse = 20 * time.Second
+
+// hostCensusRefreshAfter is the census age at which the queue runner posts a
+// fresh one just before a parallel claim or member attempt. The hub refuses
+// either once the census is more than 30 seconds old
+// (internal/store/team_host_capacity.go), so half that window leaves the call
+// 15 seconds to reach the hub.
+const hostCensusRefreshAfter = 15 * time.Second
+
+// hostCensusKnownAt is when the census on the hub was observed after a
+// saveHostRelayCensus call at now: prior's time when that call reused it, and
+// otherwise now, since a posted census is observed no earlier than now.
+func hostCensusKnownAt(prior *api.TeamHostUsage, now time.Time) time.Time {
+	if prior != nil {
+		if observed, err := time.Parse(time.RFC3339Nano, prior.ObservedAt); err == nil && now.Sub(observed) < hostCensusReuse {
+			return observed
+		}
+	}
+	return now
+}
+
 func saveHostRelayCensus(ctx context.Context, c *api.Client, task, host string, policy api.TeamHostPolicy, prior *api.TeamHostUsage, cwds []string, now time.Time) error {
 	usage := hostRelayCensus(relayDir(), host, policy.LimiterDomain, now)
 	usage.PolicyVersion = policy.Version
@@ -125,7 +148,7 @@ func saveHostRelayCensus(ctx context.Context, c *api.Client, task, host string, 
 	reserve := policy.DiskReserveMiB()
 	if prior != nil && prior.PolicyVersion == usage.PolicyVersion && prior.Complete == usage.Complete && prior.SourceDigest == usage.SourceDigest && prior.LimiterDomain == usage.LimiterDomain && diskReserveState(prior.FreeDiskMiB, reserve) == diskReserveState(usage.FreeDiskMiB, reserve) {
 		observed, err := time.Parse(time.RFC3339Nano, prior.ObservedAt)
-		if err == nil && now.Sub(observed) < 20*time.Second {
+		if err == nil && now.Sub(observed) < hostCensusReuse {
 			return nil
 		}
 	}

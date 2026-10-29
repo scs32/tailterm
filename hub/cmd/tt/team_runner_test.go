@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -473,14 +474,22 @@ func TestTeamRunnerTwoItemsWithFakeSpawnsAndCleanup(t *testing.T) {
 	_, _ = json.Marshal(list)
 }
 
+// A crash before registration that left no session or relay state takes
+// the member back and spawns it once more (wi_ca88a4f24edfd5c1 c4); any local
+// trace, or a registration, keeps the never-respawn rule.
 func TestTeamRunnerCrashAroundSpawnNeverRespawns(t *testing.T) {
-	for _, registered := range []bool{false, true} {
-		name := "before-registration"
-		if registered {
-			name = "after-registration"
-		}
-		t.Run(name, func(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		registered, trace bool
+	}{
+		{name: "before-registration"},
+		{name: "before-registration-relay-trace", trace: true},
+		{name: "after-registration", registered: true},
+	} {
+		registered := tc.registered
+		t.Run(tc.name, func(t *testing.T) {
 			f := newTeamFixture(t, true)
+			relay := relayDir()
 			ctx := context.Background()
 			q, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "add", Operation: "add", ItemID: f.item.ID, OrderMessageSeq: f.order, Host: "fixture", Cwd: t.TempDir()})
 			if err != nil {
@@ -510,7 +519,7 @@ func TestTeamRunnerCrashAroundSpawnNeverRespawns(t *testing.T) {
 					for i := 0; i+1 < len(args); i += 2 {
 						flags[args[i]] = args[i+1]
 					}
-					if registered {
+					if registered || spawns > 1 {
 						data, err := os.ReadFile(flags["--work-context-file"])
 						if err != nil {
 							t.Fatal(err)
@@ -519,6 +528,14 @@ func TestTeamRunnerCrashAroundSpawnNeverRespawns(t *testing.T) {
 						if err != nil {
 							t.Fatal(err)
 						}
+					}
+					if tc.trace {
+						if err := os.WriteFile(filepath.Join(relay, "hub-"+flags["--agent-id"]+".binding.json"), []byte("{}"), 0600); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if spawns > 1 {
+						return nil
 					}
 					panic("synthetic process crash")
 				},
@@ -541,19 +558,36 @@ func TestTeamRunnerCrashAroundSpawnNeverRespawns(t *testing.T) {
 			if readErr != nil {
 				t.Fatal(readErr)
 			}
-			want := "failed"
-			if registered {
+			want, wantSpawns := "failed", 1
+			switch {
+			case registered:
 				want = "running"
+			case !tc.trace:
+				// Taken back: unstarted again, with the same identity.
+				want = "launching"
+				var frozen teamLaunchJournal
+				if jsonErr := json.Unmarshal(q.LaunchJSON, &frozen); jsonErr != nil || len(frozen.Members) != 1 || frozen.Members[0].State != "unstarted" {
+					t.Fatalf("taken-back member %+v %v", frozen.Members, jsonErr)
+				}
 			}
 			if q.State != want || spawns != 1 {
 				t.Fatalf("restart state=%s want=%s spawns=%d error=%v", q.State, want, spawns, err)
 			}
-			if !registered && q.EscalationSeq == 0 {
-				t.Fatal("failure did not store owner escalation")
+			if want == "failed" && (q.EscalationSeq == 0 || !strings.Contains(q.Failure, "never respawn")) {
+				t.Fatalf("failure %q escalation=%d", q.Failure, q.EscalationSeq)
+			}
+			if !registered && !tc.trace {
+				if err := r.tick(ctx, f.e, f.c, "fixture"); err != nil {
+					t.Fatal(err)
+				}
+				if q, err = f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID); err != nil || q.State != "running" {
+					t.Fatalf("respawned entry %+v %v", q, err)
+				}
+				wantSpawns = 2
 			}
 			_ = r.tick(ctx, f.e, f.c, "fixture")
-			if spawns != 1 {
-				t.Fatal("restart spawned member twice")
+			if spawns != wantSpawns {
+				t.Fatalf("spawns=%d want=%d", spawns, wantSpawns)
 			}
 		})
 	}
@@ -1049,6 +1083,7 @@ func TestTeamRunnerSameItemLeadReplacementKeepsReservation(t *testing.T) {
 
 func TestTeamRunnerUnregisteredCrashReleaseRequiresSynchronizedHostProof(t *testing.T) {
 	f := newTeamFixture(t, true)
+	relay := relayDir()
 	ctx := context.Background()
 	host := spawn.Host()
 	q, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "add", Operation: "add", ItemID: f.item.ID, OrderMessageSeq: f.order, Host: host, Cwd: t.TempDir()})
@@ -1066,8 +1101,25 @@ func TestTeamRunnerUnregisteredCrashReleaseRequiresSynchronizedHostProof(t *test
 		}()
 		_ = r.tick(ctx, f.e, f.c, host)
 	}()
+	// A relay state file naming the member is a local trace, so the runner
+	// keeps the never-respawn rule; without one it would take the member back.
+	attempted, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var attempt teamLaunchJournal
+	if err := json.Unmarshal(attempted.LaunchJSON, &attempt); err != nil || len(attempt.Members) != 1 {
+		t.Fatalf("attempted launch %+v %v", attempt, err)
+	}
+	trace := filepath.Join(relay, "hub-"+attempt.Members[0].Fields.AgentID+".binding.json")
+	if err := os.WriteFile(trace, []byte("{}"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	if err := r.tick(ctx, f.e, f.c, host); err == nil {
 		t.Fatal("uncertain effect did not fail closed")
+	}
+	if err := os.Remove(trace); err != nil {
+		t.Fatal(err)
 	}
 	q, err = f.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
 	if err != nil || q.State != "failed" || spawns != 1 {
@@ -1193,7 +1245,10 @@ type launchFaultHub struct {
 	once []*unansweredOnce
 	// requests counts every request by method and path.
 	requests map[string]int
-	srv      *httptest.Server
+	// intercept, when set, sees every request first, with the team queue
+	// operation of an action; a refusal it returns answers the request.
+	intercept func(r *http.Request, operation string) *api.HTTPError
+	srv       *httptest.Server
 }
 
 // unansweredOnce is one request the fault hub does not answer: it holds a
@@ -1217,7 +1272,24 @@ func newLaunchFaultHub(t *testing.T, f teamFixture) *launchFaultHub {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h.mu.Lock()
 		h.requests[r.Method+" "+r.URL.Path]++
+		intercept := h.intercept
 		h.mu.Unlock()
+		if intercept != nil {
+			operation := ""
+			if r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/team-queue/actions") {
+				body, _ := io.ReadAll(r.Body)
+				var req api.TeamQueueRequest
+				_ = json.Unmarshal(body, &req)
+				operation = req.Operation
+				r.Body = io.NopCloser(bytes.NewReader(body))
+			}
+			if refusal := intercept(r, operation); refusal != nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(refusal.Status)
+				_ = json.NewEncoder(w).Encode(api.ErrorResponse{Error: refusal.Msg})
+				return
+			}
+		}
 		if fault := h.takeOnce(r); fault != nil {
 			if fault.refusal != nil {
 				w.Header().Set("Content-Type", "application/json")
@@ -1443,6 +1515,124 @@ func launchRetryFixture(t *testing.T) (teamFixture, *launchFaultHub, api.TeamQue
 }
 
 const launchFailedSubject = "Team queue failed and requires owner action"
+
+// wi_ca88a4f24edfd5c1 c4-c6: a spawn whose hub call was refused in transport,
+// as during a hub restart, leaves its member uncertain and backs off without
+// failing the entry. Read back as not found with no session and no relay
+// state, the member returns to unstarted with the same identity and is
+// spawned once more; any local trace still fails the entry, never respawned.
+func TestTeamRunnerUncertainSpawnHubRefusedRetriesWithoutTrace(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		outages int
+		trace   string
+	}{
+		{name: "no trace", outages: 1},
+		{name: "repeated outage", outages: 3},
+		{name: "relay state present", outages: 1, trace: "relay"},
+		{name: "session present", outages: 1, trace: "session"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, hub, q, runner, now, spawns := launchRetryFixture(t)
+			ctx := context.Background()
+			refused := &url.Error{Op: "Post", URL: hub.srv.URL + "/v1/tasks/" + f.task.ID + "/agents", Err: &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}}
+			spawn := runner.spawn
+			runner.spawn = func(e env, args []string) error {
+				if *spawns < tc.outages {
+					*spawns++
+					return fmt.Errorf("register agent: %w", refused)
+				}
+				return spawn(e, args)
+			}
+			var sessions []ownedSession
+			previous := queueMemberSessions
+			queueMemberSessions = func(context.Context) ([]ownedSession, error) { return sessions, nil }
+			t.Cleanup(func() { queueMemberSessions = previous })
+			tick := func() error { return runner.tick(ctx, hub.e, hub.c, "fixture") }
+			member := func() teamLaunchMember {
+				t.Helper()
+				got, err := hub.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var journal teamLaunchJournal
+				if err := json.Unmarshal(got.LaunchJSON, &journal); err != nil || len(journal.Members) != 1 {
+					t.Fatalf("launch journal %+v %v", journal, err)
+				}
+				return journal.Members[0]
+			}
+			state := func() api.TeamQueueEntry {
+				t.Helper()
+				got, err := hub.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return got
+			}
+			_ = tick()
+			first := member()
+			if got := state(); got.State != "launching" || first.State != "uncertain" || hub.count("fail") != 0 || *spawns != 1 {
+				t.Fatalf("after the refused spawn: state=%s member=%s fails=%d spawns=%d failure=%q", got.State, first.State, hub.count("fail"), *spawns, got.Failure)
+			}
+			// Inside the backoff nothing is read back or spawned.
+			*now = now.Add(time.Second)
+			_ = tick()
+			if *spawns != 1 || hub.count("unattempt") != 0 {
+				t.Fatalf("inside the backoff: spawns=%d unattempts=%d", *spawns, hub.count("unattempt"))
+			}
+			switch tc.trace {
+			case "relay":
+				if err := os.WriteFile(filepath.Join(relayDir(), "hub-"+first.Fields.AgentID+".binding.json"), []byte("{}"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			case "session":
+				sessions = []ownedSession{{Name: first.Fields.Name, Agent: first.Fields.AgentID, Run: first.RunID}}
+			}
+			if tc.trace != "" {
+				*now = now.Add(launchRetryMaxDelay)
+				_ = tick()
+				got := state()
+				if got.State != "failed" || !strings.Contains(got.Failure, "never respawn") || hub.count("unattempt") != 0 || *spawns != 1 {
+					t.Fatalf("with a local trace: state=%s failure=%q unattempts=%d spawns=%d", got.State, got.Failure, hub.count("unattempt"), *spawns)
+				}
+				return
+			}
+			for outage := 1; outage <= tc.outages; outage++ {
+				*now = now.Add(launchRetryMaxDelay)
+				_ = tick()
+				back := member()
+				if got := state(); got.State != "launching" || back.State != "unstarted" || back.Fields.AgentID != first.Fields.AgentID || back.RunID != first.RunID || hub.count("unattempt") != outage {
+					t.Fatalf("outage %d taken back: state=%s failure=%q member=%+v unattempts=%d", outage, got.State, got.Failure, back, hub.count("unattempt"))
+				}
+				*now = now.Add(launchRetryMaxDelay)
+				_ = tick()
+				if hub.count("fail") != 0 {
+					t.Fatalf("outage %d failed the entry: %q", outage, state().Failure)
+				}
+			}
+			got := state()
+			if got.State != "running" || *spawns != tc.outages+1 || hub.count("unattempt") != tc.outages || hub.count("fail") != 0 {
+				t.Fatalf("after the respawn: state=%s failure=%q spawns=%d unattempts=%d", got.State, got.Failure, *spawns, hub.count("unattempt"))
+			}
+			if a, err := hub.c.GetAgent(ctx, f.task.ID, first.Fields.AgentID); err != nil || a.RunID != first.RunID {
+				t.Fatalf("respawned registration %+v %v", a, err)
+			}
+			agents, err := hub.c.ListAgents(ctx, f.task.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			named := 0
+			for _, a := range agents {
+				if a.Name == first.Fields.Name {
+					named++
+				}
+			}
+			if named != 1 {
+				t.Fatalf("%d registrations named %s", named, first.Fields.Name)
+			}
+		})
+	}
+}
 
 // wi_a3ca8b64d12365c2 a1, a2: a permanent refusal during launch fails the
 // entry after exactly three backed-off attempts with one failure notice; a

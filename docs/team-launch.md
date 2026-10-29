@@ -99,8 +99,11 @@ limit other than one needs a fresh, versioned owner policy whose session, projec
 rate, burst and headroom caps cover the host's hub limiter domain. The CLI
 derives the domain from the configured hub origin. No safe production values
 are inferred. The host CLI inventories every local relay binding file before
-raising a limit, and the relay refreshes this census before parallel queue
-effects. An unreadable binding, another unbudgeted domain, missing or stale
+raising a limit. The relay posts this census once per queue pass, reusing
+an unchanged one under 20 seconds old. Before a parallel claim or member
+attempt it posts the census again once the last one is 15 seconds old, so a
+slow pass cannot present the hub a census past its 30 second window; a failed
+refresh backs off. An unreadable binding, another unbudgeted domain, missing or stale
 census, or incomplete policy stops new parallel launch effects; it does
 not kill running teams. The relay rotates the first polled project and backs
 off after a hub 429; unrelated inbox delivery continues. A shared transport
@@ -205,7 +208,13 @@ launch reservation and frozen plan before effects. Each queued lead is scoped
 to its own item. The owner can transfer that lead to a live exact member of
 the same item with `replace-lead`; the other item lead remains untouched.
 Uncertain member spawns are reconciled by exact identity and owned session;
-unresolved attempts fail the entry and require owner action. Terminal items
+unresolved attempts fail the entry and require owner action. A spawn whose hub
+call failed in transport, as during a hub restart, stays uncertain and backs
+off instead of failing. When an uncertain member then reads back as not found,
+the runner checks this host for a tmux session tagged with the member's agent
+or run and for relay state naming either. With neither, the member returns to
+unstarted and is spawned again with the same identity after the backoff; any
+trace, or a check that cannot read them, fails the entry. Terminal items
 advance only after the exact team close and host cleanup receipts. A failed
 entry keeps its slot and posts one durable owner escalation. Unrelated teams
 continue; ownership blocked by the failed entry waits for an explicit verified
@@ -292,12 +301,15 @@ or cleanup is pending. For an attempted spawn with no hub registration, run
 `release` on the saved launch host: it locks out a concurrent launch, checks
 that no matching owned session remains, and sends the exact frozen agent and
 run identities for a final hub recheck. If it cannot verify absence, release
-refuses. Release never restarts the failed item.
+refuses. Release never restarts the failed item. The queue runner makes the
+same absence check itself before it fails an unregistered attempt, so a
+failed entry here had a local trace or an unreadable session list.
 If a manual launch stops, `abandon --item --order` releases its exact reservation
 with a retry receipt. After lead selection, first clear the lead and resolve
 every member through the saved journal: registered runs need close and cleanup
 receipts, and an uncertain unregistered attempt needs a verified absence of
-its local session. `abandon` locks the journal, checks local sessions, and sends
+its local session. The queue runner checks that absence automatically;
+manual `release` and `abandon` keep their own checks unchanged. `abandon` locks the journal, checks local sessions, and sends
 the exact member identities to the hub. It refuses a live team or pending
 cleanup. Both commands are owner-side operations.
 An abandoned manual attempt cannot replay its old launch identity; queue the
@@ -339,7 +351,8 @@ item-scoped lead as project orchestrator before starting any member, then runs
 the existing `tt spawn` path in order. Output gives each name, agent ID and run.
 After an uncertain response, repeat the identical command. It reconciles exact
 saved IDs before attempting an unstarted member and refuses conflicting or
-closed identities. Do not delete a partial journal to force another launch;
+closed identities. Unlike the queue runner, this manual repeat does not run
+the automatic absence check. Do not delete a partial journal to force another launch;
 inspect the project and reconcile the original identities first.
 
 The command launches on the host where it runs. It does not select remote saved

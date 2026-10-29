@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -570,5 +571,144 @@ func TestHostCensusReportsLeastFreeDisk(t *testing.T) {
 	}
 	if got := census(500); got.FreeDiskMiB == nil || *got.FreeDiskMiB != 500 {
 		t.Fatalf("reserve flip did not write the census: %+v", got)
+	}
+}
+
+// censusClockRun is what runCensusClock saw: the entry, the census age the
+// hub saw at each claim and attempt, the stale refusals, each census call and
+// each census the runner posted rather than reused, by the fake clock.
+type censusClockRun struct {
+	entry  api.TeamQueueEntry
+	ages   []time.Duration
+	stale  int
+	calls  int
+	posts  []time.Time
+	spawns int
+	clock  time.Duration
+}
+
+// runCensusClock launches one three-member team on a parallel project
+// through a fault hub whose fake clock moves step on every read, for ticks
+// passes. The hub refuses a claim or attempt whose census is more than 30
+// seconds old by that clock, as the store does by its own clock
+// (internal/store/team_host_capacity.go). The census fake reuses a prior
+// census under hostCensusReuse old, as saveHostRelayCensus does.
+func runCensusClock(t *testing.T, step time.Duration, ticks int) censusClockRun {
+	t.Helper()
+	f := newTeamFixture(t, true)
+	hub := newLaunchFaultHub(t, f)
+	ctx := context.Background()
+	domain, err := canonicalLimiterDomain(hub.c.Base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := hub.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "clock-policy", Operation: "set_host_policy", Host: "fixture", HostPolicyVersion: 1, HostPolicyExpires: time.Now().Add(time.Hour).Format(time.RFC3339), HostMaxSessions: 100, HostMaxPolling: 10, LimiterDomain: domain, HostMaxRelayBindings: 100, HostMaxRequestsPerMinute: 100000, HostMaxBurst: 10000, HostHeadroomPercent: 20}); err != nil {
+		t.Fatal(err)
+	}
+	seed := time.Now().UTC()
+	if _, err := hub.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "clock-usage", Operation: "observe_host", Host: "fixture", HostUsage: &api.TeamHostUsage{Host: "fixture", LimiterDomain: domain, PolicyVersion: 1, ObservedAt: seed.Format(time.RFC3339Nano), RelayBindings: 1, Complete: true, SourceDigest: strings.Repeat("a", 64), FreeDiskMiB: freeDiskMiB(1 << 20)}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := hub.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "clock-limit", Operation: "set_limit", Host: "fixture", ConcurrencyLimit: 2}); err != nil {
+		t.Fatal(err)
+	}
+	q, err := hub.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "clock-add", Operation: "add", ItemID: f.item.ID, OrderMessageSeq: f.order, Host: "fixture", Cwd: t.TempDir(), Repository: "fixture-repo", BaseCommit: strings.Repeat("a", 40), Ownership: []string{"src/clock"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out censusClockRun
+	var mu sync.Mutex
+	clock, last := seed, seed
+	runner := queueCorrectionRunner(t, f, 3)
+	spawn := runner.spawn
+	runner.spawn = func(e env, args []string) error {
+		out.spawns++
+		return spawn(e, args)
+	}
+	runner.retries = &launchRetryBook{}
+	runner.now = func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return clock
+	}
+	runner.census = func(_ context.Context, _ *api.Client, _, _ string, _ api.TeamHostPolicy, prior *api.TeamHostUsage, _ []string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		out.calls++
+		if prior != nil {
+			if observed, err := time.Parse(time.RFC3339Nano, prior.ObservedAt); err == nil && clock.Sub(observed) < hostCensusReuse {
+				return nil
+			}
+		}
+		last = clock
+		out.posts = append(out.posts, clock)
+		return nil
+	}
+	hub.intercept = func(r *http.Request, operation string) *api.HTTPError {
+		mu.Lock()
+		defer mu.Unlock()
+		if r.Method == "GET" {
+			clock = clock.Add(step)
+		}
+		if operation == "claim" || operation == "attempt" {
+			age := clock.Sub(last)
+			out.ages = append(out.ages, age)
+			if age > 30*time.Second {
+				out.stale++
+				return &api.HTTPError{Status: 409, Msg: "conflict: host relay binding census is stale"}
+			}
+		}
+		return nil
+	}
+	time.Sleep(2 * time.Second) // isolated test hub's write bucket refills
+	for i := 0; i < ticks; i++ {
+		if err := runner.tick(ctx, hub.e, hub.c, "fixture"); err != nil {
+			t.Fatalf("tick %d: %v", i+1, err)
+		}
+	}
+	hub.intercept = nil
+	if out.entry, err = hub.c.GetTeamQueueEntry(ctx, f.task.ID, q.ID); err != nil {
+		t.Fatal(err)
+	}
+	out.clock = clock.Sub(seed)
+	return out
+}
+
+// wi_ca88a4f24edfd5c1 c1, c2: a pass that runs past the hub's 30 second
+// census window refreshes the census before its claim and each member
+// attempt, so none of them is refused as stale.
+func TestTeamRunnerParallelCensusRefreshBeforeLateAttempt(t *testing.T) {
+	run := runCensusClock(t, 7*time.Second, 1)
+	if run.clock <= 30*time.Second {
+		t.Fatalf("the pass took %v by the fake clock, not more than 30s", run.clock)
+	}
+	if run.stale != 0 || run.entry.State != "running" || run.spawns != 3 {
+		t.Fatalf("stale=%d state=%s failure=%q spawns=%d", run.stale, run.entry.State, run.entry.Failure, run.spawns)
+	}
+	if len(run.ages) != 4 {
+		t.Fatalf("claims and attempts seen: %v", run.ages)
+	}
+	for i, age := range run.ages {
+		if age >= hostCensusRefreshAfter {
+			t.Fatalf("claim or attempt %d followed a census %v old (all %v)", i, age, run.ages)
+		}
+	}
+	if len(run.posts) < 2 {
+		t.Fatalf("census posts %v: a late attempt was not refreshed", run.posts)
+	}
+}
+
+// wi_ca88a4f24edfd5c1 c2: a fast pass takes the tick's one census call and
+// reuses a census under 20 seconds old, with no refresh.
+func TestTeamRunnerParallelFastPassReusesCensus(t *testing.T) {
+	run := runCensusClock(t, 500*time.Millisecond, 2)
+	if run.clock >= hostCensusReuse {
+		t.Fatalf("the passes took %v by the fake clock, not under %v", run.clock, hostCensusReuse)
+	}
+	if run.stale != 0 || run.entry.State != "running" || run.spawns != 3 {
+		t.Fatalf("stale=%d state=%s failure=%q spawns=%d", run.stale, run.entry.State, run.entry.Failure, run.spawns)
+	}
+	if run.calls != 2 || len(run.posts) != 0 {
+		t.Fatalf("census calls=%d posts=%v, want one reused census per tick", run.calls, run.posts)
 	}
 }

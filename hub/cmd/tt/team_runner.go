@@ -61,6 +61,19 @@ type teamRunner struct {
 	// closedProjects remembers the projects that refused the host census
 	// as closed; nil asks them again on every live tick.
 	closedProjects *closedProjectBook
+	// censusRefresh is the host census this tick took, refreshed before a
+	// parallel claim or member attempt once it is hostCensusRefreshAfter
+	// old; nil when the tick took none.
+	censusRefresh *hostCensusRefresh
+}
+
+// hostCensusRefresh is what a refresh repeats of the tick's host census, and
+// when the census on the hub was observed.
+type hostCensusRefresh struct {
+	projects []string
+	host     string
+	list     api.TeamQueueList
+	at       time.Time
 }
 
 func (r teamRunner) clock() time.Time {
@@ -1030,8 +1043,13 @@ func (r teamRunner) tick(ctx context.Context, e env, c *api.Client, host string)
 			hostBudgetErr = errors.New("host policy limiter domain differs from relay hub")
 		} else if err := activeRelayBudget.configure(list.HostPolicy, time.Now()); err != nil {
 			hostBudgetErr = err
-		} else if err := r.hostCensus(ctx, c, projects, host, list); err != nil {
-			hostBudgetErr = fmt.Errorf("host relay binding census: %w", err)
+		} else {
+			at := r.clock()
+			if err := r.hostCensus(ctx, c, projects, host, list); err != nil {
+				hostBudgetErr = fmt.Errorf("host relay binding census: %w", err)
+			} else {
+				r.censusRefresh = &hostCensusRefresh{projects: projects, host: host, list: list, at: hostCensusKnownAt(list.HostUsage, at)}
+			}
 		}
 	}
 	if hostListed {
@@ -1293,6 +1311,11 @@ func (r teamRunner) advance(ctx context.Context, e env, c *api.Client, q api.Tea
 			// later entries still launch; failing it would strand the item.
 			return errQueuedAwaitsRebind
 		}
+		if queueParallel(queue.ConcurrencyLimit) {
+			if err := r.refreshHostCensus(ctx, c); err != nil {
+				return err
+			}
+		}
 		q, err = c.TeamQueueAction(ctx, q.TaskID, api.TeamQueueRequest{RequestID: "queue-claim-" + q.ID, Operation: "claim", EntryID: q.ID, ExpectedRevision: q.Revision, Host: host, PauseGeneration: detail.Task.PauseGeneration})
 		if err != nil {
 			var response *api.HTTPError
@@ -1521,6 +1544,29 @@ func (r teamRunner) hostCensus(ctx context.Context, c *api.Client, projects []st
 	return nil
 }
 
+// refreshHostCensus posts the tick's host census again once the last one is
+// hostCensusRefreshAfter old, so a slow pass cannot present the hub a census
+// past its 30 second window at a parallel claim or member attempt. A failed
+// refresh backs off like any hub error; it is never permanent.
+func (r teamRunner) refreshHostCensus(ctx context.Context, c *api.Client) error {
+	state := r.censusRefresh
+	if state == nil {
+		return nil
+	}
+	now := r.clock()
+	if now.Sub(state.at) < hostCensusRefreshAfter {
+		return nil
+	}
+	list := state.list
+	// No prior usage, so the census is posted rather than reused.
+	list.HostUsage = nil
+	if err := r.hostCensus(ctx, c, state.projects, state.host, list); err != nil {
+		return fmt.Errorf("refresh host relay binding census: %w", err)
+	}
+	state.at = now
+	return nil
+}
+
 // recheckClosedProjects forgets each remembered project that the hub lists
 // as open again, since the owner can reopen a closed project. While the host
 // listing names a remembered project this costs one project list read per
@@ -1702,6 +1748,39 @@ func (r teamRunner) verifyMember(ctx context.Context, e env, c *api.Client, q ap
 		return a, err
 	}
 	return a, nil
+}
+
+// queueMemberSessions lists the host's tmux sessions for the uncertain-spawn
+// absence check; tests replace it.
+var queueMemberSessions = localSessions
+
+// uncertainMemberTrace names a local trace of an uncertain member's spawn: a
+// tmux session tagged with its agent or run, or a relay state file naming
+// either. spawn.Create tags the session as it creates it, after registration,
+// so a spawn that left neither started nothing on this host. It returns ""
+// when there is none; a session list or relay directory it cannot read is an
+// error.
+func uncertainMemberTrace(ctx context.Context, m teamLaunchMember) (string, error) {
+	agent, run := m.Fields.AgentID, m.RunID
+	sessions, err := queueMemberSessions(ctx)
+	if err != nil {
+		return "", fmt.Errorf("list sessions: %w", err)
+	}
+	for _, session := range sessions {
+		if (agent != "" && session.Agent == agent) || (run != "" && session.Run == run) {
+			return "session " + session.Name, nil
+		}
+	}
+	entries, err := os.ReadDir(relayDir())
+	if err != nil && !os.IsNotExist(err) {
+		return "", fmt.Errorf("read relay state: %w", err)
+	}
+	for _, entry := range entries {
+		if (agent != "" && strings.Contains(entry.Name(), agent)) || (run != "" && strings.Contains(entry.Name(), run)) {
+			return "relay state " + entry.Name(), nil
+		}
+	}
+	return "", nil
 }
 
 // reconcileRestore settles a member spawn that registered and then timed out
@@ -1908,6 +1987,30 @@ func (r teamRunner) launch(ctx context.Context, e env, c *api.Client, q api.Team
 				// the backoff; this branch never spawns.
 				return fmt.Errorf("uncertain spawn %s: read back registration: %w", member.Fields.AgentID, err)
 			}
+			var response *api.HTTPError
+			if errors.As(err, &response) && response.Status == 404 {
+				// No registration: a spawn the hub refused, as during a hub
+				// restart, may have left nothing behind. With no session and
+				// no relay state for the member, it returns to unstarted and
+				// is spawned again with the same identity after the backoff.
+				trace, traceErr := uncertainMemberTrace(ctx, *member)
+				if traceErr == nil && trace == "" {
+					revision := q.Revision
+					if _, err := c.TeamQueueAction(ctx, q.TaskID, api.TeamQueueRequest{RequestID: fmt.Sprintf("queue-unattempt-%s-%d-%d", q.ID, i, q.Revision), Operation: "unattempt", EntryID: q.ID, ExpectedRevision: q.Revision, MemberIndex: i}); err != nil {
+						if hubTransportFault(err) {
+							return &launchStepError{op: "unattempt", revision: revision, err: err}
+						}
+						return r.fail(ctx, c, q, fmt.Errorf("uncertain spawn %s could not be taken back; never respawn: %w", member.Fields.AgentID, err))
+					}
+					// %v: the read-back's 404 must not count as a permanent
+					// refusal of this launch.
+					return &launchStepError{op: "spawn " + member.Fields.Name, revision: revision, err: fmt.Errorf("uncertain spawn %s has no registration, local session or relay state; it returns to unstarted (read back: %v)", member.Fields.AgentID, err)}
+				}
+				if traceErr != nil {
+					return r.fail(ctx, c, q, fmt.Errorf("uncertain spawn %s has no exact registration; never respawn: %w (local trace check: %v)", member.Fields.AgentID, err, traceErr))
+				}
+				return r.fail(ctx, c, q, fmt.Errorf("uncertain spawn %s has no exact registration; never respawn: %w (local trace found: %s)", member.Fields.AgentID, err, trace))
+			}
 			if err != nil {
 				return r.fail(ctx, c, q, fmt.Errorf("uncertain spawn %s has no exact registration; never respawn: %w", member.Fields.AgentID, err))
 			}
@@ -1920,6 +2023,11 @@ func (r teamRunner) launch(ctx context.Context, e env, c *api.Client, q api.Team
 		}
 		if member.State != "unstarted" {
 			return r.fail(ctx, c, q, errors.New("invalid frozen member state"))
+		}
+		if parallel {
+			if err := r.refreshHostCensus(ctx, c); err != nil {
+				return err
+			}
 		}
 		revision := q.Revision
 		q, err = c.TeamQueueAction(ctx, q.TaskID, api.TeamQueueRequest{RequestID: fmt.Sprintf("queue-attempt-%s-%d-%d", q.ID, i, q.Revision), Operation: "attempt", EntryID: q.ID, ExpectedRevision: q.Revision, MemberIndex: i})
@@ -1974,6 +2082,15 @@ func (r teamRunner) launch(ctx context.Context, e env, c *api.Client, q api.Team
 			var restore *spawnContextRestoreError
 			if errors.As(spawnErr, &restore) && hubTransportFault(restore.Err) && restore.AgentID == f.AgentID && restore.RunID == member.RunID {
 				return r.reconcileRestore(ctx, c, q, i, *member, fmt.Errorf("spawn %s: %w", f.Name, spawnErr))
+			}
+			if hubTransportFault(spawnErr) {
+				// The hub did not answer the spawn: the member stays
+				// uncertain from its attempt and the launch backs off. The
+				// uncertain branch then reads it back: an exact registration
+				// with its session is started, and one not found with no
+				// local trace returns to unstarted. Transport faults before
+				// the attempt return before any spawn.
+				return fmt.Errorf("spawn %s: hub unreachable; the member stays uncertain: %w", f.Name, spawnErr)
 			}
 			return r.fail(ctx, c, q, fmt.Errorf("spawn %s: %w", f.Name, spawnErr))
 		}
