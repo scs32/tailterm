@@ -20,7 +20,10 @@ Everything was read only: the relay log, the relay state directory and the owner
 
 Findings:
 
-- **m2: no miss, but mostly no data.** Pre-Enter failures fell from 131 on 10-24 to 2 in the whole window. Both were delivered 20 s later by the retry watch. Five of the six day-and-path cells have no failures, so they have no data, not a pass.
+- **m2: no miss, but mostly no data.** Pre-Enter failures fell from 131 on 10-24 to 2 in the whole window. The retry watch pressed Enter for both 20 s later, and that Enter retry is what the delay measures.
+  - The 00:36:36Z retry (line 76217) was followed by `Claude new user turn did not confirm within five seconds` (line 76218). The agent's next wake at 00:41:42Z (line 76224) did not confirm either.
+  - The 20:43:19Z retry (line 77106) has no such line.
+  - Five of the six day-and-path cells have no failures, so they have no data, not a pass.
 - **m4: miss on all three days.** Agents are visited one after another, and that is now the slow phase of a relay pass. On every day, at least one live binding waited more than twice the 60 s target between visits.
 - **The team queue claim is not confirmed.** The slow-pass lines name the binding visits, not the team queue (see m4).
 
@@ -101,6 +104,13 @@ Excluded on purpose: `Claude new user turn did not confirm within five seconds` 
 
 Both deliveries came from the retry watch, 20 s after the failed check: the 3 s check, the 15 s backoff and the 2 s watch tick.
 
+Delivery here means the Enter retry, as defined above. It does not mean the new turn was confirmed:
+
+- **`agt_ee9b2aa6fb6dff29`:** the 00:36:36Z retry (line 76217) was followed by `[tt relay] 2026-10-26T00:36:42Z agt_ee9b2aa6fb6dff29 Claude retry watch: Claude new user turn did not confirm within five seconds` (line 76218). The agent's next wake, at 00:41:42Z (line 76224, `wake skipped: Claude new user turn did not confirm within five seconds seqs=[46651]`), did not confirm either.
+- **`agt_d7675a9d13bc353c`:** the 20:43:19Z retry (line 77106) has no such line. No later line for that agent in the window reports an unconfirmed turn.
+
+The delay figures stay as defined.
+
 **Calibration against the baseline.** The same script, run over 10-24 (lines 73607-74960), gives:
 
 | 10-24 count | This method | Baseline (#45774) |
@@ -171,7 +181,7 @@ I also searched `~/projects/tailterm-artifacts` for numeric swap or fseventsd fi
 | 10-27 | no sample | no sample | No note dated between 17:00 PDT 10-26 and 17:00 PDT 10-27 gives a swap or fseventsd figure. Line 1293, "Update 17:14 10-26" (00:14Z), records only that the owner did not run killall. |
 | 10-28 | 9.3 of 10.2 GB at 04:22Z | no sample | Line 1339, "Update 21:22 10-27: ... Swap 9.3/10.2 GB (vmware-vmx 7.5 GB; fseventsd not top 5)". It gives no fseventsd size, so the fseventsd cell has no sample. |
 
-Context for the 10-26 sample: fseventsd restarted at 08:44 PDT (15:44Z), and swap fell from 40 to 8.3 GB (line 1268, "Update 09:20 10-26"). Later the same day swap was 9.0 of 10.2 GB, at 19:19Z on 10-28 (line 1363, "Update 12:19 10-28"). This is not used as the day's sample.
+Context for the 10-26 sample: fseventsd restarted at 08:44 PDT (15:44Z), and swap fell from 40 to 8.3 GB (line 1268, "Update 09:20 10-26"). A separate record dated 10-28 gives swap 9.0 of 10.2 GB at 19:19Z on 10-28 (line 1363, "Update 12:19 10-28"). It is not used, because the 10-28 sample in the table is the earlier 04:22Z one.
 
 ## m2: verdict
 
@@ -325,12 +335,15 @@ These are drafts. The handler saves them as native notes after lead accepts this
 > Measured 2026-10-26..28 UTC from the Mini relay log, lines 76144-81155 (report `docs/measurements/claude-wake-delivery-2026-10-26-through-28.md`).
 >
 > - m1/m2: pre-Enter failures 2/0/0, against 131 on 10-24. Both 10-26 failures were broker wakes (`input empty` 2.975 s, `input unreadable` 3.077 s), each delivered 20 s later by a retry-watch Enter. Broker 10-26: n=2, median 20 s, p90 20 s: pass. The other five day-path cells are no data, so there is no miss, but no full pass either.
+> - Delivery is the Enter retry, not a confirmed turn. The 00:36:36Z retry (L76217) was followed by "Claude new user turn did not confirm within five seconds" (L76218), and that agent's next wake at 00:41:42Z (L76224) also did not confirm. The 20:43:19Z retry (L77106) has no such line.
 > - Load: 10-26 swap 38.4/38.9 GB and fseventsd 35 GB; 10-27 no sample; 10-28 swap 9.3/10.2 GB, fseventsd no sample.
 > - m4: miss on all three days. The longest revisit interval is at least 155.6, 168.1 and 119.5 s, against the 60 s target. Slow-pass lines name the bindings phase in 296 of 297. The team-queue claim is not confirmed. Recurrence of `wi_44e5b080b7e7d846`; owner-helper decides the next step.
 
 **On `wi_b6b91a5200151bdf`:**
 
-> After-release measurement (`wi_7c80e947014908b4`, 2026-10-26..28 UTC): no m2 miss. Pre-Enter failures were 2, 0 and 0 per day, against 131 on 10-24. Both were delivered by the retry watch 20 s after the failed check (median 20 s, p90 20 s, broker n=2). The inbox path and days 10-27 and 10-28 had no failures to time. Not a recurrence.
+> After-release measurement (`wi_7c80e947014908b4`, 2026-10-26..28 UTC): no m2 miss. Pre-Enter failures were 2, 0 and 0 per day, against 131 on 10-24. Both were delivered by the retry watch's Enter 20 s after the failed check (median 20 s, p90 20 s, broker n=2). The inbox path and days 10-27 and 10-28 had no failures to time. Not a recurrence of the delay.
+>
+> The Enter retry is not a confirmed turn. After the 00:36:36Z retry (L76217) the relay logged "Claude new user turn did not confirm within five seconds" (L76218), and the agent's next wake at 00:41:42Z (L76224) also did not confirm. The 20:43:19Z retry (L77106) has no such line.
 
 **On `wi_44e5b080b7e7d846`:**
 
