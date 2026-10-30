@@ -870,7 +870,7 @@ test("f2 an unknown-path refusal sends its select step and tag with the refuse",
  assert.deepEqual(sent,[{step:"select",reason:NEW_REASON}]);assert.deepEqual(n.said,[{jobId:"rel_fixture",outcome:"refused",reason:NEW_REASON}],"the notice is unchanged");
  assert.equal(n.journal().refusalReason,NEW_REASON);
 });
-test("f2 a secret-looking tag is sent unclassified while the journal and notice keep it; a failure outside a step sends the tag alone",async()=>{
+test("f2 a secret-looking tag is sent unclassified while the journal and notice keep it; an inputs failure sends its inputs step",async()=>{
  // A new folder whose name holds a secret word (fake): its select tag is not a receipt reason.
  const TAG="Unknown release path: tools/tokenizer/a.js",f=fixture();mkdirSync(join(f.cwd,"tools/tokenizer"),{recursive:true});
  const j=job(f,change(f,"tools/tokenizer/a.js","a")),a=fake(),c=config(f,j),sent=[];let said;
@@ -881,7 +881,7 @@ test("f2 a secret-looking tag is sent unclassified while the journal and notice 
  const g=fixture(),k=job(g,change(g,"client/a.js","a")),b=fake(),d=config(g,k),alone=[];
  b.verifyInputs=async()=>{throw releaseError("Release inputs request failed");};b.refuse=async r=>{alone.push(r);b.calls.push("refuse");};
  await assert.rejects(runRelease(d,b),/refused/);
- assert.deepEqual(alone,[{reason:"Release inputs request failed"}]);assert.equal(journalAt(d).failure,undefined);
+ assert.deepEqual(alone,[{step:"inputs",reason:"Release inputs request failed"}]);assert.deepEqual(journalAt(d).failure,{step:"inputs",reason:"Release inputs request failed"});
 });
 // A CLI that answers refuse like this hub, or like an older hub or tt, a
 // failing transport or a moved generation when the refuse carries a refusal.

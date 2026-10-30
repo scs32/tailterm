@@ -179,8 +179,9 @@ const generationChanged = error => GENERATION_CHANGED.test((typeof error?.stderr
 // the unknown refusal field, or a refusal it holds invalid), tt does not know
 // the flag, or the hub saved a bare refuse under this request ID before.
 // A block carrying a revert (wi_816228d539a80c48) is answered the same way by
-// a hub or tt from before reverts were kept on blocks.
-const REFUSAL_REFUSED = [/\bhub: 400 [^\n]*\s*$/, /\bhub: 409 [^\n]*\brelease: retry changed\s*$/, /\bflag provided but not defined: -(?:reason|step|target|revert-outcome|revert-commit|revert-bug-request)\b/];
+// a hub or tt from before reverts were kept on blocks, and so is a finish
+// carrying batch exclusions (wi_861ff5962b9bb478).
+const REFUSAL_REFUSED = [/\bhub: 400 [^\n]*\s*$/, /\bhub: 409 [^\n]*\brelease: retry changed\s*$/, /\bflag provided but not defined: -(?:reason|step|target|revert-outcome|revert-commit|revert-bug-request|batch-dropped)\b/];
 const refusalRefused = error => {const text = (typeof error?.stderr === "string" ? error.stderr : Buffer.isBuffer(error?.stderr) ? error.stderr.toString("utf8") : "").slice(-CLI_STDERR_BYTES);return REFUSAL_REFUSED.some(p => p.test(text));};
 function recordCliFailure(config, job, argv, cwd, error, reason, now) {
   const text = typeof error.stderr === "string" ? error.stderr : Buffer.isBuffer(error.stderr) ? error.stderr.toString("utf8") : "";
@@ -249,15 +250,56 @@ export function transportWaitNotice(wait) {
   return {requestId: `transport-wait-${createHash("sha256").update(JSON.stringify([since, job])).digest("hex").slice(0, 16)}`, jobId: job, wake: WAKE.attention, subject: "The deployer has not reached the hub for longer than its bound",
     text: `${job ? `Release ${job} has` : "The polls of the deployer have"} waited on hub transport failures since ${since}, longer than the ${minutes} minute bound. Cause: ${cause}. A job that is not yet published stays claimed and unrefused, and the deployer tries again at every poll. Check that the hub answers from the host of the deployer; see the transport wait step in docs/project-deployment.md.`};
 }
-// What the Board may repeat of a refused CLI call's stderr: its last line,
-// word by word. A plain word, a small number or a hub id is kept; any other
-// word (a path, a token, a NAME=value pair) becomes "(removed)". null when
+// What the Board may repeat of a refused CLI call's stderr (wi_348b593aa2e48346):
+// its last line starting "tt: ", else its last non-empty line, so a usage line
+// printed after a refusal does not replace it. The line is read word by word.
+// First the word after a credential label (bearer, token, password, key,
+// secret, authorization and the like) becomes "(removed)", whatever it is.
+// Then a word is kept only when it is a word of REFUSAL_WORDS (a hyphenated
+// word only when each part is), a number of at most six digits or a hub id,
+// with an optional leading "(" and trailing "),.:;"; any other word (a path, a
+// token, a NAME=value pair, an unknown name) becomes "(removed)". null when
 // nothing readable is left.
-const SAFE_WORD = /^\(?(?:[A-Za-z][A-Za-z-]{0,23}|\d{1,6}|(?:rel|wi|tsk|agt|run)_[a-f0-9]{1,40})[),.:;]*$/;
+// REFUSAL_WORDS is fixed: every letter word of the string literals passed to
+// releaseConflict in hub/internal/store/releases.go and of its verified,
+// window and effects refusal texts, the api error texts (not found, invalid,
+// conflict), the tt deployment subcommands, and a short list of tt client and
+// OS error words. A test fails when a releaseConflict literal word is missing,
+// so a new hub refusal adds its words here in the same change.
+export const REFUSAL_WORDS = new Set(`a acceptance accepted active add adds after already an and another applies approval approved are aside at
+available back backup base batch be bearer before belongs binding block blocked bound broken bug by can
+candidate cannot changed check claim claimed clears commit compat conflict connection context contradicts
+cover covers current deadline denied deployer deployment dial digest directory dismissed does drop effect
+effects ends enqueue entry eof error evidence exact exceeded execution exit exited explicit failed failure
+fence fenced file finish first fixed for forbidden foreign found free frees generation get hand handler has
+heartbeat held history hold holds host hub i imported in incident input inputs inside inspected integrated
+integrity intervention invalid is it item items its itself job jobs joined keeps key later latest lead leads
+ledger list lock matrix may members merged migration mismatch must name named names needs network next no not
+o of omitted on once only open or order original outcome over own owned owner permission pin pipe plan
+preflight prevention prior progress project published publishes queue quiet read reason receipt reconcile
+reconciliation record recorded records recover recovery refuse refused rejected release released releases
+request requeue requeued required requires reset restoration restored retirement retry roll rolled run s
+saved set sets setup sha since snapshot stale standing starts status still such supersede superseded support
+taken target tcp termination text than that the this time timeout to tt unauthorized unavailable unclaim
+unclaimed unexpected unhold unpublished unreachable unreceipted until uses valid verification verified wait
+waiting was which while window with word work write`.split(/\s+/));
+const REFUSAL_LABEL = /^(?:bearer|token|tokens|password|passwd|pass|passphrase|pwd|key|apikey|api-key|x-api-key|secret|secrets|authorization|auth|credential|credentials|cookie|session)$/;
+const REFUSAL_WORD = /^\(?([A-Za-z][A-Za-z-]{0,23}|\d{1,6}|(?:rel|wi|tsk|agt|run)_[a-f0-9]{1,40})[),.:;]*$/;
+const refusalWord = w => {
+  const core = REFUSAL_WORD.exec(w)?.[1];
+  if (!core) return false;
+  if (!/^[A-Za-z]/.test(core)) return true;
+  if (/^(?:rel|wi|tsk|agt|run)_/.test(core)) return true;
+  const parts = core.toLowerCase().split("-");
+  return parts.every(p => p && REFUSAL_WORDS.has(p));
+};
+const labelCore = w => w.replace(/^\(+/, "").replace(/[),.:;=]+$/, "").toLowerCase();
 export function refusalText(stderr) {
   const text = typeof stderr === "string" ? stderr : Buffer.isBuffer(stderr) ? stderr.toString("utf8") : "";
-  const line = (text.trim().split("\n").at(-1) || "").trim().replace(/^tt: /, "").slice(0, 1024);
-  const words = line.split(/\s+/).filter(Boolean).map(w => SAFE_WORD.test(w) ? w : "(removed)").filter((w, i, all) => w !== "(removed)" || all[i - 1] !== w);
+  const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
+  const line = (lines.findLast(l => l.startsWith("tt: ")) ?? lines.at(-1) ?? "").replace(/^tt: /, "").slice(0, 1024);
+  const raw = line.split(/\s+/).filter(Boolean);
+  const words = raw.map((w, i) => i > 0 && REFUSAL_LABEL.test(labelCore(raw[i - 1])) ? "(removed)" : refusalWord(w) ? w : "(removed)").filter((w, i, all) => w !== "(removed)" || all[i - 1] !== w);
   while (words.length && words.join(" ").length > 120) words.pop();
   return words.some(w => w !== "(removed)") ? words.join(" ") : null;
 }
@@ -387,7 +429,15 @@ export function windowWaitNotice(job, wait) {
       : `Release ${job.id} waits for the release quiet window${span}, which covers its selected targets ${wait.covered.join(", ")} until ${wait.until}. ${kept} It goes on at the first poll after the window ends; no unhold is needed.`};
 }
 const sha = s => /^[a-f0-9]{40}$/.test(s || "");
-const git = (cwd,...argv) => execFileSync("git",argv,{cwd,encoding:"utf8",stdio:["ignore","pipe","pipe"]}).trim();
+// A failed git child throws the tag "git SUBCOMMAND failed" (wi_57a3e40fb5d351cd
+// u2), SUBCOMMAND only from GIT_OPS, else "git failed": never git's stderr,
+// its arguments or a path. gitFailure marks it so abortIntegration still
+// classifies a failed checkout or cherry-pick as a conflict or refusal.
+const GIT_OPS = new Set(["checkout","cherry-pick","clone","diff","merge-base","rev-list","rev-parse","status","update-ref","worktree"]);
+const gitError = op => Object.assign(releaseError(GIT_OPS.has(op) ? `git ${op} failed` : "git failed"), {gitFailure: true});
+const git = (cwd,...argv) => {try{return execFileSync("git",argv,{cwd,encoding:"utf8",stdio:["ignore","pipe","pipe"]}).trim();}catch{throw gitError(argv[0]);}};
+// diffPaths (verify-matrix.mjs) with a failure tagged as the git helper does.
+const changedPaths = (cwd,from,to) => {try{return diffPaths(cwd,from,to);}catch{throw gitError("diff");}};
 const ancestor = (cwd,a,b) => {try{git(cwd,"merge-base","--is-ancestor",a,b);return true;}catch{return false;}};
 // Whether tip already carries the candidate: its commit is its base, or it
 // is an ancestor of tip and every path it changes has its content at tip.
@@ -428,19 +478,27 @@ export function integrateCandidate(cwd, job, branch="tasks-hub") {
   } catch (error) {abortIntegration(cwd,expected,error);}
   if (commits && !commits.length) return {expected,integrated:expected,changed:[],noChange:NO_CHANGE};
   const integrated=git(cwd,"rev-parse","HEAD");
-  return {expected,integrated,changed:diffPaths(cwd,expected,integrated)};
+  return {expected,integrated,changed:changedPaths(cwd,expected,integrated)};
 }
 // Ends a failed checkout or cherry-pick back on the commit it started from
 // and throws the refusal.
+// A pick that stops with no unmerged path, CHERRY_PICK_HEAD set and an index
+// equal to HEAD is an empty pick (its change is already there): it is found
+// first, then aborted and HEAD restored like any other, and only then thrown
+// as EMPTY_PICK. Aborting a series undoes the commits already picked.
+export const EMPTY_PICK="integration-empty-cherry-pick";
 function abortIntegration(cwd,expected,error) {
   // The unmerged paths are read before the abort discards them, untrimmed
   // and without git's stderr, and reduced here to valid paths and counts.
   let unmerged=[];
   try {unmerged=[...new Set(execFileSync("git",["diff","--name-only","--diff-filter=U","-z"],{cwd,encoding:"utf8",stdio:["ignore","pipe","ignore"]}).split("\0").filter(Boolean))].sort();} catch {}
   const valid=unmerged.filter(p=>CONFLICT_PATH.test(p)),conflict={paths:valid.slice(0,CONFLICT_PATHS),count:unmerged.length,rejected:unmerged.length-valid.length};
+  let empty=false;
+  if (!conflict.count) try {git(cwd,"rev-parse","-q","--verify","CHERRY_PICK_HEAD");execFileSync("git",["diff","--cached","--quiet","HEAD"],{cwd,stdio:["ignore","ignore","ignore"]});empty=true;} catch {}
   try {git(cwd,"cherry-pick","--abort");} catch {}
   git(cwd,"checkout","--detach",expected);
-  if (typeof error?.releaseReason==="string") throw error;
+  if (typeof error?.releaseReason==="string" && !error.gitFailure) throw error;
+  if (empty) throw releaseError(EMPTY_PICK);
   if (!conflict.count) throw releaseError("Candidate integration refused");
   // All the paths or only their count, never a partial list.
   const named="integration-conflict: "+conflict.paths.join(", "),listed=conflict.rejected===0 && conflict.count<=CONFLICT_PATHS && REASON.test(named);
@@ -461,6 +519,10 @@ export function failedChecks(receipt){
 // claimed; the hub settles the other jobs with the lead's released finish.
 // Absent or 1, none of this runs.
 export const BATCH_MAX_JOBS=8,BATCH_IMPORT_WAIT_MS=1800000;
+// The most batch exclusions one finish sends (the hub's ReleaseBatchDroppedMax),
+// and the shape of a release job id the hub takes in them.
+export const BATCH_DROPPED_MAX=1000;
+const RELEASE_JOB_ID=/^rel_[0-9a-f]{16}$/;
 export function releaseBatchPolicy(config){
   const batch=config?.releaseBatch;
   if(batch===undefined)return {max:1,importWaitMs:BATCH_IMPORT_WAIT_MS};
@@ -481,6 +543,22 @@ export function batchCandidates(jobs,lead,solo=new Set()){
   const at=jobs.find(j=>j.id===lead?.id)?.rowId;
   if(!Number.isSafeInteger(at) || solo.has(lead.id))return [];
   return jobs.filter(j=>j.state==="verified" && !j.agentId && Number.isSafeInteger(j.rowId) && j.rowId>at && j.pauseGeneration===lead.pauseGeneration && sha(j.baseCommit) && j.baseCommit===lead.baseCommit && !solo.has(j.id)).sort((a,b)=>a.rowId-b.rowId);
+}
+// Why each active job queued after the lead that batchCandidates leaves out
+// cannot join (wi_861ff5962b9bb478 e4), one reason each, in queue order: it is
+// claimed, not verified (held, merged, blocked), of another pause generation
+// or base commit, or marked to release alone; every one of them when the lead
+// itself is marked to release alone. The ids after the lead come with them,
+// in queue order, so the journal can send its exclusions in that order.
+export function batchPassedOver(jobs,lead,solo=new Set()){
+  const at=jobs.find(j=>j.id===lead?.id)?.rowId;
+  if(!Number.isSafeInteger(at))return {queue:[],excluded:[]};
+  const after=jobs.filter(j=>Number.isSafeInteger(j.rowId) && j.rowId>at).sort((a,b)=>a.rowId-b.rowId),excluded=[];
+  for(const j of after){
+    const reason=solo.has(lead.id)?"batch-lead-solo":j.agentId?"batch-claimed":j.state!=="verified"?"batch-not-verified":j.pauseGeneration!==lead.pauseGeneration?"batch-other-generation":!sha(j.baseCommit) || j.baseCommit!==lead.baseCommit?"batch-other-base":solo.has(j.id)?"batch-solo":"";
+    if(reason)excluded.push({jobId:j.id,reason});
+  }
+  return {queue:after.map(j=>j.id),excluded};
 }
 const racePackages=argv=>{const first=Array.isArray(argv)?argv.findIndex(a=>typeof a==="string" && a.startsWith("./")):-1;return first<1 || argv.slice(first).some(a=>typeof a!=="string" || !a.startsWith("./"))?null:{flags:argv.slice(0,first),packages:argv.slice(first)};};
 // The union of base's and extra's checks, or null when they cannot share one
@@ -572,14 +650,18 @@ function pickCandidate(cwd,job,head){
 // batch only when a member joined. The hub refuses a range that adds no
 // commit, so a lead with no change opens no batch, and a member the batch's
 // head already carries is dropped as batch-no-change; each releases alone.
+// A candidate never tried is dropped too, with why (wi_861ff5962b9bb478 e4):
+// batch-lead-no-change when the lead has no change, batch-full once the batch
+// holds max jobs, batch-closed after a refused batch-open or lead add. A
+// refused member add drops that member only, and later candidates are tried.
 export async function integrateBatch(cwd,lead,candidates,max,hooks={}){
   const first=integrateCandidate(cwd,lead),jobs=[],dropped=[];
   await hooks.integrated?.(first);
-  if(first.noChange)return {...first,dropped};
+  if(first.noChange)return {...first,dropped:candidates.map(c=>({jobId:c.id,reason:"batch-lead-no-change"}))};
   const range=(job,from,to)=>({jobId:job.id,entryId:job.entryId,generation:job.generation,commit:job.commit,verificationDigest:job.verificationDigest,from,to});
   let head=first.integrated,id=null,closed=false;
-  for(const member of candidates){
-    if(closed || Math.max(jobs.length,1)>=max)break;
+  for(const [at,member] of candidates.entries()){
+    if(closed || Math.max(jobs.length,1)>=max){dropped.push(...candidates.slice(at).map(c=>({jobId:c.id,reason:closed?"batch-closed":"batch-full"})));break;}
     const misfit=hooks.fits?.(member);
     if(typeof misfit==="string" && misfit){dropped.push({jobId:member.id,reason:misfit});continue;}
     let to;
@@ -596,7 +678,7 @@ export async function integrateBatch(cwd,lead,candidates,max,hooks={}){
     }
     jobs.push(range(member,head,to));head=to;
   }
-  return {expected:first.expected,integrated:head,changed:diffPaths(cwd,first.expected,head),dropped,...(jobs.length>1?{batch:{id,base:first.expected,jobs,dropped}}:{})};
+  return {expected:first.expected,integrated:head,changed:changedPaths(cwd,first.expected,head),dropped,...(jobs.length>1?{batch:{id,base:first.expected,jobs,dropped}}:{})};
 }
 // The batch's own receipt and, for a released batch, one finished journal per
 // member, written from the lead journal's saved intent and final receipt.
@@ -908,7 +990,7 @@ export async function runRelease(config, adapter) {
   // Progress for the hub's hung-runner check: each new phase at its
   // checkpoint and each step as it begins, once. Best effort; an adapter
   // without progress is not told.
-  let step=null,toldPhase=null,toldStep=null;
+  let step=null,staged=null,toldPhase=null,toldStep=null;
   const tell=()=>{
     const at=step?`${step.step} ${step.target??""}`:null;
     if(typeof state.phase!=="string" || (state.phase===toldPhase && (at===null || at===toldStep)))return;
@@ -917,6 +999,11 @@ export async function runRelease(config, adapter) {
   };
   const checkpoint=()=>{save(journalPath,state);tell();};
   const begin=next=>{step=next;tell();};
+  // A stage before publication that has no step of its own in the progress
+  // stream (the start fence, a resumed batch, the integrated matrix run, the
+  // inputs check and the fence and publish) still names the step a failure
+  // journals and refuses with (wi_57a3e40fb5d351cd u2); progress is not told.
+  const stage=next=>{staged=next;};
   // How often this job went on at a generation the hub advanced under it.
   const noteAdopted=()=>{if(adopted){state.generationAdoptions=(state.generationAdoptions||0)+adopted;adopted=0;}};
   noteAdopted();
@@ -1007,6 +1094,20 @@ export async function runRelease(config, adapter) {
     const own=member.plan?.checks,ids=Array.isArray(own)?own.map(c=>c?.id):undefined,lead=new Set((job.plan?.checks||[]).map(c=>c.id));
     const checks=member.id===job.id?undefined:mergeAcceptedChecks(batchChecks(),own);
     return {...(checks?{checks}:{}),fields:ids?{checkIds:ids,...(member.id===job.id?{}:{contributed:ids.filter(id=>!lead.has(id))})}:{}};
+  };
+  // The exclusions a finish sends to the hub (wi_861ff5962b9bb478 e1), built
+  // from the journal alone so every finish of this job, resumed or not, sends
+  // the same file: in queue order, ids of the hub's shape other than this job,
+  // reasons as receipt reasons are sent. Beyond BATCH_DROPPED_MAX the first
+  // ones are sent with the count of the rest; the journal keeps them all. null
+  // when there are none.
+  const finishDropped=()=>{
+    const order=new Map((state.batchQueue||[]).map((id,i)=>[id,i]));
+    const list=(state.batchDropped||[]).filter(d=>RELEASE_JOB_ID.test(d?.jobId||"") && d.jobId!==job.id).map((d,i)=>({jobId:d.jobId,reason:receiptReason(d.reason),at:order.get(d.jobId)??order.size+i}));
+    if(!list.length)return null;
+    list.sort((a,b)=>a.at-b.at);
+    const dropped=list.slice(0,BATCH_DROPPED_MAX).map(({jobId,reason})=>({jobId,reason}));
+    return {dropped,...(list.length>BATCH_DROPPED_MAX?{omitted:list.length-BATCH_DROPPED_MAX}:{})};
   };
   // A job left out of this claim's batch is listed once, with its first reason.
   const noteDropped=entries=>{for(const {jobId,reason} of entries)if(!state.batchDropped?.some(d=>d.jobId===jobId))(state.batchDropped??=[]).push({jobId,reason});};
@@ -1110,21 +1211,23 @@ export async function runRelease(config, adapter) {
       state.batchSelected=state.integrated;checkpoint();
     }
     const clock=config.now||(()=>Date.now()),wait=config.batch?.importWaitMs??BATCH_IMPORT_WAIT_MS;
+    // The matrix step stays set for a failure that does not fall back.
+    const fellBack=fell=>{if(fell===true)staged=null;return fell===true?null:waiting;};
     for(let pass=0;;pass++){
-      state.phase="waiting_matrix";checkpoint();await fence();
+      state.phase="waiting_matrix";checkpoint();stage({step:"matrix"});await fence();
       let verified,failure;
       try{verified=await adapter.verifyIntegrated(batchJob());}catch(error){failure=error;}
-      if(verified===true){state.phase="integrated";checkpoint();return null;}
+      if(verified===true){staged=null;state.phase="integrated";checkpoint();return null;}
       if(failure){
         const reason=failureReason(failure);
         const fell=await fallback(reason==="batch-plan-uncovered"?reason:"batch-matrix-failed",reason,failure);
-        if(fell)return fell===true?null:waiting;
+        if(fell)return fellBack(fell);
         throw failure;
       }
       if(adapter.matrixImportRequested && state.batchImportRequestedAt===undefined){state.batchImportRequestedAt=clock();checkpoint();}
       if(pass || state.batchImportRequestedAt===undefined || clock()-state.batchImportRequestedAt<wait)return waiting;
       const fell=await fallback("batch-import-timeout");
-      if(fell)return fell===true?null:waiting;
+      if(fell)return fellBack(fell);
       // The drop was refused: the import may just have been saved, so the
       // batch stands and is read once more.
     }
@@ -1189,11 +1292,11 @@ export async function runRelease(config, adapter) {
     const cause=pushed.outcome==="failed"?{...(pushed.timedOut?{timedOut:true}:{}),...(pushed.exitCode!==undefined?{exitCode:pushed.exitCode}:{}),...(pushed.signal?{signal:pushed.signal}:{}),...(pushed.elapsedMs!==undefined?{elapsedMs:pushed.elapsedMs}:{}),reason:pushed.reason,remoteCheck,...(stderrSHA256?{stderrSHA256}:{})}:{};
     receipt.push={remote:"origin",commit:receipt.commit,outcome:pushed.outcome,...cause};checkpoint();
     if(receipt.push.outcome==="failed" && remoteCheck!=="landed" && !state.pushEscalated){state.pushEscalated=true;checkpoint();try{await adapter.escalate({jobId:job.id,outcome:"released",push:"failed",pushCause:cause});}catch{}}
-    state.phase="finishing";checkpoint();await fence();state.finishGeneration=adapter.job?.generation??job.generation;checkpoint();await adapter.finish(receipt,state.finishGeneration);materialize();state.phase="complete";checkpoint();return receipt;
+    state.phase="finishing";checkpoint();await fence();state.finishGeneration=adapter.job?.generation??job.generation;checkpoint();await adapter.finish(receipt,state.finishGeneration,finishDropped());materialize();state.phase="complete";checkpoint();return receipt;
   };
   try {
     if(state.phase==="receipt_pending" || state.phase==="finishing"){
-      await adapter.finish(state.receipt,state.finishGeneration);materialize();state.phase=state.receipt.outcome==="released"?"complete":"blocked";checkpoint();return state.receipt;
+      await adapter.finish(state.receipt,state.finishGeneration,finishDropped());materialize();state.phase=state.receipt.outcome==="released"?"complete":"blocked";checkpoint();return state.receipt;
     }
     if(state.phase==="pushing")return await pushAndFinish(state.receipt);
     if(state.phase==="refusing")await refuseUnpublished();
@@ -1204,14 +1307,21 @@ export async function runRelease(config, adapter) {
     // The candidates the daemon left out at this claim, saved before anything
     // is integrated; a resumed run (any later poll) adds none, and with or
     // without a batch the lead's journal keeps them.
-    if(state.phase==="prepared" && config.batch?.max>1 && Array.isArray(config.batch.excluded))noteDropped(config.batch.excluded);
+    if(state.phase==="prepared" && config.batch?.max>1 && Array.isArray(config.batch.excluded)){
+      noteDropped(config.batch.excluded);
+      if(Array.isArray(config.batch.queue))state.batchQueue=config.batch.queue.filter(id=>typeof id==="string");
+    }
     // A new job is journaled only once its fence check answered, so a check
     // that could not reach the hub leaves no journal for the next poll to
     // find ambiguous; a resumed one keeps the journal it has.
+    // Every stage before publication runs as a step (wi_57a3e40fb5d351cd u2),
+    // so its failure is journaled and refused with the step that failed.
+    stage({step:"fence"});
     if(state.phase==="prepared"){await fence();checkpoint();}else{checkpoint();await fence();}
+    staged=null;
     let integration;
     if(["waiting_matrix","waiting_inputs","waiting_window"].includes(state.phase))integration={expected:state.expected,integrated:state.integrated};
-    else if(state.phase==="batching")integration=await resumeBatch();
+    else if(state.phase==="batching"){stage({step:"integrate"});integration=await resumeBatch();staged=null;}
     else if(config.batch?.max>1 && config.batch.candidates?.length){begin({step:"integrate"});integration=await openBatch();step=null;}
     else{begin({step:"integrate"});integration=integrateCandidate(cwd,job);step=null;if(integration.noChange)state.noChange=integration.noChange;}
     state.integrated=integration.integrated;state.expected=integration.expected;state.phase="integrated";checkpoint();
@@ -1227,7 +1337,7 @@ export async function runRelease(config, adapter) {
       await fence();state.mergedSent=true;checkpoint();await adapter.merged(job.commit);state.phase="merged";checkpoint();
       state.receipt={version:1,jobId:job.id,commit:job.commit,verificationDigest:job.verificationDigest,targets:[],outcome:"released"};
       state.phase="finishing";checkpoint();await fence();state.finishGeneration=adapter.job?.generation??job.generation;checkpoint();
-      await adapter.finish(state.receipt,state.finishGeneration);state.phase="complete";checkpoint();return state.receipt;
+      await adapter.finish(state.receipt,state.finishGeneration,finishDropped());state.phase="complete";checkpoint();return state.receipt;
     }
     if(state.batch){
       const waiting=await verifyBatch();if(waiting)return waiting;
@@ -1244,17 +1354,18 @@ export async function runRelease(config, adapter) {
       // Saved before the matrix run is started, so a runner stopped while
       // the run waits or runs resumes this job from its attempt record.
       state.phase="waiting_matrix";checkpoint();
+      stage({step:"matrix"});
       await fence();if(await adapter.verifyIntegrated({...job,integratedCommit:integration.integrated,...selection([job.plan])})!==true)return {jobId:job.id,outcome:"waiting_matrix"};
-      state.phase="integrated";checkpoint();
+      staged=null;state.phase="integrated";checkpoint();
     }
     const windowWait=await quietWindow(selected);if(windowWait)return windowWait;
-    if(adapter.verifyInputs && !await adapter.verifyInputs(integration.integrated)){state.phase="waiting_inputs";checkpoint();return {jobId:job.id,outcome:"waiting_inputs"};}
+    if(adapter.verifyInputs){stage({step:"inputs"});if(!await adapter.verifyInputs(integration.integrated)){state.phase="waiting_inputs";checkpoint();return {jobId:job.id,outcome:"waiting_inputs"};}staged=null;}
     // w2: the pinned wrangler is installed (npm ci when the lockfile changed)
     // and checked before publication, so a missing one refuses the job
     // unpublished with no target deployed. It runs before the fence check, so
     // a claim lost during npm ci is still found unpublished.
     if(selected.includes("tailos") && adapter.releaseTools){begin({step:"prepare",target:"tailos"});await adapter.releaseTools(integration.integrated);step=null;}
-    await fence();publishIntegration(cwd,integration.integrated,integration.expected);state.published=true;checkpoint();
+    stage({step:"publish"});await fence();publishIntegration(cwd,integration.integrated,integration.expected);state.published=true;staged=null;checkpoint();
     await adapter.merged(integration.integrated);state.phase="merged";checkpoint();
     const receipt={version:1,jobId:job.id,commit:integration.integrated,verificationDigest:job.verificationDigest,targets:[],outcome:"released"};
     state.receipt=receipt;
@@ -1318,7 +1429,8 @@ export async function runRelease(config, adapter) {
     // An unconfirmed batch call: nothing here may touch the checkout or the job.
     if(error?.batchWait)return {jobId:job.id,outcome:"waiting_batch"};
     // The first failed target step is kept; a resumed run never rewrites it.
-    if(step && !state.failure){const rehearsal=failureRehearsal(error);state.failure={...step,reason:failureReason(error),...(rehearsal?{rehearsal}:{})};state.failureDetail??=failureDetail(error);checkpoint();}
+    const failed=step||staged;
+    if(failed && !state.failure){const rehearsal=failureRehearsal(error);state.failure={...failed,reason:failureReason(error),...(rehearsal?{rehearsal}:{})};state.failureDetail??=failureDetail(error);checkpoint();}
     // The first failure's validated detail is kept even when no step was set;
     // a journal that cannot be written here is left to the checkpoints below.
     if(!state.failureDetail){state.failureDetail=failureDetail(error);try{checkpoint();}catch{}}
@@ -1373,7 +1485,7 @@ export async function runRelease(config, adapter) {
       // Retryable like the success receipt: a lost response resumes this
       // exact receipt and generation, with no second rollback or escalation.
       state.finishGeneration=adapter.job?.generation??job.generation;state.phase="receipt_pending";checkpoint();
-      try{await adapter.finish(state.receipt,state.finishGeneration);}catch{throw releaseError("Release failed; final receipt pending retry");}
+      try{await adapter.finish(state.receipt,state.finishGeneration,finishDropped());}catch{throw releaseError("Release failed; final receipt pending retry");}
       try{materialize();}catch{throw releaseError("Release failed; batch receipt pending retry");}
       state.phase="blocked";checkpoint();
     }else{
@@ -1560,7 +1672,7 @@ export class HostAdapter {
         if(cause)failed.transport=true;
         if(argv[0]===cli)failed.refusal=refusalText(error.stderr);
         if(argv[0]===cli && argv[1]==="deployment" && generationChanged(error))failed.generationChanged=true;
-        if(argv[0]===cli && argv[1]==="deployment" && ((argv[2]==="refuse" && argv.includes("--reason")) || (argv[2]==="block" && argv.includes("--revert-outcome"))) && refusalRefused(error))failed.refusalRefused=true;
+        if(argv[0]===cli && argv[1]==="deployment" && ((argv[2]==="refuse" && argv.includes("--reason")) || (argv[2]==="block" && argv.includes("--revert-outcome")) || (argv[2]==="finish" && argv.includes("--batch-dropped"))) && refusalRefused(error))failed.refusalRefused=true;
         if(kept)this.cliFailures.push(cause?{...kept,transport:true}:kept);
         throw failed;
       }
@@ -1908,7 +2020,7 @@ export class HostAdapter {
   async releaseTools(commit){
     if(git(this.config.cwd,"rev-parse","HEAD")!==commit)throw releaseError("Candidate build checkout mismatch");
     const baselines=this.baselines||this.config.baselines;
-    if(this.installedFor!==commit && diffPaths(this.config.cwd,baselines.tailos,commit).includes("package-lock.json"))this.command(["npm","ci"]);
+    if(this.installedFor!==commit && changedPaths(this.config.cwd,baselines.tailos,commit).includes("package-lock.json"))this.command(["npm","ci"]);
     this.installedFor=commit;
     if(!pinnedWrangler(this.config.cwd))throw releaseError("Pinned wrangler not installed; run npm ci");
   }
@@ -1925,7 +2037,7 @@ export class HostAdapter {
     const baselines=this.baselines||this.config.baselines;
     artifact.schemaChanged=["hub","bridge"].includes(target) && schemaChanged(this.config.cwd,baselines.hub,commit);
     if(target==="tailos"){
-      if(this.installedFor!==commit && diffPaths(this.config.cwd,baselines.tailos,commit).includes("package-lock.json"))this.command(["npm","ci"]);
+      if(this.installedFor!==commit && changedPaths(this.config.cwd,baselines.tailos,commit).includes("package-lock.json"))this.command(["npm","ci"]);
       this.command(["npm","run","build:static"]);this.command(["npm","run","verify:release"]);
       // A resumed run skips the pre-publication check; the deploy needs it.
       if(!pinnedWrangler(this.config.cwd))throw releaseError("Pinned wrangler not installed; run npm ci");
@@ -2138,7 +2250,16 @@ export class HostAdapter {
     const dir=join(this.config.journalDirectory,"tailos-dist-"+a.commit);if(existsSync(dir))return;
     rmSync(dir+".tmp",{recursive:true,force:true});cpSync(join(this.config.cwd,"dist-static"),dir+".tmp",{recursive:true});chmodSync(dir+".tmp",0o700);renameSync(dir+".tmp",dir);
   }
-  async finish(receipt,expectedGeneration){const path=join(this.config.journalDirectory || dirname(this.config.journalPath),this.job.id+"-receipt.json");save(path,receipt);this.native("finish",["--file",path],expectedGeneration);}
+  // The batch exclusions, when there are any, go beside the receipt in their
+  // own file. A tt or hub from before they were kept refuses the flag or the
+  // field; the bare finish is then sent once, under the same request id.
+  async finish(receipt,expectedGeneration,dropped){
+    const dir=this.config.journalDirectory || dirname(this.config.journalPath),path=join(dir,this.job.id+"-receipt.json");save(path,receipt);
+    if(!dropped){this.native("finish",["--file",path],expectedGeneration);return;}
+    const list=join(dir,this.job.id+"-batch-dropped.json");save(list,dropped);
+    try{this.native("finish",["--file",path,"--batch-dropped",list],expectedGeneration);}
+    catch(error){if(error?.refusalRefused!==true)throw error;this.native("finish",["--file",path],expectedGeneration);}
+  }
   // The block of a job that failed with no receipt (wi_816228d539a80c48).
   // After publication it carries the journaled tasks-hub revert as flags, and
   // the hub saves it on the job; with none it is the bare block, as before. A
@@ -2537,10 +2658,13 @@ export function hostLockNames(cwd,job){
   try{const record=JSON.parse(readFileSync(lock,"utf8"));return record?.jobId===job.id && record.agentId===job.agentId && record.runId===job.runId;}
   catch{return true;}
 }
+// A requeued job's host lock is freed once its reconciliation proves no run
+// holds it: for a verified, held, refused or superseded job. A held job is
+// freed like a verified one, so an owner hold never keeps a lock (wi_f2ab).
 export function reconcileHostLocks(config,jobs){
   for(const job of jobs){
     const r=job.reconciliations?.at(-1);
-    if(!r?.lockDigest || !r.noActiveExecution || !r.refResolved || !["no_effects","restored"].includes(r.journalState) || !["verified","refused","superseded"].includes(job.state))continue;
+    if(!r?.lockDigest || !r.noActiveExecution || !r.refResolved || !["no_effects","restored"].includes(r.journalState) || !["verified","held","refused","superseded"].includes(job.state))continue;
     const lock=hostLockPath(config.cwd,job);
     if(!existsSync(lock) || fileDigest(lock)!==r.lockDigest)continue;
     const record=JSON.parse(readFileSync(lock,"utf8"));
@@ -2767,6 +2891,9 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
     let solo;try{solo=readBatchSolo(config.journalDirectory);}catch{process.stderr.write("Batch solo file unreadable; releasing one job at a time.\n");return batch;}
     // Every queued candidate left out here is handed over with its reason;
     // the release records them in the lead's journal once, at this claim.
+    // So is every other active job queued after the lead, with the reason
+    // the candidate filter left it out, and the queue order of them all.
+    const passed=batchPassedOver(jobs,current,solo);batch.queue=passed.queue;
     const limit=2*(batchPolicy.max-1);
     for(const [at,summary] of batchCandidates(jobs,current,solo).entries()){
       let reason="over-limit";
@@ -2776,6 +2903,7 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
       }
       if(reason)batch.excluded.push({jobId:summary.id,reason});
     }
+    batch.excluded.push(...passed.excluded);
     return batch;
   };
   // One fence-wait notice per holder, waiting job and reason per process; the

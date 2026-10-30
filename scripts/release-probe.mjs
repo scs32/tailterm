@@ -119,13 +119,20 @@ function readReady(config, host, service, deps) {
 const REDACTED = "[redacted]", NAME = /^[A-Za-z0-9._-]{1,64}$/;
 // Control characters go first; then known environment values, labelled
 // credentials, and any long opaque run with both a letter and a digit (which
-// also hides commit hashes and container ids); then the line is cut.
+// also hides commit hashes and container ids); then the line is cut. A label
+// takes its value after "=", ":" or only whitespace ("password hunter2secret9",
+// "x-api-key abc123def456"), so a short unlabelled-looking value is hidden too
+// (wi_6233a249bfdc688f). A long run whose "_", "." and "-" separated parts are
+// each lowercase letters or at most four digits is a name, such as a
+// migration file name, and is kept.
+const LABELLED = /((?:x-)?api[_-]?key|token|secret|password|passwd|authorization)["']?(?:\s*[=:]\s*|\s+)\S+/gi;
+const NAME_RUN = /^(?:[a-z]+|\d{1,4})(?:[_.-](?:[a-z]+|\d{1,4}))*$/;
 function redactLine(line, secrets) {
   let s = String(line).replace(/[\u0000-\u001f\u007f-\u009f]/g, "");
   for (const v of secrets) s = s.split(v).join(REDACTED);
   s = s.replace(/Bearer\s+\S+/gi, REDACTED)
-    .replace(/(token|secret|password|passwd|authorization|api[_-]?key)["']?\s*[=:]\s*\S+/gi, REDACTED)
-    .replace(/[A-Za-z0-9+\/_=.-]{24,}/g, m => /[A-Za-z]/.test(m) && /[0-9]/.test(m) ? REDACTED : m);
+    .replace(LABELLED, REDACTED)
+    .replace(/[A-Za-z0-9+\/_=.-]{24,}/g, m => /[A-Za-z]/.test(m) && /[0-9]/.test(m) && !NAME_RUN.test(m) ? REDACTED : m);
   return s.slice(0, CAPTURE_LINE_LENGTH);
 }
 

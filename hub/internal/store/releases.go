@@ -53,6 +53,10 @@ const releasesSchema = `CREATE TABLE IF NOT EXISTS release_jobs (
  CREATE TRIGGER IF NOT EXISTS release_batch_no_delete BEFORE DELETE ON release_batches BEGIN SELECT RAISE(ABORT,'release batch history'); END;
  CREATE TRIGGER IF NOT EXISTS release_batch_job_no_update BEFORE UPDATE ON release_batch_jobs BEGIN SELECT RAISE(ABORT,'immutable release batch job'); END;
  CREATE TRIGGER IF NOT EXISTS release_batch_job_no_delete BEFORE DELETE ON release_batch_jobs BEGIN SELECT RAISE(ABORT,'immutable release batch job'); END;
+ CREATE TABLE IF NOT EXISTS release_batch_exclusions (
+ task_id TEXT NOT NULL REFERENCES tasks(id),job_id TEXT NOT NULL,lead_job_id TEXT NOT NULL,reason TEXT NOT NULL,saved_at INTEGER NOT NULL,
+ PRIMARY KEY(task_id,job_id,lead_job_id));
+ CREATE INDEX IF NOT EXISTS release_batch_exclusions_newest ON release_batch_exclusions(task_id,job_id,saved_at);
  CREATE TABLE IF NOT EXISTS release_liveness_jobs (
  task_id TEXT NOT NULL,job_id TEXT NOT NULL,state TEXT NOT NULL,since TEXT NOT NULL,
  PRIMARY KEY(task_id,job_id));
@@ -179,6 +183,9 @@ func (s *Store) Release(ctx context.Context, task, id string) (api.ReleaseJob, e
 	j, err := releaseLoad(ctx, s.db, task, id)
 	if err == nil && j.State == "claimed" {
 		j.MatrixApprovals, err = releaseMatrixApprovals(ctx, s.db, task)
+	}
+	if err == nil {
+		err = releaseBatchExcluded(ctx, s.db, task, &j)
 	}
 	return j, err
 }
@@ -754,8 +761,11 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 	if req.Refusal != nil && req.Operation != "refuse" {
 		return zero, api.ErrInvalid
 	}
-	// So is a revert outside a block.
+	// So is a revert outside a block, and batch exclusions outside a finish.
 	if req.Revert != nil && req.Operation != "block" {
+		return zero, api.ErrInvalid
+	}
+	if (req.BatchDropped != nil || req.BatchDroppedOmitted != 0) && req.Operation != "finish" {
 		return zero, api.ErrInvalid
 	}
 	// The owner's window setting has its own record and receipt; it is never
@@ -926,8 +936,16 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 			if batch != nil {
 				return zero, releaseConflict("job " + j.ID + " leads release batch " + batch.ID + " (" + batch.State + "); reconcile it with refuse and restoration evidence first")
 			}
+			// A held job a hand release already shipped is superseded in
+			// this one request: its hold is released here with cause
+			// "supersede", so no unhold leaves it verified for the deployer
+			// to claim before the supersede is saved (wi_b270).
 			if j.State == "held" {
-				return zero, releaseConflict("job " + j.ID + " is on an owner hold; release the hold first with tt deployment unhold")
+				handID := ""
+				if req.Supersession != nil {
+					handID = req.Supersession.HandReleaseID
+				}
+				liftReleaseHold(&j, api.ReleaseHoldEvent{Action: "release", Cause: "supersede", Reason: "superseded by hand release " + handID, AgentID: req.AgentID, RunID: req.RunID, At: ts(s.now())})
 			}
 			// A retry follows the job it names, so only the entry's latest
 			// job may be superseded.
@@ -1137,6 +1155,19 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 				if err = validateReleaseDiagnostics(r); err != nil {
 					return zero, err
 				}
+				if err = validateReleaseBatchDropped(j.ID, req.BatchDropped, req.BatchDroppedOmitted); err != nil {
+					return zero, err
+				}
+				j.BatchDropped = slices.Clone(req.BatchDropped)
+				j.BatchDroppedOmitted = req.BatchDroppedOmitted
+				// Each excluded job's view reads them by job (Store.Release).
+				// Only this finish writes them: a replay returns its receipt
+				// above, and a refused finish rolls back.
+				for _, d := range req.BatchDropped {
+					if _, err = tx.ExecContext(ctx, `INSERT INTO release_batch_exclusions(task_id,job_id,lead_job_id,reason,saved_at) VALUES(?,?,?,?,?)`, task, d.JobID, j.ID, d.Reason, s.now().UnixNano()); err != nil {
+						return zero, err
+					}
+				}
 				j.Receipt = r
 				j.State = r.Outcome
 				j.SettledAt = ts(s.now())
@@ -1296,6 +1327,54 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 	}
 	s.notify(task)
 	return j, nil
+}
+
+// validateReleaseBatchDropped checks the batch exclusions a finish carries
+// (wi_861f): at most api.ReleaseBatchDroppedMax release jobs, each once, never
+// the finishing job itself, each with a reason a refusal could carry; an
+// omitted count only beside a full list. Anything else is invalid.
+var releaseJobIDPattern = regexp.MustCompile(`^rel_[0-9a-f]{16}$`)
+
+func validateReleaseBatchDropped(job string, dropped []api.ReleaseBatchExclusion, omitted int) error {
+	if len(dropped) > api.ReleaseBatchDroppedMax || omitted < 0 || (omitted > 0 && len(dropped) != api.ReleaseBatchDroppedMax) {
+		return api.ErrInvalid
+	}
+	seen := make(map[string]bool, len(dropped))
+	for _, d := range dropped {
+		if !releaseJobIDPattern.MatchString(d.JobID) || d.JobID == job || seen[d.JobID] || !validReleaseReason(d.Reason) {
+			return api.ErrInvalid
+		}
+		seen[d.JobID] = true
+	}
+	return nil
+}
+
+// releaseBatchExcluded fills a job's derived BatchExcluded from the
+// release_batch_exclusions rows each lead's finish saved: the newest
+// api.ReleaseBatchExcludedMax leads, and the count of the rest. A job no lead
+// excluded, or one excluded only before the table existed, gets neither.
+func releaseBatchExcluded(ctx context.Context, q *sql.DB, task string, j *api.ReleaseJob) error {
+	var n int
+	if err := q.QueryRowContext(ctx, `SELECT count(*) FROM release_batch_exclusions WHERE task_id=? AND job_id=?`, task, j.ID).Scan(&n); err != nil || n == 0 {
+		return err
+	}
+	rows, err := q.QueryContext(ctx, `SELECT lead_job_id,reason FROM release_batch_exclusions WHERE task_id=? AND job_id=? ORDER BY saved_at DESC,lead_job_id DESC LIMIT ?`, task, j.ID, api.ReleaseBatchExcludedMax)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var e api.ReleaseBatchExcluded
+		if err = rows.Scan(&e.LeadJobID, &e.Reason); err != nil {
+			return err
+		}
+		j.BatchExcluded = append(j.BatchExcluded, e)
+	}
+	if err = rows.Err(); err != nil {
+		return err
+	}
+	j.BatchExcludedOmitted = n - len(j.BatchExcluded)
+	return nil
 }
 
 // validateReleaseRefEffects checks the tasks-hub effects a receipt reports: a
@@ -1670,11 +1749,8 @@ func holdRelease(ctx context.Context, tx *sql.Tx, task string, j *api.ReleaseJob
 		return releaseConflict("job " + j.ID + " is already " + j.State + "; a hold applies only before a claim (a claimed job with no effects uses tt deployment set-aside)")
 	}
 	// A requeue may leave the host release lock with this job. The runner
-	// frees it only for a verified, refused or superseded job, and the hub
-	// cannot see whether it has, so the record alone decides.
-	if n := len(j.Reconciliations); n > 0 && j.Reconciliations[n-1].LockDigest != "" {
-		return releaseConflict("job " + j.ID + " was requeued with a host release lock, which the deployer frees only while the job is verified; it cannot be held")
-	}
+	// frees it for a held job as for a verified one (reconcileHostLocks), so
+	// such a job can be held (wi_f2ab).
 	h := req.Hold
 	if h == nil || !releaseText(h.Reason) || len(h.UntilItems) > 16 {
 		return api.ErrInvalid

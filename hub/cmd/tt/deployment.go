@@ -61,6 +61,7 @@ func cmdDeployment(e env, args []string) error {
 	commit := fs.String("commit", "", "exact integrated commit")
 	planFile := fs.String("plan-file", "", "integrated matrix plan JSON (handler import)")
 	file := fs.String("file", "", "receipt, reconcile or set-aside record JSON file")
+	batchDropped := fs.String("batch-dropped", "", "JSON file {\"dropped\":[{\"jobId\",\"reason\"}],\"omitted\":N}: the jobs the lead's batch passed over (finish)")
 	released := fs.String("released-commit", "", "tasks-hub commit that carried a hand release (supersede)")
 	releaseName := fs.String("release", "", "optional release name; must equal the hand release record's (supersede)")
 	handRelease := fs.String("hand-release", "", "recorded hand release ID from tt deployment hand-release (supersede)")
@@ -92,6 +93,9 @@ func cmdDeployment(e env, args []string) error {
 	hasRevert := *revertOutcome != "" || *revertCommit != "" || *revertBug != ""
 	if hasRevert && args[0] != "block" {
 		return errors.New("--revert-outcome, --revert-commit and --revert-bug-request are block flags")
+	}
+	if *batchDropped != "" && args[0] != "finish" {
+		return errors.New("--batch-dropped is a finish flag")
 	}
 	var retry *api.ReleaseRetry
 	if args[0] == "retry" {
@@ -272,6 +276,9 @@ func cmdDeployment(e env, args []string) error {
 		} else if args[0] == "finish" {
 			req.Receipt = &api.ReleaseReceipt{}
 			err = json.Unmarshal(b, req.Receipt)
+			if err == nil && *batchDropped != "" {
+				req.BatchDropped, req.BatchDroppedOmitted, err = deploymentBatchDropped(*batchDropped)
+			}
 		} else {
 			planBytes, readErr := os.ReadFile(*planFile)
 			if readErr != nil {
@@ -320,6 +327,29 @@ func cmdDeployment(e env, args []string) error {
 		}
 	}
 	return err
+}
+
+// deploymentBatchDropped reads a finish's batch exclusions file (wi_861f):
+// {"dropped": [{"jobId", "reason"}], "omitted": N}. Unknown fields are refused;
+// the hub checks the ids, reasons and bounds.
+func deploymentBatchDropped(path string) ([]api.ReleaseBatchExclusion, int, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, 0, err
+	}
+	var in struct {
+		Dropped []api.ReleaseBatchExclusion `json:"dropped"`
+		Omitted int                         `json:"omitted"`
+	}
+	d := json.NewDecoder(bytes.NewReader(b))
+	d.DisallowUnknownFields()
+	if err = d.Decode(&in); err != nil {
+		return nil, 0, fmt.Errorf("--batch-dropped: %w", err)
+	}
+	if len(in.Dropped) == 0 && in.Omitted == 0 {
+		return nil, 0, errors.New("--batch-dropped names no job")
+	}
+	return in.Dropped, in.Omitted, nil
 }
 
 // deploymentHold builds the handler's hold or unhold record: a one-line

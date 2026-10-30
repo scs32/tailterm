@@ -1814,3 +1814,95 @@ func TestDeploymentUsageListsRunnerOperations(t *testing.T) {
 		}
 	}
 }
+
+// wi_861f e1: tt deployment finish --batch-dropped FILE sends the file's
+// exclusions and omitted count beside the receipt; without the flag the
+// finish carries neither; the flag belongs to finish, and a malformed file is
+// refused before any hub call.
+func TestDeploymentFinishBatchDropped(t *testing.T) {
+	var bodies [][]byte
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, b)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(api.ReleaseJob{ID: "rel_fixture", State: "released", Generation: 4})
+	}))
+	defer hub.Close()
+	e := env{hub: hub.URL, task: "tsk_0123456789abcdef", agent: "agt_0123456789abcdef", runID: "run_0123456789abcdef"}
+	dir := t.TempDir()
+	write := func(name, text string) string {
+		t.Helper()
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(text), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	receipt := write("receipt.json", `{"version":1,"jobId":"rel_fixture","commit":"`+strings.Repeat("c", 40)+`","verificationDigest":"`+strings.Repeat("d", 64)+`","targets":[],"outcome":"released"}`)
+	finish := func(name string, flags ...string) map[string]json.RawMessage {
+		t.Helper()
+		before := len(bodies)
+		args := append([]string{"finish", "--job", "rel_fixture", "--generation", "3", "--request-id", "finish-" + name, "--file", receipt}, flags...)
+		if _, err := captureRelayOutput(t, false, func() error { return cmdDeployment(e, args) }); err != nil || len(bodies) != before+1 {
+			t.Fatalf("%s: %v %d", name, err, len(bodies))
+		}
+		var wire map[string]json.RawMessage
+		if err := json.Unmarshal(bodies[len(bodies)-1], &wire); err != nil {
+			t.Fatal(err)
+		}
+		return wire
+	}
+	plain := finish("plain")
+	if _, ok := plain["batchDropped"]; ok {
+		t.Fatal("a bare finish sends exclusions", plain)
+	}
+	if _, ok := plain["batchDroppedOmitted"]; ok {
+		t.Fatal("a bare finish sends an omitted count", plain)
+	}
+	dropped := write("dropped.json", `{"dropped":[{"jobId":"rel_0000000000000001","reason":"batch-full"},{"jobId":"rel_0000000000000002","reason":"batch-other-base"}],"omitted":3}`)
+	wire := finish("dropped", "--batch-dropped", dropped)
+	if string(wire["batchDropped"]) != `[{"jobId":"rel_0000000000000001","reason":"batch-full"},{"jobId":"rel_0000000000000002","reason":"batch-other-base"}]` || string(wire["batchDroppedOmitted"]) != "3" {
+		t.Fatalf("exclusions on the wire %s %s", wire["batchDropped"], wire["batchDroppedOmitted"])
+	}
+	if string(wire["receipt"]) != string(plain["receipt"]) {
+		t.Fatal("exclusions changed the receipt on the wire", string(wire["receipt"]))
+	}
+	before := len(bodies)
+	for name, text := range map[string]string{"unknown field": `{"dropped":[],"extra":1}`, "not json": `dropped`, "empty": `{}`} {
+		err := cmdDeployment(e, []string{"finish", "--job", "rel_fixture", "--generation", "3", "--request-id", "bad", "--file", receipt, "--batch-dropped", write(strings.ReplaceAll(name, " ", "-")+".json", text)})
+		if err == nil || !strings.Contains(err.Error(), "batch-dropped") {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	if err := cmdDeployment(e, []string{"merged", "--job", "rel_fixture", "--generation", "3", "--request-id", "merged", "--commit", strings.Repeat("c", 40), "--batch-dropped", dropped}); err == nil || !strings.Contains(err.Error(), "finish flag") {
+		t.Fatalf("exclusions on merged: %v", err)
+	}
+	if len(bodies) != before {
+		t.Fatalf("a refused flag reached the hub: %d", len(bodies)-before)
+	}
+}
+
+// wi_861f e2: tt deployment get --job prints a lead's exclusions and an
+// excluded job's leads as the hub returns them.
+func TestDeploymentGetShowsBatchExclusions(t *testing.T) {
+	task := "tsk_0123456789abcdef"
+	lead, excluded := "rel_0123456789abcdef", "rel_fedcba9876543210"
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Query().Get("job") == lead {
+			_ = json.NewEncoder(w).Encode(api.ReleaseJob{ID: lead, TaskID: task, State: "released", BatchDropped: []api.ReleaseBatchExclusion{{JobID: excluded, Reason: "batch-full"}}, BatchDroppedOmitted: 4})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(api.ReleaseJob{ID: excluded, TaskID: task, State: "verified", BatchExcluded: []api.ReleaseBatchExcluded{{LeadJobID: lead, Reason: "batch-full"}}, BatchExcludedOmitted: 2})
+	}))
+	defer hub.Close()
+	e := env{hub: hub.URL, task: task, token: "fixture"}
+	output, err := captureCLIOutput(t, func() error { return cmdDeployment(e, []string{"get", "--job", lead}) })
+	if err != nil || !strings.Contains(output, `"batchDropped": [`) || !strings.Contains(output, `"jobId": "`+excluded+`"`) || !strings.Contains(output, `"reason": "batch-full"`) || !strings.Contains(output, `"batchDroppedOmitted": 4`) {
+		t.Fatal(output, err)
+	}
+	output, err = captureCLIOutput(t, func() error { return cmdDeployment(e, []string{"get", "--job", excluded}) })
+	if err != nil || !strings.Contains(output, `"batchExcluded": [`) || !strings.Contains(output, `"leadJobId": "`+lead+`"`) || !strings.Contains(output, `"batchExcludedOmitted": 2`) {
+		t.Fatal(output, err)
+	}
+}

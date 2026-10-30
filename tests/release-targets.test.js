@@ -5,7 +5,7 @@ import {chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync} from "node:fs"
 import {tmpdir} from "node:os";
 import {join} from "node:path";
 import {fileURLToPath} from "node:url";
-import {candidateKnown, configuredBaselineTimes, releaseBaselines, selectReleaseTargets, targetsForPaths} from "../scripts/release-targets.mjs";
+import {candidateKnown, configuredBaselineTimes, releaseBaselines, schemaChanged, selectReleaseTargets, targetsForPaths} from "../scripts/release-targets.mjs";
 import {buildInputs, deploymentBaselines} from "../scripts/release-inputs.mjs";
 import {readBaselines, serveDeployment} from "../scripts/release-runner.mjs";
 import {releaseReply, releaseReplySource} from "./release-runner-fixtures.mjs";
@@ -352,4 +352,14 @@ test("t2 the running map is the floor: the candidate's map adds targets for unkn
   // The invalid path rule is not the candidate's to relax, and an invalid path is never asked.
   for (const p of ["../x.js", "/abs/x.js", "tools/../x.js", "a\nb"]) assert.equal(reasonOf(() => targetsForPaths([NEW_FILE, p], () => [])), "Invalid release path", JSON.stringify(p));
   assert.equal(reasonOf(() => targetsForPaths(["tools/../x.js"], () => assert.fail("asked"))), "Invalid release path");
+});
+
+test("t3 an invalid settledAt and a failed git diff throw tagged reasons the runner can journal", () => {
+  assert.equal(reasonOf(() => releaseBaselines(all(sha("a")), [{id: "rel_bad", state: "released", settledAt: "not a time", receipt: {outcome: "released", commit: sha("b"), targets: []}}])), "Invalid release settledAt");
+  // A baseline commit the repository lacks: git diff fails, and git's own
+  // message (which names the commit) is not carried.
+  const r = candidateRepo({"client/next.js": "next"}), missing = "f".repeat(40);
+  assert.equal(reasonOf(() => selectReleaseTargets(r.cwd, {...all(r.base), mini: missing}, r.candidate)), "git diff failed");
+  assert.equal(reasonOf(() => schemaChanged(r.cwd, missing, r.candidate)), "git diff failed");
+  assert.equal(schemaChanged(r.cwd, r.base, r.candidate), false, "a diff that works is unchanged");
 });

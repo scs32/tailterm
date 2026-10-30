@@ -413,3 +413,10 @@ test("the probe command prints nothing on failure", () => {
   const r = spawnSync(process.execPath, ["scripts/release-probe.mjs", "live", "mini", "--config", cfg], { encoding: "utf8" });
   assert.equal(r.status, 1); assert.equal(r.stdout, ""); assert.equal(r.stderr, "");
 });
+
+test("H6 capture redaction hides short credentials after a bare label and keeps migration file names whole", () => {
+  const lines = ["password hunter2secret9", "x-api-key abc123def456", "migration 0042_add_index_on_messages_task_seq.sql failed", "charge sk_live_4242424242424242 refused", "id SYNTHETICa1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6 end"];
+  const [out] = sanitizeCapture({ logs: [{ service: "hub", lines }] }).logs, text = JSON.stringify(out);
+  for (const value of ["hunter2secret9", "abc123def456", "sk_live_4242424242424242", "SYNTHETICa1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"]) assert.ok(!text.includes(value), value);
+  assert.deepEqual(out.lines, ["[redacted]", "[redacted]", "migration 0042_add_index_on_messages_task_seq.sql failed", "charge [redacted] refused", "id [redacted] end"]);
+});

@@ -75,6 +75,38 @@ type ReleaseJob struct {
 	// project's owner matrix approvals, for a claimed job only. It is a hint
 	// for the runner; the verification import proves the one it cites.
 	MatrixApprovals []ReleaseMatrixApproval `json:"matrixApprovals,omitempty"`
+	// BatchDropped is saved on a lead job by its finish (wi_861f): each job its
+	// claim's batch passed over, with the runner's one reason, in queue order.
+	// At most ReleaseBatchDroppedMax are kept; BatchDroppedOmitted counts the
+	// rest. An older runner sends neither.
+	BatchDropped        []ReleaseBatchExclusion `json:"batchDropped,omitempty"`
+	BatchDroppedOmitted int                     `json:"batchDroppedOmitted,omitempty"`
+	// BatchExcluded is derived on exact detail reads and never saved on the
+	// job: the leads whose finish saved this job among its exclusions (the
+	// hub's indexed exclusion rows), newest first, at most
+	// ReleaseBatchExcludedMax; BatchExcludedOmitted counts the rest.
+	BatchExcluded        []ReleaseBatchExcluded `json:"batchExcluded,omitempty"`
+	BatchExcludedOmitted int                    `json:"batchExcludedOmitted,omitempty"`
+}
+
+// ReleaseBatchDroppedMax bounds a lead's saved exclusions: a claim that
+// passed over more sends the first ones in queue order and the omitted count.
+// ReleaseBatchExcludedMax bounds the leads an excluded job's detail names.
+const (
+	ReleaseBatchDroppedMax  = 1000
+	ReleaseBatchExcludedMax = 20
+)
+
+// ReleaseBatchExclusion is one job a lead's batch passed over and why.
+type ReleaseBatchExclusion struct {
+	JobID  string `json:"jobId"`
+	Reason string `json:"reason"`
+}
+
+// ReleaseBatchExcluded is one lead that passed over a job and why.
+type ReleaseBatchExcluded struct {
+	LeadJobID string `json:"leadJobId"`
+	Reason    string `json:"reason"`
 }
 
 // ReleaseSummary is an explicit projection; heavy evidence is available only by ID.
@@ -426,8 +458,9 @@ type ReleaseHoldWindow struct {
 // "window" on a hold the release quiet window placed, and set on every
 // release: "handler" for an unhold, "items_released" when the hub lifted the
 // hold because TriggerJobID settled the last named item, "not_before" when
-// the hold's not-before time passed. A hold the job was created with, from an
-// entry hold, has cause "entry".
+// the hold's not-before time passed, "supersede" when a supersede of the held
+// job released it in the same request. A hold the job was created with, from
+// an entry hold, has cause "entry".
 // Generation is the job's generation after the event.
 type ReleaseHoldEvent struct {
 	Action       string   `json:"action"`
@@ -602,6 +635,11 @@ type ReleaseRequest struct {
 	// Revert is accepted on a block only; a bare block, from an older
 	// runner, leaves it out.
 	Revert *ReleaseRevert `json:"revert,omitempty"`
+	// BatchDropped and BatchDroppedOmitted are accepted on a finish only and
+	// saved on the job beside its receipt, which they never change. An
+	// omitted count needs a full list of ReleaseBatchDroppedMax.
+	BatchDropped        []ReleaseBatchExclusion `json:"batchDropped,omitempty"`
+	BatchDroppedOmitted int                     `json:"batchDroppedOmitted,omitempty"`
 }
 
 // ReleaseProgressWait is the wait a release runner's poll ended in. It is

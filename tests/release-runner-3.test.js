@@ -160,7 +160,7 @@ test("g3 every integrateCandidate refusal has its own tag and leaves the checkou
  // The candidate's change is already on tasks-hub: an empty pick, no conflict.
  // tasks-hub moves first, so its copy of the change is never the same commit.
  const e=fixture(),ec=change(e,"client/a.js","a");git(e.cwd,"checkout","tasks-hub");change(e,"client/c.js","c");change(e,"client/a.js","a");
- assert.equal(refusesUnchanged(e.cwd,job(e,ec),"Candidate integration refused").status,"");
+ assert.equal(refusesUnchanged(e.cwd,job(e,ec),"integration-empty-cherry-pick").status,"");
 });
 // An accepted no-change result (wi_d46b5de7ad79c8c3): a commit already on an
 // advanced tasks-hub integrates as nothing, and only a merge commit is nonlinear.
@@ -245,10 +245,11 @@ test("n2 an empty series is a no-op and a merge commit is refused, alone and as 
  assert.deepEqual(r.dropped,[{jobId:"rel_same",reason:"batch-no-change"},{jobId:"rel_empty",reason:"batch-no-change"},{jobId:"rel_merge",reason:"Nonlinear candidate series"}]);
  assert.deepEqual(calls,[]);assert.equal(r.batch,undefined);assert.equal(r.expected,tip);assert.deepEqual(r.changed,["client/a.js"]);
  assert.equal(git(f.cwd,"rev-parse","HEAD"),r.integrated);assert.equal(git(f.cwd,"rev-parse","HEAD^"),tip);assert.equal(git(f.cwd,"status","--porcelain"),"");
- // A lead with no change stops before any member, with no batch call.
+ // A lead with no change stops before any member, with no batch call; each
+ // member is dropped as batch-lead-no-change (wi_861f e4).
  const g=fixture(),gtip=advanced(g);git(g.cwd,"checkout","candidate");const gc=change(g,"client/m.js","m");
  const none=await integrateBatch(g.cwd,job(g,g.base),[{...job(g,gc),id:"rel_m"}],8,{open:async()=>{calls.push("open");return "bat_0000000000000000";},add:async()=>{calls.push("add");return true;}});
- assert.deepEqual(none,{expected:gtip,integrated:gtip,changed:[],noChange:NO_CHANGE,dropped:[]});assert.deepEqual(calls,[]);assert.deepEqual(checkoutState(g.cwd),{status:"",head:gtip,ref:gtip});
+ assert.deepEqual(none,{expected:gtip,integrated:gtip,changed:[],noChange:NO_CHANGE,dropped:[{jobId:"rel_m",reason:"batch-lead-no-change"}]});assert.deepEqual(calls,[]);assert.deepEqual(checkoutState(g.cwd),{status:"",head:gtip,ref:gtip});
 });
 test("g3 the pre-step runner refusals are tagged and leave the journal alone",async()=>{
  const tagged=tag=>e=>failureReason(e)===tag;
@@ -288,7 +289,7 @@ test("g7 the journal keeps a failure's validated text and nothing that was not v
  const shaped=`token="${TOKEN}"`,rb=await journalOf(...start(),a=>{a.prepare=async()=>{throw releaseError(shaped);};},/Release failed/);
  assert.deepEqual(rb.journal.failure,{step:"prepare",target:"tailos",reason:"unclassified"});assert.deepEqual(rb.journal.failureDetail,{tagRejected:"characters",tagLength:shaped.length});absent(rb.raw,TOKEN,"token=");
  const before=await journalOf(...start(),a=>{let checks=0;a.fence=async()=>{if(!checks++)return true;throw releaseError(shaped);};});
- assert.equal(before.journal.refusalReason,"unclassified");assert.equal(before.journal.failure,undefined);assert.deepEqual(before.journal.failureDetail,{tagRejected:"characters",tagLength:shaped.length});
+ assert.equal(before.journal.refusalReason,"unclassified");assert.deepEqual(before.journal.failure,{step:"fence",reason:"unclassified"});assert.deepEqual(before.journal.failureDetail,{tagRejected:"characters",tagLength:shaped.length});
  absent(before.raw+JSON.stringify(before.escalation),TOKEN,"token=");
  const long="SYNTHETICPRIVATETOKEN".repeat(10),rc=await journalOf(...start(),a=>{a.prepare=async()=>{throw releaseError(long);};},/Release failed/);
  assert.deepEqual(rc.journal.failureDetail,{tagRejected:"length",tagLength:210});absent(rc.raw,"SYNTHETICPRIVATETOKEN");
@@ -784,7 +785,7 @@ test("held r1 r2 r3 a refused claim sends exactly one notice with the hub's reas
  assert.equal(err,"Release claim held; handler reconciliation required.\n".repeat(3));
  // Over three polls exactly one typed notice to each of the handler and the owner helper, and none to the Board.
  const sent=h.calls().filter(c=>c.argv[0]==="send").map(sendOf);assert.deepEqual(sent.map(s=>s.to),[HELD_HANDLER,HELD_HELPER]);const [n,copy]=sent;
- const id=heldClaimNotice(held,"claim","hub: 409 conflict: release: candidate changed since enqueue token (removed) (tt deployment claim exit 1)",CODE_RUN).requestId;
+ const id=heldClaimNotice(held,"claim","hub: 409 conflict: release: candidate changed since enqueue (removed) (tt deployment claim exit 1)",CODE_RUN).requestId;
  assert.match(id,new RegExp("^rel_held-claim-held-"+CODE_RUN+"-[a-f0-9]{8}$"));assert.equal(n.requestId,id+"-handler");assert.equal(copy.requestId,id+"-helper");
  assert.deepEqual({...copy,to:null,requestId:null},{...n,to:null,requestId:null});
  assert.equal(n.kind,"notice");assert.equal(n.subject,"A release job is skipped because the hub refused its claim");
@@ -792,7 +793,7 @@ test("held r1 r2 r3 a refused claim sends exactly one notice with the hub's reas
  assert.equal(h.calls().filter(c=>c.argv[0]==="agents").length,1);assert.equal(h.calls().filter(c=>c.argv[1]==="handler").length,1);
  assert.deepEqual(n.refs,["release-job=rel_held","item="+HELD_ITEM,"commit="+"c".repeat(40)]);
  assert.ok(n.text.includes("Release rel_held (item "+HELD_ITEM+", commit "+"c".repeat(12)+")"));
- assert.ok(n.text.includes("Reason: hub: 409 conflict: release: candidate changed since enqueue token (removed) (tt deployment claim exit 1)."));
+ assert.ok(n.text.includes("Reason: hub: 409 conflict: release: candidate changed since enqueue (removed) (tt deployment claim exit 1)."));
  assert.match(n.text,/Database handler: reconcile the job .*Owner helper: for information\.$/);assert.match(n.text,SAFE_TEXT);assert.ok(n.subject.length<=120&&!/rel_|wi_/.test(n.subject));
  // Nothing private in any argv word of any call: not the secret, the variable or the journal directory.
  for(const c of h.calls())for(const word of c.argv)for(const secret of [HELD_SECRET,"SYNTHETIC","TAILTERM_TOKEN",h.home,tmpdir()])assert.ok(!word.includes(secret),secret);

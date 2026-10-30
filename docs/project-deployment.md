@@ -554,6 +554,19 @@ digest changed OLD8 to NEW8; no owner approval covers it` (below),
 `verify-matrix.mjs timeout` or `exit N` from the plan command, or `unclassified` for an
 untagged error. It never claims a rollback was attempted.
 
+The runner's other modules and its git calls refuse with fixed tags too
+(wi_57a3e40fb5d351cd): `Invalid release settledAt` (a ledger job whose
+`settledAt` is not a time), `git diff failed` (a target selection or schema
+check whose diff fails, for example on a baseline commit the checkout lacks),
+`integration-empty-cherry-pick` (below), and `git SUBCOMMAND failed` for any
+other failed git call outside integration's conflict classification, SUBCOMMAND
+being one of `checkout`, `cherry-pick`, `clone`, `diff`, `merge-base`,
+`rev-list`, `rev-parse`, `status`, `update-ref` or `worktree` (else `git
+failed`). A git tag names the operation only, never git's stderr, its
+arguments or a path. A failed checkout or cherry-pick while integrating keeps
+its own classification: `integration-conflict: ...` or `Candidate integration
+refused`.
+
 **A matrix changed after approval (wi_715ea343cc605b1c).** A job is approved
 under one `verification/matrix.json` digest. When tasks-hub gains a matrix
 change before the job is released, the integrated commit carries another digest,
@@ -698,16 +711,38 @@ runs longer than the lead would alone.
 The deployer reads at most `2*(maxJobs-1)` candidates, in queue order, and takes
 the first that fit until the batch is full.
 
-Every candidate whose full record the deployer tried to read and left out, and
-every candidate past the read limit, is recorded once in the lead's journal,
-`journalDirectory/ID.json` on the deployer host, as `batchDropped: [{jobId, reason}]`,
-whether or not a batch forms. Candidates are the queue summaries that are
-verified, unclaimed, after the lead, of its base commit and pause generation,
-and not marked batch-solo; a job passed over before that gets no entry, and
-neither does one that fit but met a full batch, so an empty or missing list
-does not tell these cases apart. Later polls of the same claim add nothing. When a
-batch forms, its receipt `journalDirectory/bat_ID-receipt.json` carries the same list as
-`dropped`. The hub's release record and `tt deployment get` do not show it.
+Every active job queued after the lead that does not join its batch is recorded
+once per claim, with one reason, in the lead's journal, `journalDirectory/ID.json`
+on the deployer host, as `batchDropped: [{jobId, reason}]`, whether or not a
+batch forms (wi_861ff5962b9bb478). That covers the queue summaries left out
+before any read, the candidates whose full record was read and left out, those
+past the read limit, those dropped while the batch was built and those never
+tried. Candidates are the queue summaries that are verified, unclaimed, after
+the lead, of its base commit and pause generation, and not marked batch-solo.
+Later polls of the same claim add nothing. When a batch forms, its receipt
+`journalDirectory/bat_ID-receipt.json` carries the same list as `dropped`.
+
+Where the reasons appear: the lead's journal (above), and the hub. Every finish
+of the lead (released, rolled back, blocked, a no-change result, or a resumed
+`receipt_pending` finish) sends the list beside its receipt with `tt deployment
+finish --batch-dropped FILE`, FILE being `{"dropped": [{jobId, reason}],
+"omitted": N}` built from the journal alone, so a resumed finish sends the same
+bytes. The hub saves it on the lead's record as `batchDropped` and leaves the
+receipt as it is. `tt deployment get --job LEAD` shows it. `tt deployment get
+--job ID` of a job a lead passed over shows `batchExcluded: [{leadJobId,
+reason}]`, derived on each read and never saved on the job: the finish also
+writes one row per exclusion to the hub's `release_batch_exclusions` table
+(indexed by job), which the read uses; a replayed finish adds none, and jobs
+excluded before the table existed show nothing (no backfill). Bounds: at most 1000
+exclusions per lead claim reach the hub, the first in queue order, with
+`batchDroppedOmitted` counting the rest (the journal keeps them all, and the
+bound never blocks the finish); an excluded job's view names the newest 20
+leads that passed it over, with `batchExcludedOmitted` counting older ones. Only
+ids of the hub's shape other than the lead are sent, with reasons sent as
+receipt reasons are (a reason naming a credential word is `unclassified`). A
+`tt` or hub from before this refuses the flag or the field; the runner then
+sends the bare finish once, under the same request ID, and the hub shows
+nothing.
 
 | Reason | Meaning |
 | --- | --- |
@@ -716,12 +751,23 @@ batch forms, its receipt `journalDirectory/bat_ID-receipt.json` carries the same
 | `batch-ineligible` | the full record is no longer verified, unclaimed, or of the lead's base, repository or pause generation |
 | `detail-unreadable` | the job's full record could not be read |
 | `over-limit` | queued past the `2*(maxJobs-1)` candidates that are read |
+| `batch-claimed` | claimed by a deployer run |
+| `batch-not-verified` | not verified (for example held, merged or blocked) |
+| `batch-other-generation` | of another project pause generation |
+| `batch-other-base` | of another base commit |
+| `batch-solo` | marked to release alone after a failed batch |
+| `batch-lead-solo` | the lead itself is marked to release alone, so no batch forms |
+| `batch-full` | read and fit, but the batch already held `maxJobs` jobs |
+| `batch-closed` | never tried: the hub refused the batch-open or the lead's batch-add |
+| `batch-lead-no-change` | never tried: the lead had no change, so no batch opened |
 
 The same list also keeps the jobs dropped while the batch was built: a
 cherry-pick failure by its reason, `batch-no-change` (the batch's head already
 carries it, as above, a range the hub refuses because it adds no commit; the job
-releases alone later as a no-change result), `batch-open-refused` and
-`batch-add-refused`. A lead with no change opens no batch and releases alone.
+releases alone later as a no-change result), `batch-open-refused` (the member
+whose turn opened the batch, when the hub refused the open or the lead's add)
+and `batch-add-refused` (the hub refused this member's add; later candidates
+are still tried). A lead with no change opens no batch and releases alone.
 To see why a job did not ride with the one before it:
 
 ```sh
@@ -1490,7 +1536,11 @@ job's commit`), and any `--release` equals the record's. It saves
 `supersession: {releasedCommit, release, handReleaseId, targets, agentId,
 runId}` and `settledAt` (the record's time, replacing a rolled-back receipt's),
 keeps the job's history and retry identity, and sets the terminal state
-`superseded`, shown as "superseded (released by hand)". The targets the record
+`superseded`, shown as "superseded (released by hand)". A `held` job is
+superseded the same way, with no unhold first (wi_b270): the one request
+releases its hold, appending a `release` event with cause `supersede` to
+`holdHistory`, and saves it `superseded` at one generation step, so the deployer
+cannot claim it in between. The same request ID replays. The targets the record
 shipped advance to its released commit in the baselines. Claim, the runner and
 the project fence skip the job. Each use needs its own recorded order; there is
 no standing order to supersede.
@@ -1575,8 +1625,12 @@ job that is refused in turn can be retried the same way.
 
 A retried job is integrated like any other. If the earlier attempt published
 the change and `tasks-hub` still carries it, the runner's cherry-pick is empty
-and the new job is refused before publication; revert the change on `tasks-hub`
-first, or supersede the job with a hand release instead.
+and the new job is refused before publication with
+`integration-empty-cherry-pick`; revert the change on `tasks-hub` first, or
+supersede the job with a hand release instead. The runner first aborts the pick
+and puts the checkout back on the tip it started from, undoing any commit of
+the series already picked, so no `CHERRY_PICK_HEAD` or sequencer state is left.
+A batch member whose pick is empty is dropped with the same reason.
 
 ### A generation that advances under a claim (wi_395d07d432a93bc7)
 
@@ -1725,7 +1779,8 @@ saves its `hold`: the reason, the release condition (`untilItems` or
 - It keeps its place in the queue. It does not count as a waiting job: the
   deployer posts no fence-wait notice for it, and it does not make a claimed job
   ahead of it eligible for set-aside.
-- `reconcile` and `supersede` are refused until the hold is released.
+- `reconcile` is refused until the hold is released. A `supersede` releases
+  the hold itself, in the same request (below).
 - `tt deployment list` shows it in the active view with state `held` and its
   `hold`; `tt deployment get` also shows `holdHistory`.
 
@@ -1742,8 +1797,10 @@ only with `unhold`.
 Every transition is appended to the job's `holdHistory` and never rewritten: a
 `hold` event, then a `release` event whose `cause` is `handler` (an unhold, with
 the handler's agent, run and reason), `items_released` (with `triggerJobId`,
-the job whose release met the condition) or `not_before` (its time passed). Each carries the job generation after
-the event and the hub time.
+the job whose release met the condition), `not_before` (its time passed) or
+`supersede` (a supersede of the held job, with the handler's agent and run and
+the hand release it cites). Each carries the job generation after the event and
+the hub time.
 
 Rules the hub checks:
 
@@ -1753,9 +1810,12 @@ Rules the hub checks:
   time that is not after the hub time. A hold names items or a time, not both.
 - Only a `verified`, unclaimed job can be held. A claimed job with no effects is
   set aside first and then held; the refusal says so. A job whose latest
-  reconcile record carries a host lock digest (a requeue) cannot be held: the
-  runner frees that lock only while the job is `verified`, and the hub cannot
-  see the host.
+  reconcile record carries a host lock digest (a requeue) can be held
+  (wi_f2ab6a1f4bb38a78): the runner frees that lock for a `held` job as for a
+  `verified` one, under the same checks (the lock file's digest and its job,
+  agent and run must match the record). A deployer running an older runner frees
+  it only while the job is `verified`, so such a lock stays until the deployer
+  restarts on the current runner.
 - Both commands need the job's exact generation and replay by request ID.
 
 After the hub saves either command, the CLI posts one board notice linked to
@@ -2032,9 +2092,10 @@ saved.
   pass, until the window ends. Effects that already began (publication,
   deploys, live checks, the push and the finish) finish.
 - A job whose latest reconcile record carries a host lock digest (a requeue)
-  is never held, because the runner frees that lock only while the job is
-  `verified`. Its claim is still refused while the window is open, and it
-  becomes claimable at the end without an unhold.
+  is never held by the window, which keeps the rule from before the runner
+  freed a held job's lock (an owner hold may take it, see "Holding a verified
+  job"). Its claim is still refused while the window is open, and it becomes
+  claimable at the end without an unhold.
 
 ### Probes and rollback programs
 
@@ -2146,9 +2207,12 @@ as usual, with no restart. A window made invalid again later is told again.
 - Each line has control characters removed, then is redacted and cut to 300
   characters. Redacted, in order: every environment value of 6 or more
   characters from `app.config`; `Bearer` values and `token`, `secret`,
-  `password`, `passwd`, `authorization` or `api key` followed by `=` or `:` and
-  a value; and any run of 24 or more of `A-Za-z0-9+/_=.-` with both a letter and
-  a digit (this also hides commit hashes and container ids).
+  `password`, `passwd`, `authorization`, `api key` or `x-api-key` followed by
+  `=`, `:` or only whitespace and a value (so `password hunter2secret9` is
+  hidden too); and any run of 24 or more of `A-Za-z0-9+/_=.-` with both a letter
+  and a digit (this also hides commit hashes and container ids), unless each of
+  its `_`, `.` and `-` separated parts is lowercase letters or at most four
+  digits: a name such as `0042_add_index_on_messages_task_seq.sql` is kept.
 
 The capture is best effort: it runs after the verdict is fixed and cannot change
 it, the exit status or `waitedMs`. The runner reduces whatever the probe printed
@@ -2160,7 +2224,15 @@ has already exited may return no log lines.
 A probe failure prints nothing and exits 1. When a target step fails, the
 journal's `failure` field keeps the first one as `{step, target, reason}`: step
 is `prepare`, `rehearse`, `deploy` or `live-check`. A failed target selection
-is kept as step `select`, with no target (see "Effects on tasks-hub"). A failed
+is kept as step `select`, with no target (see "Effects on tasks-hub"). Every
+stage before publication is a step too (wi_57a3e40fb5d351cd): `fence` (the
+start fence check), `integrate` (integration, and a resumed batch
+declaration), `matrix` (the integrated matrix run, of a single job or a batch),
+`inputs` (the inputs check), `prepare` with target `tailos` (the release tools)
+and `publish` (the fence check and the `tasks-hub` update). The refuse carries
+the step. `fence`, `matrix`, `inputs`, `publish` and a resumed `integrate` are
+journal steps only; the runner's progress reports keep their phases and steps.
+A released job's journal has no `failure`. A failed
 rehearsal container
 run adds `rehearsal` (see "Migration rehearsal container"). The reason is at most 160
 characters and is only a fixed message the runner or adapter tagged (for example
@@ -2868,9 +2940,17 @@ notice and belongs to the transport wait.
   `Reason:`; the refs carry `release-job`, `item` and the full `commit`. For a
   refused claim the reason is the last line the hub's refusal printed, followed
   by the failed call in brackets, for example `hub: 409 conflict: release:
-  candidate changed since enqueue (tt deployment claim exit 1)`. Only plain
-  words, numbers of at most six digits and hub ids are repeated; every other
-  word (a path, a token, a `NAME=value` pair) reads `(removed)`. The exact
+  candidate changed since enqueue (tt deployment claim exit 1)`. The line read
+  is the last one starting `tt: `, else the last non-empty line, so a usage line
+  printed after the refusal does not replace it. The word after a credential
+  label (`bearer`, `token`, `password`, `key`, `secret`, `authorization` and the
+  like) reads `(removed)` whatever it is. Then only words of the runner's fixed
+  refusal vocabulary (`REFUSAL_WORDS`: the words of the hub's release refusals
+  and api error texts, the `tt deployment` subcommands and a short list of tt
+  and OS error words), numbers of at most six digits and hub ids are repeated;
+  every other word (a path, a token, a `NAME=value` pair, a name the vocabulary
+  lacks) reads `(removed)`. A test fails when a hub release refusal gains a word
+  the vocabulary lacks, so both change together. The exact
   stderr stays in `cli-failures.json` (Failed CLI calls, above). For a held
   journal the reason is fixed: the journal is unreadable, shows effects or is
   not of exactly the set-aside claim.

@@ -4444,17 +4444,33 @@ func TestReleaseHoldValidation(t *testing.T) {
 	if held, err := s.ReleaseAction(ctx, task.ID, holdRequest("hold-open", h, a, "Hold it", b.ItemID, c.ItemID)); err != nil || held.State != "held" {
 		t.Fatal(held.State, err)
 	}
-	// A requeue may leave the host release lock with the job.
-	locked := rewriteJob(t, s, c, func(j *api.ReleaseJob) {
+}
+
+// wi_f2ab: a verified job requeued with a host release lock can be held; the
+// runner frees the lock of a held job as of a verified one, so the hold does
+// not wait for another reconciliation.
+func TestReleaseHoldTakesLockedRequeue(t *testing.T) {
+	s, task, h, _, jobs := holdFixture(t, 1)
+	ctx := context.Background()
+	locked := rewriteJob(t, s, jobs[0], func(j *api.ReleaseJob) {
 		j.Reconciliations = append(j.Reconciliations, api.ReleaseReconciliation{Disposition: "requeue", LockDigest: strings.Repeat("e", 64)})
 	})
-	if _, err = s.ReleaseAction(ctx, task.ID, holdRequest("hold-locked", h, locked, "Hold it")); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "host release lock") {
-		t.Fatal("hold on a requeued job with a host lock", err)
+	held, err := s.ReleaseAction(ctx, task.ID, holdRequest("hold-locked", h, locked, "Hold it"))
+	if err != nil || held.State != "held" || held.Generation != locked.Generation+1 || held.Hold == nil || held.Hold.Reason != "Hold it" {
+		t.Fatal("hold on a requeued job with a host lock", held.State, err)
+	}
+	if n := len(held.Reconciliations); n == 0 || held.Reconciliations[n-1].LockDigest != strings.Repeat("e", 64) {
+		t.Fatal("the hold changed the reconciliation record", held.Reconciliations)
+	}
+	free, err := s.ReleaseAction(ctx, task.ID, unholdRequest("unhold-locked", h, held, "Go"))
+	if err != nil || free.State != "verified" {
+		t.Fatal("unhold of a locked requeue", free.State, err)
 	}
 }
 
 // a5: a held job is outside the release line: no batch takes it, set-aside
-// does not count it as waiting, and reconcile and supersede wait for unhold.
+// does not count it as waiting, and reconcile waits for unhold. A supersede
+// releases the hold itself (TestReleaseSupersedeLiftsHold).
 func TestReleaseHeldJobIsOutsideTheLine(t *testing.T) {
 	ctx := context.Background()
 	f := newBatchFixture(t, 1)
@@ -4486,22 +4502,58 @@ func TestReleaseHeldJobIsOutsideTheLine(t *testing.T) {
 	if _, err = f.s.ReleaseAction(ctx, f.task.ID, reconcile); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "tt deployment unhold") {
 		t.Fatal("held job reconciled", err)
 	}
-	hand := recordHandRelease(t, f.s, f.task, "hand", candidateB, []string{candidateB})
-	supersede := func(key string, j api.ReleaseJob) (api.ReleaseJob, error) {
-		return f.s.ReleaseAction(ctx, f.task.ID, api.ReleaseRequest{RequestID: key, Operation: "supersede", AgentID: f.h.ID, RunID: f.h.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, Supersession: &api.ReleaseSupersession{ReleasedCommit: candidateB, HandReleaseID: hand.ID}})
-	}
-	if _, err = supersede("supersede-held", held); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "tt deployment unhold") {
-		t.Fatal("held job superseded", err)
-	}
 	if releaseRow(t, f.s, f.task, held.ID) != row {
 		t.Fatal("a refused operation changed the held job")
 	}
+	hand := recordHandRelease(t, f.s, f.task, "hand", candidateB, []string{candidateB})
 	free, err := f.s.ReleaseAction(ctx, f.task.ID, unholdRequest("unhold", f.h, held, "Owner go"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if done, err := supersede("supersede", free); err != nil || done.State != "superseded" || len(done.HoldHistory) != 2 {
+	done, err := f.s.ReleaseAction(ctx, f.task.ID, api.ReleaseRequest{RequestID: "supersede", Operation: "supersede", AgentID: f.h.ID, RunID: f.h.RunID, JobID: free.ID, ExpectedGeneration: free.Generation, Supersession: &api.ReleaseSupersession{ReleasedCommit: candidateB, HandReleaseID: hand.ID}})
+	if err != nil || done.State != "superseded" || len(done.HoldHistory) != 2 {
 		t.Fatal("unheld job was not supersedable", done.State, err)
+	}
+}
+
+// wi_b270: a supersede of a held job saves it superseded in one request: one
+// generation step, a release event with cause supersede in its hold history,
+// and the same request ID replays. Reconcile of a held job is still refused.
+func TestReleaseSupersedeLiftsHold(t *testing.T) {
+	ctx := context.Background()
+	f := newBatchFixture(t, 1)
+	held, err := f.s.ReleaseAction(ctx, f.task.ID, holdRequest("hold", f.h, f.members[0], "Wait for the owner"))
+	if err != nil || held.State != "held" {
+		t.Fatal(held.State, err)
+	}
+	recovery := recoveryEvidence(t, f.s, f.task, f.h, held)
+	reconcile := api.ReleaseRequest{RequestID: "reconcile-held", Operation: "reconcile", AgentID: f.h.ID, RunID: f.h.RunID, JobID: held.ID, ExpectedGeneration: held.Generation, Reconciliation: &recovery}
+	if _, err = f.s.ReleaseAction(ctx, f.task.ID, reconcile); !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "tt deployment unhold") {
+		t.Fatal("held job reconciled", err)
+	}
+	hand := recordHandRelease(t, f.s, f.task, "hand", candidateB, []string{candidateB})
+	req := api.ReleaseRequest{RequestID: "supersede-held", Operation: "supersede", AgentID: f.h.ID, RunID: f.h.RunID, JobID: held.ID, ExpectedGeneration: held.Generation, Supersession: &api.ReleaseSupersession{ReleasedCommit: candidateB, HandReleaseID: hand.ID}}
+	done, err := f.s.ReleaseAction(ctx, f.task.ID, req)
+	if err != nil || done.State != "superseded" || done.Generation != held.Generation+1 || done.Hold != nil || done.Supersession == nil || done.Supersession.HandReleaseID != hand.ID {
+		t.Fatal("held job was not superseded in one request", done.State, done.Generation, err)
+	}
+	if len(done.HoldHistory) != 2 {
+		t.Fatalf("hold history %+v", done.HoldHistory)
+	}
+	ev := done.HoldHistory[1]
+	if ev.Action != "release" || ev.Cause != "supersede" || ev.AgentID != f.h.ID || ev.RunID != f.h.RunID || ev.Generation != done.Generation || !strings.Contains(ev.Reason, hand.ID) {
+		t.Fatalf("release event %+v", ev)
+	}
+	saved, err := releaseLoad(ctx, f.s.db, f.task.ID, held.ID)
+	if err != nil || saved.State != "superseded" || saved.Generation != done.Generation || len(saved.HoldHistory) != 2 {
+		t.Fatal("saved", saved.State, err)
+	}
+	row := releaseRow(t, f.s, f.task, held.ID)
+	if again, err := f.s.ReleaseAction(ctx, f.task.ID, req); err != nil || again.Generation != done.Generation || again.State != "superseded" || len(again.HoldHistory) != 2 {
+		t.Fatal("replay", again.Generation, err)
+	}
+	if releaseRow(t, f.s, f.task, held.ID) != row {
+		t.Fatal("the replay changed the job")
 	}
 }
 
@@ -8764,4 +8816,202 @@ func TestDeployerLivenessStaleCode(t *testing.T) {
 			t.Fatalf("second copy: %+v", e)
 		}
 	})
+}
+
+// wi_861f e1: a finish may carry the jobs the lead's batch passed over. They
+// are saved on the lead, its receipt is the same as without them, anything
+// malformed is refused with nothing saved, and an omitted count rides only
+// beside a full list.
+func TestReleaseFinishSavesBatchDropped(t *testing.T) {
+	s, task, _, d, jobs := holdFixture(t, 3)
+	ctx := context.Background()
+	excluded := func(n, from int) []api.ReleaseBatchExclusion {
+		out := make([]api.ReleaseBatchExclusion, n)
+		for i := range out {
+			out[i] = api.ReleaseBatchExclusion{JobID: fmt.Sprintf("rel_%016x", from+i), Reason: "batch-full"}
+		}
+		return out
+	}
+	merged := func(j api.ReleaseJob) (api.ReleaseJob, api.ReleaseRequest) {
+		t.Helper()
+		j, err := s.ReleaseAction(ctx, task.ID, claimRequest(j.ID+"-claim", d, j))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if j, err = s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: j.ID + "-merged", Operation: "merged", AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, IntegratedCommit: j.Commit}); err != nil {
+			t.Fatal(err)
+		}
+		finish := api.ReleaseRequest{RequestID: j.ID + "-finish", Operation: "finish", AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation}
+		finish.Receipt = &api.ReleaseReceipt{Version: 1, JobID: j.ID, Commit: j.Commit, VerificationDigest: j.VerificationDigest, Outcome: "released", Targets: []api.ReleaseTargetReceipt{{Target: "tailos", Release: "fixture", ArtifactSHA256: strings.Repeat("a", 64), Outcome: "released"}}}
+		return j, finish
+	}
+	receiptBytes := func(r *api.ReleaseReceipt) string { b, _ := json.Marshal(r); return string(b) }
+	// A finish without exclusions is unchanged: nothing new is saved.
+	plain, plainFinish := merged(jobs[2])
+	done, err := s.ReleaseAction(ctx, task.ID, plainFinish)
+	if err != nil || done.State != "released" || done.BatchDropped != nil || done.BatchDroppedOmitted != 0 || receiptBytes(done.Receipt) != receiptBytes(plainFinish.Receipt) {
+		t.Fatal("plain finish", done.State, err)
+	}
+	if raw := releaseRow(t, s, task, plain.ID); strings.Contains(raw, "batchDropped") {
+		t.Fatal("a plain finish saved exclusions", raw)
+	}
+	lead, finish := merged(jobs[0])
+	row := releaseRow(t, s, task, lead.ID)
+	bad := map[string]func(*api.ReleaseRequest){
+		"1001 entries": func(r *api.ReleaseRequest) { r.BatchDropped = excluded(1001, 1) },
+		"duplicate":    func(r *api.ReleaseRequest) { r.BatchDropped = append(excluded(2, 1), excluded(1, 1)...) },
+		"the job itself": func(r *api.ReleaseRequest) {
+			r.BatchDropped = []api.ReleaseBatchExclusion{{JobID: lead.ID, Reason: "batch-full"}}
+		},
+		"bad id": func(r *api.ReleaseRequest) {
+			r.BatchDropped = []api.ReleaseBatchExclusion{{JobID: "job-1", Reason: "batch-full"}}
+		},
+		"empty reason": func(r *api.ReleaseRequest) {
+			r.BatchDropped = []api.ReleaseBatchExclusion{{JobID: "rel_0000000000000001"}}
+		},
+		"two line reason": func(r *api.ReleaseRequest) {
+			r.BatchDropped = []api.ReleaseBatchExclusion{{JobID: "rel_0000000000000001", Reason: "batch\nfull"}}
+		},
+		"secret word reason": func(r *api.ReleaseRequest) {
+			r.BatchDropped = []api.ReleaseBatchExclusion{{JobID: "rel_0000000000000001", Reason: "bad token"}}
+		},
+		"omitted, short list": func(r *api.ReleaseRequest) { r.BatchDropped, r.BatchDroppedOmitted = excluded(999, 1), 5 },
+		"omitted alone":       func(r *api.ReleaseRequest) { r.BatchDroppedOmitted = 5 },
+		"negative omitted":    func(r *api.ReleaseRequest) { r.BatchDropped, r.BatchDroppedOmitted = excluded(1000, 1), -1 },
+	}
+	keys := 0
+	for name, change := range bad {
+		r := finish
+		keys++
+		r.RequestID = fmt.Sprintf("bad-finish-%d", keys)
+		change(&r)
+		if _, err = s.ReleaseAction(ctx, task.ID, r); !errors.Is(err, api.ErrInvalid) {
+			t.Fatal(name, err)
+		}
+		if releaseRow(t, s, task, lead.ID) != row {
+			t.Fatal(name, "a refused finish changed the job")
+		}
+	}
+	rowsOf := func(lead string) int {
+		t.Helper()
+		var n int
+		if err := s.db.QueryRow(`SELECT count(*) FROM release_batch_exclusions WHERE task_id=? AND lead_job_id=?`, task.ID, lead).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	if rowsOf(lead.ID) != 0 || rowsOf(plain.ID) != 0 {
+		t.Fatal("a refused or plain finish saved exclusion rows")
+	}
+	// Exclusions belong to a finish only.
+	check := api.ReleaseRequest{RequestID: "check-dropped", Operation: "check", AgentID: d.ID, RunID: d.RunID, JobID: lead.ID, ExpectedGeneration: lead.Generation, BatchDropped: excluded(1, 1)}
+	if _, err = s.ReleaseAction(ctx, task.ID, check); !errors.Is(err, api.ErrInvalid) {
+		t.Fatal("exclusions on a check", err)
+	}
+	// 205 exclusions, all saved.
+	finish.BatchDropped = excluded(205, 1)
+	done, err = s.ReleaseAction(ctx, task.ID, finish)
+	if err != nil || done.State != "released" || len(done.BatchDropped) != 205 || done.BatchDroppedOmitted != 0 || done.BatchDropped[204].JobID != fmt.Sprintf("rel_%016x", 205) {
+		t.Fatal("finish with exclusions", done.State, len(done.BatchDropped), err)
+	}
+	if receiptBytes(done.Receipt) != receiptBytes(finish.Receipt) {
+		t.Fatal("exclusions changed the receipt", receiptBytes(done.Receipt))
+	}
+	saved, err := s.Release(ctx, task.ID, lead.ID)
+	if err != nil || len(saved.BatchDropped) != 205 || receiptBytes(saved.Receipt) != receiptBytes(finish.Receipt) {
+		t.Fatal("saved", len(saved.BatchDropped), err)
+	}
+	if rowsOf(lead.ID) != 205 {
+		t.Fatal("exclusion rows", rowsOf(lead.ID))
+	}
+	if again, err := s.ReleaseAction(ctx, task.ID, finish); err != nil || again.Generation != done.Generation || len(again.BatchDropped) != 205 {
+		t.Fatal("replay", err)
+	}
+	if rowsOf(lead.ID) != 205 {
+		t.Fatal("a replayed finish added exclusion rows", rowsOf(lead.ID))
+	}
+	// The excluded job numbered 203, queued after the lead, names it.
+	late := api.ReleaseJob{ID: fmt.Sprintf("rel_%016x", 203), TaskID: task.ID, EntryID: api.NewID("tqe"), State: "verified", Generation: 1}
+	raw, _ := json.Marshal(late)
+	if _, err = s.db.Exec(`INSERT INTO release_jobs VALUES(?,?,?,?,?,?)`, task.ID, late.ID, late.EntryID, late.State, late.Generation, string(raw)); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.Release(ctx, task.ID, late.ID); err != nil || len(got.BatchExcluded) != 1 || got.BatchExcluded[0] != (api.ReleaseBatchExcluded{LeadJobID: lead.ID, Reason: "batch-full"}) {
+		t.Fatal("excluded job 203", got.BatchExcluded, err)
+	}
+	// A full list plus an omitted count saves both.
+	full, fullFinish := merged(jobs[1])
+	fullFinish.BatchDropped, fullFinish.BatchDroppedOmitted = excluded(1000, 5000), 5
+	if done, err = s.ReleaseAction(ctx, task.ID, fullFinish); err != nil || len(done.BatchDropped) != 1000 || done.BatchDroppedOmitted != 5 {
+		t.Fatal("full list and omitted", len(done.BatchDropped), err)
+	}
+	if saved, err = s.Release(ctx, task.ID, full.ID); err != nil || len(saved.BatchDropped) != 1000 || saved.BatchDroppedOmitted != 5 || rowsOf(full.ID) != 1000 {
+		t.Fatal("saved full list", len(saved.BatchDropped), err)
+	}
+}
+
+// wi_861f e2: an excluded job's exact read names the leads that passed it
+// over, from release_batch_exclusions, newest first, at most 20 with an
+// omitted count beyond; the lead's read carries its list; a job no lead
+// excluded carries neither, and so does a lead record saved with a list but
+// no rows (no backfill). Nothing derived is saved on the job.
+func TestReleaseGetShowsBatchExcluded(t *testing.T) {
+	s, task, _, _, jobs := holdFixture(t, 1)
+	ctx := context.Background()
+	older := jobs[0]
+	insert := func(j api.ReleaseJob) {
+		t.Helper()
+		raw, _ := json.Marshal(j)
+		if _, err := s.db.Exec(`INSERT INTO release_jobs VALUES(?,?,?,?,?,?)`, task.ID, j.ID, j.EntryID, j.State, j.Generation, string(raw)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	id := func(i int) string { return fmt.Sprintf("rel_%016x", 0x9000+i) }
+	target, other := id(900), id(901)
+	exclude := func(lead, job, reason string, at int64) {
+		t.Helper()
+		if _, err := s.db.Exec(`INSERT INTO release_batch_exclusions(task_id,job_id,lead_job_id,reason,saved_at) VALUES(?,?,?,?,?)`, task.ID, job, lead, reason, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 22 settled leads, each passing over the target, saved in order; the last also over another job.
+	for i := range 22 {
+		lead := api.ReleaseJob{ID: id(i), TaskID: task.ID, EntryID: api.NewID("tqe"), State: "released", Generation: 3, BatchDropped: []api.ReleaseBatchExclusion{{JobID: target, Reason: fmt.Sprintf("batch-full %d", i)}}}
+		exclude(lead.ID, target, fmt.Sprintf("batch-full %d", i), int64(1000+i))
+		if i == 21 {
+			lead.BatchDropped = append(lead.BatchDropped, api.ReleaseBatchExclusion{JobID: other, Reason: "batch-other-base"})
+			exclude(lead.ID, other, "batch-other-base", int64(1000+i))
+		}
+		insert(lead)
+	}
+	insert(api.ReleaseJob{ID: target, TaskID: task.ID, EntryID: api.NewID("tqe"), State: "verified", Generation: 1})
+	insert(api.ReleaseJob{ID: other, TaskID: task.ID, EntryID: api.NewID("tqe"), State: "verified", Generation: 1})
+	// A lead record carrying a list with no rows (saved before the table) adds nothing.
+	insert(api.ReleaseJob{ID: id(950), TaskID: task.ID, EntryID: api.NewID("tqe"), State: "released", Generation: 3, BatchDropped: []api.ReleaseBatchExclusion{{JobID: older.ID, Reason: "batch-full"}}})
+	before := releaseRow(t, s, task, target)
+	got, err := s.Release(ctx, task.ID, target)
+	if err != nil || len(got.BatchExcluded) != 20 || got.BatchExcludedOmitted != 2 {
+		t.Fatal("excluded job", len(got.BatchExcluded), got.BatchExcludedOmitted, err)
+	}
+	for i, e := range got.BatchExcluded {
+		if e.LeadJobID != id(21-i) || e.Reason != fmt.Sprintf("batch-full %d", 21-i) {
+			t.Fatalf("%d: %+v", i, e)
+		}
+	}
+	if releaseRow(t, s, task, target) != before {
+		t.Fatal("a read saved the derived exclusions")
+	}
+	if got, err = s.Release(ctx, task.ID, other); err != nil || len(got.BatchExcluded) != 1 || got.BatchExcluded[0] != (api.ReleaseBatchExcluded{LeadJobID: id(21), Reason: "batch-other-base"}) || got.BatchExcludedOmitted != 0 {
+		t.Fatal("second excluded job", got.BatchExcluded, err)
+	}
+	if got, err = s.Release(ctx, task.ID, id(21)); err != nil || len(got.BatchDropped) != 2 || got.BatchExcluded != nil {
+		t.Fatal("lead", got.BatchDropped, got.BatchExcluded, err)
+	}
+	if got, err = s.Release(ctx, task.ID, older.ID); err != nil || got.BatchDropped != nil || got.BatchExcluded != nil || got.BatchExcludedOmitted != 0 {
+		t.Fatal("older job", got.BatchDropped, got.BatchExcluded, err)
+	}
+	raw, _ := json.Marshal(got)
+	if strings.Contains(string(raw), "batchDropped") || strings.Contains(string(raw), "batchExcluded") {
+		t.Fatal("an older job's wire form names exclusions", string(raw))
+	}
 }

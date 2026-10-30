@@ -4,6 +4,9 @@ import { diffPaths } from "./verify-matrix.mjs";
 const targets = ["hub", "bridge", "mini", "tailos"];
 // A fixed reason the release runner may journal and post (its REASON pattern).
 function tagged(reason) { const error = new Error(reason); error.releaseReason = reason; return error; }
+// A failed git diff (for example a baseline commit the checkout lacks) is
+// tagged; git's own message is never carried.
+function changedPaths(cwd, from, to) { try { return diffPaths(cwd, from, to); } catch { throw tagged("git diff failed"); } }
 // The one unknown path a reason may name; any other is counted, never quoted.
 const NAMED_PATH = /^[A-Za-z0-9_.\/-]{1,120}$/;
 // An unknown source file blocks release rather than silently omitting a target.
@@ -99,7 +102,7 @@ export function selectReleaseTargets(cwd, baselines, commit) {
   const known = candidateKnown(cwd, commit);
   return targets.filter(t => {
     if (!/^[a-f0-9]{40}$/.test(baselines[t] || "")) throw tagged("Missing last successful target baseline");
-    return targetsForPaths(diffPaths(cwd, baselines[t], commit), known).includes(t);
+    return targetsForPaths(changedPaths(cwd, baselines[t], commit), known).includes(t);
   });
 }
 // When each configured baseline went live, from the private config's optional
@@ -142,7 +145,7 @@ export function releaseBaselines(baselines, jobs, configuredAt, now = Date.now()
   for (const [target, at] of Object.entries(configuredBaselineTimes(configuredAt, now))) events.push({at, index: -1, commit: baselines[target], targets: [target]});
   jobs.forEach((job, index) => {
     const at = job.settledAt ? Date.parse(job.settledAt) : null;
-    if (job.settledAt && Number.isNaN(at)) throw new Error("Invalid release settledAt");
+    if (job.settledAt && Number.isNaN(at)) throw tagged("Invalid release settledAt");
     if (job.receipt?.outcome === "released") {
       const shipped = job.receipt.targets.filter(t => t.outcome === "released").map(t => t.target);
       events.push({at, index, commit: job.receipt.commit, targets: shipped});
@@ -160,5 +163,5 @@ export function releaseBaselines(baselines, jobs, configuredAt, now = Date.now()
 // Conservative: any non-test store source change since the live hub needs a
 // backup-copy migration rehearsal.
 export function schemaChanged(cwd, hubBaseline, commit) {
-  return diffPaths(cwd, hubBaseline, commit).some(p => /^hub\/internal\/store\/.*\.go$/.test(p) && !p.endsWith("_test.go"));
+  return changedPaths(cwd, hubBaseline, commit).some(p => /^hub\/internal\/store\/.*\.go$/.test(p) && !p.endsWith("_test.go"));
 }

@@ -285,3 +285,91 @@ func TestReleasesHTTPBoundsOptionsAndFullDetail(t *testing.T) {
 		t.Fatal("full active detail", code, detail.State)
 	}
 }
+
+// wi_861f e2/e3 over real HTTP: a finish POST carrying batchDropped answers
+// 201 and saves it on the lead; a malformed list answers 400 with the job
+// unchanged; GET of the lead returns batchDropped, GET of an excluded job
+// returns batchExcluded naming the lead and reason, and an older job returns
+// neither. Only the jobs are seeded, in this test's own isolated database.
+func TestReleaseHTTPBatchExclusions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "hub.sqlite")
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	c := &client{t: t, st: st, who: api.Caller{Node: "devbox", User: "stephen@example.com"}}
+	c.srv = httptest.NewServer(New(st, func(*http.Request) (api.Caller, error) { return c.who, nil }))
+	t.Cleanup(c.srv.Close)
+	ctx := context.Background()
+	task := c.task("release-batch-exclusions-http")
+	actions, base := "/v1/tasks/"+task.ID+"/releases/actions", "/v1/tasks/"+task.ID+"/releases?job="
+	d, err := st.AddAgent(ctx, task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "deployer", Host: "devbox", Session: "deployer", Role: api.AgentRoleDeployment}, c.who)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	// The deployer's run is live, as its heartbeat leaves it.
+	if _, err = db.Exec(`UPDATE agents SET status='running',last_seen_at=? WHERE id=?`, time.Now().UTC().Format(time.RFC3339Nano), d.ID); err != nil {
+		t.Fatal(err)
+	}
+	var pause int64
+	if err = db.QueryRow(`SELECT pause_generation FROM tasks WHERE id=?`, task.ID).Scan(&pause); err != nil {
+		t.Fatal(err)
+	}
+	insert := func(j api.ReleaseJob) {
+		t.Helper()
+		raw, _ := json.Marshal(j)
+		if _, err := db.Exec(`INSERT INTO release_jobs VALUES(?,?,?,?,?,?)`, task.ID, j.ID, j.EntryID, j.State, j.Generation, string(raw)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	commit, digest := strings.Repeat("c", 40), strings.Repeat("d", 64)
+	older := api.ReleaseJob{ID: api.NewID("rel"), TaskID: task.ID, EntryID: api.NewID("tqe"), Commit: commit, State: "released", Generation: 4}
+	lead := api.ReleaseJob{ID: api.NewID("rel"), TaskID: task.ID, EntryID: api.NewID("tqe"), BaseCommit: strings.Repeat("a", 40), Commit: commit, VerificationDigest: digest, IntegratedCommit: commit, Published: true, State: "merged", Generation: 3, AgentID: d.ID, RunID: d.RunID, PauseGeneration: pause}
+	excluded := api.ReleaseJob{ID: api.NewID("rel"), TaskID: task.ID, EntryID: api.NewID("tqe"), Commit: strings.Repeat("e", 40), State: "verified", Generation: 1, PauseGeneration: pause}
+	insert(older)
+	insert(lead)
+	insert(excluded)
+	finish := func(key string, dropped []api.ReleaseBatchExclusion) api.ReleaseRequest {
+		return api.ReleaseRequest{RequestID: key, Operation: "finish", AgentID: d.ID, RunID: d.RunID, JobID: lead.ID, ExpectedGeneration: lead.Generation, BatchDropped: dropped,
+			Receipt: &api.ReleaseReceipt{Version: 1, JobID: lead.ID, Commit: commit, VerificationDigest: digest, Targets: []api.ReleaseTargetReceipt{}, Outcome: "released"}}
+	}
+	var before api.ReleaseJob
+	if code := c.do("GET", base+lead.ID, nil, &before); code != 200 || before.State != "merged" {
+		t.Fatal("lead before", code, before.State)
+	}
+	var refusal api.ErrorResponse
+	if code := c.do("POST", actions, finish("finish-bad", []api.ReleaseBatchExclusion{{JobID: lead.ID, Reason: "batch-full"}}), &refusal); code != 400 {
+		t.Fatal("malformed exclusions", code, refusal.Error)
+	}
+	var unchanged api.ReleaseJob
+	if code := c.do("GET", base+lead.ID, nil, &unchanged); code != 200 || unchanged.State != "merged" || unchanged.Generation != lead.Generation || unchanged.BatchDropped != nil {
+		t.Fatal("a refused finish changed the lead", code, unchanged.State)
+	}
+	var done api.ReleaseJob
+	if code := c.do("POST", actions, finish("finish", []api.ReleaseBatchExclusion{{JobID: excluded.ID, Reason: "batch-other-base"}}), &done); code != 201 || done.State != "released" || len(done.BatchDropped) != 1 {
+		t.Fatal("finish with exclusions", code, done.State, done.BatchDropped)
+	}
+	var got api.ReleaseJob
+	if code := c.do("GET", base+lead.ID, nil, &got); code != 200 || len(got.BatchDropped) != 1 || got.BatchDropped[0] != (api.ReleaseBatchExclusion{JobID: excluded.ID, Reason: "batch-other-base"}) || got.BatchExcluded != nil {
+		t.Fatal("lead detail", code, got.BatchDropped)
+	}
+	got = api.ReleaseJob{}
+	if code := c.do("GET", base+excluded.ID, nil, &got); code != 200 || len(got.BatchExcluded) != 1 || got.BatchExcluded[0] != (api.ReleaseBatchExcluded{LeadJobID: lead.ID, Reason: "batch-other-base"}) || got.BatchExcludedOmitted != 0 || got.BatchDropped != nil {
+		t.Fatal("excluded detail", code, got.BatchExcluded)
+	}
+	res, err := http.Get(c.srv.URL + base + older.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := io.ReadAll(res.Body)
+	res.Body.Close()
+	if res.StatusCode != 200 || strings.Contains(string(raw), "batchDropped") || strings.Contains(string(raw), "batchExcluded") {
+		t.Fatal("older job", res.StatusCode, string(raw))
+	}
+}
