@@ -4041,6 +4041,211 @@ func TestHandlerRotationStartupProviderFailure(t *testing.T) {
 	}
 }
 
+// successorWaitRotation is a due template rotation whose successor comes
+// online but never reports a completed turn, ticked by a runner on a fake
+// clock from the launch (bug wi_e09e377485f7f21a).
+type successorWaitRotation struct {
+	*stuckRotation
+	r      *rotationRunner
+	clock  time.Time
+	start  time.Time
+	handle api.HandlerRotation
+}
+
+func newSuccessorWaitRotation(t *testing.T) *successorWaitRotation {
+	t.Helper()
+	f := &successorWaitRotation{stuckRotation: newStuckRotation(t)}
+	f.online, f.unready = true, true
+	f.deps.online = 3 * time.Second
+	f.clock = time.Now().UTC()
+	f.start = f.clock
+	f.deps.clock = func() time.Time { return f.clock }
+	f.r = f.runner()
+	f.r.deps = f.deps
+	if err := f.at(0); err != nil {
+		t.Fatalf("first tick: %v", err)
+	}
+	f.handle = f.assertHeld(t)
+	return f
+}
+
+// at advances the runner's clock and runs one tick.
+func (f *successorWaitRotation) at(d time.Duration) error {
+	f.clock = f.clock.Add(d)
+	return f.try(f.r)
+}
+
+func (f *successorWaitRotation) successor(t *testing.T) api.Agent {
+	t.Helper()
+	a, err := f.c.GetAgent(context.Background(), f.task.ID, f.handle.SuccessorAgentID)
+	if err != nil || !a.Online {
+		t.Fatalf("successor %+v %v", a, err)
+	}
+	return a
+}
+
+// working reports what the relay sampled on 10-30: the successor busy in a
+// turn with model output, never idle.
+func (f *successorWaitRotation) working(t *testing.T) {
+	t.Helper()
+	a := f.successor(t)
+	now := time.Now().UTC()
+	activity := api.AgentActivity{State: "working", ObservedAt: now, LastEventAt: now, Tokens: api.TokenTotals{Output: 6121, Total: 6121}}
+	if _, err := f.c.ReportActivity(context.Background(), f.task.ID, a.ID, api.ActivityReport{RequestID: api.NewID("act"), RunID: a.RunID, Activity: activity}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// post sends a NOTICE as the given agent's exact run.
+func (f *successorWaitRotation) post(t *testing.T, from api.Agent, to api.Agent, subject string) {
+	t.Helper()
+	env := api.Envelope{Kind: api.EnvelopeKindNotice, To: to.Name, Subject: subject, Body: api.EnvelopeBody{Text: "Identity verified; waiting for the handoff NOTICE."}}
+	req := api.PostMessageRequest{Envelope: &env, Text: api.RenderText(env), To: to.ID, AgentID: from.ID, RunID: from.RunID}
+	if _, err := f.c.PostMessage(context.Background(), f.task.ID, req); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// waitsThenStuck checks that the rotation waits uncounted up to
+// api.HandlerSuccessorReadyWait from the launch, then makes three counted
+// resumes that end in one stuck notice to each recipient, with nothing moved.
+func (f *successorWaitRotation) waitsThenStuck(t *testing.T) {
+	t.Helper()
+	for _, d := range []time.Duration{time.Minute, 4 * time.Minute, 4*time.Minute + 59*time.Second} {
+		if err := f.at(d); err != nil {
+			t.Fatalf("wait at %s: %v", f.clock.Sub(f.start), err)
+		}
+	}
+	f.assertHeld(t)
+	if j := f.journal(t); j.ResumeFailures != 0 || len(f.stuckNotices(t)) != 0 || f.spawns != 1 {
+		t.Fatalf("before the bound: failures=%d notices=%d spawns=%d", j.ResumeFailures, len(f.stuckNotices(t)), f.spawns)
+	}
+	for i := 1; i <= rotationResumeCeiling; i++ {
+		d := time.Minute
+		if i == 1 {
+			d = time.Second
+		}
+		if err := f.at(d); err == nil || !strings.Contains(err.Error(), "did not complete a turn or post a message") {
+			t.Fatalf("resume %d at %s: %v", i, f.clock.Sub(f.start), err)
+		}
+		if n := len(f.stuckNotices(t)); (i < rotationResumeCeiling && n != 0) || (i == rotationResumeCeiling && n != 2) {
+			t.Fatalf("notices after resume %d: %d", i, n)
+		}
+	}
+	if to := f.noticesTo(t); len(to) != 2 || to[f.helper.ID] != 1 || to[f.old.ID] != 1 {
+		t.Fatalf("stuck notices %v", to)
+	}
+	f.assertHeld(t)
+	if f.spawns != 1 {
+		t.Fatalf("spawns %d", f.spawns)
+	}
+}
+
+// The 10-30 rotations (bug wi_e09e377485f7f21a, criteria r1 and r6): each
+// successor posted that it was waiting for the handoff, but the relay sampled
+// it working at every report and never idle, so the hub refused every commit
+// until the bound. A post by the successor's exact run since the prepare is
+// now readiness. The second arm has no activity report at all.
+func TestHandlerRotationSuccessorPostIsReady(t *testing.T) {
+	for _, arm := range []struct {
+		name    string
+		working bool
+	}{{"working at every sample", true}, {"no activity report", false}} {
+		t.Run(arm.name, func(t *testing.T) {
+			f := newSuccessorWaitRotation(t)
+			if arm.working {
+				f.working(t)
+			}
+			// Working with output, and no post: still a wait.
+			if err := f.at(time.Minute); err != nil {
+				t.Fatalf("wait before the post: %v", err)
+			}
+			f.assertHeld(t)
+			successor := f.successor(t)
+			f.post(t, successor, f.old, "Successor identity verified and waiting for the handoff")
+			if arm.working {
+				f.working(t)
+			}
+			if err := f.at(time.Minute); err != nil {
+				t.Fatalf("tick after the post: %v", err)
+			}
+			got, err := f.c.GetHandlerRotation(context.Background(), f.task.ID, f.handle.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The owed request and the delivery of the successor's own NOTICE
+			// to the old handler both move.
+			if got.State != api.HandlerRotationCommitted || got.Receipt == nil || got.Receipt.Reissued != 2 {
+				t.Fatalf("rotation: %+v", got)
+			}
+			detail, err := f.c.GetTask(context.Background(), f.task.ID)
+			old, oldErr := f.c.GetAgent(context.Background(), f.task.ID, f.old.ID)
+			if err != nil || oldErr != nil || detail.Task.PrimaryHandlerID != successor.ID || old.Status != api.AgentClosed || old.SuccessorID != successor.ID {
+				t.Fatalf("primary: %+v old %+v %v %v", detail.Task, old, err, oldErr)
+			}
+			if owed := f.owedByOld(t); len(owed) != 1 || !strings.Contains(owed[0], " "+successor.ID+" ") {
+				t.Fatalf("obligations after the commit: %v", owed)
+			}
+			if len(f.stuckNotices(t)) != 0 || f.spawns != 1 {
+				t.Fatalf("notices=%d spawns=%d", len(f.stuckNotices(t)), f.spawns)
+			}
+		})
+	}
+}
+
+// Only the successor's own exact run counts, and not while its provider
+// refuses it (bug wi_e09e377485f7f21a, criteria r1 and r3): the old
+// handler's post, another agent's post to the successor and the successor's
+// post while provider_blocked leave the rotation prepared to the bound, as
+// does a successor that never posts and is never sampled idle.
+func TestHandlerRotationSuccessorPostIdentity(t *testing.T) {
+	t.Run("other agents post", func(t *testing.T) {
+		f := newSuccessorWaitRotation(t)
+		f.working(t)
+		successor := f.successor(t)
+		f.post(t, f.old, successor, "Primary handler fixture notice to its successor")
+		f.post(t, f.worker, successor, "Worker fixture notice addressed to the successor")
+		f.waitsThenStuck(t)
+	})
+	t.Run("successor posts while provider blocked", func(t *testing.T) {
+		f := newSuccessorWaitRotation(t)
+		successor := f.successor(t)
+		now := time.Now().UTC()
+		block := api.ProviderBlock{Provider: "openai", Runtime: "codex", Model: "gpt-6-astra", Class: api.ProviderBlockRateLimited, Code: "response_too_many_failed_attempts", Status: 429, Since: now}
+		if _, err := f.c.ReportActivity(context.Background(), f.task.ID, successor.ID, api.ActivityReport{RequestID: api.NewID("act"), RunID: successor.RunID,
+			Activity: api.AgentActivity{State: "provider_blocked", ObservedAt: now, LastEventAt: now, Provider: &block, Tokens: api.TokenTotals{Output: 12, Total: 12}}}); err != nil {
+			t.Fatal(err)
+		}
+		f.post(t, successor, f.old, "Successor identity verified and waiting for the handoff")
+		f.waitsThenStuck(t)
+	})
+	t.Run("no post and never idle", func(t *testing.T) {
+		f := newSuccessorWaitRotation(t)
+		f.working(t)
+		f.waitsThenStuck(t)
+	})
+}
+
+// The successor's briefing makes it post once and end its first turn, so the
+// relay wakes it for the handoff NOTICE (bug wi_e09e377485f7f21a, r5).
+func TestHandlerRotationSuccessorBriefingEndsTurn(t *testing.T) {
+	f := newRotationCLI(t, handlerTemplateDigest("an older assignment"))
+	r, err := f.rotate(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.assertRotated(t, r, 0)
+	if len(f.briefings) != 1 {
+		t.Fatalf("briefings %d", len(f.briefings))
+	}
+	b := f.briefings[0]
+	for _, want := range []string{handlerSuccessorBriefing, "verify tt and your identity", "post exactly one NOTICE", "end your turn", "Never wait or poll for the NOTICE inside a turn", "do not page your unread backlog", "tt handler rotation list"} {
+		if !strings.Contains(b, want) {
+			t.Fatalf("successor briefing misses %q:\n%s", want, b)
+		}
+	}
+}
+
 // The runner replaces a primary that a provider rate limit has stopped for 20
 // minutes while it holds obligations, with the limit policy off (bug
 // wi_ce7310979bc45479, order #46760, criteria a6 and a7). A retry wake fired

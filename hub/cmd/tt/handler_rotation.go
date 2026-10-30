@@ -168,7 +168,8 @@ type handlerRotationJournal struct {
 	// rotationStuckAbortAfter counts from it (bug wi_63793d7e551231f6).
 	StuckAt time.Time `json:"stuckAt,omitempty"`
 	// SpawnedAt is when the successor's launch was recorded: its first
-	// completed turn is awaited until api.HandlerSuccessorReadyWait after it.
+	// completed turn or post is awaited until api.HandlerSuccessorReadyWait
+	// after it.
 	SpawnedAt time.Time `json:"spawnedAt,omitempty"`
 }
 
@@ -246,18 +247,10 @@ func productionRotationDeps() rotationDeps {
 }
 
 // errSuccessorNotReady is a wait, not a failure: the successor is online but
-// has not completed a turn yet, and api.HandlerSuccessorReadyWait has not
-// passed since its launch. The rotation stays prepared and the old handler
-// keeps every obligation.
+// the hub has seen neither a completed turn nor a post from its exact run,
+// and api.HandlerSuccessorReadyWait has not passed since its launch. The
+// rotation stays prepared and the old handler keeps every obligation.
 var errSuccessorNotReady = errors.New("the successor has not completed a turn yet")
-
-// successorMayBeReady reads the successor's current activity without writing.
-// A completed turn with a model reply is ready; any output at all in this run
-// means a reply was made, so the hub, which reads every report of the run,
-// decides at commit.
-func successorMayBeReady(a api.Agent) bool {
-	return a.Activity != nil && (api.HandlerSuccessorReady(*a.Activity) || a.Activity.Tokens.Output > 0)
-}
 
 // A death probe answers gone, alive or unknown. Only gone carries evidence,
 // and only gone lets the runner ask the hub for a dead primary rotation.
@@ -798,9 +791,12 @@ func runHandlerRotation(ctx context.Context, d rotationDeps, e env, c *api.Clien
 			}
 		}
 		// Online is not ready: the successor's exact run must complete a turn
-		// with a model reply before it takes the obligations (bug
-		// wi_ce7310979bc45479). Until then, and for at most
-		// api.HandlerSuccessorReadyWait from its launch, this is a wait.
+		// with a model reply, or post a message, before it takes the
+		// obligations (bugs wi_ce7310979bc45479 and wi_e09e377485f7f21a). Only
+		// the hub sees every report and message of the run, so each poll asks
+		// it with a commit; a refused commit writes nothing. Until it accepts,
+		// and for at most api.HandlerSuccessorReadyWait from its launch, this
+		// is a wait.
 		if j.SpawnedAt.IsZero() {
 			// Journaled before readiness existed: the bound starts now.
 			j.SpawnedAt = d.now().UTC()
@@ -811,50 +807,45 @@ func runHandlerRotation(ctx context.Context, d rotationDeps, e env, c *api.Clien
 		readyBy := j.SpawnedAt.Add(api.HandlerSuccessorReadyWait)
 		notReady := func() error {
 			if !d.now().Before(readyBy) {
-				return successorStartError{fmt.Errorf("successor %s did not complete a turn within %s of its launch; the rotation stays prepared and the old handler keeps its obligations: rerun to resume or abort with tt handler rotate --abort", j.SuccessorName, api.HandlerSuccessorReadyWait)}
+				return successorStartError{fmt.Errorf("successor %s did not complete a turn or post a message within %s of its launch; the rotation stays prepared and the old handler keeps its obligations: rerun to resume or abort with tt handler rotate --abort", j.SuccessorName, api.HandlerSuccessorReadyWait)}
 			}
 			return fmt.Errorf("%w: successor %s, waiting until %s", errSuccessorNotReady, j.SuccessorName, readyBy.UTC().Format(time.RFC3339))
 		}
 		pollUntil := d.now().Add(d.readyWait)
 		for {
-			a, err := c.GetAgent(ctx, task, j.SuccessorAgentID)
-			if err != nil {
-				return zero, err
+			commit := api.HandlerRotationRequest{Operation: api.HandlerRotationCommit, RequestID: "rotation-commit-" + j.RotationID, RotationID: j.RotationID}
+			if j.Reason == api.HandlerRotationReasonDeadPrimary {
+				// The successor took time to start: look again before the commit,
+				// and leave the old handler primary on any doubt.
+				old, err := c.GetAgent(ctx, task, j.OldAgentID)
+				if err != nil {
+					return zero, err
+				}
+				state, detail := handlerProbeUnknown, "this host has no death probe"
+				if d.probe != nil && old.RunID == j.OldRunID {
+					state, detail, commit.DeathEvidence = d.probe(ctx, hub, old)
+				}
+				if state != handlerProbeGone || commit.DeathEvidence == nil {
+					if abortErr := abortJournaledRotation(ctx, d, e, c, task, path, j); abortErr != nil {
+						return zero, fmt.Errorf("the second death probe of %s says %s (%s); aborting the rotation failed and will retry: %w", old.Name, state, detail, abortErr)
+					}
+					return zero, fmt.Errorf("%w: the second probe of %s says %s (%s); the rotation was aborted and it stays primary", errDeathNotConfirmed, old.Name, state, detail)
+				}
 			}
-			if successorMayBeReady(a) {
+			_, err := c.HandlerRotationAction(ctx, task, commit)
+			if err == nil {
 				break
 			}
-			if !d.now().Before(readyBy) || !d.now().Before(pollUntil) {
-				return zero, notReady()
-			}
-			select {
-			case <-ctx.Done():
-				return zero, ctx.Err()
-			case <-time.After(d.readyPoll):
-			}
-		}
-		commit := api.HandlerRotationRequest{Operation: api.HandlerRotationCommit, RequestID: "rotation-commit-" + j.RotationID, RotationID: j.RotationID}
-		if j.Reason == api.HandlerRotationReasonDeadPrimary {
-			// The successor took time to start: look again before the commit,
-			// and leave the old handler primary on any doubt.
-			old, err := c.GetAgent(ctx, task, j.OldAgentID)
-			if err != nil {
-				return zero, err
-			}
-			state, detail := handlerProbeUnknown, "this host has no death probe"
-			if d.probe != nil && old.RunID == j.OldRunID {
-				state, detail, commit.DeathEvidence = d.probe(ctx, hub, old)
-			}
-			if state != handlerProbeGone || commit.DeathEvidence == nil {
-				if abortErr := abortJournaledRotation(ctx, d, e, c, task, path, j); abortErr != nil {
-					return zero, fmt.Errorf("the second death probe of %s says %s (%s); aborting the rotation failed and will retry: %w", old.Name, state, detail, abortErr)
-				}
-				return zero, fmt.Errorf("%w: the second probe of %s says %s (%s); the rotation was aborted and it stays primary", errDeathNotConfirmed, old.Name, state, detail)
-			}
-		}
-		if _, err := c.HandlerRotationAction(ctx, task, commit); err != nil {
 			if code, _ := rotationRefusal(err); code == api.HandlerRotationRefusedSuccessorNotReady {
-				return zero, notReady()
+				if !d.now().Before(readyBy) || !d.now().Before(pollUntil) {
+					return zero, notReady()
+				}
+				select {
+				case <-ctx.Done():
+					return zero, ctx.Err()
+				case <-time.After(d.readyPoll):
+				}
+				continue
 			}
 			if j.Reason == api.HandlerRotationReasonDeadPrimary && deathUnconfirmedRefusal(err) {
 				if abortErr := abortJournaledRotation(ctx, d, e, c, task, path, j); abortErr != nil {

@@ -263,7 +263,11 @@ func handlerTemplateDigest(assignment string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-const handlerSuccessorBriefing = "\nYou are starting as the successor in a handler rotation. Until the hub's directed handoff NOTICE arrives, do not take intake or records: the previous handler stays primary. The NOTICE names the rotation; read its durable handoff with tt handler rotation get ID and continue from it."
+// handlerSuccessorBriefing tells a rotation successor to post once and end
+// its first turn: the hub commits on that post and only then sends the
+// handoff NOTICE, so a successor that waits inside its turn for the NOTICE
+// was never seen ready (bug wi_e09e377485f7f21a, r5).
+const handlerSuccessorBriefing = "\nYou are starting as the successor in a handler rotation. The previous handler stays primary until the hub's directed handoff NOTICE arrives; the hub posts it only when it commits the rotation, and the relay wakes you then. In your first turn: verify tt and your identity, post exactly one NOTICE to the primary handler saying you are waiting for the handoff, and end your turn. Never wait or poll for the NOTICE inside a turn, and do not page your unread backlog or take intake or records before it. On any earlier wake, run tt handler rotation list; if no rotation naming you is committed, end the turn without reading the inbox. The NOTICE names the rotation; read its durable handoff with tt handler rotation get ID and continue from it."
 
 // primaryHandlerFirst moves the project's explicit primary handler to the
 // front, so briefings name it. Without one the legacy order applies.

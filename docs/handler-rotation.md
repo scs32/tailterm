@@ -250,26 +250,49 @@ never bound to the relay, so no wake reached it and the obligations waited for
 a person. Online is therefore not readiness.
 
 - **At commit** the hub refuses `successor_not_ready`, and moves nothing,
-  unless the activity receipts hold a report from the successor's exact agent
-  and current run, observed at or after the prepare, that shows a completed
-  turn with a model reply: state `idle` or `finished_silent`, no provider
-  block, a turn-end reason that is not a provider error (`turn ended by
-  provider error`), and output tokens above zero. Receipts are read by agent
-  and run, so the old handler's activity and an earlier run of the successor
-  never count. This applies to every reason, a dead primary included.
-- **The host routine** reads the successor's current activity first, without
-  writing, and commits only when it shows that turn or any output in the run;
-  the hub decides from all of the run's reports. `tt handler rotate` polls
-  every 10 seconds; the runner checks once per tick.
+  unless the successor's exact agent and current run shows one of two kinds
+  of evidence since the prepare:
+  - a completed turn: an activity receipt observed at or after the prepare
+    with state `idle` or `finished_silent`, no provider block, a turn-end
+    reason that is not a provider error (`turn ended by provider error`), and
+    output tokens above zero; or
+  - a post: a message it posted at or after the prepare (bug
+    `wi_e09e377485f7f21a`), while its current activity is not
+    `provider_blocked`. Hub broker messages never count. A post is a model
+    reply even when the relay never samples the turn idle.
+
+  Receipts and messages are read by agent and run, so the old handler's
+  activity or posts, another agent's message to the successor and an earlier
+  run of the successor never count. This applies to every reason, a dead
+  primary included.
+- **The host routine** asks the hub on each poll by attempting the commit; a
+  refused commit writes nothing. `tt handler rotate` polls every 10 seconds;
+  the runner tries once per tick. A dead-primary rotation runs its second
+  death probe before each attempt.
 - **Until 10 minutes after the launch** (`spawnedAt` in the journal; a journal
   without it starts the 10 minutes at its first resume) a successor that is
   not ready is a wait: the rotation stays prepared, the runner neither counts
   nor logs it, and the old handler keeps every obligation. Nothing is sent to
   the successor, so the wait does not depend on a relay wake reaching it.
 - **After 10 minutes** each resume that still finds it not ready is a counted
-  failure ("did not complete a turn within 10m0s"), and at the
-  [ceiling](#a-successor-that-never-comes-online) the runner stops with one
-  stuck notice each to the owner helper and the handler.
+  failure ("did not complete a turn or post a message within 10m0s"), and at
+  the [ceiling](#a-successor-that-never-comes-online) the runner stops with
+  one stuck notice each to the owner helper and the handler.
+
+The successor's briefing tells it to verify `tt` and its identity, post
+exactly one NOTICE to the primary handler saying it is waiting for the
+handoff, and end its turn. It never waits or polls for the handoff NOTICE
+inside a turn and does not page its unread backlog first; the hub posts the
+NOTICE when it commits, and the relay wakes the successor then.
+
+Why posts count, and why the bound did not change: on 2026-10-30 three
+rotations went stuck although each successor had posted within minutes that
+it was waiting for the handoff. The relay samples a run's state, not its turn
+ends, at most every 15 seconds, and each successor was idle for well under a
+second between turns, so no sample saw a completed turn. Activity-report lag
+was not the cause, and no longer window would fix a sampler that never sees
+the idle state. The bound stays 10 minutes from `spawnedAt`. A successor that
+never posts and is never sampled idle still ends stuck.
 
 A prepared rotation can therefore last about 13 minutes: the two minute online
 wait, the 10 minute readiness bound and three counted resumes a minute apart.
@@ -1050,10 +1073,13 @@ directory are inert without the new CLI.
   cannot be reached at commit, is still retried on every tick.
 - The hub does not reprovision a handler when the count reaches zero; that is
   follow-up `wi_42be87739d7bbfc9`.
-- Readiness comes from the relay's activity report for the successor's run. A
-  Codex successor binds to the relay only through its own `tt` commands, so one
-  whose first turns never run one is never ready; it ends in the stuck notice
-  and the old handler keeps its obligations.
+- Readiness comes from the relay's activity report for the successor's run or
+  from a message the run posted. A Codex successor binds to the relay only
+  through its own `tt` commands, so one whose first turns never run one and
+  never post is never ready; it ends in the stuck notice and the old handler
+  keeps its obligations. The relay samples state, not turn ends, so a
+  successor that ignores its briefing, never posts and is never sampled idle
+  ends stuck the same way.
 - A runner whose due list was empty asks again only after 5 minutes, so a
   `provider_blocked` replacement in a project with nothing else listed can come
   up to 5 minutes after the 20 minute bound.

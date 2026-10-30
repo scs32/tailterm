@@ -1594,11 +1594,12 @@ func (s *Store) commitHandlerRotation(ctx context.Context, tx *sql.Tx, t api.Tas
 	// Online is not readiness: a successor whose first turn fails at its
 	// provider would hold every obligation, unbound and unwakeable (bug
 	// wi_ce7310979bc45479). Nothing moves until its exact run has completed a
-	// turn with a model reply since the prepare; the old handler keeps all.
+	// turn with a model reply, or posted a message, since the prepare; the old
+	// handler keeps all.
 	if ready, err := successorReady(ctx, tx, t.ID, successor, r.CreatedAt); err != nil {
 		return zero, err
 	} else if !ready {
-		return zero, &api.HandlerRotationRefusal{Code: api.HandlerRotationRefusedSuccessorNotReady, Detail: fmt.Sprintf("successor %s has not completed a turn with a model reply since the prepare; %s keeps its obligations until it does", successor.Name, old.Name)}
+		return zero, &api.HandlerRotationRefusal{Code: api.HandlerRotationRefusedSuccessorNotReady, Detail: fmt.Sprintf("successor %s has not completed a turn with a model reply or posted a message since the prepare; %s keeps its obligations until it does", successor.Name, old.Name)}
 	}
 	handoff, err := s.snapshotHandlerHandoff(ctx, tx, t, old, busy)
 	if err != nil {
@@ -1823,11 +1824,15 @@ func providerBlockedPrimary(ctx context.Context, q queryRower, task string, poli
 	return b, b.obligations > 0, nil
 }
 
-// successorReady reports whether the successor's exact current run has an
-// activity report observed at or after since that shows a completed turn with
-// a model reply (api.HandlerSuccessorReady). Receipts are read by agent and
-// run, so the old handler's activity and an earlier run of the successor
-// never count.
+// successorReady reports whether the successor's exact current run is ready
+// to take the obligations. Either an activity report observed at or after
+// since shows a completed turn with a model reply (api.HandlerSuccessorReady),
+// or the run posted a message at or after since while its current activity is
+// not provider_blocked. A post is a model reply even when the relay never
+// samples the turn idle (bug wi_e09e377485f7f21a). Receipts and messages are
+// read by agent and run, and broker messages never count, so the old
+// handler's activity, another agent's message and an earlier run of the
+// successor never count.
 func successorReady(ctx context.Context, q queryRower, task string, successor api.Agent, since time.Time) (bool, error) {
 	rows, err := q.QueryContext(ctx, `SELECT payload FROM agent_activity_receipts WHERE task_id=? AND agent_id=? AND run_id=?`, task, successor.ID, successor.RunID)
 	if err != nil {
@@ -1844,6 +1849,41 @@ func successorReady(ctx context.Context, q queryRower, task string, successor ap
 			continue
 		}
 		if !a.ObservedAt.Before(since) && api.HandlerSuccessorReady(a) {
+			return true, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	rows.Close()
+	return successorPosted(ctx, q, task, successor, since)
+}
+
+// successorPosted reports whether the successor's exact run posted a message
+// at or after since, and its current activity is not provider_blocked: a run
+// its provider refuses cannot take the obligations whatever it said earlier.
+func successorPosted(ctx context.Context, q queryRower, task string, successor api.Agent, since time.Time) (bool, error) {
+	var state string
+	err := q.QueryRowContext(ctx, `SELECT state FROM agent_activity WHERE task_id=? AND agent_id=? AND run_id=?`, task, successor.ID, successor.RunID).Scan(&state)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
+	if state == "provider_blocked" {
+		return false, nil
+	}
+	// Timestamps are not stored in a sortable form, so they are compared here
+	// rather than in SQL.
+	rows, err := q.QueryContext(ctx, `SELECT created_at FROM messages WHERE task_id=? AND from_agent=? AND from_run_id=? AND from_node<>?`, task, successor.ID, successor.RunID, api.BrokerNode)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			return false, err
+		}
+		if !parseTS(raw).Before(since) {
 			return true, nil
 		}
 	}

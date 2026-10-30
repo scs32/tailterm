@@ -59,8 +59,9 @@ const (
 	// or the run has not been silent for the policy's minutes.
 	HandlerRotationRefusedDeathUnconfirmed = "death_unconfirmed"
 	HandlerRotationRefusedNotSilent        = "not_silent"
-	// Commit only: the successor's exact run has not completed a turn with a
-	// model reply since the prepare (HandlerSuccessorReady).
+	// Commit only: the successor's exact run has neither completed a turn
+	// with a model reply (HandlerSuccessorReady) nor posted a message since
+	// the prepare.
 	HandlerRotationRefusedSuccessorNotReady = "successor_not_ready"
 	// A provider_blocked prepare only: the primary's current run is not in
 	// the blocked state the reason needs.
@@ -99,7 +100,11 @@ const (
 	// before the runner replaces it (order #46760, q2).
 	HandlerProviderBlockedAfter = 20 * time.Minute
 	// HandlerSuccessorReadyWait bounds how long a prepared rotation waits,
-	// from the successor's spawn, for the successor's first completed turn.
+	// from the successor's spawn, for the successor's exact run to be ready:
+	// a completed turn with a model reply (HandlerSuccessorReady) or a message
+	// it posted since the prepare, as the hub checks at commit. The bound did
+	// not change when posts began to count (bug wi_e09e377485f7f21a): the
+	// 10-30 successors posted within minutes but were never sampled idle.
 	HandlerSuccessorReadyWait = 10 * time.Minute
 )
 
