@@ -2712,7 +2712,7 @@ func TestStallWatchHandlerGateJudgedByHandlerSilence(t *testing.T) {
 		checkStallText(t, text)
 		for _, want := range []string{entry, f.items[0].ID, "held for 30 min by a gate only the database handler can lift", "the handler has not cleared it since " + metAt.Format(time.RFC3339),
 			"a handler-gated wait on entry tqe_00000000000000aa (item " + f.items[1].ID + "), condition accepted, met at " + metAt.Format(time.RFC3339) + " (wait notice #77)",
-			"Member posts and work do not count", "ask the database handler to run the gate's checks", "tt team queue wait clear --entry " + entry + " --on tqe_00000000000000aa"} {
+			"Member posts and work do not count", "ask the database handler to run the gate's checks", "tt team queue wait clear --task " + f.task.ID + " --entry " + entry + " --on tqe_00000000000000aa"} {
 			if !strings.Contains(text, want) {
 				t.Fatalf("gate notice lacks %q: %s", want, text)
 			}
@@ -2858,7 +2858,7 @@ func TestStallWatchReleaseAndHostWaitPlannedThenGate(t *testing.T) {
 		checkStallText(t, env.Body.Text)
 		want := fmt.Sprintf("a wait on host admission set at %s, past its 60 min bound at %s", setAt.Format(time.RFC3339), setAt.Add(time.Hour).Format(time.RFC3339))
 		if !strings.Contains(env.Body.Text, want) || env.Refs["gate"] != "host" || env.Refs["gateOn"] != "host" || env.Refs["gateNotice"] != "" ||
-			!strings.Contains(env.Body.Text, "--entry "+entry+" --on host") {
+			!strings.Contains(env.Body.Text, "tt team queue wait clear --task "+f.task.ID+" --entry "+entry+" --on host") {
 			t.Fatalf("host gate notice lacks %q: %s %v", want, env.Body.Text, env.Refs)
 		}
 		f.advance(time.Minute)

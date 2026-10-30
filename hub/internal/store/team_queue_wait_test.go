@@ -2229,6 +2229,11 @@ func TestQueueWaitReleaseJobSetMetAndOrphaned(t *testing.T) {
 		if len(got) != 1 || !strings.Contains(got[0].Envelope.Body.Text, fmt.Sprintf("waits on release job %s (item %s) for %s until it settles, but the release job was removed", id, f.items[0].ID, waitPause)) {
 			t.Fatalf("orphaned notices %+v", got)
 		}
+		// Review 51637 f1: the re-set form is the release one, not the entry one.
+		reset := fmt.Sprintf("set a new one with tt team queue wait set --task %s --entry %s --on RELEASE_JOB --reason TEXT --until departed|settled [--resume handler].", f.task.ID, f.waiting.ID)
+		if text := got[0].Envelope.Body.Text; !strings.Contains(text, reset) || strings.Contains(text, "PREDECESSOR_ENTRY") || strings.Contains(text, "accepted|done|released") {
+			t.Fatalf("orphaned notice re-set form: %s", text)
+		}
 		if listed := f.waitingEntry(t); len(listed.Waits) != 1 || listed.Waits[0].Text() != fmt.Sprintf("wait on release %s needs a handler decision: the release job was removed", id) {
 			t.Fatalf("listed %+v", listed.Waits)
 		}

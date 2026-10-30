@@ -878,18 +878,22 @@ func (s *Store) queueWaitOrphaned(ctx context.Context, w queueWaitRow, reason st
 		if err != nil || handler.ID == "" {
 			return false, err
 		}
+		// The re-set form matches the wait's kind. A host wait is never
+		// orphaned, so it needs no form here.
 		until := "it is " + w.until
+		reset := "--on PREDECESSOR_ENTRY --owns PATH|--reason TEXT --until accepted|done|released"
 		if w.onKind == api.TeamQueueWaitOnRelease {
 			until = "its matrix departs"
 			if w.until == api.TeamQueueWaitSettled {
 				until = "it settles"
 			}
+			reset = "--on RELEASE_JOB --reason TEXT --until departed|settled [--resume handler]"
 		}
 		text := fmt.Sprintf("Queue entry %s (item %s) waits on %s for %s until %s, but %s, so that condition cannot be met. "+
 			"Decide: clear the wait with tt team queue wait clear --task %s --entry %s --on %s and tell the waiting lead, "+
-			"or clear it and set a new one with tt team queue wait set --task %s --entry %s --on PREDECESSOR_ENTRY --owns PATH|--reason TEXT --until accepted|done|released. "+
+			"or clear it and set a new one with tt team queue wait set --task %s --entry %s %s. "+
 			"The waiting lead was not told and nothing was released.",
-			w.entry, w.item, w.onText(), w.waitedFor(), until, reason, w.task, w.entry, w.onEntry, w.task, w.entry)
+			w.entry, w.item, w.onText(), w.waitedFor(), until, reason, w.task, w.entry, w.onEntry, w.task, w.entry, reset)
 		seq, err := s.postQueueWaitNotice(ctx, tx, task, handler, queueWaitOrphanedSubject, text, w.refs("queue_wait_orphaned"))
 		if err != nil {
 			return false, err

@@ -399,6 +399,7 @@ type stallHelper struct {
 type stallLifts struct{ resumed, released time.Time }
 
 type stallTeam struct {
+	task          string
 	entry, item   string
 	admission     time.Time
 	waiting, held bool
@@ -638,7 +639,7 @@ func loadStallViews(ctx context.Context, q queryRower, task string) (map[string]
 		if n := len(v.teams); n > 0 && v.teams[n-1].entry == entry {
 			team = v.teams[n-1]
 		} else {
-			team = &stallTeam{entry: entry, item: item, admission: parseTS(admitted), waiting: waiting, held: held, gated: stallGatedWait(gate), hostSet: parseTS(hostSet),
+			team = &stallTeam{task: id, entry: entry, item: item, admission: parseTS(admitted), waiting: waiting, held: held, gated: stallGatedWait(gate), hostSet: parseTS(hostSet),
 				lifts: stallLifts{resumed: v.resumed, released: latest(parseTS(released), parseTS(cleared))}}
 			if team.admission.IsZero() {
 				team.admission = parseTS(created)
@@ -1299,8 +1300,8 @@ func (t *stallTeam) notice(episode string, since, now time.Time, helperState str
 		text += fmt.Sprintf(" The owner helper is %s, so this goes to the owner.", helperState)
 	}
 	if gate != nil {
-		text += fmt.Sprintf(" %s %s %sask the database handler to run the gate's checks, then send the waiting lead its resume and clear the wait with tt team queue wait clear --entry %s --on %s, or clear it.",
-			stallUnknownCause, stallRecordFirst, stallNextStep, t.entry, gate.on)
+		text += fmt.Sprintf(" %s %s %sask the database handler to run the gate's checks, then send the waiting lead its resume and clear the wait with tt team queue wait clear --task %s --entry %s --on %s, or clear it.",
+			stallUnknownCause, stallRecordFirst, stallNextStep, t.task, t.entry, gate.on)
 	} else {
 		text += fmt.Sprintf(" %s %s %sread the team's last messages and look at its lead's session, then decide whether to prompt the lead.", stallUnknownCause, stallRecordFirst, stallNextStep)
 	}
