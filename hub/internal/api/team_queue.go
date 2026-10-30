@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/url"
@@ -135,7 +136,64 @@ const (
 	// only: the team stays paused until the database handler's explicit
 	// resume. An empty resume is automatic: the met notice resumes the team.
 	TeamQueueWaitResumeHandler = "handler"
+
+	// What a wait waits on, named by its predecessor key: a queue entry
+	// (tqe_ID), a release job (rel_ID) or the matrix host's admission (the
+	// key "host"). An entry wait omits its kind from the JSON.
+	TeamQueueWaitOnEntry   = "entry"
+	TeamQueueWaitOnRelease = "release"
+	TeamQueueWaitOnHost    = "host"
+	// TeamQueueWaitHostKey is the predecessor key of a wait on host admission.
+	TeamQueueWaitHostKey = "host"
+
+	// A release wait's conditions: its matrix departs (the integrated matrix
+	// result is in, or the job merged, blocked or settled) or it settles
+	// (released, refused, rolled back or superseded). A host wait's only
+	// condition is the database handler's resume.
+	TeamQueueWaitDeparted = "departed"
+	TeamQueueWaitSettled  = "settled"
+	TeamQueueWaitHandler  = "handler"
 )
+
+// TeamQueueWaitOnKind is the kind of a wait's predecessor key, or "" when the
+// key is none of tqe_ID, rel_ID and host.
+func TeamQueueWaitOnKind(key string) string {
+	switch {
+	case teamQueueWaitHexID(key, "tqe_"):
+		return TeamQueueWaitOnEntry
+	case teamQueueWaitHexID(key, "rel_"):
+		return TeamQueueWaitOnRelease
+	case key == TeamQueueWaitHostKey:
+		return TeamQueueWaitOnHost
+	}
+	return ""
+}
+
+// teamQueueWaitHexID reports a prefix and 16 hex digits, the shape of a
+// queue entry ID (store validTeamQueueID); a release job ID is also lower
+// case (compatibilityReleaseID).
+func teamQueueWaitHexID(key, prefix string) bool {
+	if len(key) != len(prefix)+16 || !strings.HasPrefix(key, prefix) || (prefix == "rel_" && strings.ToLower(key) != key) {
+		return false
+	}
+	_, err := hex.DecodeString(key[len(prefix):])
+	return err == nil
+}
+
+// ValidTeamQueueWaitCondition reports whether until is a condition of the
+// kind: accepted, done or released for an entry; departed or settled for a
+// release job; handler for host admission.
+func ValidTeamQueueWaitCondition(kind, until string) bool {
+	switch kind {
+	case TeamQueueWaitOnEntry:
+		return ValidTeamQueueWaitUntil(until)
+	case TeamQueueWaitOnRelease:
+		return until == TeamQueueWaitDeparted || until == TeamQueueWaitSettled
+	case TeamQueueWaitOnHost:
+		return until == TeamQueueWaitHandler
+	}
+	return false
+}
 
 // ValidTeamQueueWaitResume reports whether resume is automatic ("") or
 // "handler".
@@ -148,14 +206,17 @@ func ValidTeamQueueWaitUntil(until string) bool {
 	return until == TeamQueueWaitAccepted || until == TeamQueueWaitDone || until == TeamQueueWaitReleased
 }
 
-// TeamQueueWait is one entry's recorded wait for paths another entry owns.
-// The broker tick moves it from waiting to met and tells the waiting lead
-// once; orphaned means the predecessor can no longer meet the condition and
-// a handler must decide. Resume "handler" keeps the team paused after the
-// notice until the database handler resumes it.
+// TeamQueueWait is one entry's recorded wait for paths another entry owns,
+// or a pause on a release job or on host admission. The broker tick moves it
+// from waiting to met and tells the waiting lead once; orphaned means the
+// predecessor can no longer meet the condition and a handler must decide.
+// Resume "handler" keeps the team paused after the notice until the database
+// handler resumes it. OnEntryID is the predecessor key: a tqe_ID, a rel_ID or
+// "host", as OnKind says; OnItemID is the predecessor's item, empty for host.
 type TeamQueueWait struct {
 	OnItemID  string   `json:"onItemId"`
 	OnEntryID string   `json:"onEntryId"`
+	OnKind    string   `json:"onKind,omitempty"`
 	Paths     []string `json:"paths"`
 	Until     string   `json:"until"`
 	State     string   `json:"state"`
@@ -214,6 +275,26 @@ func (w TeamQueueWait) Text() string {
 		held = teamQueueWaitReasonText(w.Reason)
 	}
 	gated := w.Resume == TeamQueueWaitResumeHandler
+	// on names the predecessor: an entry's item, or the release job.
+	on, until := w.OnItemID, w.Until
+	switch w.OnKind {
+	case TeamQueueWaitOnHost:
+		if w.State == TeamQueueWaitOrphaned {
+			return fmt.Sprintf("wait on host admission needs a handler decision: %s", w.Reason)
+		}
+		return fmt.Sprintf("waits on host admission for %s until the database handler resumes it", held)
+	case TeamQueueWaitOnRelease:
+		on = "release " + w.OnEntryID
+		if w.State == TeamQueueWaitWaiting {
+			until = "its matrix departs"
+			if w.Until == TeamQueueWaitSettled {
+				until = "it settles"
+			}
+			if w.OnItemID != "" {
+				on += " (item " + w.OnItemID + ")"
+			}
+		}
+	}
 	switch w.State {
 	case TeamQueueWaitMet:
 		commit := w.MetCommit
@@ -221,22 +302,22 @@ func (w TeamQueueWait) Text() string {
 			commit = "none recorded"
 		}
 		if gated && pathless {
-			return fmt.Sprintf("wait on %s met (%s, commit %s): still paused for %s until the database handler resumes it", w.OnItemID, w.Until, commit, held)
+			return fmt.Sprintf("wait on %s met (%s, commit %s): still paused for %s until the database handler resumes it", on, w.Until, commit, held)
 		}
 		if gated {
-			return fmt.Sprintf("wait on %s met (%s, commit %s): the database handler resumes the team before it edits %s", w.OnItemID, w.Until, commit, held)
+			return fmt.Sprintf("wait on %s met (%s, commit %s): the database handler resumes the team before it edits %s", on, w.Until, commit, held)
 		}
 		if pathless {
-			return fmt.Sprintf("wait on %s met (%s, commit %s): resume the work paused for %s", w.OnItemID, w.Until, commit, held)
+			return fmt.Sprintf("wait on %s met (%s, commit %s): resume the work paused for %s", on, w.Until, commit, held)
 		}
-		return fmt.Sprintf("wait on %s met (%s, commit %s): rebase before editing %s", w.OnItemID, w.Until, commit, held)
+		return fmt.Sprintf("wait on %s met (%s, commit %s): rebase before editing %s", on, w.Until, commit, held)
 	case TeamQueueWaitOrphaned:
-		return fmt.Sprintf("wait on %s needs a handler decision: %s", w.OnItemID, w.Reason)
+		return fmt.Sprintf("wait on %s needs a handler decision: %s", on, w.Reason)
 	}
 	if gated {
-		return fmt.Sprintf("waits on %s for %s until %s, then a handler resume", w.OnItemID, held, w.Until)
+		return fmt.Sprintf("waits on %s for %s until %s, then a handler resume", on, held, until)
 	}
-	return fmt.Sprintf("waits on %s for %s until %s", w.OnItemID, held, w.Until)
+	return fmt.Sprintf("waits on %s for %s until %s", on, held, until)
 }
 
 // TeamQueueEstimateDefault is a lane default estimate: the tokens, the lane
@@ -529,8 +610,10 @@ type TeamQueueRequest struct {
 	// that saves the corrected spec.
 	HandlerSpecArgs []string `json:"handlerSpecArgs,omitempty"`
 	// wait_set and wait_clear: EntryID is the waiting entry, WaitOnEntryID
-	// the predecessor entry. WaitPaths and WaitUntil (accepted, done or
-	// released) belong to wait_set; WaitReason is wait_set's reason for a
+	// the predecessor key: an entry tqe_ID, a release job rel_ID or "host".
+	// WaitPaths and WaitUntil (accepted, done or released for an entry;
+	// departed or settled for a release job; handler or empty for host)
+	// belong to wait_set; WaitReason is wait_set's reason for a
 	// wait that names no path, and wait_clear's optional why. WaitResume is
 	// wait_set's resume mode: "handler" when the team stays paused until the
 	// database handler resumes it, empty for an automatic resume.

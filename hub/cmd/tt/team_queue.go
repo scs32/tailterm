@@ -33,8 +33,9 @@ func validTeamQueueEntryID(id string) bool {
 const teamQueueUsage = "usage: tt team queue add|list|policy|limit|provision|scope|wait|rebind|requeue|fail|accept|integrated|replace-lead|remove|reorder|release|abandon"
 
 // teamQueueWaitUsage is the shared-path wait command (docs/project-queue.md,
-// "Team queue shared-path waits").
-const teamQueueWaitUsage = "usage: tt team queue wait set --entry tqe_WAITING --on tqe_PREDECESSOR --owns PATH [--owns PATH...] --until accepted|done|released [--resume handler]\n       tt team queue wait set --entry tqe_WAITING --on tqe_PREDECESSOR --reason TEXT --until accepted|done|released [--resume handler]\n       tt team queue wait clear --entry tqe_WAITING --on tqe_PREDECESSOR [--reason TEXT]"
+// "Team queue shared-path waits"), with the release-job and host-admission
+// waits (docs/stall-watch.md, "Handler gate").
+const teamQueueWaitUsage = "usage: tt team queue wait set --entry tqe_WAITING --on tqe_PREDECESSOR --owns PATH [--owns PATH...] --until accepted|done|released [--resume handler]\n       tt team queue wait set --entry tqe_WAITING --on tqe_PREDECESSOR --reason TEXT --until accepted|done|released [--resume handler]\n       tt team queue wait set --entry tqe_WAITING --on rel_JOB --reason TEXT --until departed|settled [--resume handler]\n       tt team queue wait set --entry tqe_WAITING --on host --reason TEXT [--until handler] [--resume handler]\n       tt team queue wait clear --entry tqe_WAITING --on tqe_PREDECESSOR|rel_JOB|host [--reason TEXT]"
 
 // parseQueueLimit reads --limit: none (no fixed cap, stored as 0) or N >= 1.
 func parseQueueLimit(raw string) (int, bool) {
@@ -258,8 +259,8 @@ func cmdTeamQueue(e env, args []string) error {
 	unmergedHead := fs.Bool("unmerged-head", false, "requeue --cwd: take a HEAD with commits not on tasks-hub as the base")
 	addBase := fs.String("base", "", "add: commit for the new worktree, on tasks-hub (default: the tasks-hub tip)")
 	reason := fs.String("reason", "", "fail: why the owner is failing this entry; wait set: why a wait that shares no path pauses; wait clear: why the wait is cleared")
-	waitOn := fs.String("on", "", "wait: the predecessor queue entry ID")
-	waitUntil := fs.String("until", "", "wait set: the condition, accepted, done or released")
+	waitOn := fs.String("on", "", "wait: the predecessor, a queue entry ID, a release job rel_ID or host")
+	waitUntil := fs.String("until", "", "wait set: the condition, accepted, done or released for an entry; departed or settled for a release job; handler or omitted for host")
 	waitResume := fs.String("resume", "", "wait set: handler, when the team stays paused until the database handler resumes it; omit for an automatic resume")
 	source := fs.Int64("source", 0, "rebind: the amendment's message sequence")
 	policyVersion := fs.Int64("policy-version", 0, "owner host policy version")
@@ -286,14 +287,34 @@ func cmdTeamQueue(e env, args []string) error {
 	}
 	if sub == "wait" {
 		// Checked before any hub call, so a mistyped command costs nothing.
-		ok := validTeamQueueEntryID(*entry) && validTeamQueueEntryID(*waitOn)
+		kind := api.TeamQueueWaitOnKind(*waitOn)
+		ok := validTeamQueueEntryID(*entry) && kind != ""
+		if kind == api.TeamQueueWaitOnEntry {
+			ok = ok && validTeamQueueEntryID(*waitOn)
+		}
 		if waitVerb == "set" {
 			// Shared paths, or a reason for a pause that shares no path: one
 			// of the two. The hub checks the reason's length.
 			if (len(ownership) > 0) == (strings.TrimSpace(*reason) != "") {
 				return errors.New("wait set needs --owns PATH for a shared path, or --reason TEXT for a pause that shares no path, not both\n" + teamQueueWaitUsage)
 			}
-			ok = ok && api.ValidTeamQueueWaitUntil(*waitUntil) && api.ValidTeamQueueWaitResume(*waitResume)
+			until := *waitUntil
+			switch kind {
+			case api.TeamQueueWaitOnRelease, api.TeamQueueWaitOnHost:
+				if len(ownership) > 0 {
+					return errors.New("a wait on a release job or on host admission takes --reason TEXT, not --owns\n" + teamQueueWaitUsage)
+				}
+				if kind == api.TeamQueueWaitOnHost {
+					// Only the database handler resumes a host wait.
+					if until == "" {
+						until = api.TeamQueueWaitHandler
+					}
+					if *waitResume != "" && *waitResume != api.TeamQueueWaitResumeHandler {
+						return errors.New("a wait on host admission resumes only by the database handler: omit --resume or give handler\n" + teamQueueWaitUsage)
+					}
+				}
+			}
+			ok = ok && api.ValidTeamQueueWaitCondition(kind, until) && api.ValidTeamQueueWaitResume(*waitResume)
 		} else {
 			ok = ok && len(ownership) == 0 && *waitUntil == "" && *waitResume == ""
 		}
@@ -1047,6 +1068,12 @@ func cmdTeamQueue(e env, args []string) error {
 			fmt.Printf("requeue %s %s at %d item-revision=%d%s\n", result.ID, result.ItemID, result.Position, result.ItemRevision, queueAttemptText(result))
 		} else if sub == "wait" {
 			text := "no longer waits on entry " + *waitOn
+			switch api.TeamQueueWaitOnKind(*waitOn) {
+			case api.TeamQueueWaitOnRelease:
+				text = "no longer waits on release job " + *waitOn
+			case api.TeamQueueWaitOnHost:
+				text = "no longer waits on host admission"
+			}
 			for _, w := range result.Waits {
 				if w.OnEntryID == *waitOn {
 					text = w.Text()

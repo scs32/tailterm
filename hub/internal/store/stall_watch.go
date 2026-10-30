@@ -74,6 +74,10 @@ const (
 	stallActionTeam       = "team-quiet"
 	stallActionTeamPing   = "team-quiet-ping"
 
+	// stallActivityGate marks a team episode about a handler gate: judged
+	// by the handler's silence, it ends only when the gate is gone.
+	stallActivityGate = "handler-gate"
+
 	stallHelperSubject    = "The owner helper has gone quiet while it owes the owner"
 	stallTeamSubject      = "A running team has gone quiet"
 	stallTeamOwnerSubject = "A running team has gone quiet and needs the owner"
@@ -398,14 +402,70 @@ type stallTeam struct {
 	entry, item   string
 	admission     time.Time
 	waiting, held bool
+	gated         *stallGate // the newest gated met wait, if any
+	hostSet       time.Time  // when the open host wait was set, if any
 	lifts         stallLifts // project resume; hold released or shared-path wait closed
 	members       []stallAgent
 }
 
+// stallGate is a wait only the database handler's resume ends: a gated met
+// wait, or a host wait past its bound. at is when the gate opened: the met
+// time, or the end of the host bound.
+type stallGate struct {
+	kind, on, item, until string
+	at, setAt             time.Time
+	notice                int64
+}
+
+// stallGatedWait reads query 3's gated met wait.
+func stallGatedWait(raw string) *stallGate {
+	var w struct {
+		Kind, On, Item, Until, At string
+		Notice                    int64
+	}
+	if raw == "" || json.Unmarshal([]byte(raw), &w) != nil {
+		return nil
+	}
+	return &stallGate{kind: w.Kind, on: w.On, item: w.Item, until: w.Until, at: parseTS(w.At), notice: w.Notice}
+}
+
+// hostPlanned reports an open host wait still inside its bound: a planned
+// wait, as the handler may still be checking the host.
+func (t *stallTeam) hostPlanned(now time.Time) bool {
+	return !t.hostSet.IsZero() && now.Before(t.hostSet.Add(queueWaitHostBound))
+}
+
+// handlerGate is the gate that holds the team at now, the newest when there
+// are two, or nil: none while a planned wait is open.
+func (t *stallTeam) handlerGate(now time.Time) *stallGate {
+	if t.waiting || t.hostPlanned(now) {
+		return nil
+	}
+	g := t.gated
+	if !t.hostSet.IsZero() {
+		if due := t.hostSet.Add(queueWaitHostBound); g == nil || due.After(g.at) {
+			g = &stallGate{kind: api.TeamQueueWaitOnHost, on: api.TeamQueueWaitHostKey, until: api.TeamQueueWaitHandler, at: due, setAt: t.hostSet}
+		}
+	}
+	return g
+}
+
+// text names the gate in a notice: what it waits on and since when.
+func (g *stallGate) text() string {
+	if g.kind == api.TeamQueueWaitOnHost {
+		return fmt.Sprintf("a wait on host admission set at %s, past its %d min bound at %s", g.setAt.UTC().Format(time.RFC3339), int(queueWaitHostBound/time.Minute), g.at.UTC().Format(time.RFC3339))
+	}
+	on := fmt.Sprintf("entry %s (item %s)", g.on, g.item)
+	if g.kind == api.TeamQueueWaitOnRelease {
+		on = fmt.Sprintf("release job %s (item %s)", g.on, g.item)
+	}
+	return fmt.Sprintf("a handler-gated wait on %s, condition %s, met at %s (wait notice #%d)", on, g.until, g.at.UTC().Format(time.RFC3339), g.notice)
+}
+
 type stallEpisode struct {
-	id, kind, subject, runID, recipient, ownerState string
-	quietSince, openedAt                            time.Time
-	noticeSeq, scanned                              int64
+	id, kind, subject, runID, recipient, ownerState, activity string
+	quietSince, openedAt                                      time.Time
+	noticeSeq, scanned                                        int64
 }
 
 // stallView is everything the watch reads about one project.
@@ -470,7 +530,7 @@ func loadStallViews(ctx context.Context, q queryRower, task string) (map[string]
 	}
 	// 1. Open episodes, through the partial index.
 	rows, err := q.QueryContext(ctx, `SELECT e.id,e.task_id,e.kind,e.subject_id,e.run_id,e.recipient,e.owner_state,e.quiet_since,e.opened_at,e.notice_seq,e.scanned_seq,
- t.status=? AND t.pause_state=? FROM stall_watch_episodes e JOIN tasks t ON t.id=e.task_id
+ t.status=? AND t.pause_state=?,e.activity FROM stall_watch_episodes e JOIN tasks t ON t.id=e.task_id
  WHERE e.closed_at='' AND (?='' OR e.task_id=?) ORDER BY e.opened_at,e.id`, api.TaskOpen, api.ProjectPauseActive, task, task)
 	if err != nil {
 		return nil, err
@@ -479,7 +539,7 @@ func loadStallViews(ctx context.Context, q queryRower, task string) (map[string]
 		var e stallEpisode
 		var id, quiet, opened string
 		var active bool
-		if err := rows.Scan(&e.id, &id, &e.kind, &e.subject, &e.runID, &e.recipient, &e.ownerState, &quiet, &opened, &e.noticeSeq, &e.scanned, &active); err != nil {
+		if err := rows.Scan(&e.id, &id, &e.kind, &e.subject, &e.runID, &e.recipient, &e.ownerState, &quiet, &opened, &e.noticeSeq, &e.scanned, &active, &e.activity); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -539,9 +599,14 @@ func loadStallViews(ctx context.Context, q queryRower, task string) (map[string]
 		return nil, err
 	}
 	// 3. Running entries of open, active projects with the live runs bound to
-	// their items. Membership by admission is judged below.
+	// their items. Membership by admission is judged below. An open wait is
+	// planned unless only the handler's resume ends it: a gated met wait (the
+	// newest is read) or a host wait, whose set time is read.
 	rows, err = q.QueryContext(ctx, `SELECT e.task_id,e.id,e.item_id,e.created_at,e.admitted_at,
- EXISTS(SELECT 1 FROM team_queue_waits w WHERE w.task_id=e.task_id AND w.entry_id=e.id AND w.state IN ('waiting','met','orphaned')),
+ EXISTS(SELECT 1 FROM team_queue_waits w WHERE w.task_id=e.task_id AND w.entry_id=e.id AND w.state IN ('waiting','met','orphaned') AND w.on_kind<>'host' AND NOT (w.state='met' AND w.resume='handler')),
+ COALESCE((SELECT json_object('kind',w.on_kind,'on',w.on_entry_id,'item',w.on_item_id,'until',w.until,'at',w.met_at,'notice',w.notice_seq) FROM team_queue_waits w
+  WHERE w.task_id=e.task_id AND w.entry_id=e.id AND w.state='met' AND w.resume='handler' ORDER BY w.met_at DESC,w.on_entry_id LIMIT 1),''),
+ COALESCE((SELECT w.set_at FROM team_queue_waits w WHERE w.task_id=e.task_id AND w.entry_id=e.id AND w.state='waiting' AND w.on_kind='host'),''),
  EXISTS(SELECT 1 FROM team_queue_budget_holds h WHERE h.task_id=e.task_id AND h.entry_id=e.id AND h.state='held'),
  COALESCE(a.id,''),COALESCE(a.name,''),COALESCE(a.run_id,''),COALESCE(a.status,''),COALESCE(a.last_seen_at,''),COALESCE(b.created_at,''),COALESCE(b.context_through_message_seq,0),
  COALESCE(x.state,''),COALESCE(x.payload,''),COALESCE(p.last_working_at,''),CASE WHEN a.id IS NULL THEN 0 ELSE `+stallDecisionsSQL+` END,
@@ -560,9 +625,9 @@ func loadStallViews(ctx context.Context, q queryRower, task string) (map[string]
 	}
 	for rows.Next() {
 		var a stallAgent
-		var id, entry, item, created, admitted, seen, bound, payload, worked, waited, answered, resumed, released, cleared string
+		var id, entry, item, created, admitted, gate, hostSet, seen, bound, payload, worked, waited, answered, resumed, released, cleared string
 		var waiting, held bool
-		if err := rows.Scan(&id, &entry, &item, &created, &admitted, &waiting, &held, &a.id, &a.name, &a.runID, &a.status, &seen, &bound, &a.contextSeq, &a.state, &payload, &worked, &a.decisions,
+		if err := rows.Scan(&id, &entry, &item, &created, &admitted, &waiting, &gate, &hostSet, &held, &a.id, &a.name, &a.runID, &a.status, &seen, &bound, &a.contextSeq, &a.state, &payload, &worked, &a.decisions,
 			&a.obligations, &waited, &answered, &resumed, &released, &cleared); err != nil {
 			rows.Close()
 			return nil, err
@@ -573,7 +638,7 @@ func loadStallViews(ctx context.Context, q queryRower, task string) (map[string]
 		if n := len(v.teams); n > 0 && v.teams[n-1].entry == entry {
 			team = v.teams[n-1]
 		} else {
-			team = &stallTeam{entry: entry, item: item, admission: parseTS(admitted), waiting: waiting, held: held,
+			team = &stallTeam{entry: entry, item: item, admission: parseTS(admitted), waiting: waiting, held: held, gated: stallGatedWait(gate), hostSet: parseTS(hostSet),
 				lifts: stallLifts{resumed: v.resumed, released: latest(parseTS(released), parseTS(cleared))}}
 			if team.admission.IsZero() {
 				team.admission = parseTS(created)
@@ -873,12 +938,17 @@ func (v *stallView) helperQuiet(now time.Time, reads *stallReads) (time.Time, bo
 
 // teamNeverQuiet names the planned wait or the progress that keeps a team
 // from being quiet, or is empty.
+// A team held by a handler gate is judged by the handler's silence, so its
+// members' decisions, work, matrix waits and obligations do not keep it from
+// being quiet.
 func (t *stallTeam) neverQuiet(now time.Time) string {
 	switch {
-	case t.waiting:
+	case t.waiting || t.hostPlanned(now):
 		return "shared-path-wait"
 	case t.held:
 		return "held"
+	case t.handlerGate(now) != nil:
+		return ""
 	}
 	for _, m := range t.members {
 		if m.decisions > 0 {
@@ -1004,6 +1074,30 @@ func (v *stallView) decide(ctx context.Context, q queryRower, now time.Time) (st
 		if len(t.members) == 0 || t.neverQuiet(now) != "" {
 			continue
 		}
+		route := func(o stallOpen, since time.Time) stallOpen {
+			switch {
+			case helperState == "":
+				o.notice = t.notice(o.id, since, now, "", false, false, 0)
+			case night:
+				o.recipient, o.ownerState = stallRecipientOwner, stallOwnerDeferred
+				o.notice = t.notice(o.id, since, now, helperState, true, true, 0)
+			default:
+				o.recipient, o.ownerState = stallRecipientOwner, stallOwnerPinged
+				o.notice = t.notice(o.id, since, now, helperState, false, true, 0)
+			}
+			return o
+		}
+		if gate := t.handlerGate(now); gate != nil {
+			// Judged by the handler's silence: the gate's opening starts the
+			// quiet time, and nothing a member does moves it.
+			since := latest(t.admission, t.lifts.resumed, t.lifts.released, gate.at)
+			if now.Sub(since) < stallWatchTeamQuiet {
+				continue
+			}
+			o := stallOpen{id: api.NewID("swe"), kind: stallKindTeam, subject: t.entry, item: t.item, activity: stallActivityGate, quietSince: since, recipient: stallRecipientHelper}
+			plan.opens = append(plan.opens, route(o, since))
+			continue
+		}
 		// The end of a planned wait starts the quiet time afresh.
 		since := latest(t.admission, t.lifts.resumed, t.lifts.released)
 		for _, m := range t.members {
@@ -1033,19 +1127,8 @@ func (v *stallView) decide(ctx context.Context, q queryRower, now time.Time) (st
 		if since = latest(since, ended); now.Sub(since) < stallWatchTeamQuiet {
 			continue
 		}
-		id := api.NewID("swe")
-		o := stallOpen{id: id, kind: stallKindTeam, subject: t.entry, item: t.item, quietSince: since, recipient: stallRecipientHelper}
-		switch {
-		case helperState == "":
-			o.notice = t.notice(id, since, now, "", false, false, 0)
-		case night:
-			o.recipient, o.ownerState = stallRecipientOwner, stallOwnerDeferred
-			o.notice = t.notice(id, since, now, helperState, true, true, 0)
-		default:
-			o.recipient, o.ownerState = stallRecipientOwner, stallOwnerPinged
-			o.notice = t.notice(id, since, now, helperState, false, true, 0)
-		}
-		plan.opens = append(plan.opens, o)
+		o := stallOpen{id: api.NewID("swe"), kind: stallKindTeam, subject: t.entry, item: t.item, quietSince: since, recipient: stallRecipientHelper}
+		plan.opens = append(plan.opens, route(o, since))
 	}
 	// An episode read that filled its limit without an ending post moves the
 	// cursors, so the next sweep continues from there.
@@ -1091,6 +1174,18 @@ func (v *stallView) ended(e stallEpisode, team *stallTeam, now time.Time, reads 
 	}
 	if reason := team.neverQuiet(now); reason != "" {
 		return reason, nil
+	}
+	// A gate episode ends only when its gate is gone; an ordinary one ends
+	// when a gate takes over, which opens its own episode.
+	gate := team.handlerGate(now)
+	if e.activity == stallActivityGate {
+		if gate == nil {
+			return "gate-cleared", nil
+		}
+		return "", nil
+	}
+	if gate != nil {
+		return stallActivityGate, nil
 	}
 	if len(team.members) == 0 {
 		return "no-members", nil
@@ -1193,12 +1288,30 @@ func (t *stallTeam) notice(episode string, since, now time.Time, helperState str
 	sort.Strings(members)
 	text := fmt.Sprintf("The team of queue entry %s (item %s) has been quiet for %s: no post, no working report and no matrix wait from its %d member(s) since %s. Members: %s.",
 		t.entry, t.item, stallDuration(now.Sub(since)), len(t.members), since.UTC().Format(time.RFC3339), providerNameList(members, 600))
+	gate := t.handlerGate(now)
+	if gate != nil {
+		// The gate's words come before the next step, so they name no action.
+		text = fmt.Sprintf("The team of queue entry %s (item %s) has been held for %s by a gate only the database handler can lift, and the handler has not cleared it since %s. Gate: %s. "+
+			"Member posts and work do not count while the gate is open. Members: %s.",
+			t.entry, t.item, stallDuration(now.Sub(since)), since.UTC().Format(time.RFC3339), gate.text(), providerNameList(members, 600))
+	}
 	if helperState != "" {
 		text += fmt.Sprintf(" The owner helper is %s, so this goes to the owner.", helperState)
 	}
-	text += fmt.Sprintf(" %s %s %sread the team's last messages and look at its lead's session, then decide whether to prompt the lead.", stallUnknownCause, stallRecordFirst, stallNextStep)
+	if gate != nil {
+		text += fmt.Sprintf(" %s %s %sask the database handler to run the gate's checks, then send the waiting lead its resume and clear the wait with tt team queue wait clear --entry %s --on %s, or clear it.",
+			stallUnknownCause, stallRecordFirst, stallNextStep, t.entry, gate.on)
+	} else {
+		text += fmt.Sprintf(" %s %s %sread the team's last messages and look at its lead's session, then decide whether to prompt the lead.", stallUnknownCause, stallRecordFirst, stallNextStep)
+	}
 	n := stallNotice{action: stallActionTeam, subject: stallTeamSubject, toHelper: !owner, refs: stallNoticeRefs(stallKindTeam, episode, owner, night)}
 	n.refs["entry"], n.refs["item"] = t.entry, t.item
+	if gate != nil {
+		n.refs["gate"], n.refs["gateOn"] = gate.kind, gate.on
+		if gate.notice > 0 {
+			n.refs["gateNotice"] = fmt.Sprint(gate.notice)
+		}
+	}
 	if owner {
 		n.subject = stallTeamOwnerSubject
 	}

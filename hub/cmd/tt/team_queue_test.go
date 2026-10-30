@@ -2912,3 +2912,107 @@ func TestTeamQueueWaitCLIHandlerResume(t *testing.T) {
 		t.Fatalf("an automatic wait carries a resume: %v\n%s", err, jsonList)
 	}
 }
+
+// wi_01c344b8a065887f a7: a wait on a release job (--on rel_ID) and on host
+// admission (--on host) round trip through the hub, print and list their
+// sentences and clear; the forms the hub would refuse are refused first.
+func TestQueueWaitCLIReleaseAndHost(t *testing.T) {
+	f := newTeamFixture(t, true)
+	ctx := context.Background()
+	repo, head := queueGitRepo(t)
+	parallelCLIProject(t, f, "none")
+	second, secondOrder := queueFixtureItem(t, f, "behind-release")
+	add := func(key, item string, order int64) api.TeamQueueEntry {
+		t.Helper()
+		q, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: key, Operation: "add", ItemID: item, OrderMessageSeq: order, Host: spawn.Host(), Cwd: repo, Repository: filepath.Join(repo, ".git"), BaseCommit: head, Serial: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return q
+	}
+	pred, waiting := add("release-pred", f.item.ID, f.order), add("release-waiting", second.ID, secondOrder)
+	// The release job the waiting team waits behind, as the release path
+	// records it for the predecessor's item.
+	job := api.NewID("rel")
+	db, err := sql.Open("sqlite", f.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	record, _ := json.Marshal(map[string]any{"id": job, "taskId": f.task.ID, "entryId": pred.ID, "itemId": f.item.ID, "state": "claimed", "generation": 1})
+	if _, err := db.Exec(`INSERT INTO release_jobs(task_id,id,entry_id,state,generation,record_json) VALUES(?,?,?,'claimed',1,?)`, f.task.ID, job, pred.ID, string(record)); err != nil {
+		t.Fatal(err)
+	}
+	run := func(e env, args ...string) (string, error) {
+		t.Helper()
+		return captureCLIOutput(t, func() error { return cmdTeamQueue(e, append([]string{"wait"}, args...)) })
+	}
+	// No hub listens here: a refusal that reached it would be a connection error.
+	offline := f.e
+	offline.hub = "http://127.0.0.1:1"
+	for name, c := range map[string]struct {
+		args []string
+		text string
+	}{
+		"a release job with --owns":   {[]string{"set", "--entry", waiting.ID, "--on", job, "--owns", "hub/a.go", "--until", "departed"}, "takes --reason TEXT, not --owns"},
+		"host with --owns":            {[]string{"set", "--entry", waiting.ID, "--on", "host", "--owns", "hub/a.go"}, "takes --reason TEXT, not --owns"},
+		"host until accepted":         {[]string{"set", "--entry", waiting.ID, "--on", "host", "--reason", "quiet host", "--until", "accepted"}, teamQueueWaitUsage},
+		"host with another resume":    {[]string{"set", "--entry", waiting.ID, "--on", "host", "--reason", "quiet host", "--resume", "auto"}, "resumes only by the database handler"},
+		"a release job until done":    {[]string{"set", "--entry", waiting.ID, "--on", job, "--reason", "quiet host", "--until", "done"}, teamQueueWaitUsage},
+		"a release job, no condition": {[]string{"set", "--entry", waiting.ID, "--on", job, "--reason", "quiet host"}, teamQueueWaitUsage},
+		"an entry until departed":     {[]string{"set", "--entry", waiting.ID, "--on", pred.ID, "--reason", "quiet host", "--until", "departed"}, teamQueueWaitUsage},
+		"an unknown predecessor kind": {[]string{"set", "--entry", waiting.ID, "--on", "wi_0123456789abcdef", "--reason", "quiet host", "--until", "accepted"}, teamQueueWaitUsage},
+		"a host key in capitals":      {[]string{"set", "--entry", waiting.ID, "--on", "HOST", "--reason", "quiet host"}, teamQueueWaitUsage},
+		"clear with a malformed job":  {[]string{"clear", "--entry", waiting.ID, "--on", "rel_short"}, teamQueueWaitUsage},
+	} {
+		if _, err := run(offline, c.args...); err == nil || !strings.Contains(err.Error(), c.text) {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	for _, want := range []string{"--on rel_JOB --reason TEXT --until departed|settled [--resume handler]", "--on host --reason TEXT [--until handler] [--resume handler]", "--on tqe_PREDECESSOR|rel_JOB|host"} {
+		if !strings.Contains(teamQueueWaitUsage, want) {
+			t.Fatalf("the usage lacks %q: %s", want, teamQueueWaitUsage)
+		}
+	}
+	if got, _ := f.c.GetTeamQueueEntry(ctx, f.task.ID, waiting.ID); len(got.Waits) != 0 {
+		t.Fatalf("a refused set stored a wait: %+v", got.Waits)
+	}
+
+	handlerEnv := f.e
+	handlerEnv.agent, handlerEnv.runID = f.handler.ID, f.handler.RunID
+	const pause = "matrix host held by the release; start on the handler resume"
+	release := fmt.Sprintf("waits on release %s (item %s) for %s until its matrix departs, then a handler resume", job, f.item.ID, pause)
+	out, err := run(handlerEnv, "set", "--entry", waiting.ID, "--on", job, "--reason", pause, "--until", "departed", "--resume", "handler")
+	if err != nil || out != fmt.Sprintf("wait set %s %s: %s\n", waiting.ID, second.ID, release) {
+		t.Fatalf("release wait set: %q %v", out, err)
+	}
+	host := "waits on host admission for " + pause + " until the database handler resumes it"
+	if out, err = run(handlerEnv, "set", "--entry", waiting.ID, "--on", "host", "--reason", pause); err != nil || out != fmt.Sprintf("wait set %s %s: %s\n", waiting.ID, second.ID, host) {
+		t.Fatalf("host wait set: %q %v", out, err)
+	}
+	// The explicit host form is the identical wait.
+	if _, err = run(handlerEnv, "set", "--entry", waiting.ID, "--on", "host", "--reason", pause, "--until", "handler", "--resume", "handler"); err != nil {
+		t.Fatalf("explicit host repeat: %v", err)
+	}
+	list, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"list"}) })
+	if err != nil || !strings.Contains(list, "\n  "+release+"\n") || !strings.Contains(list, "\n  "+host+"\n") {
+		t.Fatalf("list does not print both waits: %v\n%s", err, list)
+	}
+	jsonList, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"list", "--json"}) })
+	if err != nil || !strings.Contains(jsonList, `"onKind": "release"`) || !strings.Contains(jsonList, `"onKind": "host"`) || !strings.Contains(jsonList, `"until": "departed"`) {
+		t.Fatalf("json does not carry the kinds:\n%s", jsonList)
+	}
+	// The hub refuses a job it does not have.
+	if _, err := run(handlerEnv, "set", "--entry", waiting.ID, "--on", api.NewID("rel"), "--reason", pause, "--until", "settled"); err == nil || !strings.Contains(err.Error(), "is not one of this project's release jobs") {
+		t.Fatalf("an unknown job: %v", err)
+	}
+	if out, err = run(handlerEnv, "clear", "--entry", waiting.ID, "--on", job, "--reason", "matrix departed; handler resumed"); err != nil || out != fmt.Sprintf("wait clear %s %s: no longer waits on release job %s\n", waiting.ID, second.ID, job) {
+		t.Fatalf("release clear: %q %v", out, err)
+	}
+	if out, err = run(handlerEnv, "clear", "--entry", waiting.ID, "--on", "host"); err != nil || out != fmt.Sprintf("wait clear %s %s: no longer waits on host admission\n", waiting.ID, second.ID) {
+		t.Fatalf("host clear: %q %v", out, err)
+	}
+	if got, _ := f.c.GetTeamQueueEntry(ctx, f.task.ID, waiting.ID); len(got.Waits) != 0 {
+		t.Fatalf("cleared waits still open: %+v", got.Waits)
+	}
+}

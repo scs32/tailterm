@@ -3,6 +3,7 @@
 Feature `wi_fa5f10477f93c57d` revision 2, owner order #32210, builder assignment #32236.
 Follow-up feature `wi_830e10326defc8ee`, owner order #32312, builder assignment #32351: the helper states that send a team notice to the owner, and the hold after a hub start.
 Bug `wi_363c6bde9126fb4e` revision 2, order #42896, amendment #42976, builder assignment #42985: an open owner-gated obligation is a team planned wait.
+Bug `wi_01c344b8a065887f` revision 4, order #51489, builder assignment #51557: a handler gate is judged by the handler's silence, and waits on a release job or on host admission (see [Handler gate](#handler-gate)).
 
 On 2026-10-10 the owner helper went quiet and the first owner ping came 4 h 20 min later, because the helper is itself the escalation point for team stalls and nothing watched it. A team that goes quiet as a whole was noticed only through obligation timers, measured in hours. The hub now watches both.
 
@@ -64,7 +65,7 @@ The transcript time and the report time are not used. The first moves on every t
 
 **Team.** The live runs bound to the entry's item at or after its admission, with no project role and a status that is not closed, exited or retired. A run bound before this admission belongs to an earlier team: its posts and working reports neither count as progress nor end an episode. A team with no member is left to the queue's `nothing-running` stall ([project-queue.md](project-queue.md)).
 
-**Team quiet since.** The latest of: the admission, the newest exact-run post by a member, each member's last working time, the newest member binding, and the end of the team's last never-quiet case.
+**Team quiet since.** The latest of: the admission, the newest exact-run post by a member, each member's last working time, the newest member binding, and the end of the team's last never-quiet case. A team held by a handler gate is timed from the gate instead (see [Handler gate](#handler-gate)).
 
 **Team quiet.** No never-quiet case holds and 30 minutes have passed since "team quiet since".
 
@@ -77,7 +78,7 @@ For a team:
 | Case | What the hub reads |
 | --- | --- |
 | owner pause | the project is paused or closed |
-| shared-path wait | the entry has a wait in state `waiting`, `met` or `orphaned` |
+| shared-path wait | the entry has a wait in state `waiting`, `met` or `orphaned` that is not a handler gate: a handler-gated `met` wait is a gate, and a host wait is planned only for its first 60 min (see [Handler gate](#handler-gate)) |
 | held entry | the entry has a token budget hold in state `held` |
 | open owner decision | a member's run has an unanswered `tt ask` |
 | working | a member's effective state is `working` |
@@ -111,12 +112,33 @@ The hub reads the end of each case from rows that already exist:
 | open owner decision | the time of the owner's answer to a request from that run |
 | planned wait | the close time of the newest owner-gated obligation a member held or sent (for a direct owner REQUEST, the owner's answer); for one still open whose BLOCK was lifted by an ack, its last progress time, which the ack sets |
 | held entry | the time the hold was continued or stopped |
-| shared-path wait | the time the wait was closed (resumed, overdue or cleared) |
+| shared-path wait | the time the wait was closed (resumed, overdue or cleared); when it gives way to a handler gate, the gate's opening time |
 | matrix wait | the first activity report without the wait, or 4 h 30 min after its start when the relay stopped reporting |
 | owner pause | the project's last resume |
 | working | the last working time |
 
 These times are compared to the second.
+
+### Handler gate
+
+A **handler gate** is an open queue wait that only the database handler's explicit resume ends: a handler-gated wait (`--resume handler`) whose condition is met, or a wait on host admission that has passed its 60 minute bound. Its team is waiting for the handler, not for itself, so the watch judges the handler's silence:
+
+- The gate is not a planned wait and keeps nothing quiet. While no planned wait or held entry is open, the team is judged by the gate alone: its members' posts, `working` reports, matrix waits, owner decisions and owner-gated obligations neither keep it from being quiet nor move "team quiet since".
+- Team quiet since is the latest of the admission, the project's last resume, the last close of a wait or hold, and the gate's opening: the met time, or for a host wait the end of its bound. When two gates are open, the newer one counts.
+- 30 minutes after that, one team notice opens an episode with activity `handler-gate`, sent by the usual routing (the helper, or the owner). It names the gate: the predecessor's kind and key, its item, the condition, the met time and the wait notice number, or for a host wait its set time and the end of its bound. Its refs carry `gate`, `gateOn` and `gateNotice`. Its next step asks the database handler to run the gate's checks, then send the waiting lead its resume and clear the wait, or clear it.
+- A member's post never ends a gate episode. It ends with close reason `gate-cleared` when the handler's `tt team queue wait clear` removes the gate, and, as any episode, when the entry stops running, the project pauses, or a planned wait or a hold opens. An ordinary episode that is open when a gate opens ends with close reason `handler-gate`. After the clear, a new episode needs a full 30 minutes from it.
+- An owner pause, a held entry and a team with no member still keep the watch silent, and the hold after a hub start still applies.
+
+The wait sweep reports the same gate from its own side, once, to the owner helper and the primary handler: a gated met wait 15 minutes after its met time (`TAILTERM_QUEUE_WAIT_IDLE_MINUTES`), a host wait 60 minutes after it was set. The report goes out whatever the team does, and the wait stays open and listed. So a silent handler gets that report first and the team notice 15 or 30 minutes later; the two reach different roles on purpose.
+
+Two waits exist for teams held behind something other than a queue entry. Both name a reason, never paths:
+
+| Wait | Set with | Planned while | Then |
+| --- | --- | --- | --- |
+| release job | `tt team queue wait set --entry tqe_WAITING --on rel_JOB --reason TEXT --until departed\|settled [--resume handler]` | the job's matrix has not departed (`departed`: the integrated matrix result is in, or the job merged, blocked or settled; a job reset to verified has not departed) or the job has not settled (`settled`: released, refused, rolled back or superseded) | the waiting lead is told once. An automatic wait then follows the shared-path rule and this watch counts from its close; a gated one is a handler gate. A removed job orphans the wait to the handler |
+| host admission | `tt team queue wait set --entry tqe_WAITING --on host --reason TEXT` | it was set less than 60 minutes ago | it is never met: it is a handler gate until the handler clears it |
+
+A host wait's condition and resume are both `handler`, whether given or omitted. The hub cannot see the host lock, so the 60 minute bound stands in for the handler's check.
 
 ## After a hub start
 

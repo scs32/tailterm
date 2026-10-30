@@ -2641,3 +2641,249 @@ func TestMatrixRunEndNoticeAgentless(t *testing.T) {
 		}
 	})
 }
+
+// gateWait records an open wait of entry on a predecessor key of kind, as
+// the wait sweep leaves it: met waits carry their met time and notice.
+func (f *stallFixture) gateWait(entry, kind, on, until, state, resume string, notice int64) {
+	f.t.Helper()
+	metAt := ""
+	if state == "met" {
+		metAt = ts(f.now())
+	}
+	item := f.items[1].ID
+	if kind == "host" {
+		item = ""
+	}
+	f.exec(`INSERT INTO team_queue_waits(task_id,entry_id,item_id,on_entry_id,on_item_id,paths_json,on_kind,until,state,set_at,met_at,notice_seq,reason,resume) VALUES(?,?,?,?,?,'[]',?,?,?,?,?,?,'a quiet host',?)`,
+		f.task.ID, entry, f.items[0].ID, on, item, kind, until, state, ts(f.now()), metAt, notice, resume)
+}
+
+// waitMoves changes an open wait's state now, as the sweep or a clear does.
+func (f *stallFixture) waitMoves(entry, on, state string, notice int64) {
+	f.t.Helper()
+	switch state {
+	case "met":
+		f.exec(`UPDATE team_queue_waits SET state='met',met_at=?,notice_seq=? WHERE task_id=? AND entry_id=? AND on_entry_id=?`, ts(f.now()), notice, f.task.ID, entry, on)
+	default:
+		f.exec(`UPDATE team_queue_waits SET state=?,closed_at=? WHERE task_id=? AND entry_id=? AND on_entry_id=?`, state, ts(f.now()), f.task.ID, entry, on)
+	}
+}
+
+// episodeActivity is the newest episode's activity.
+func (f *stallFixture) episodeActivity() string {
+	f.t.Helper()
+	var activity string
+	if err := f.s.db.QueryRow(`SELECT activity FROM stall_watch_episodes WHERE task_id=? ORDER BY opened_at DESC LIMIT 1`, f.task.ID).Scan(&activity); err != nil {
+		f.t.Fatal(err)
+	}
+	return activity
+}
+
+// wi_01c344b8a065887f a2 (o2): an entry whose only open wait is gated and met
+// is judged by the handler's silence. Member posts and work after the met
+// time move nothing; 30 minutes after it one team notice names the gate and
+// keeps the notice text rule; a member post does not end that episode; the
+// handler's clear ends it as gate-cleared, and the next notice needs a fresh
+// 30 minutes from the clear. A gated wait still waiting stays planned.
+func TestStallWatchHandlerGateJudgedByHandlerSilence(t *testing.T) {
+	root := newStallFixture(t, stallNoon)
+	t.Run("met gate", func(t *testing.T) {
+		f := root.project(t, stallNoon)
+		h := f.helper()
+		f.state(h, "idle")
+		entry := f.entry(0)
+		lead := f.member("lead-a", 0)
+		builder := f.member("builder-a", 0)
+		f.gateWait(entry, "entry", "tqe_00000000000000aa", "accepted", "met", "handler", 77)
+		metAt := f.now()
+		f.advance(10 * time.Minute)
+		f.post(lead, 0)
+		f.state(builder, "working")
+		f.none("the gate's first 10 minutes")
+		f.advance(19 * time.Minute)
+		f.post(lead, 0)
+		f.none("29 minutes after the met time, whatever the team did")
+		f.advance(time.Minute)
+		step, env, to := f.one(stallActionTeam)
+		if to != h.ID || env.Subject != stallTeamSubject {
+			t.Fatalf("gate notice to %s subject %q", to, env.Subject)
+		}
+		text := env.Body.Text
+		checkStallText(t, text)
+		for _, want := range []string{entry, f.items[0].ID, "held for 30 min by a gate only the database handler can lift", "the handler has not cleared it since " + metAt.Format(time.RFC3339),
+			"a handler-gated wait on entry tqe_00000000000000aa (item " + f.items[1].ID + "), condition accepted, met at " + metAt.Format(time.RFC3339) + " (wait notice #77)",
+			"Member posts and work do not count", "ask the database handler to run the gate's checks", "tt team queue wait clear --entry " + entry + " --on tqe_00000000000000aa"} {
+			if !strings.Contains(text, want) {
+				t.Fatalf("gate notice lacks %q: %s", want, text)
+			}
+		}
+		if env.Refs["gate"] != "entry" || env.Refs["gateOn"] != "tqe_00000000000000aa" || env.Refs["gateNotice"] != "77" || env.Refs["entry"] != entry || step.MessageSeq == 0 {
+			t.Fatalf("refs %v", env.Refs)
+		}
+		if f.episodeActivity() != stallActivityGate {
+			t.Fatalf("episode activity %q", f.episodeActivity())
+		}
+		// Posts and work do not end it, and it is not posted twice.
+		f.advance(5 * time.Minute)
+		f.post(lead, 0)
+		f.post(builder, 0)
+		f.none("a member post during the gate episode")
+		f.advance(30 * time.Minute)
+		f.none("the gate episode stays open")
+		if f.open() != 1 {
+			t.Fatalf("%d open episodes", f.open())
+		}
+		// The handler clears the wait: the episode ends with no notice.
+		f.advance(time.Minute)
+		f.waitMoves(entry, "tqe_00000000000000aa", "cleared", 0)
+		f.state(builder, "idle")
+		f.none("the clear ends the episode")
+		f.closed("gate-cleared")
+		// An ordinary episode needs a full 30 minutes from the clear.
+		f.advance(29 * time.Minute)
+		f.none("29 minutes after the clear")
+		f.advance(time.Minute)
+		_, env, _ = f.one(stallActionTeam)
+		if strings.Contains(env.Body.Text, "Gate:") || env.Refs["gate"] != "" || f.episodeActivity() != "" {
+			t.Fatalf("after the clear the team notice still names a gate: %s", env.Body.Text)
+		}
+	})
+	t.Run("an ordinary episode gives way to the gate", func(t *testing.T) {
+		f := root.project(t, stallNoon)
+		h := f.helper()
+		f.state(h, "idle")
+		entry := f.entry(0)
+		f.member("lead-a", 0)
+		f.advance(30 * time.Minute)
+		f.one(stallActionTeam)
+		// A gate that opens under an open ordinary episode ends it and
+		// counts its own 30 minutes.
+		f.advance(time.Minute)
+		f.gateWait(entry, "entry", "tqe_00000000000000ab", "done", "met", "handler", 12)
+		f.none("the gate replaces the ordinary episode")
+		f.closed(stallActivityGate)
+		f.advance(29 * time.Minute)
+		f.none("29 minutes into the gate")
+		f.advance(time.Minute)
+		if _, env, _ := f.one(stallActionTeam); !strings.Contains(env.Body.Text, "wait notice #12") {
+			t.Fatalf("gate notice %s", env.Body.Text)
+		}
+	})
+	for _, c := range []struct{ name, state, resume string }{{"a gated wait still waiting", "waiting", "handler"}, {"an automatic met wait", "met", ""}} {
+		t.Run(c.name, func(t *testing.T) {
+			f := root.project(t, stallNoon)
+			h := f.helper()
+			f.state(h, "idle")
+			entry := f.entry(0)
+			f.member("lead-a", 0)
+			f.gateWait(entry, "entry", "tqe_00000000000000ac", "accepted", c.state, c.resume, 3)
+			for i := 0; i < 4; i++ {
+				f.advance(30 * time.Minute)
+				f.none("a planned wait")
+			}
+			if f.episodes() != 0 {
+				t.Fatal("an episode opened")
+			}
+		})
+	}
+	t.Run("a held entry still suppresses the gate", func(t *testing.T) {
+		f := root.project(t, stallNoon)
+		h := f.helper()
+		f.state(h, "idle")
+		entry := f.entry(0)
+		f.member("lead-a", 0)
+		f.gateWait(entry, "entry", "tqe_00000000000000ad", "accepted", "met", "handler", 4)
+		f.exec(`INSERT INTO team_queue_budget_holds(task_id,entry_id,item_id,estimate_tokens,team_tokens,team_state,state,created_at) VALUES(?,?,?,1,'2','running','held',?)`,
+			f.task.ID, entry, f.items[0].ID, ts(f.now()))
+		for i := 0; i < 3; i++ {
+			f.advance(30 * time.Minute)
+			f.none("a held entry")
+		}
+	})
+}
+
+// wi_01c344b8a065887f a5 (o5): a release wait while its job is live and a
+// host wait inside its 60 min bound keep the team never quiet. Once a gated
+// release wait is met, or the host bound passes, with no clear, the team
+// notice comes 30 minutes later naming the gate. An automatic release wait
+// is planned until the wait sweep closes it, and the watch counts from that
+// close.
+func TestStallWatchReleaseAndHostWaitPlannedThenGate(t *testing.T) {
+	root := newStallFixture(t, stallNoon)
+	const job = "rel_00000000000000f1"
+	t.Run("gated release wait", func(t *testing.T) {
+		f := root.project(t, stallNoon)
+		h := f.helper()
+		f.state(h, "idle")
+		entry := f.entry(0)
+		f.member("lead-a", 0)
+		f.gateWait(entry, "release", job, "departed", "waiting", "handler", 0)
+		for i := 0; i < 4; i++ {
+			f.advance(30 * time.Minute)
+			f.none("the release job is live")
+		}
+		f.waitMoves(entry, job, "met", 41)
+		metAt := f.now()
+		f.advance(29 * time.Minute)
+		f.none("29 minutes after the matrix departed")
+		f.advance(time.Minute)
+		_, env, _ := f.one(stallActionTeam)
+		checkStallText(t, env.Body.Text)
+		want := "a handler-gated wait on release job " + job + " (item " + f.items[1].ID + "), condition departed, met at " + metAt.Format(time.RFC3339) + " (wait notice #41)"
+		if !strings.Contains(env.Body.Text, want) || env.Refs["gate"] != "release" || env.Refs["gateOn"] != job {
+			t.Fatalf("gate notice lacks %q: %s %v", want, env.Body.Text, env.Refs)
+		}
+		f.advance(time.Minute)
+		f.waitMoves(entry, job, "cleared", 0)
+		f.none("the clear")
+		f.closed("gate-cleared")
+	})
+	t.Run("host wait", func(t *testing.T) {
+		f := root.project(t, stallNoon)
+		h := f.helper()
+		f.state(h, "idle")
+		entry := f.entry(0)
+		lead := f.member("lead-a", 0)
+		f.gateWait(entry, "host", "host", "handler", "waiting", "handler", 0)
+		setAt := f.now()
+		f.advance(30 * time.Minute)
+		f.none("30 minutes into the host bound")
+		f.advance(30 * time.Minute)
+		f.none("the host bound has just passed")
+		f.post(lead, 0)
+		f.advance(29 * time.Minute)
+		f.none("29 minutes after the host bound")
+		f.advance(time.Minute)
+		_, env, _ := f.one(stallActionTeam)
+		checkStallText(t, env.Body.Text)
+		want := fmt.Sprintf("a wait on host admission set at %s, past its 60 min bound at %s", setAt.Format(time.RFC3339), setAt.Add(time.Hour).Format(time.RFC3339))
+		if !strings.Contains(env.Body.Text, want) || env.Refs["gate"] != "host" || env.Refs["gateOn"] != "host" || env.Refs["gateNotice"] != "" ||
+			!strings.Contains(env.Body.Text, "--entry "+entry+" --on host") {
+			t.Fatalf("host gate notice lacks %q: %s %v", want, env.Body.Text, env.Refs)
+		}
+		f.advance(time.Minute)
+		f.waitMoves(entry, "host", "cleared", 0)
+		f.none("the clear")
+		f.closed("gate-cleared")
+	})
+	t.Run("automatic release wait", func(t *testing.T) {
+		f := root.project(t, stallNoon)
+		h := f.helper()
+		f.state(h, "idle")
+		entry := f.entry(0)
+		f.member("lead-a", 0)
+		f.gateWait(entry, "release", job, "settled", "waiting", "", 0)
+		f.advance(time.Hour)
+		f.none("the release job is live")
+		f.waitMoves(entry, job, "met", 9)
+		f.advance(time.Hour)
+		f.none("an automatic met wait is planned")
+		f.waitMoves(entry, job, "resumed", 0)
+		f.advance(29 * time.Minute)
+		f.none("29 minutes after the wait closed")
+		f.advance(time.Minute)
+		if _, env, _ := f.one(stallActionTeam); strings.Contains(env.Body.Text, "Gate:") || env.Refs["gate"] != "" {
+			t.Fatalf("an automatic wait named a gate: %s", env.Body.Text)
+		}
+	})
+}
