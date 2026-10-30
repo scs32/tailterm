@@ -18,7 +18,7 @@ Board, Projects, Bugs and Features show previously saved reads immediately while
 refreshing from the hub. The saved/offline label describes that local copy.
 The cache is encrypted in this browser's vault, isolated by hub and credential,
 and excluded from profile sync and portable exports. It retains up to 100 reads
-or 4 MiB for at most seven days, evicting older entries. An unvisited view or a
+or 8 MiB for at most seven days, evicting older entries. An unvisited view or a
 new browser origin may need a connection before it has anything to show.
 
 Board refreshes normally fetch only messages newer than the saved conversation.
