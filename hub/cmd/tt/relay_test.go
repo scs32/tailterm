@@ -11,6 +11,7 @@ import (
 	"github.com/scs32/tailterm/hub/internal/server"
 	"github.com/scs32/tailterm/hub/internal/spawn"
 	"github.com/scs32/tailterm/hub/internal/store"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -4448,5 +4449,288 @@ func TestRelayTeamQueuePassObservesBackoff(t *testing.T) {
 	}
 	if got := strings.Count(stderr, "[tt relay] team queue: "); got != 1 {
 		t.Fatalf("team queue log entries = %d: %s", got, stderr)
+	}
+}
+
+// relayVisitFixture runs the relay loop against a local hub with many bound
+// Codex agents, away from the live hub, relay state, config and tmux socket.
+// It counts each agent's visits through the relayVisitRun seam.
+type relayVisitFixture struct {
+	dir      string
+	bindings []runtimeBinding
+	// onAgentRead, when set, runs on each read of a bound agent before the
+	// hub answers it.
+	onAgentRead atomic.Pointer[func(agent string)]
+	// onVisit, when set, runs inside each visit before the real one.
+	onVisit atomic.Pointer[func(agent string)]
+
+	mu                      sync.Mutex
+	started, ended, running map[string]int
+	concurrent              int
+	maxConcurrent, maxAgent int
+}
+
+func newRelayVisitFixture(t *testing.T, n, workers int, wait time.Duration, pause func() bool) *relayVisitFixture {
+	t.Helper()
+	f := &relayVisitFixture{started: map[string]int{}, ended: map[string]int{}, running: map[string]int{}}
+	f.dir = t.TempDir()
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("TAILTERM_RELAY_STATE", f.dir)
+	t.Setenv("TT_TMUX_SOCKET", "relay-visit-test-"+strconv.FormatInt(time.Now().UnixNano(), 10))
+	for _, name := range []string{"TAILTERM_TOKEN", "TAILTERM_TASK", "TAILTERM_AGENT", "TAILTERM_RUN"} {
+		t.Setenv(name, "")
+	}
+	runs := map[string]string{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/pause"):
+			_ = json.NewEncoder(w).Encode(api.ProjectPauseStatus{State: api.ProjectPauseActive})
+		case strings.HasSuffix(r.URL.Path, "/wake-jobs/lease"):
+			http.NotFound(w, r)
+		case strings.Contains(r.URL.Path, "/agents/") && strings.Count(r.URL.Path, "/") == 5:
+			agent := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+			run, ok := runs[agent]
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			if hook := f.onAgentRead.Load(); hook != nil {
+				(*hook)(agent)
+			}
+			_ = json.NewEncoder(w).Encode(api.Agent{ID: agent, RunID: run, Name: agent, Status: api.AgentDone, Online: true})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	t.Setenv("TAILTERM_HUB", server.URL)
+	for i := 1; i <= n; i++ {
+		b := runtimeBinding{Hub: server.URL, Task: "tsk_0000000000000001", Agent: fmt.Sprintf("agt_%016x", i), Run: fmt.Sprintf("run_%016x", i), Thread: fmt.Sprintf("00000000-0000-4000-8000-%012x", i), Codex: filepath.Join(f.dir, "fake-codex")}
+		runs[b.Agent] = b.Run
+		if err := writePrivateJSON(filepath.Join(f.dir, bindingKey(b)+".binding.json"), b); err != nil {
+			t.Fatal(err)
+		}
+		f.bindings = append(f.bindings, b)
+	}
+	noop := func(context.Context) error { return nil }
+	stubRelayTeamQueue(t, noop)
+	oldHandler, oldSteward, oldPause := relayHandlerRotation, relayStewardRotation, relayLoopPause
+	oldWorkers, oldWait, oldRun := relayVisitWorkers, relayVisitWait, relayVisitRun
+	t.Cleanup(func() {
+		relayHandlerRotation, relayStewardRotation, relayLoopPause = oldHandler, oldSteward, oldPause
+		relayVisitWorkers, relayVisitWait, relayVisitRun = oldWorkers, oldWait, oldRun
+	})
+	relayHandlerRotation, relayStewardRotation, relayLoopPause = noop, noop, pause
+	relayVisitWorkers, relayVisitWait = workers, wait
+	relayVisitRun = func(dir, path, progressPath string, b runtimeBinding, progress relayProgress, pass *relayPassTiming, cache activityWorktreeCache, deps *runtimePromptDeps) {
+		f.mu.Lock()
+		f.started[b.Agent]++
+		f.running[b.Agent]++
+		f.concurrent++
+		f.maxConcurrent = max(f.maxConcurrent, f.concurrent)
+		f.maxAgent = max(f.maxAgent, f.running[b.Agent])
+		f.mu.Unlock()
+		if hook := f.onVisit.Load(); hook != nil {
+			(*hook)(b.Agent)
+		}
+		relayVisit(dir, path, progressPath, b, progress, pass, cache, deps)
+		f.mu.Lock()
+		f.running[b.Agent]--
+		f.concurrent--
+		f.ended[b.Agent]++
+		f.mu.Unlock()
+	}
+	return f
+}
+
+func (f *relayVisitFixture) progressPath(b runtimeBinding) string {
+	return filepath.Join(f.dir, bindingKey(b)+".progress.json")
+}
+
+// One binding whose hub read blocks no longer holds the others' visits: it
+// is detached after relayVisitWait, never visited twice at once, and visited
+// again once its visit ends (wi_da5fae2aef5ca94a).
+func TestRelayVisitsOtherBindingsWhileOneHubCallBlocks(t *testing.T) {
+	var f *relayVisitFixture
+	entered, release := make(chan struct{}), make(chan struct{})
+	var enterOnce, releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	var passes int
+	var released bool
+	var blockedStarted, blockedEnded int
+	var progressWhileBlocked bool
+	var otherMin, startedAtRelease int
+	deadline := time.Now().Add(15 * time.Second)
+	pause := func() bool {
+		passes++
+		if time.Now().After(deadline) {
+			f.mu.Lock()
+			t.Errorf("pass %d timed out: started %v, ended %v", passes, f.started, f.ended)
+			f.mu.Unlock()
+			return false
+		}
+		blocked := f.bindings[0]
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if !released {
+			select {
+			case <-entered:
+			default:
+				return true
+			}
+			otherMin = -1
+			for _, b := range f.bindings[1:] {
+				if otherMin < 0 || f.ended[b.Agent] < otherMin {
+					otherMin = f.ended[b.Agent]
+				}
+			}
+			if otherMin < 3 {
+				return true
+			}
+			blockedStarted, blockedEnded = f.started[blocked.Agent], f.ended[blocked.Agent]
+			_, err := os.Stat(f.progressPath(blocked))
+			progressWhileBlocked = err == nil
+			startedAtRelease = f.started[blocked.Agent]
+			released = true
+			unblock()
+			return true
+		}
+		// After release: the blocked visit ends and the binding is visited again.
+		if f.ended[blocked.Agent] >= 2 {
+			return false
+		}
+		time.Sleep(5 * time.Millisecond)
+		return true
+	}
+	f = newRelayVisitFixture(t, 8, 2, 50*time.Millisecond, pause)
+	t.Cleanup(unblock)
+	blockedAgent := f.bindings[0].Agent
+	hook := func(agent string) {
+		if agent != blockedAgent {
+			return
+		}
+		first := false
+		enterOnce.Do(func() { first = true; close(entered) })
+		if first {
+			<-release
+		}
+	}
+	f.onAgentRead.Store(&hook)
+	if err := cmdRelay(nil); err != nil {
+		t.Fatal(err)
+	}
+	if !released {
+		t.Fatal("the blocked read was never released")
+	}
+	if otherMin < 3 {
+		t.Fatalf("other bindings visited at least %d times while one blocked, want 3", otherMin)
+	}
+	if blockedStarted != 1 || blockedEnded != 0 || startedAtRelease != 1 {
+		t.Fatalf("blocked binding visits while blocked: started %d, ended %d, want 1 and 0", blockedStarted, blockedEnded)
+	}
+	if progressWhileBlocked {
+		t.Fatal("the blocked binding's progress was saved before its visit ended")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.maxAgent != 1 {
+		t.Fatalf("most visits of one binding at once = %d, want 1", f.maxAgent)
+	}
+	if f.ended[blockedAgent] < 2 {
+		t.Fatalf("blocked binding visits after release = %d ended, want the blocked one and another", f.ended[blockedAgent])
+	}
+	if _, err := os.Stat(f.progressPath(f.bindings[0])); err != nil {
+		t.Fatalf("the blocked visit saved no progress after release: %v", err)
+	}
+}
+
+// The pool runs at most relayVisitWorkers visits at once, one per binding,
+// and visits every binding in every pass.
+func TestRelayVisitWorkersBoundConcurrency(t *testing.T) {
+	const bindings, workers, passTotal = 10, 3, 3
+	var f *relayVisitFixture
+	var passes int
+	var perPass [][]int
+	pause := func() bool {
+		passes++
+		f.mu.Lock()
+		var counts []int
+		for _, b := range f.bindings {
+			counts = append(counts, f.ended[b.Agent])
+		}
+		f.mu.Unlock()
+		perPass = append(perPass, counts)
+		return passes < passTotal
+	}
+	f = newRelayVisitFixture(t, bindings, workers, time.Minute, pause)
+	// Each visit holds until the concurrent count reads relayVisitWorkers, so
+	// the pool fills; the tail of a pass, with fewer bindings left, goes on
+	// after a short wait.
+	hook := func(string) {
+		hold := time.After(200 * time.Millisecond)
+		for {
+			f.mu.Lock()
+			full := f.concurrent >= workers
+			f.mu.Unlock()
+			if full {
+				return
+			}
+			select {
+			case <-hold:
+				return
+			case <-time.After(2 * time.Millisecond):
+			}
+		}
+	}
+	f.onVisit.Store(&hook)
+	if err := cmdRelay(nil); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.maxConcurrent != workers {
+		t.Fatalf("most visits at once = %d, want relayVisitWorkers %d", f.maxConcurrent, workers)
+	}
+	if f.maxAgent != 1 {
+		t.Fatalf("most visits of one binding at once = %d, want 1", f.maxAgent)
+	}
+	if len(perPass) != passTotal {
+		t.Fatalf("passes = %d, want %d", len(perPass), passTotal)
+	}
+	for i, counts := range perPass {
+		for j, n := range counts {
+			if n != i+1 {
+				t.Fatalf("binding %d visits by the end of pass %d = %d, want %d (none dropped): %v", j, i+1, n, i+1, perPass)
+			}
+		}
+	}
+}
+
+// Under --once a visit past relayVisitWait is not detached: it ends, and its
+// progress is saved, before the relay returns.
+func TestRelayOnceWaitsForEveryVisit(t *testing.T) {
+	pause := func() bool { t.Error("once mode paused between passes"); return false }
+	f := newRelayVisitFixture(t, 3, 2, 20*time.Millisecond, pause)
+	slow := f.bindings[0].Agent
+	hook := func(agent string) {
+		if agent == slow {
+			time.Sleep(300 * time.Millisecond)
+		}
+	}
+	f.onAgentRead.Store(&hook)
+	if err := cmdRelay([]string{"--once"}); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	ended, started := maps.Clone(f.ended), maps.Clone(f.started)
+	f.mu.Unlock()
+	for _, b := range f.bindings {
+		if started[b.Agent] != 1 || ended[b.Agent] != 1 {
+			t.Fatalf("visits of %s when --once returned: started %d, ended %d, want 1 and 1", b.Agent, started[b.Agent], ended[b.Agent])
+		}
+		if _, err := os.Stat(f.progressPath(b)); err != nil {
+			t.Fatalf("progress of %s not saved when --once returned: %v", b.Agent, err)
+		}
 	}
 }

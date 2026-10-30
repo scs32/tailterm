@@ -1330,6 +1330,12 @@ var (
 	relayStewardRotation = relayStewardRotationTick
 	relayLoopCleanup     = relayCleanup
 	relayLoopPause       = func() bool { time.Sleep(3 * time.Second); return true }
+	// relayVisitWorkers is how many binding visits a pass runs at once, and
+	// relayVisitWait how long a pass waits for one visit before detaching it.
+	relayVisitWorkers = 4
+	relayVisitWait    = 10 * time.Second
+	// relayVisitRun is one binding's visit.
+	relayVisitRun = relayVisit
 	// relayHubReachStart starts the hub reachability watch and returns its stop.
 	relayHubReachStart = startHubReachWatch
 	// relayClaudeRetryStart starts the Claude due-retry watch and returns its stop.
@@ -1521,11 +1527,13 @@ func relayNotLogged(skipped int, one, many string) string {
 type relayPassTiming struct {
 	start, lapAt              time.Time
 	startPhase, bindings, end time.Duration
-	visited                   int
-	step                      string
-	stepTook                  time.Duration
 
-	mu       sync.Mutex // guards the slowest hub call
+	// mu guards the visit count, the slowest step and the slowest hub call:
+	// visits note their own time, and a detached one may still run.
+	mu       sync.Mutex
+	visited  int
+	step     string
+	stepTook time.Duration
 	call     string
 	callTook time.Duration
 }
@@ -1539,11 +1547,31 @@ func newRelayPassTiming() *relayPassTiming {
 // empty name starts the next step without naming the time before it.
 func (p *relayPassTiming) lap(name string) time.Time {
 	now := relayPassClock()
-	if took := now.Sub(p.lapAt); name != "" && took > p.stepTook {
-		p.step, p.stepTook = name, took
+	if name != "" {
+		p.noteStep(name, now.Sub(p.lapAt))
 	}
 	p.lapAt = now
 	return now
+}
+
+func (p *relayPassTiming) noteStep(name string, took time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if took > p.stepTook {
+		p.step, p.stepTook = name, took
+	}
+}
+
+// dispatched counts one binding visit started in this pass.
+func (p *relayPassTiming) dispatched() {
+	p.mu.Lock()
+	p.visited++
+	p.mu.Unlock()
+}
+
+// noteVisit keeps one agent's visit as the slowest step when it is.
+func (p *relayPassTiming) noteVisit(agent string, took time.Duration) {
+	p.noteStep("binding "+agent, took)
 }
 
 func (p *relayPassTiming) noteCall(method, path string, took time.Duration) {
@@ -1564,11 +1592,11 @@ func (p *relayPassTiming) line(now time.Time, limit *relaySlowLimiter) string {
 	if !ok {
 		return ""
 	}
+	p.mu.Lock()
 	line := fmt.Sprintf("[tt relay] %s slow pass %.1fs: start %.1fs, bindings %.1fs (%d bindings), end %.1fs", now.UTC().Format(time.RFC3339), total.Seconds(), p.startPhase.Seconds(), p.bindings.Seconds(), p.visited, p.end.Seconds())
 	if p.step != "" {
 		line += fmt.Sprintf("; slowest step %s %.1fs", p.step, p.stepTook.Seconds())
 	}
-	p.mu.Lock()
 	if p.call != "" {
 		line += fmt.Sprintf("; slowest hub call %s %.1fs", p.call, p.callTook.Seconds())
 	}
@@ -1603,6 +1631,97 @@ func timeRelayClient(c *api.Client, pass *relayPassTiming) {
 	}
 	c.HTTP.Transport = relayTimedTransport{base: base, pass: pass}
 }
+
+// relayVisitPool runs the relay loop's binding visits, so one slow visit no
+// longer holds every other binding's (wi_da5fae2aef5ca94a). Until then the
+// loop visited each binding in turn. A binding has at most one visit running.
+// Only the relay loop starts visits and waits for them.
+type relayVisitPool struct {
+	mu       sync.Mutex
+	visiting map[string]bool // binding paths with a visit running
+	running  sync.WaitGroup  // every visit running, detached ones included
+}
+
+// busy reports whether path has a visit running.
+func (v *relayVisitPool) busy(path string) bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.visiting[path]
+}
+
+// inFlight reports whether any visit runs; between passes, only a detached one.
+func (v *relayVisitPool) inFlight() bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return len(v.visiting) > 0
+}
+
+// wait blocks until every visit, detached ones included, has ended.
+func (v *relayVisitPool) wait() { v.running.Wait() }
+
+// relayVisitPass is one pass's dispatch through the pool. Each of its
+// relayVisitWorkers slots holds a worktree cache: the cache is a bare map, so
+// a detached visit keeps its own and the slot gets a fresh one.
+type relayVisitPass struct {
+	pool   *relayVisitPool
+	slots  chan activityWorktreeCache
+	held   sync.WaitGroup // visits this pass still waits for
+	detach bool
+}
+
+func (v *relayVisitPool) pass(detach bool) *relayVisitPass {
+	workers := max(relayVisitWorkers, 1)
+	p := &relayVisitPass{pool: v, slots: make(chan activityWorktreeCache, workers), detach: detach}
+	for range workers {
+		p.slots <- activityWorktreeCache{}
+	}
+	return p
+}
+
+// start runs visit for the binding at path once a slot is free. The caller
+// checks busy first. With detach, the pass waits relayVisitWait for the visit
+// and then gives its slot to the next binding while the visit runs on.
+func (p *relayVisitPass) start(path, agent string, timing *relayPassTiming, visit func(activityWorktreeCache)) {
+	cache := <-p.slots
+	p.pool.mu.Lock()
+	if p.pool.visiting == nil {
+		p.pool.visiting = map[string]bool{}
+	}
+	p.pool.visiting[path] = true
+	p.pool.mu.Unlock()
+	p.pool.running.Add(1)
+	p.held.Add(1)
+	began := relayPassClock()
+	var freed sync.Once
+	free := func(next activityWorktreeCache) {
+		freed.Do(func() {
+			p.slots <- next
+			p.held.Done()
+		})
+	}
+	var detachTimer *time.Timer
+	if p.detach {
+		detachTimer = time.AfterFunc(relayVisitWait, func() {
+			timing.noteVisit(agent, relayPassClock().Sub(began))
+			free(activityWorktreeCache{})
+		})
+	}
+	go func() {
+		visit(cache)
+		timing.noteVisit(agent, relayPassClock().Sub(began))
+		p.pool.mu.Lock()
+		delete(p.pool.visiting, path)
+		p.pool.mu.Unlock()
+		p.pool.running.Done()
+		if detachTimer != nil {
+			detachTimer.Stop()
+		}
+		free(cache)
+	}()
+}
+
+// wait blocks until each visit of the pass has ended or been detached.
+func (p *relayVisitPass) wait() { p.held.Wait() }
 
 func cmdRelay(args []string) error {
 	fs := flag.NewFlagSet("relay", flag.ContinueOnError)
@@ -1639,6 +1758,7 @@ func cmdRelay(args []string) error {
 	var rotation relayRotationPass
 	var sweep relaySweepPass
 	var slowPasses relaySlowLimiter
+	var visitPool relayVisitPool
 	promptDeps := nativeRuntimePromptDeps()
 	var lastClaudeRetry, lastPendingBind, lastWindowSize time.Time
 	var claudeRetryCursor int
@@ -1650,7 +1770,9 @@ func cmdRelay(args []string) error {
 			// A rotation pass stops the rotated handler's old session itself,
 			// and a team queue pass stops sessions too; the loop cleanup waits
 			// until both are collected, so two never stop one session at once.
-			if !rotation.inFlight() && !queue.inFlight() {
+			// It waits for a detached binding visit too, which may wake or
+			// retire a session.
+			if !rotation.inFlight() && !queue.inFlight() && !visitPool.inFlight() {
 				relayLoopCleanup()
 			}
 			pass.lap("cleanup")
@@ -1739,12 +1861,15 @@ func cmdRelay(args []string) error {
 		bindingsAt := pass.lap("")
 		pass.startPhase = bindingsAt.Sub(pass.start)
 		paths, _ := filepath.Glob(filepath.Join(dir, "*.binding.json"))
-		worktreeCache := activityWorktreeCache{}
-		// visiting names the binding whose visit the next lap ends.
-		visiting := ""
+		// Visits run through the pool, at most one per binding at a time; a
+		// visit past relayVisitWait is detached, except under --once.
+		visits := visitPool.pass(!*once)
 		for _, path := range paths {
-			pass.lap(visiting)
-			visiting = ""
+			// A binding whose detached visit still runs is visited again
+			// once that visit ends, never twice at once.
+			if visitPool.busy(path) {
+				continue
+			}
 			data, err := os.ReadFile(path)
 			if err != nil {
 				continue
@@ -1772,82 +1897,13 @@ func cmdRelay(args []string) error {
 				fmt.Printf("%s %s thread=%s queued-through=%d broker-wakes=%v%s %s\n", b.Task, b.Agent, b.Thread, progress.Through, progress.BrokerWakes, wake, progress.Error)
 				continue
 			}
-			visiting = "binding " + b.Agent
-			pass.visited++
-			e := env{hub: b.Hub}
-			e.loadConfig()
-			c, err := e.client(15 * time.Second)
-			if err == nil {
-				timeRelayClient(c, pass)
-				attachRelayBudget(c, activeRelayBudget)
-				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-				retired, retirementErr := probeRelayRetirement(ctx, dir, path, b, &progress, c, time.Now().UTC())
-				if retirementErr != nil {
-					fmt.Fprintf(os.Stderr, "[tt relay] %s retirement: %v\n", b.Agent, retirementErr)
-				}
-				if retired {
-					cancel()
-					continue
-				}
-				if retirementErr != nil {
-					err = retirementErr
-					cancel()
-				} else {
-					now := time.Now().UTC()
-					if heartbeatErr := relayHelperHeartbeat(ctx, b, &progress, c, now, activityProbeNative); heartbeatErr != nil {
-						fmt.Fprintf(os.Stderr, "[tt relay] %s helper heartbeat: %v\n", b.Agent, heartbeatErr)
-					}
-					// A broker-path error never suppresses the existing paths.
-					queued, brokerErr := false, error(nil)
-					queue := nativeQueue
-					if b.Runtime == "claude" {
-						// A stalled turn is detected, and on a host set to
-						// interrupt it is interrupted, before delivery, so the
-						// wake it held back is typed in this same pass. The
-						// wrapper notes that wake in the stall record.
-						if relayStallPassDue(b, progress) {
-							// The pass holds claudePaneInput, so the retry
-							// watch never types into a pane it interrupts;
-							// its own wake runs under that hold.
-							ctx := context.WithValue(ctx, claudePaneInputHeld{}, true)
-							claudePaneInput.Lock()
-							claudeStallPass(ctx, b, nativeClaudeStallOps(c))
-							claudePaneInput.Unlock()
-						}
-						queue = claudeStallWake(claudeQueue, time.Now)
-					}
-					queued, brokerErr = relayWakeJob(ctx, b, &progress, c, now, queue)
-					if brokerErr != nil {
-						fmt.Fprintf(os.Stderr, "[tt relay] %s broker wake: %v\n", b.Agent, brokerErr)
-					}
-					if !queued {
-						err = relayOne(ctx, b, &progress, c, now, queue)
-					}
-					cancel()
-					// Host observation runs after delivery, using the same host budget.
-					// A slow or drifting transcript never delays a broker or inbox turn.
-					activityCtx, stopActivity := context.WithTimeout(context.WithValue(context.WithValue(context.Background(), activityWorktreeContextKey{}, worktreeCache), runtimePromptDepsKey{}, promptDeps), 5*time.Second)
-					if activityErr := runActivitySafely(func() error {
-						return relayActivityTick(prepareUsageContext(activityCtx, b, c, now), b, c, now, activityProbeNative)
-					}); activityErr != nil {
-						fmt.Fprintf(os.Stderr, "[tt relay] %s activity: %v\n", b.Agent, activityErr)
-					}
-					stopActivity()
-				}
-			}
-			if err != nil {
-				if progress.Error != err.Error() {
-					fmt.Fprintf(os.Stderr, "[tt relay] %s: %v\n", b.Agent, err)
-				}
-				progress.Error = err.Error()
-			} else {
-				progress.Error = ""
-			}
-			if err := saveRelayProgress(dir, progressPath, b, progress); err != nil {
-				fmt.Fprintln(os.Stderr, "[tt relay] save progress:", err)
-			}
+			pass.dispatched()
+			visits.start(path, b.Agent, pass, func(worktreeCache activityWorktreeCache) {
+				relayVisitRun(dir, path, progressPath, b, progress, pass, worktreeCache, promptDeps)
+			})
 		}
-		endAt := pass.lap(visiting)
+		visits.wait()
+		endAt := pass.lap("")
 		pass.bindings = endAt.Sub(bindingsAt)
 		if !*status {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -1893,7 +1949,112 @@ func cmdRelay(args []string) error {
 		if !relayLoopPause() {
 			rotation.collect(&queueBackoff, true)
 			queue.collect(&queueBackoff, true)
+			visitPool.wait()
 			return nil
 		}
+	}
+}
+
+// relayUsageCapability serializes each hub's usage capability check across
+// concurrent visits, so a stale cache is read from the hub once, not once per
+// visit that finds it stale.
+var relayUsageCapability struct {
+	sync.Mutex
+	hubs map[string]*sync.Mutex
+}
+
+func relayUsageContext(ctx context.Context, b runtimeBinding, c *api.Client, now time.Time) context.Context {
+	relayUsageCapability.Lock()
+	if relayUsageCapability.hubs == nil {
+		relayUsageCapability.hubs = map[string]*sync.Mutex{}
+	}
+	hub := relayUsageCapability.hubs[b.Hub]
+	if hub == nil {
+		hub = &sync.Mutex{}
+		relayUsageCapability.hubs[b.Hub] = hub
+	}
+	relayUsageCapability.Unlock()
+	hub.Lock()
+	defer hub.Unlock()
+	return prepareUsageContext(ctx, b, c, now)
+}
+
+// relayVisit is one binding's visit in a relay pass: the retirement probe, the
+// helper heartbeat, the stall pass for Claude, the broker wake job or the
+// inbox wake under one 20-second context, then the activity tick, and the
+// saved progress. The visit pool runs it with a worktree cache no other
+// running visit holds.
+func relayVisit(dir, path, progressPath string, b runtimeBinding, progress relayProgress, pass *relayPassTiming, worktreeCache activityWorktreeCache, promptDeps *runtimePromptDeps) {
+	e := env{hub: b.Hub}
+	e.loadConfig()
+	c, err := e.client(15 * time.Second)
+	if err == nil {
+		timeRelayClient(c, pass)
+		attachRelayBudget(c, activeRelayBudget)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		retired, retirementErr := probeRelayRetirement(ctx, dir, path, b, &progress, c, time.Now().UTC())
+		if retirementErr != nil {
+			fmt.Fprintf(os.Stderr, "[tt relay] %s retirement: %v\n", b.Agent, retirementErr)
+		}
+		if retired {
+			cancel()
+			return
+		}
+		if retirementErr != nil {
+			err = retirementErr
+			cancel()
+		} else {
+			now := time.Now().UTC()
+			if heartbeatErr := relayHelperHeartbeat(ctx, b, &progress, c, now, activityProbeNative); heartbeatErr != nil {
+				fmt.Fprintf(os.Stderr, "[tt relay] %s helper heartbeat: %v\n", b.Agent, heartbeatErr)
+			}
+			// A broker-path error never suppresses the existing paths.
+			queued, brokerErr := false, error(nil)
+			queue := nativeQueue
+			if b.Runtime == "claude" {
+				// A stalled turn is detected, and on a host set to
+				// interrupt it is interrupted, before delivery, so the
+				// wake it held back is typed in this same pass. The
+				// wrapper notes that wake in the stall record.
+				if relayStallPassDue(b, progress) {
+					// The pass holds claudePaneInput, so the retry
+					// watch never types into a pane it interrupts;
+					// its own wake runs under that hold.
+					ctx := context.WithValue(ctx, claudePaneInputHeld{}, true)
+					claudePaneInput.Lock()
+					claudeStallPass(ctx, b, nativeClaudeStallOps(c))
+					claudePaneInput.Unlock()
+				}
+				queue = claudeStallWake(claudeQueue, time.Now)
+			}
+			queued, brokerErr = relayWakeJob(ctx, b, &progress, c, now, queue)
+			if brokerErr != nil {
+				fmt.Fprintf(os.Stderr, "[tt relay] %s broker wake: %v\n", b.Agent, brokerErr)
+			}
+			if !queued {
+				err = relayOne(ctx, b, &progress, c, now, queue)
+			}
+			cancel()
+			// Host observation runs after delivery, using the same host budget.
+			// A slow or drifting transcript never delays a broker or inbox turn.
+			activityCtx, stopActivity := context.WithTimeout(context.WithValue(context.WithValue(context.Background(), activityWorktreeContextKey{}, worktreeCache), runtimePromptDepsKey{}, promptDeps), 5*time.Second)
+			if activityErr := runActivitySafely(func() error {
+				return relayActivityTick(relayUsageContext(activityCtx, b, c, now), b, c, now, activityProbeNative)
+			}); activityErr != nil {
+				fmt.Fprintf(os.Stderr, "[tt relay] %s activity: %v\n", b.Agent, activityErr)
+			}
+			stopActivity()
+		}
+	}
+	if err != nil {
+		if progress.Error != err.Error() {
+			fmt.Fprintf(os.Stderr, "[tt relay] %s: %v\n", b.Agent, err)
+		}
+		progress.Error = err.Error()
+	} else {
+		progress.Error = ""
+	}
+	if err := saveRelayProgress(dir, progressPath, b, progress); err != nil {
+		fmt.Fprintln(os.Stderr, "[tt relay] save progress:", err)
 	}
 }
