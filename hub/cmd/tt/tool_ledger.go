@@ -49,7 +49,9 @@ import (
 // its own row: the command text with secrets replaced, the exit code Claude
 // Code reports, a SHA-256 of the output and the commit HEAD named when the
 // call started. The output, the cwd and the repository path are never
-// stored, and no process is started. See docs/claude-mods-evidence-capture.md.
+// stored, and no process is started. See the evidence capture page in docs/,
+// "Verification evidence capture for Claude sessions". Its file name is not
+// written here: tests/clean-view-mod.test.js keeps that prefix out of launch paths.
 //
 // The owner helper's session has no agent identity in its environment. Its
 // calls are ledgered under the helper registered from that exact runtime
