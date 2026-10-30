@@ -536,9 +536,12 @@ verification and other write routes are not recorded yet; that is a follow-up.
   arm's handler is leased by a stuck entry, with no fallback, is stalled behind
   that entry even while another arm is free, and its reason and notice end with
   `. It waits for a free handler of arm S`. A wait behind working teams or
-  provider limits is not a stall. Nor is a wait whose handler need says how
-  the arm gets a handler (the runner adding one, the ceiling, the cap, an
-  offline handler or provisioning off): it keeps the need's reason.
+  provider limits is not a stall. Nor is a wait whose handler need says the
+  runner is adding a handler (offered or reserved): it keeps the need's
+  reason. A wait whose need asks a person to act (provisioning off, the
+  ceiling, the cap, an offline handler or a refused spec) is stalled behind
+  the stuck holder like a plain wait, names it, and keeps the need's reason
+  and fix after the arm text in its reason and notice (`wi_dbb1529b84b724ae`).
 
 ## Rollback
 

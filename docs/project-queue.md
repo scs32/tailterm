@@ -595,10 +595,14 @@ even while a handler of another arm is free. The reason is the usual
 `. It waits for a free handler of arm S`, and the stall notice carries the same
 text. An arm wait behind working teams, or with every arm at a provider limit,
 is ordinary waiting (`wi_376dfb3ee857ffcd`). So is an arm wait whose handler
-need says how the drawn arm gets a handler: the runner adding one, the
-provision ceiling, the project agent cap, an offline handler or provisioning
-off. It keeps the need's reason and fix; only a plain wait for a busy handler of
-the arm becomes the stall.
+need says the runner is adding a handler (offered or already reserved): it
+keeps the need's reason. An arm wait whose need asks a person to act
+(provisioning off, the provision ceiling, the project agent cap, an offline
+handler or a refused spec) is stalled behind the stuck entry holding the drawn
+arm's handler like a plain wait, names it, and keeps the need's reason and fix
+after the arm: `. It waits for a free handler of arm S: 1 of 1 leased, limit
+none; automatic provisioning is off. Fix: ...`, in the reason and the stall
+notice (`wi_dbb1529b84b724ae`).
 
 ## Handlers and the limit
 
@@ -1047,7 +1051,12 @@ stall on the entries behind it.
 A launching entry with no live run whose last write, and the item's last run
 exit if later, is older than the stall grace (5 minutes) is now a
 `nothing-running` stall of its own. An earlier team's exit alone never dates
-it, so a relaunched item is not stalled at its claim. The list shows
+it, so a relaunched item is not stalled at its claim. A launch the project
+agent cap holds is no stall: its reason is `Launch held at the project agent
+cap: ...` (see [Project agent cap](#project-agent-cap)). A launching entry is
+also dated from the project's first agent close or exit after its last write,
+when that is later, so once a seat frees a launch the cap held gets its
+backed-off retry before the stall shows (`wi_dbb1529b84b724ae`). The list shows
 it on the entry: `reason=Stalled: tqe_ID (wi_ID): an entry holds its slot,
 handler lease and ownership with nothing running for it. Fix: ...`, and
 `--json` has `stall` with the entry as its blocker. Entries queued behind it
@@ -1273,8 +1282,13 @@ itself (no planner or plan reviewer) and runs the approved matrix itself: the
 hub only requires the verifier to be admitted to the exact item and distinct
 from the builder and every review-round reviewer. Review keeps the Planned
 rules: an exact frozen candidate, at most two rounds, one disposition, and
-acceptance only with the hub-saved passing receipt for the exact final SHA
-rebased on tasks-hub. The lead prompt is in [team-launch.md](team-launch.md).
+acceptance only with the hub-saved passing receipt for the exact final SHA.
+Under owner decision #50024 (`wi_25bf79a0bf7d24c5`), once that receipt passes a
+later tasks-hub move needs no rebase and no new full matrix when `git diff
+--name-only PLAN_BASE..TIP` touches none of the candidate's owned paths: the
+lead accepts on the plan base. It rebases only when that diff touches an owned
+path or the cherry-pick would conflict. The lead prompt is in
+[team-launch.md](team-launch.md).
 
 **Records: s1 is bounded.** The lane saves its records through operations that
 already exist: queue freeze, attempt, started and running with the exact
@@ -1854,8 +1868,10 @@ and ownership until seats free. While the project has no seat for its next
 member and none of its members is live, it is no stall: its reason is
 `Launch held at the project agent cap: N open + 1 seats > CAP`, and the work
 behind it waits as behind any working team. Once a seat frees and still no
-member is live, after the stall grace it shows as the `nothing-running` stall;
-the stall notice then carries the text above as the last launch error.
+member is live, it shows as the `nothing-running` stall a stall grace after
+the first agent close or exit following the launch's last write, not its old
+write, so the runner's backed-off retry comes first; the stall notice then
+carries the text above as the last launch error.
 
 **Interaction with the concurrency limit.** The limit is a ceiling on teams,
 the cap is a ceiling on agents in the project, and host capacity is a third,

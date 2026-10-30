@@ -118,6 +118,19 @@ func (s *Store) classifyStallBlockerHeld(ctx context.Context, q queryRower, e ap
 		// Held since the later of the item's last run and the entry's own
 		// last write: a relaunch is not dated from an earlier team's exit.
 		since := parseStallTime(last.String, e.UpdatedAt)
+		if e.State == "launching" {
+			// A launch the cap held retries on its backoff once a seat
+			// frees, and refused attempts write nothing, so it is dated from
+			// the first agent close or exit after its last write
+			// (wi_dbb1529b84b724ae).
+			freed, err := firstSeatFreedAfter(ctx, q, e.TaskID, parseStallTime(e.UpdatedAt))
+			if err != nil {
+				return nil, "", err
+			}
+			if freed.After(since) {
+				since = freed
+			}
+		}
 		// A launch in progress has no runs yet; only an entry that has had
 		// none for the whole grace period is stuck.
 		if s.now().Sub(since) < s.queueNoticeGrace() {
@@ -207,6 +220,31 @@ func (s *Store) classifyStallBlockerHeld(ctx context.Context, q queryRower, e ap
 		return nil, "", nil
 	}
 	return &stallBlocker{cause: api.StallIdleEntry, since: since, fix: fmt.Sprintf("if its candidate shipped, %s; otherwise narrow it to what it changed: tt team queue scope --task %s --entry %s --owns PATH", shipped, e.TaskID, e.ID)}, "", nil
+}
+
+// firstSeatFreedAfter is the time of the project's first closed or exited
+// event after after, or zero. Events are never rewritten, so a repeated close
+// or a later exit cannot move it; times are compared parsed, because ts trims
+// trailing zeros.
+func firstSeatFreedAfter(ctx context.Context, q queryRower, task string, after time.Time) (time.Time, error) {
+	rows, err := q.QueryContext(ctx, `SELECT created_at FROM events WHERE task_id=? AND kind IN (?,?) ORDER BY seq DESC`, task, api.EventClosed, api.EventExited)
+	if err != nil {
+		return time.Time{}, err
+	}
+	defer rows.Close()
+	var first time.Time
+	for rows.Next() {
+		var created string
+		if err := rows.Scan(&created); err != nil {
+			return time.Time{}, err
+		}
+		at := parseStallTime(created)
+		if !at.After(after) {
+			break
+		}
+		first = at
+	}
+	return first, rows.Err()
 }
 
 var stallCauseText = map[string]string{
@@ -312,6 +350,9 @@ func (s *Store) explainQueueStalls(ctx context.Context, q queryRower, capacity *
 		var blocker *api.TeamQueueEntry
 		cause, fix, armWait := "", "", ""
 		var since time.Time
+		// The arm wait's reason before any stall: a need's tail follows the
+		// arm in the stall reason when a person acts on it.
+		waitReason, runnerAdds := e.BlockReason, false
 		if !parallel {
 			for j := range active {
 				if active[j].State == "failed" {
@@ -354,12 +395,12 @@ func (s *Store) explainQueueStalls(ctx context.Context, q queryRower, capacity *
 			// freeWithout says whether releasing one blocker's lease frees
 			// a handler for e.
 			freeWithout := func(a api.TeamQueueEntry) (bool, error) { return a.HandlerID != "", nil }
-			// A handler need that says how the drawn arm gets a handler (the
-			// runner adds one, or a fix or ceiling a person acts on) owns the
-			// wait, as it did before arm stalls; only a plain wait for a busy
-			// handler of the arm is judged by its draw here.
-			needOwns := e.HandlerNeed != nil && e.BlockReason != armWaitReason(e.HandlerNeed.Arm)
-			if policy.Enabled && !needOwns {
+			// A handler need where the runner is adding a handler (offered or
+			// already reserved) owns the wait: it clears by itself. Any other
+			// arm wait, plain or with a need a person acts on, is judged by its
+			// draw here. need() in handler_ab.go writes the reserved text.
+			runnerAdds = e.HandlerNeed != nil && (e.HandlerNeed.Provision || strings.HasSuffix(e.HandlerNeed.Reason, "; the runner is adding one"))
+			if policy.Enabled && !runnerAdds {
 				free, drawn, limited, err := armFree(*e, active)
 				if err != nil {
 					return nil, err
@@ -438,6 +479,9 @@ func (s *Store) explainQueueStalls(ctx context.Context, q queryRower, capacity *
 		setQueueStall(e, blocker, cause, fix, since)
 		if armWait != "" && blocker != nil {
 			e.BlockReason += ". It waits for a free handler of arm " + armWait
+			if e.HandlerNeed != nil && !runnerAdds && waitReason != armWaitReason(armWait) {
+				e.BlockReason += ": " + e.HandlerNeed.Reason
+			}
 		}
 	}
 	return movable, nil

@@ -153,9 +153,10 @@ func TestQueueStallArmWaitBlockerHoldsDrawnArm(t *testing.T) {
 }
 
 // wi_376dfb3ee857ffcd a2: no arm stall when the drawn arm is free, when it is
-// held by a working team, or when every arm is at a provider limit. A drawn
-// arm whose handler need says how it gets one (here the runner adds one)
-// keeps that need's reason, as before arm stalls (verifier finding #50081).
+// held by a working team, or when every arm is at a provider limit. Only a
+// drawn arm whose handler need says the runner is adding one (offered or
+// reserved) keeps that need's reason (verifier finding #50081,
+// wi_dbb1529b84b724ae).
 func TestQueueStallArmWaitNoStall(t *testing.T) {
 	t.Run("drawn arm free", func(t *testing.T) {
 		f := newArmStallQueue(t, 2)
@@ -191,6 +192,24 @@ func TestQueueStallArmWaitNoStall(t *testing.T) {
 			t.Fatalf("need %+v reason %q", got.HandlerNeed, got.BlockReason)
 		}
 	})
+	t.Run("drawn arm's handler is being reserved", func(t *testing.T) {
+		f := newArmStallQueue(t, 2)
+		a, b := f.add(t, 0, "src/a"), f.add(t, 1, "src/b")
+		f.policy(t, true, map[string]string{a.ID: "S", b.ID: "S"})
+		f.run(t, a)
+		f.advance(6 * time.Minute)
+		listed := listedEntry(t, f.s, f.task.ID, b.ID)
+		agentID := api.NewID("agt")
+		if _, err := f.s.TeamQueueAction(context.Background(), f.task.ID, api.TeamQueueRequest{RequestID: "reserve-b", Operation: "provision_handler", EntryID: b.ID, ExpectedRevision: listed.Revision,
+			Host: "mini", HandlerAgentID: agentID, HandlerSpecRuntime: armS.Runtime, HandlerSpecModel: armS.Model, HandlerSpecReasoning: armS.Reasoning, HandlerSpecDigest: digestP}); err != nil {
+			t.Fatal(err)
+		}
+		assertNoStall(t, f.choresQueue, b.ID, "a handler of the drawn arm is reserved")
+		got := listedEntry(t, f.s, f.task.ID, b.ID)
+		if got.HandlerNeed == nil || got.HandlerNeed.Provision || got.HandlerNeed.AgentID != agentID || got.BlockReason != "Waiting for a free handler of arm S: 1 of 1 leased, limit none; the runner is adding one" {
+			t.Fatalf("need %+v reason %q", got.HandlerNeed, got.BlockReason)
+		}
+	})
 	t.Run("every arm limited", func(t *testing.T) {
 		f := newArmStallQueue(t, 2)
 		a, b := f.add(t, 0, "src/a"), f.add(t, 1, "src/b")
@@ -207,6 +226,68 @@ func TestQueueStallArmWaitNoStall(t *testing.T) {
 			t.Fatalf("limited reason %q", got.BlockReason)
 		}
 	})
+}
+
+// wi_dbb1529b84b724ae f1: an arm wait whose handler need asks a person to act
+// (provisioning off, an offline handler of the arm, the project agent cap)
+// behind a stuck entry holding the drawn arm's handler is stalled behind that
+// entry, names it, and keeps the need's reason and fix after the arm, in the
+// list and in the notice.
+func TestQueueStallArmWaitNeedAsksPersonNamesHolder(t *testing.T) {
+	for _, tc := range []struct {
+		name, want string
+		setup      func(t *testing.T, f *armStallQueue)
+	}{
+		{"provisioning off", "automatic provisioning is off. Fix: tt team queue provision", func(t *testing.T, f *armStallQueue) {
+			if _, err := f.s.TeamQueueAction(context.Background(), f.task.ID, api.TeamQueueRequest{RequestID: api.NewID("tqr"), Operation: "set_handler_provision", HandlerProvision: api.HandlerProvisionOff}); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"offline handler of the arm", "the limit already has its handlers, and ", func(t *testing.T, f *armStallQueue) {
+			h := f.armHandler(t, "handler-s2", armS)
+			if _, err := f.s.db.Exec(`UPDATE agents SET last_seen_at='' WHERE id=?`, h.ID); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"project agent cap", "cannot add one: " + projectAgentCapPrefix, func(t *testing.T, f *armStallQueue) {
+			// Three handlers are open and B is a bug team of five: the team
+			// fits, the team and one more handler do not.
+			f.s.MaxAgents = 8
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newArmStallQueue(t, 2)
+			a, b := f.add(t, 0, "src/a"), f.add(t, 1, "src/b")
+			f.policy(t, true, map[string]string{a.ID: "S", b.ID: "S"})
+			a = f.run(t, a)
+			if a.HandlerID != f.hS.ID {
+				t.Fatalf("holder leased %s, want handler-s", a.HandlerID)
+			}
+			tc.setup(t, f)
+			inside := listedEntry(t, f.s, f.task.ID, b.ID)
+			if inside.Stall != nil || inside.HandlerNeed == nil || inside.HandlerNeed.Provision || !strings.Contains(inside.HandlerNeed.Reason, tc.want) ||
+				inside.BlockReason != armWaitReason("S")+": "+inside.HandlerNeed.Reason {
+				t.Fatalf("inside the grace: %+v need %+v %q", inside.Stall, inside.HandlerNeed, inside.BlockReason)
+			}
+			f.advance(6 * time.Minute)
+			assertStall(t, f.choresQueue, b.ID, api.StallNothingRunning, a.ID, "tt team queue fail --task "+f.task.ID+" --entry "+a.ID)
+			got := listedEntry(t, f.s, f.task.ID, b.ID)
+			if got.HandlerNeed == nil || !strings.Contains(got.HandlerNeed.Reason, tc.want) {
+				t.Fatalf("need %+v", got.HandlerNeed)
+			}
+			tail := armSWait + ": " + got.HandlerNeed.Reason
+			if !strings.HasPrefix(got.BlockReason, "Stalled: "+a.ID+" ("+a.ItemID+"): ") || !strings.HasSuffix(got.BlockReason, tail) {
+				t.Fatalf("stall reason %q, want the tail %q", got.BlockReason, tail)
+			}
+			text := stallNoticeText(t, f.s, f.task.ID, b.ID)
+			if !strings.Contains(text, "Stalled: "+a.ID) || !strings.Contains(text, tail) {
+				t.Fatalf("notice text %q", text)
+			}
+			if got.HandlerNeed.Fix != "" && !strings.Contains(text, "Fix: "+got.HandlerNeed.Fix) {
+				t.Fatalf("notice lacks the need's fix %q: %q", got.HandlerNeed.Fix, text)
+			}
+		})
+	}
 }
 
 // wi_376dfb3ee857ffcd a3: with no arm policy, and with a disabled one, the
@@ -253,8 +334,8 @@ func TestQueueStallArmPolicyOffUnchanged(t *testing.T) {
 
 // wi_376dfb3ee857ffcd a4 (wi_d85481431355ef78): a launch whose member
 // registration the project agent cap refuses is held, not stalled: neither it
-// nor the work behind it shows the nothing-running stall's fail fix. Once the
-// cap has room again the stall returns.
+// nor the work behind it shows the nothing-running stall's fail fix. A grace
+// after the cap has room again the stall returns.
 func TestQueueStallCapHeldLaunchIsNotStalled(t *testing.T) {
 	f := newChoresQueue(t, 2, 1, 0)
 	advance := f.clock(t)
@@ -283,7 +364,10 @@ func TestQueueStallCapHeldLaunchIsNotStalled(t *testing.T) {
 	if got := listedEntry(t, f.s, f.task.ID, a.ID); got.State != "launching" || got.BlockReason != "Launch held at the project agent cap: 2 open + 1 seats > 2" {
 		t.Fatalf("held launch %s %q", got.State, got.BlockReason)
 	}
-	setAgentStatus(t, f.s, filler.ID, "closed")
+	if _, err := f.s.CloseAgent(ctx, filler.ID, f.by); err != nil {
+		t.Fatal(err)
+	}
+	advance(6 * time.Minute)
 	fix := "tt team queue fail --task " + f.task.ID + " --entry " + a.ID
 	assertStall(t, f, a.ID, api.StallNothingRunning, a.ID, fix)
 	assertStall(t, f, b.ID, api.StallNothingRunning, a.ID, fix)
