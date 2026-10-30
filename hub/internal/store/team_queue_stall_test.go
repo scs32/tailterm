@@ -289,6 +289,105 @@ func TestQueueStallCapHeldLaunchIsNotStalled(t *testing.T) {
 	assertStall(t, f, b.ID, api.StallNothingRunning, a.ID, fix)
 }
 
+// wi_dbb1529b84b724ae h1: a launch the project agent cap held is dated from
+// the first seat freeing after its last write, not from that old write, so
+// neither it nor the work behind it shows the nothing-running stall (or can
+// post its notice) until a grace after the seat frees, which the runner's
+// backed-off retry needs. Later closes and exits do not defer it further.
+func TestQueueStallFreedCapHeldLaunchDatedFromSeat(t *testing.T) {
+	// held sets up launch A refused at the cap by the given fillers, with B
+	// queued behind it, past the grace.
+	held := func(t *testing.T, fillers, max int) (*choresQueue, func(time.Duration), api.TeamQueueEntry, api.TeamQueueEntry, []api.Agent) {
+		t.Helper()
+		f := newChoresQueue(t, 2, 1, 0)
+		advance := f.clock(t)
+		ctx := context.Background()
+		a, err := claimEntry(f.s, f.task, f.add(t, 0, "src"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		b := f.add(t, 1, "src/b")
+		plan, _ := capLaunchPlan(f.task, f.items[0], f.orders[0], a, 1)
+		if a, err = f.s.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "freeze", Operation: "freeze", EntryID: a.ID, ExpectedRevision: a.Revision, LaunchJSON: plan}); err != nil {
+			t.Fatal(err)
+		}
+		var filled []api.Agent
+		for i := 0; i < fillers; i++ {
+			filled = append(filled, capFiller(t, f.s, f.task, fmt.Sprintf("late-worker-%d", i)))
+		}
+		f.s.MaxAgents = max
+		want := fmt.Sprintf("conflict: project agent cap: %d open + 1 seats > %d", max, max)
+		if _, err := f.s.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "attempt", Operation: "attempt", EntryID: a.ID, ExpectedRevision: a.Revision}); !errors.Is(err, api.ErrConflict) || err.Error() != want {
+			t.Fatalf("attempt at a full project: %v", err)
+		}
+		advance(6 * time.Minute)
+		for _, id := range []string{a.ID, b.ID} {
+			if got := listedEntry(t, f.s, f.task.ID, id); got.Stall != nil {
+				t.Fatalf("cap-held %s: %+v %q", id, got.Stall, got.BlockReason)
+			}
+		}
+		return f, advance, a, b, filled
+	}
+	closeAgent := func(t *testing.T, f *choresQueue, id string) {
+		t.Helper()
+		if _, err := f.s.CloseAgent(context.Background(), id, f.by); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// freed asserts no stall and a refused notice at the seat-free instant.
+	freed := func(t *testing.T, f *choresQueue, a, b api.TeamQueueEntry) {
+		t.Helper()
+		for _, id := range []string{a.ID, b.ID} {
+			if got := listedEntry(t, f.s, f.task.ID, id); got.Stall != nil || strings.Contains(got.BlockReason, "tt team queue fail") {
+				t.Fatalf("seat just freed, %s: %+v %q", id, got.Stall, got.BlockReason)
+			}
+		}
+		notice := api.TeamQueueStall{Cause: api.StallNothingRunning, BlockerEntryID: a.ID, BlockerRevision: a.Revision}
+		if _, err := f.s.TeamQueueAction(context.Background(), f.task.ID, api.TeamQueueRequest{RequestID: notice.NoticeRequestID(a.ID), Operation: "stall_notice", EntryID: a.ID}); !errors.Is(err, api.ErrConflict) {
+			t.Fatalf("notice at the seat freeing: %v", err)
+		}
+	}
+	// stalled asserts the stall after the grace, dated from the seat freeing.
+	stalled := func(t *testing.T, f *choresQueue, a, b api.TeamQueueEntry, seat time.Time) {
+		t.Helper()
+		fix := "tt team queue fail --task " + f.task.ID + " --entry " + a.ID
+		for _, id := range []string{a.ID, b.ID} {
+			assertStall(t, f, id, api.StallNothingRunning, a.ID, fix)
+			if since := listedEntry(t, f.s, f.task.ID, id).Stall.Since; since != ts(seat) {
+				t.Fatalf("%s since %s, want the seat freeing %s", id, since, ts(seat))
+			}
+		}
+	}
+	t.Run("one seat", func(t *testing.T) {
+		f, advance, a, b, filled := held(t, 1, 2)
+		seat := f.s.now()
+		closeAgent(t, f, filled[0].ID)
+		freed(t, f, a, b)
+		advance(6 * time.Minute)
+		stalled(t, f, a, b, seat)
+	})
+	t.Run("two seats", func(t *testing.T) {
+		f, advance, a, b, filled := held(t, 2, 3)
+		seat := f.s.now()
+		closeAgent(t, f, filled[0].ID)
+		closeAgent(t, f, filled[1].ID)
+		freed(t, f, a, b)
+		advance(6 * time.Minute)
+		stalled(t, f, a, b, seat)
+	})
+	t.Run("later events do not defer", func(t *testing.T) {
+		f, advance, a, b, filled := held(t, 2, 3)
+		seat := f.s.now()
+		closeAgent(t, f, filled[0].ID)
+		freed(t, f, a, b)
+		advance(3 * time.Minute)
+		closeAgent(t, f, filled[0].ID)
+		closeAgent(t, f, filled[1].ID)
+		advance(3 * time.Minute)
+		stalled(t, f, a, b, seat)
+	})
+}
+
 const moveHint = "; move it: tt team queue scope --task "
 
 // wi_376dfb3ee857ffcd a5 (wi_0806c5126e184b8c): a stall behind an entry that
