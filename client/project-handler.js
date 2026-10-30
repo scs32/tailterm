@@ -16,10 +16,12 @@ const handlerEvidenceRule =
 // Shared-path sequencing is recorded as a structured queue wait, which the
 // hub answers with one notice to the waiting lead (wi_44cabd7e6233bc1b,
 // docs/project-queue.md); a pause that shares no path is a pathless wait with
-// --reason (wi_8237a5d578808c82). hub/cmd/tt/coordination.go (handlerWaitRule)
+// --reason (wi_8237a5d578808c82). A handler-gated wait (--resume handler,
+// wi_99ce2fa485c23648) starts only on the handler's explicit resume
+// (wi_bca175343bbeeaf0). hub/cmd/tt/coordination.go (handlerWaitRule)
 // carries the same sentences.
 const handlerWaitRule =
-  "Shared-path sequencing: when one team must wait for a path another team owns, record a structured wait with tt team queue wait set --entry WAITING_ENTRY --on PREDECESSOR_ENTRY --owns PATH --until accepted|done|released, not only a sequencing note; the hub then tells the waiting lead once when the condition is met. For a pause that shares no path, such as a quiet host for a release, use --reason TEXT in place of --owns PATH. When the hub reports a wait that needs a handler decision, clear it with tt team queue wait clear --entry WAITING_ENTRY --on PREDECESSOR_ENTRY and tell the waiting lead, or set a new wait.";
+  "Shared-path sequencing: when a team waits on another team's path, run tt team queue wait set --entry tqe_WAITING --on tqe_PREDECESSOR --owns PATH --until accepted|done|released, not only a note; the hub tells the waiting lead once it is met. A pathless pause (a quiet host) uses --reason TEXT for --owns PATH. Add --resume handler when the team must await your own checks: its met notice never starts work, so after them send the lead an explicit resume and clear the wait. If the hub says a wait needs your decision, run tt team queue wait clear --entry tqe_WAITING --on tqe_PREDECESSOR and tell the lead, or set a new wait.";
 // A handler sends no success claim before every cited check has passed
 // (wi_5edba07856e84f45). hub/cmd/tt/coordination.go (handlerReadBackRule)
 // carries the same sentences.

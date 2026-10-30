@@ -1246,13 +1246,14 @@ func TestBriefingNamesLeadAndVerifierOperationException(t *testing.T) {
 // wi_44cabd7e6233bc1b, wi_8237a5d578808c82: the primary handler records
 // shared-path sequencing and pathless pauses as a structured queue wait, and
 // the browser handler prompt in client/project-handler.js carries the same
-// sentences.
+// sentences. wi_bca175343bbeeaf0: the rule names --resume handler for a wait
+// that starts only on the handler's explicit resume.
 func TestPrimaryHandlerGuidanceRecordsSharedPathWaits(t *testing.T) {
-	const rule = "Shared-path sequencing: when one team must wait for a path another team owns, record a structured wait with tt team queue wait set --entry WAITING_ENTRY --on PREDECESSOR_ENTRY --owns PATH --until accepted|done|released, not only a sequencing note; the hub then tells the waiting lead once when the condition is met. For a pause that shares no path, such as a quiet host for a release, use --reason TEXT in place of --owns PATH. When the hub reports a wait that needs a handler decision, clear it with tt team queue wait clear --entry WAITING_ENTRY --on PREDECESSOR_ENTRY and tell the waiting lead, or set a new wait."
+	const rule = "Shared-path sequencing: when a team waits on another team's path, run tt team queue wait set --entry tqe_WAITING --on tqe_PREDECESSOR --owns PATH --until accepted|done|released, not only a note; the hub tells the waiting lead once it is met. A pathless pause (a quiet host) uses --reason TEXT for --owns PATH. Add --resume handler when the team must await your own checks: its met notice never starts work, so after them send the lead an explicit resume and clear the wait. If the hub says a wait needs your decision, run tt team queue wait clear --entry tqe_WAITING --on tqe_PREDECESSOR and tell the lead, or set a new wait."
 	if handlerWaitRule != rule {
 		t.Fatalf("wait rule changed: %q", handlerWaitRule)
 	}
-	if n := strings.Count(primaryHandlerGuidance, rule); n != 1 || strings.Count(primaryHandlerGuidance, "tt team queue wait set") != 1 || strings.Count(primaryHandlerGuidance, "tt team queue wait clear") != 1 {
+	if n := strings.Count(primaryHandlerGuidance, rule); n != 1 || strings.Count(primaryHandlerGuidance, "tt team queue wait set") != 1 || strings.Count(primaryHandlerGuidance, "tt team queue wait clear") != 1 || strings.Count(primaryHandlerGuidance, "--resume handler") != 1 {
 		t.Fatalf("handler role text states the wait rule %d times", n)
 	}
 	browser, err := os.ReadFile("../../../client/project-handler.js")

@@ -197,9 +197,11 @@ const handlerEvidenceRule = "Record a recurrence, log reference or other evidenc
 // as a structured queue wait, which the hub answers with one notice to the
 // waiting lead, and what to do with a wait the hub hands back
 // (wi_44cabd7e6233bc1b, docs/project-queue.md). A pause that shares no path
-// is a pathless wait with --reason (wi_8237a5d578808c82). The browser handler
-// prompt in client/project-handler.js carries the same sentences.
-const handlerWaitRule = "Shared-path sequencing: when one team must wait for a path another team owns, record a structured wait with tt team queue wait set --entry WAITING_ENTRY --on PREDECESSOR_ENTRY --owns PATH --until accepted|done|released, not only a sequencing note; the hub then tells the waiting lead once when the condition is met. For a pause that shares no path, such as a quiet host for a release, use --reason TEXT in place of --owns PATH. When the hub reports a wait that needs a handler decision, clear it with tt team queue wait clear --entry WAITING_ENTRY --on PREDECESSOR_ENTRY and tell the waiting lead, or set a new wait."
+// is a pathless wait with --reason (wi_8237a5d578808c82). A handler-gated
+// wait (--resume handler, wi_99ce2fa485c23648) starts only on the handler's
+// explicit resume (wi_bca175343bbeeaf0). The browser handler prompt in
+// client/project-handler.js carries the same sentences.
+const handlerWaitRule = "Shared-path sequencing: when a team waits on another team's path, run tt team queue wait set --entry tqe_WAITING --on tqe_PREDECESSOR --owns PATH --until accepted|done|released, not only a note; the hub tells the waiting lead once it is met. A pathless pause (a quiet host) uses --reason TEXT for --owns PATH. Add --resume handler when the team must await your own checks: its met notice never starts work, so after them send the lead an explicit resume and clear the wait. If the hub says a wait needs your decision, run tt team queue wait clear --entry tqe_WAITING --on tqe_PREDECESSOR and tell the lead, or set a new wait."
 
 // The rules below apply to every Database handler, including an
 // owner-provisioned auxiliary (leased arm) handler working on its one leased
