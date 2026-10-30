@@ -895,6 +895,9 @@ export function checkClean(cwd, commit) {
 // wi_de301820aa1e91f9: lsof on a loaded host has run past 5 s (10-13 and
 // 10-24 matrix logs), so a timed-out probe is retried before the check is
 // refused. Any other probe error still refuses it at once.
+// wi_2312ac12c995f590: lsof stats every mount and blocked 42 s on a hung NFS
+// automount, so it runs with -b (no blocking kernel calls) and -w (which
+// drops the warnings -b writes, so a free port still has empty stderr).
 export const PORT_PROBE_TIMEOUT_MS = 10000;
 export const PORT_PROBE_ATTEMPTS = 3;
 // Port and timeout policy is included in the approved command environment,
@@ -909,7 +912,7 @@ export function occupiedPorts(check, run = spawnSync) {
   return ports.flatMap((port) => {
     let probe;
     for (let attempt = 1; attempt <= PORT_PROBE_ATTEMPTS; attempt++) {
-      probe = run("lsof", ["-nP", "-iTCP:" + port, "-sTCP:LISTEN", "-Fp"], {
+      probe = run("lsof", ["-b", "-w", "-nP", "-iTCP:" + port, "-sTCP:LISTEN", "-Fp"], {
         encoding: "utf8",
         timeout: PORT_PROBE_TIMEOUT_MS,
       });
@@ -2263,7 +2266,8 @@ export function verifierHomeProcesses(home, probes = {}) {
   for (const [pid, entry] of table)
     if (underRoots(roots, entry.command.split(" ")[0])) add(pid, "argv");
   let pid = 0;
-  for (const line of run("lsof", ["-nP", "-w", "-u", String(uid), "-F", "pn"]).split("\n")) {
+  // -b: never block on a hung mount (wi_2312ac12c995f590, see occupiedPorts).
+  for (const line of run("lsof", ["-b", "-nP", "-w", "-u", String(uid), "-F", "pn"]).split("\n")) {
     if (line[0] === "p") pid = Number(line.slice(1));
     else if (line[0] === "n" && underRoots(roots, line.slice(1))) add(pid, "file");
   }

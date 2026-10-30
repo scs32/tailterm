@@ -1255,7 +1255,7 @@ test("bundle v7 an unreadable environ is skipped only for a process that started
   assert.deepEqual(sweep.calls, [
     "ps -axww -o pid=,ppid=,uid=,command=",
     "ps -o pid=,etimes= -p 700,701,500",
-    `lsof -nP -w -u 501 -F pn`,
+    `lsof -b -nP -w -u 501 -F pn`,
   ]);
   // No unreadable process: no second ps.
   sweep = linuxSweep(t, { 711: { environ: () => "HOME=/somewhere/else\0" } });

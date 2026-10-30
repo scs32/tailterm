@@ -1241,7 +1241,7 @@ test("a timed-out port owner probe is retried and any other probe error refuses 
   assert.equal(retried.calls.length, 2);
   for (const call of retried.calls) {
     assert.equal(call.command, "lsof");
-    assert.deepEqual(call.args, ["-nP", "-iTCP:4173", "-sTCP:LISTEN", "-Fp"]);
+    assert.deepEqual(call.args, ["-b", "-w", "-nP", "-iTCP:4173", "-sTCP:LISTEN", "-Fp"]);
     assert.equal(call.options.timeout, 10000);
   }
   const free = probes(timedOut, { status: 1, stdout: "", stderr: "" });
@@ -1260,6 +1260,46 @@ test("a timed-out port owner probe is retried and any other probe error refuses 
   });
   assert.throws(() => occupiedPorts(check, missing.run), /^Error: Port owner inspection unavailable: spawnSync lsof ENOENT$/);
   assert.equal(missing.calls.length, 1, "only a timeout is retried");
+});
+
+// wi_2312ac12c995f590: plain lsof stats every mount and blocked 42 s on a
+// hung NFS automount, so both matrix lsof calls pass -b. The port probe also
+// passes -w, since -b otherwise writes warnings that would make a free port
+// (status 1, empty stdout and stderr) read as a failed probe.
+test("matrix lsof calls pass -b so a hung mount cannot block them", (t) => {
+  const check = {
+    id: "fixture-browser",
+    environment: { VERIFICATION_TIMEOUT_MS: "1000", VERIFICATION_REQUIRED_PORTS: "4173" },
+  };
+  const portCalls = [];
+  const free = (command, args, options) => {
+    portCalls.push({ command, args, options });
+    return { status: 1, stdout: "", stderr: "" };
+  };
+  assert.deepEqual(occupiedPorts(check, free), []);
+  assert.equal(portCalls.length, 1);
+  assert.equal(portCalls[0].command, "lsof");
+  assert.ok(portCalls[0].args.includes("-b"), "port probe passes -b");
+  assert.ok(portCalls[0].args.includes("-w"), "port probe passes -w");
+  assert.equal(portCalls[0].options.timeout, matrixRunner.PORT_PROBE_TIMEOUT_MS);
+
+  const home = tempDir(t, "lsof-b-home-");
+  const sweepCalls = [];
+  const found = matrixRunner.verifierHomeProcesses(home, {
+    platform: "linux",
+    uid: 501,
+    self: 500,
+    readEnviron: () => "HOME=/somewhere/else\0",
+    run: (command, args) => {
+      sweepCalls.push({ command, args });
+      if (command === "lsof") return `p700\nn${join(home, "held.log")}\np701\nn/elsewhere\n`;
+      return "500 1 501 node runner\n700 1 501 holder\n701 1 501 other\n";
+    },
+  });
+  assert.deepEqual(found, [{ pid: 700, reasons: ["file"], command: "holder" }]);
+  const sweep = sweepCalls.filter((call) => call.command === "lsof");
+  assert.equal(sweep.length, 1);
+  assert.deepEqual(sweep[0].args, ["-b", "-nP", "-w", "-u", "501", "-F", "pn"]);
 });
 
 test("matrix timeout kills its own process group descendants and retains failed receipt evidence", async (t) => {
