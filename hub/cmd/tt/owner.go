@@ -157,11 +157,13 @@ func cmdOwnerIntervene(e env, args []string) error {
 	if m.Intervention != nil && m.Intervention.ProductItemID != "" {
 		link = "product fix " + m.Intervention.ProductItemID
 	}
-	recorded := req.Actor
+	// An older hub drops --actor and replies without one; say so rather than
+	// echo the requested actor as if the hub had stored it.
+	by := "actor not recorded"
 	if m.Intervention != nil && m.Intervention.Actor != "" {
-		recorded = m.Intervention.Actor
+		by = "by " + m.Intervention.Actor
 	}
-	fmt.Printf("intervention #%d recorded: %s on %s by %s (%s)\n", m.Seq, req.Kind, req.ItemID, recorded, link)
+	fmt.Printf("intervention #%d recorded: %s on %s %s (%s)\n", m.Seq, req.Kind, req.ItemID, by, link)
 	return nil
 }
 

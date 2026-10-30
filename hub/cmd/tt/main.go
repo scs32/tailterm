@@ -68,7 +68,7 @@ Commands
                                read Board history in pages: tt inbox --board --after N --limit 200, one call at a time; --seq is for one message
   context [--json]             print this exact run's bound work-item context
   owner extend|answer|cancel OBLIGATION_ID ...  the owner's controls over an obligation
-  owner intervene --task ID --kind K --item ID [--product-item ID] --text T  record an owner intervention
+  owner intervene --task ID --kind K --item ID [--product-item ID] --text T [--actor owner|helper]  record an owner intervention
   owner interventions --task ID [--tz ZONE]  owner interventions per day and kind
   operational-record get       read a legacy operational record (writes retired in phase 3)
   current-assignment [--item ID --action-key KEY] [--json]  read a legacy directive

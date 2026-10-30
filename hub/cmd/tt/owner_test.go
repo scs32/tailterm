@@ -298,6 +298,32 @@ func TestOwnerInterveneActorFollowsSession(t *testing.T) {
 	}
 }
 
+// A hub older than the actor drops --actor and replies without one: the line
+// says the actor was not recorded, never echoes the requested value.
+func TestOwnerInterveneSaysActorNotRecordedOnOlderHub(t *testing.T) {
+	for _, tc := range []struct{ name, reply string }{
+		{"intervention without actor", `{"seq":9,"intervention":{"kind":"decision-on-behalf","itemTaskId":"tsk_0000000000000001","itemId":"wi_0000000000000001"}}`},
+		{"no intervention", `{"seq":9}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plainTerminal(t)
+			t.Setenv("CLAUDE_CODE_SESSION_ID", "session-under-test")
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(tc.reply))
+			}))
+			t.Cleanup(srv.Close)
+			out, err := captureCLIOutput(t, func() error {
+				return cmdOwner(env{hub: srv.URL, task: "tsk_0000000000000001"}, []string{"intervene", "--kind", "decision-on-behalf",
+					"--item", "wi_0000000000000001", "--text", "Chose the release window", "--actor", "helper"})
+			})
+			if err != nil || out != "intervention #9 recorded: decision-on-behalf on wi_0000000000000001 actor not recorded (no product item)\n" {
+				t.Fatalf("older hub: %q %v", out, err)
+			}
+		})
+	}
+}
+
 func TestOwnerInterventionsPrintsActorSplit(t *testing.T) {
 	plainTerminal(t)
 	e, c, task, _ := cliWorkItemFixture(t)
