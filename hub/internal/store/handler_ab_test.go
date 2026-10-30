@@ -1611,9 +1611,14 @@ func TestHandlerProvisionAbandonedRegisteredHandlerStillCounts(t *testing.T) {
 	got := listedEntry(t, f.s, f.task.ID, q.ID)
 	stuckFix := "tt retire --task " + f.task.ID + " handler-stuck"
 	if got.HandlerNeed == nil || got.HandlerNeed.Provision || got.HandlerNeed.Handlers != 4 || got.HandlerNeed.Fix != stuckFix ||
-		!strings.HasPrefix(got.BlockReason, "Waiting for a free handler of arm S: 3 of 4 leased, limit 4; the limit already has its handlers, and handler-stuck is offline. ") ||
-		!strings.HasSuffix(got.BlockReason, "Fix: "+stuckFix) {
+		!strings.HasPrefix(got.HandlerNeed.Reason, "3 of 4 leased, limit 4; the limit already has its handlers, and handler-stuck is offline. ") ||
+		!strings.HasSuffix(got.HandlerNeed.Reason, "Fix: "+stuckFix) {
 		t.Fatalf("stuck handler need %+v %q", got.HandlerNeed, got.BlockReason)
+	}
+	// The holders have had nothing running past the stall grace, and the
+	// wait asks a person to act, so it stalls behind one and keeps the need.
+	if want := f.armStall(t, got, armWaitReason("S")+": "+got.HandlerNeed.Reason); got.BlockReason != want {
+		t.Fatalf("stuck handler reason:\n got %s\nwant %s", got.BlockReason, want)
 	}
 	if _, err := f.provision(got, "after-stuck", api.NewID("agt"), armS, digestP); !errors.Is(err, api.ErrConflict) {
 		t.Fatalf("provision on top of a stuck handler: %v", err)
@@ -2027,6 +2032,7 @@ func TestHandlerProvisionStopsAfterThreeNeverRegisteredAttempts(t *testing.T) {
 	want := "Waiting for a free handler of arm S: 3 of 3 leased, limit 4; cannot add one: 3 automatic attempts for this entry reserved a handler on mini that never came online (last " + offered[2] +
 		") and the ceiling is 3, so the hub adds no more and automatic attempts do not resume for this entry. An operator must diagnose the handler launch on mini: run tt doctor there, and check that the saved launch spec's run command starts a handler and what the team queue runner logged for it. " +
 		"To add a handler by hand, set up a database handler (Projects → Set up database handler) or resume a retired one with tt resume NAME, in project " + f.task.ID + ". The entry leases a handler of arm S as soon as one is free"
+	want = f.armStall(t, stopped, want)
 	if stopped.BlockReason != want {
 		t.Fatalf("reason at the ceiling:\n got %s\nwant %s", stopped.BlockReason, want)
 	}
@@ -2212,6 +2218,26 @@ func ceilingTail(task string) string {
 		". The entry leases a handler of arm S as soon as one is free"
 }
 
+// armStall is an entry's reason once the stall grace has passed and its arm
+// wait asks a person to act: every arm-S handler is leased by a claimed entry
+// with nothing running, so it stalls behind one of them, naming it, and keeps
+// the wait's reason and fix after the arm text (wi_dbb1529b84b724ae f1).
+func (f *provisionFixture) armStall(t *testing.T, got api.TeamQueueEntry, wait string) string {
+	t.Helper()
+	s := got.Stall
+	if s == nil || s.Cause != api.StallNothingRunning || !strings.HasPrefix(wait, armWaitReason("S")+": ") {
+		t.Fatalf("arm wait stall %+v for %q: %q", s, wait, got.BlockReason)
+	}
+	for _, h := range f.entries {
+		if h.ID == s.BlockerEntryID && h.HandlerID != "" && strings.Contains(s.Fix, "tt team queue fail --task "+f.task.ID+" --entry "+h.ID) {
+			return "Stalled: " + h.ID + " (" + h.ItemID + "): " + stallCauseText[api.StallNothingRunning] + ". Fix: " + s.Fix +
+				". It waits for a free handler of arm S" + strings.TrimPrefix(wait, armWaitReason("S"))
+		}
+	}
+	t.Fatalf("stall %+v does not name a claimed holder", s)
+	return ""
+}
+
 // p1, p5 (wi_a3c581cb936faaaf): a provisioned handler that comes online and
 // then exits, is closed or is retired counts toward the ceiling, whether its
 // reservation was saved registered or abandoned, so the replacement loop
@@ -2270,6 +2296,7 @@ func TestHandlerProvisionCeilingStopsHandlersThatComeOnlineThenStop(t *testing.T
 	want := "Waiting for a free handler of arm S: 3 of 3 leased, limit 4; cannot add one: 3 automatic attempts for this entry reserved a handler on mini that came online and later exited, was closed or was retired (last " + offered[2] +
 		") and the ceiling is 3, so the hub adds no more and automatic attempts do not resume for this entry. An operator must find out why the handler on mini stopped after it came online: run tt doctor there, and check what the handler's session and the team queue runner logged for it." +
 		ceilingTail(f.task.ID)
+	want = f.armStall(t, got, want)
 	if got.BlockReason != want {
 		t.Fatalf("reason at the ceiling:\n got %s\nwant %s", got.BlockReason, want)
 	}
@@ -2293,7 +2320,7 @@ func TestHandlerProvisionLateOnlineIsNotNeverCameOnline(t *testing.T) {
 	never := "Waiting for a free handler of arm S: 3 of 3 leased, limit 4; cannot add one: 3 automatic attempts for this entry reserved a handler on mini that never came online (last " + offered[2] +
 		") and the ceiling is 3, so the hub adds no more and automatic attempts do not resume for this entry. An operator must diagnose the handler launch on mini: run tt doctor there, and check that the saved launch spec's run command starts a handler and what the team queue runner logged for it." +
 		ceilingTail(f.task.ID)
-	if got := listedEntry(t, f.s, f.task.ID, id); got.BlockReason != never {
+	if got := listedEntry(t, f.s, f.task.ID, id); got.BlockReason != f.armStall(t, got, never) {
 		t.Fatalf("before the late registration:\n got %s\nwant %s", got.BlockReason, never)
 	}
 	if err := withTx(f.s, func(tx *sql.Tx) error { return settleHandlerProvisions(ctx, tx, f.task.ID, f.s.now()) }); err != nil {
@@ -2321,7 +2348,7 @@ func TestHandlerProvisionLateOnlineIsNotNeverCameOnline(t *testing.T) {
 	want := "Waiting for a free handler of arm S: 3 of 3 leased, limit 4; cannot add one: 3 automatic attempts for this entry reserved a handler on mini, of which 2 never came online and 1 came online and later exited, was closed or was retired (last " + offered[2] +
 		", which came online) and the ceiling is 3, so the hub adds no more and automatic attempts do not resume for this entry. An operator must find out why the handler on mini stopped after it came online: run tt doctor there, and check what the handler's session and the team queue runner logged for it." +
 		ceilingTail(f.task.ID)
-	if got.BlockReason != want || got.HandlerNeed == nil || got.HandlerNeed.Provision {
+	if got.HandlerNeed == nil || got.HandlerNeed.Provision || got.BlockReason != f.armStall(t, got, want) {
 		t.Fatalf("after the late handler closed %+v:\n got %s\nwant %s", got.HandlerNeed, got.BlockReason, want)
 	}
 	if f.rows(t, "abandoned") != 3 || f.allRows(t) != 3 || f.notices(t, provisionNotice) != 3 {
