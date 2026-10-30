@@ -544,6 +544,8 @@ export function batchCandidates(jobs,lead,solo=new Set()){
   if(!Number.isSafeInteger(at) || solo.has(lead.id))return [];
   return jobs.filter(j=>j.state==="verified" && !j.agentId && Number.isSafeInteger(j.rowId) && j.rowId>at && j.pauseGeneration===lead.pauseGeneration && sha(j.baseCommit) && j.baseCommit===lead.baseCommit && !solo.has(j.id)).sort((a,b)=>a.rowId-b.rowId);
 }
+// The release states that are settled; a settled job is never passed over.
+const SETTLED_STATES=new Set(["released","rolled_back","refused","superseded"]);
 // Why each active job queued after the lead that batchCandidates leaves out
 // cannot join (wi_861ff5962b9bb478 e4), one reason each, in queue order: it is
 // claimed, not verified (held, merged, blocked), of another pause generation
@@ -553,7 +555,7 @@ export function batchCandidates(jobs,lead,solo=new Set()){
 export function batchPassedOver(jobs,lead,solo=new Set()){
   const at=jobs.find(j=>j.id===lead?.id)?.rowId;
   if(!Number.isSafeInteger(at))return {queue:[],excluded:[]};
-  const after=jobs.filter(j=>Number.isSafeInteger(j.rowId) && j.rowId>at).sort((a,b)=>a.rowId-b.rowId),excluded=[];
+  const after=jobs.filter(j=>Number.isSafeInteger(j.rowId) && j.rowId>at && !SETTLED_STATES.has(j.state)).sort((a,b)=>a.rowId-b.rowId),excluded=[];
   for(const j of after){
     const reason=solo.has(lead.id)?"batch-lead-solo":j.agentId?"batch-claimed":j.state!=="verified"?"batch-not-verified":j.pauseGeneration!==lead.pauseGeneration?"batch-other-generation":!sha(j.baseCommit) || j.baseCommit!==lead.baseCommit?"batch-other-base":solo.has(j.id)?"batch-solo":"";
     if(reason)excluded.push({jobId:j.id,reason});

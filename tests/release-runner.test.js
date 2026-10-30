@@ -719,7 +719,9 @@ test("batch20 every active job after the lead that cannot join has one pre-read 
   {id:"rel_joins",rowId:5,state:"verified",pauseGeneration:1,baseCommit:base},
   {id:"rel_gen",rowId:6,state:"verified",pauseGeneration:2,baseCommit:base},
   {id:"rel_base",rowId:7,state:"verified",pauseGeneration:1,baseCommit:"c".repeat(40)},
-  {id:"rel_solo",rowId:8,state:"verified",pauseGeneration:1,baseCommit:base}];
+  {id:"rel_solo",rowId:8,state:"verified",pauseGeneration:1,baseCommit:base},
+  // Settled jobs after the lead are not active: none is passed over or queued.
+  ...["released","rolled_back","refused","superseded"].map((state,i)=>({id:"rel_settled_"+state,rowId:9+i,state,pauseGeneration:1,baseCommit:base}))];
  const solo=new Set(["rel_solo"]),out=batchPassedOver(jobs,lead,solo);
  assert.deepEqual(out.queue,["rel_claimed","rel_held","rel_joins","rel_gen","rel_base","rel_solo"]);
  assert.deepEqual(out.excluded,[{jobId:"rel_claimed",reason:"batch-claimed"},{jobId:"rel_held",reason:"batch-not-verified"},{jobId:"rel_gen",reason:"batch-other-generation"},{jobId:"rel_base",reason:"batch-other-base"},{jobId:"rel_solo",reason:"batch-solo"}]);
