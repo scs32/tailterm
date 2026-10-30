@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -401,7 +402,11 @@ func TestToolLedgerOneRowPerCall(t *testing.T) {
 		t.Fatalf("rows after one call = %v", rows)
 	}
 	digest, _ := rows[0]["argsDigest"].(string)
-	want := map[string]any{"v": float64(1), "time": rows[0]["time"], "task": "tsk_ledger", "agent": "agt_ledger", "run": "run_ledger", "session": "s1", "tool": "Bash", "toolUseId": "u1", "argsDigest": digest, "outcome": "ok", "durationMs": float64(1234), "durationSource": "claude"}
+	// go test is a verification command (feature wi_95d33b4e3248bac5); the
+	// payload's cwd is no repository, so there is no commit.
+	evidence := map[string]any{"kinds": []any{"go-test"}, "command": "go test ./...", "exitCode": float64(0), "exitSource": "success",
+		"outputDigest": fmt.Sprintf("%x", sha256.Sum256([]byte("ok\x00"))), "outputSource": "stdout+stderr"}
+	want := map[string]any{"v": float64(1), "time": rows[0]["time"], "task": "tsk_ledger", "agent": "agt_ledger", "run": "run_ledger", "session": "s1", "tool": "Bash", "toolUseId": "u1", "argsDigest": digest, "outcome": "ok", "durationMs": float64(1234), "durationSource": "claude", "evidence": evidence}
 	if fmt.Sprint(rows[0]) != fmt.Sprint(want) || !toolDigestRE.MatchString(digest) {
 		t.Fatalf("row = %v\nwant  %v", rows[0], want)
 	}
@@ -1546,5 +1551,572 @@ func TestToolLedgerRedactionOffChangesNothing(t *testing.T) {
 				t.Fatalf("the row with redaction off is not the ledger's own row: %d rows", len(rows))
 			}
 		})
+	}
+}
+
+// Verification evidence (feature wi_95d33b4e3248bac5).
+
+// evidenceRepo makes a git repository with one commit and returns its path
+// and HEAD. Extra arguments go to git init.
+func evidenceRepo(t *testing.T, dir string, initArgs ...string) (string, string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	gitFixtureCommand(t, dir, append([]string{"init", "-q", "-b", "main"}, initArgs...)...)
+	evidenceCommit(t, dir, "base")
+	return dir, gitFixtureCommand(t, dir, "rev-parse", "HEAD")
+}
+
+func evidenceCommit(t *testing.T, dir, message string) string {
+	t.Helper()
+	gitFixtureCommand(t, dir, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", message)
+	return gitFixtureCommand(t, dir, "rev-parse", "HEAD")
+}
+
+func evidenceBash(id, command, cwd string) map[string]any {
+	return map[string]any{"session_id": "s1", "tool_use_id": id, "tool_name": "Bash", "tool_input": map[string]any{"command": command}, "cwd": cwd}
+}
+
+func evidenceWith(fields map[string]any, extra map[string]any) map[string]any {
+	out := map[string]any{}
+	for k, v := range fields {
+		out[k] = v
+	}
+	for k, v := range extra {
+		out[k] = v
+	}
+	return out
+}
+
+func evidenceOf(t *testing.T, row map[string]any) map[string]any {
+	t.Helper()
+	ev, ok := row["evidence"].(map[string]any)
+	if !ok {
+		t.Fatalf("row has no evidence: %v", row)
+	}
+	return ev
+}
+
+func evidenceDigest(parts ...string) string {
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(strings.Join(parts, "\x00"))))
+}
+
+// a2: the classifier's table. Only the listed verification commands count;
+// quoted text, arguments, nested shells and other commands do not.
+func TestToolLedgerEvidenceClassify(t *testing.T) {
+	nested := strings.Repeat("$(", toolDenyMaxNest+2) + "go test ./x" + strings.Repeat(")", toolDenyMaxNest+2)
+	for _, c := range []struct{ command, want string }{
+		{"go test ./x -count=1", "go-test"},
+		{"go vet ./...", "go-vet"},
+		{"go -C hub test ./cmd/tt", "go-test"},
+		{"go -C=hub vet ./...", "go-vet"},
+		{"/usr/local/go/bin/go test ./...", "go-test"},
+		{"npm test", "npm-test"},
+		{"npm t", "npm-test"},
+		{"npm run test", "npm-test"},
+		{"npm run test:unit", "npm-test"},
+		{"npm run-script test", "npm-test"},
+		{"npm --prefix hub test", "npm-test"},
+		{"pnpm test", "npm-test"},
+		{"yarn test", "npm-test"},
+		{"bun test", "npm-test"},
+		{"node --test tests/a.test.js", "node-test"},
+		{"node --test", "node-test"},
+		{"node --import tsx --test tests/a.test.ts", "node-test"},
+		{"node scripts/verify-matrix.mjs run plan.json /tmp/logs", "verify-matrix"},
+		{"./scripts/verify-matrix.mjs run plan.json /tmp/logs", "verify-matrix"},
+		{"node scripts/verify-matrix-host-lock.mjs exec --item X --timeout-minutes 10 --record /r -- go test ./x", "go-test"},
+		{"node scripts/verify-matrix-host-lock.mjs exec --item X -- npm test", "npm-test"},
+		{"node scripts/verify-matrix-host-lock.mjs exec -- node scripts/verify-matrix-host-lock.mjs exec -- go vet ./...", "go-vet"},
+		{"env X=1 go test ./x", "go-test"},
+		{"X=1 Y=2 go test ./x", "go-test"},
+		{"timeout 30m go test ./x", "go-test"},
+		{"time go test ./x", "go-test"},
+		{"nice -n 5 go vet ./...", "go-vet"},
+		{"cd hub && go test ./cmd/tt", "go-test"},
+		{"go test ./x 2>&1 | tail -30", "go-test"},
+		{"go vet ./... && go test ./... && npm test", "go-vet,go-test,npm-test"},
+		{"go test ./a; go test ./b", "go-test"},
+		{"out=$(go test ./x)", "go-test"}, // a substitution runs
+		// None of these runs a verification command.
+		{"node scripts/verify-matrix-host-lock.mjs status", ""},
+		{"node scripts/verify-matrix-host-lock.mjs exec --item X", ""},
+		{"node scripts/verify-matrix-host-lock.mjs run plan.json", ""},
+		{"node tests/a.js --test", ""},
+		{"node -e 'x' --test", ""},
+		{"node --check scripts/verify-matrix.mjs", ""},
+		{`echo "go test"`, ""},
+		{`pkill -f "go test"`, ""},
+		{`grep -n "npm test" docs/a.md`, ""},
+		{"bash -c 'go test ./x'", ""},
+		{"sh -c 'npm test'", ""},
+		{"eval go test ./x", ""},
+		{"go build ./...", ""},
+		{"go testx", ""},
+		{"npm run build", ""},
+		{"npm install", ""},
+		{"git commit -m 'go test'", ""},
+		{"cat <<'EOF'\ngo test ./x\nEOF", ""},
+		{nested, ""},
+		{"go test ./x; " + strings.Repeat("a", toolDenyMaxCommand), ""},
+		{"", ""},
+	} {
+		got := strings.Join(toolEvidenceKinds(c.command, toolDenyMaxCommand), ",")
+		if got != c.want {
+			t.Errorf("toolEvidenceKinds(%.80q) = %q; want %q", c.command, got, c.want)
+		}
+	}
+	// The cap is the hook's: a command at it is classified, one byte over is not.
+	at := "go test ./x #" + strings.Repeat("a", toolDenyMaxCommand-len("go test ./x #"))
+	if got := toolEvidenceKinds(at, toolDenyMaxCommand); len(got) != 1 || len(toolEvidenceKinds(at+"a", toolDenyMaxCommand)) != 0 {
+		t.Fatalf("at the cap = %v", got)
+	}
+}
+
+// a4: the commit read from files matches git rev-parse HEAD in a plain
+// repository and a subdirectory, a linked worktree, packed refs, a detached
+// HEAD and a SHA-256 repository; no repository, an unborn branch, a relative
+// cwd and a broken HEAD give none.
+func TestToolLedgerEvidenceCommit(t *testing.T) {
+	base := t.TempDir()
+	repo, head := evidenceRepo(t, filepath.Join(base, "repo"))
+	sub := filepath.Join(repo, "a", "b")
+	if err := os.MkdirAll(sub, 0700); err != nil {
+		t.Fatal(err)
+	}
+	wt := filepath.Join(base, "wt")
+	gitFixtureCommand(t, repo, "worktree", "add", "-q", "-b", "side", wt)
+	wtHead := evidenceCommit(t, wt, "side")
+	packed, _ := evidenceRepo(t, filepath.Join(base, "packed"))
+	packedHead := evidenceCommit(t, packed, "second")
+	gitFixtureCommand(t, packed, "pack-refs", "--all")
+	if _, err := os.Stat(filepath.Join(packed, ".git", "refs", "heads", "main")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("loose ref still there after pack-refs: %v", err)
+	}
+	detached, first := evidenceRepo(t, filepath.Join(base, "detached"))
+	evidenceCommit(t, detached, "second")
+	gitFixtureCommand(t, detached, "checkout", "-q", "--detach", first)
+	sha256Repo, sha256Head := evidenceRepo(t, filepath.Join(base, "sha256"), "--object-format=sha256")
+	unborn := filepath.Join(base, "unborn")
+	if err := os.MkdirAll(unborn, 0700); err != nil {
+		t.Fatal(err)
+	}
+	gitFixtureCommand(t, unborn, "init", "-q")
+	garbage, _ := evidenceRepo(t, filepath.Join(base, "garbage"))
+	if err := os.WriteFile(filepath.Join(garbage, ".git", "HEAD"), []byte("not a ref\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	escape, _ := evidenceRepo(t, filepath.Join(base, "escape"))
+	if err := os.WriteFile(filepath.Join(escape, ".git", "HEAD"), []byte("ref: refs/../../../repo/.git/refs/heads/main\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct{ name, cwd, want string }{
+		{"plain", repo, head},
+		{"subdirectory", sub, head},
+		{"linked worktree", wt, wtHead},
+		{"main checkout beside a worktree", repo, head},
+		{"packed refs", packed, packedHead},
+		{"detached", detached, first},
+		{"sha256", sha256Repo, sha256Head},
+		{"no repository", t.TempDir(), ""},
+		{"unborn branch", unborn, ""},
+		{"garbage HEAD", garbage, ""},
+		{"ref outside refs", escape, ""},
+		{"relative cwd", "repo", ""},
+		{"empty cwd", "", ""},
+	} {
+		if c.want != "" {
+			if real := gitFixtureCommand(t, c.cwd, "rev-parse", "HEAD"); real != c.want {
+				t.Fatalf("%s: fixture HEAD %s, git rev-parse %s", c.name, c.want, real)
+			}
+		}
+		if got := toolEvidenceCommit(c.cwd); got != c.want {
+			t.Errorf("%s: commit = %q; want %q", c.name, got, c.want)
+		}
+	}
+	if len(sha256Head) != 64 || len(head) != 40 {
+		t.Fatalf("fixture ids %q %q are not SHA-256 and SHA-1", sha256Head, head)
+	}
+}
+
+// a1: a verification command's row holds the exact command, its exit code,
+// the digest of its output and the commit it ran at.
+func TestToolLedgerEvidenceRow(t *testing.T) {
+	e, root := toolLedgerSandbox(t)
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second) // the row is the subject here, not timing
+	setToolLedger(t, &toolRedactScanBudget, 30*time.Second)
+	repo, head := evidenceRepo(t, filepath.Join(t.TempDir(), "repo"))
+	command := "go test ./x -count=1"
+	call := evidenceBash("u1", command, repo)
+	toolHook(t, e, "PreToolUse", call)
+	toolHook(t, e, "PostToolUse", evidenceWith(call, map[string]any{"tool_response": map[string]any{"stdout": "ok  \tx\t0.1s\n", "stderr": "warn\n", "interrupted": false}}))
+	rows := toolLedgerRows(t, root, e.agent)
+	if len(rows) != 1 || rows[0]["outcome"] != "ok" {
+		t.Fatalf("rows = %v", rows)
+	}
+	want := map[string]any{"kinds": []any{"go-test"}, "command": command, "exitCode": float64(0), "exitSource": "success",
+		"outputDigest": evidenceDigest("ok  \tx\t0.1s\n", "warn\n"), "outputSource": "stdout+stderr", "commit": head, "commitSource": "pre"}
+	if got := evidenceOf(t, rows[0]); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("evidence = %v\nwant       %v", got, want)
+	}
+	for i, c := range []struct {
+		error string
+		code  float64
+	}{{"Exit code 3\nFAIL x 0.2s", 3}, {"Error: Exit code 128", 128}} {
+		call := evidenceBash(fmt.Sprintf("f%d", i), command, repo)
+		toolHook(t, e, "PreToolUse", call)
+		toolHook(t, e, "PostToolUseFailure", evidenceWith(call, map[string]any{"error": c.error}))
+		rows := toolLedgerRows(t, root, e.agent)
+		row := rows[len(rows)-1]
+		want := map[string]any{"kinds": []any{"go-test"}, "command": command, "exitCode": c.code, "exitSource": "error-text",
+			"outputDigest": evidenceDigest(c.error), "outputSource": "error", "commit": head, "commitSource": "pre"}
+		if got := evidenceOf(t, row); row["outcome"] != "error" || fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Fatalf("failure %q: row %v\nwant evidence %v", c.error, row, want)
+		}
+	}
+}
+
+// a2: any other Bash call and any other tool keep exactly the row they had,
+// and their pending entries hold no commit.
+func TestToolLedgerEvidenceOnlyVerification(t *testing.T) {
+	e, root := toolLedgerSandbox(t)
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second) // the rows are the subject here, not timing
+	repo, _ := evidenceRepo(t, filepath.Join(t.TempDir(), "repo"))
+	base := "agent,argsDigest,outcome,run,session,task,time,tool,toolUseId,v"
+	for i, c := range []struct {
+		tool  string
+		input map[string]any
+	}{
+		{"Bash", map[string]any{"command": "ls -la"}},
+		{"Bash", map[string]any{"command": `echo "go test ./x"`}},
+		{"Bash", map[string]any{"command": "bash -c 'go test ./x'"}},
+		{"Read", map[string]any{"file_path": filepath.Join(repo, "a.go")}},
+		{"Task", map[string]any{"command": "go test ./x", "prompt": "go test ./x"}},
+		{"mcp__x__bash", map[string]any{"command": "go test ./x"}},
+	} {
+		id := fmt.Sprintf("u%d", i)
+		call := map[string]any{"session_id": "s1", "tool_use_id": id, "tool_name": c.tool, "tool_input": c.input, "cwd": repo}
+		toolHook(t, e, "PreToolUse", call)
+		for _, entry := range toolPendingFiles(t, root, e.agent) {
+			data, err := os.ReadFile(filepath.Join(root, e.agent, "pending", entry.Name()))
+			if err != nil || bytes.Contains(data, []byte(`"commit"`)) {
+				t.Fatalf("%s %v pending entry %s: %v", c.tool, c.input, data, err)
+			}
+		}
+		toolHook(t, e, "PostToolUse", evidenceWith(call, map[string]any{"tool_response": map[string]any{"stdout": "x"}}))
+		rows := toolLedgerRows(t, root, e.agent)
+		if row := rows[len(rows)-1]; rowKeys(row) != base+"" && rowKeys(row) != "agent,argsDigest,durationMs,durationSource,outcome,run,session,task,time,tool,toolUseId,v" {
+			t.Errorf("%s %v row keys = %s", c.tool, c.input, rowKeys(row))
+		}
+	}
+	for _, row := range toolLedgerRows(t, root, e.agent) {
+		if _, ok := row["evidence"]; ok {
+			t.Errorf("row with evidence: %v", row)
+		}
+	}
+}
+
+// a3: no row or pending entry holds the output, the error text, the cwd,
+// the transcript path, the repository root or any path derived from them.
+func TestToolLedgerEvidenceStoresNoOutput(t *testing.T) {
+	e, root := toolLedgerSandbox(t)
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second) // the stored content is the subject here, not timing
+	setToolLedger(t, &toolRedactScanBudget, 30*time.Second)
+	repo, head := evidenceRepo(t, filepath.Join(t.TempDir(), "MARK-ROOT"))
+	cwd := filepath.Join(repo, "MARK-CWD")
+	if err := os.MkdirAll(cwd, 0700); err != nil {
+		t.Fatal(err)
+	}
+	wt := filepath.Join(filepath.Dir(repo), "MARK-WORKTREE")
+	gitFixtureCommand(t, repo, "worktree", "add", "-q", "-b", "side", wt)
+	markers := []string{"MARK-STDOUT", "MARK-STDERR", "MARK-ERROR", "MARK-CWD", "MARK-TRANSCRIPT", "MARK-ROOT", "MARK-WORKTREE", filepath.Dir(repo)}
+	command := "go test ./x -run TestEvidence -count=1"
+	call := func(id, dir string) map[string]any {
+		return evidenceWith(evidenceBash(id, command, dir), map[string]any{"transcript_path": "/MARK-TRANSCRIPT.jsonl"})
+	}
+	toolHook(t, e, "PreToolUse", call("u1", cwd))
+	toolHook(t, e, "PostToolUse", evidenceWith(call("u1", cwd), map[string]any{"tool_response": map[string]any{"stdout": "MARK-STDOUT", "stderr": "MARK-STDERR"}}))
+	toolHook(t, e, "PreToolUse", call("u2", wt))
+	toolHook(t, e, "PostToolUseFailure", evidenceWith(call("u2", wt), map[string]any{"error": "Exit code 1\nMARK-ERROR"}))
+	toolHook(t, e, "PostToolUseFailure", evidenceWith(call("u3", cwd), map[string]any{"error": "Exit code 130\nMARK-ERROR", "is_interrupt": true}))
+	toolHook(t, e, "PreToolUse", call("u4", cwd)) // stays pending
+	files := 0
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		files++
+		for _, marker := range markers {
+			if bytes.Contains(data, []byte(marker)) || strings.Contains(path, marker) {
+				t.Errorf("%s holds %s", path, marker)
+			}
+		}
+		return nil
+	})
+	if err != nil || files != 3 { // ledger, lock, one pending
+		t.Fatalf("read %d files, %v", files, err)
+	}
+	rows := toolLedgerRows(t, root, e.agent)
+	if len(rows) != 3 {
+		t.Fatalf("rows = %v", rows)
+	}
+	// Not vacuous: the evidence is there, the command whole, commits read.
+	if ev := evidenceOf(t, rows[0]); ev["command"] != command || ev["commit"] != head || ev["outputDigest"] != evidenceDigest("MARK-STDOUT", "MARK-STDERR") {
+		t.Fatalf("evidence = %v", ev)
+	}
+	if ev := evidenceOf(t, rows[1]); ev["commit"] != gitFixtureCommand(t, wt, "rev-parse", "HEAD") || ev["exitCode"] != float64(1) {
+		t.Fatalf("worktree evidence = %v", ev)
+	}
+}
+
+// a3: a secret in the command is stored as [redacted], groups A, B and C
+// alike, and every other byte as written. A command over 16 KiB has no text.
+func TestToolLedgerEvidenceRedactsCommand(t *testing.T) {
+	e, root := toolLedgerSandbox(t)
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second) // the stored text is the subject here, not timing
+	setToolLedger(t, &toolRedactScanBudget, 30*time.Second)
+	e.token = "hub-token-0123456789abcdefghij"
+	github := "ghp_" + strings.Repeat("aB3dE6", 6)
+	assigned := "Zq8vLm2Rt5Wx9Kp3Nf7Hj"
+	long := "go test ./x -run " + strings.Repeat("A", toolEvidenceCommandBytes)
+	for i, c := range []struct {
+		command, want string
+		redacted      any
+		skip          any
+	}{
+		{"HUB=" + e.token + " go test ./x -count=1", "HUB=[redacted] go test ./x -count=1", float64(1), nil}, // group A
+		{"GH=" + github + " go test ./x -count=1", "GH=[redacted] go test ./x -count=1", float64(1), nil},    // group B
+		{"go test ./x -args password=" + assigned, "go test ./x -args password=[redacted]", float64(1), nil}, // group C
+		{"GH=" + github + " go test ./x -args password=" + assigned, "GH=[redacted] go test ./x -args password=[redacted]", float64(2), nil},
+		{"go test ./cmd/tt -run 'Ledger' -count=1", "go test ./cmd/tt -run 'Ledger' -count=1", nil, nil},
+		{long, "", nil, "oversize"},
+	} {
+		call := evidenceBash(fmt.Sprintf("u%d", i), c.command, "/no/repo")
+		toolHook(t, e, "PreToolUse", call)
+		toolHook(t, e, "PostToolUse", evidenceWith(call, map[string]any{"tool_response": map[string]any{"stdout": "ok"}}))
+		rows := toolLedgerRows(t, root, e.agent)
+		ev := evidenceOf(t, rows[len(rows)-1])
+		command, _ := ev["command"].(string)
+		if command != c.want || ev["commandRedacted"] != c.redacted || ev["commandSkip"] != c.skip || fmt.Sprint(ev["kinds"]) != "[go-test]" || ev["exitCode"] != float64(0) {
+			t.Errorf("command %.60q: evidence %v; want text %q, redacted %v, skip %v", c.command, ev, c.want, c.redacted, c.skip)
+		}
+	}
+	data, err := os.ReadFile(filepath.Join(root, e.agent, "ledger.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{e.token, github, assigned} {
+		if bytes.Contains(data, []byte(secret)) {
+			t.Errorf("ledger holds %s", secret)
+		}
+	}
+}
+
+// a3: a scan that runs out of its budget stores no text; the kinds, exit
+// code, digest and commit are still recorded.
+func TestToolLedgerEvidenceRedactTimeout(t *testing.T) {
+	e, root := toolLedgerSandbox(t)
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second) // the stored text is the subject here, not timing
+	setToolLedger(t, &toolRedactScanBudget, 0)            // already spent when the scan starts
+	repo, head := evidenceRepo(t, filepath.Join(t.TempDir(), "repo"))
+	call := evidenceBash("u1", "go test ./x -count=1", repo)
+	toolHook(t, e, "PreToolUse", call)
+	toolHook(t, e, "PostToolUseFailure", evidenceWith(call, map[string]any{"error": "Exit code 2\nbuild failed"}))
+	rows := toolLedgerRows(t, root, e.agent)
+	want := map[string]any{"kinds": []any{"go-test"}, "commandSkip": "timeout", "exitCode": float64(2), "exitSource": "error-text",
+		"outputDigest": evidenceDigest("Exit code 2\nbuild failed"), "outputSource": "error", "commit": head, "commitSource": "pre"}
+	if len(rows) != 1 || fmt.Sprint(evidenceOf(t, rows[0])) != fmt.Sprint(want) {
+		t.Fatalf("rows = %v\nwant evidence %v", rows, want)
+	}
+}
+
+// a4: the commit is HEAD when the command started, even when the command
+// moves HEAD; a post with no pre reads it at the post; outside a repository
+// there is none. The hook starts no process: git is not on its PATH.
+func TestToolLedgerEvidenceCommitAtStart(t *testing.T) {
+	e, root := toolLedgerSandbox(t)
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second) // the commit is the subject here, not timing
+	repo, first := evidenceRepo(t, filepath.Join(t.TempDir(), "repo"))
+	path := os.Getenv("PATH")
+	t.Setenv("PATH", t.TempDir())
+	git := func(args ...string) string {
+		os.Setenv("PATH", path)
+		defer os.Setenv("PATH", t.TempDir())
+		return gitFixtureCommand(t, repo, args...)
+	}
+	out := map[string]any{"tool_response": map[string]any{"stdout": "ok"}}
+	call := evidenceBash("u1", "go test ./... && git commit -qam next", repo)
+	toolHook(t, e, "PreToolUse", call)
+	git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", "moved")
+	second := git("rev-parse", "HEAD")
+	if second == first {
+		t.Fatal("HEAD did not move")
+	}
+	toolHook(t, e, "PostToolUse", evidenceWith(call, out))
+	toolHook(t, e, "PostToolUse", evidenceWith(evidenceBash("u2", "go test ./...", repo), out)) // no pre
+	toolHook(t, e, "PreToolUse", evidenceBash("u3", "go test ./...", t.TempDir()))
+	toolHook(t, e, "PostToolUse", evidenceWith(evidenceBash("u3", "go test ./...", t.TempDir()), out))
+	rows := toolLedgerRows(t, root, e.agent)
+	if len(rows) != 3 {
+		t.Fatalf("rows = %v", rows)
+	}
+	for i, want := range []struct{ commit, source any }{{first, "pre"}, {second, "post"}, {nil, nil}} {
+		if ev := evidenceOf(t, rows[i]); ev["commit"] != want.commit || ev["commitSource"] != want.source {
+			t.Errorf("row %d evidence = %v; want commit %v from %v", i, ev, want.commit, want.source)
+		}
+	}
+}
+
+// a5: an exit code only from a PostToolUse or an "Exit code N" failure.
+// Interrupted, background and other failures carry none.
+func TestToolLedgerEvidenceExitCode(t *testing.T) {
+	e, root := toolLedgerSandbox(t)
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second) // the fields are the subject here, not timing
+	for i, c := range []struct {
+		event  string
+		extra  map[string]any
+		code   any
+		source any
+		skip   any
+	}{
+		{"PostToolUseFailure", map[string]any{"error": "Exit code 3\nFAIL"}, float64(3), "error-text", nil},
+		{"PostToolUseFailure", map[string]any{"error": "Error: Exit code 128"}, float64(128), "error-text", nil},
+		{"PostToolUseFailure", map[string]any{"error": "Exit code 255"}, float64(255), "error-text", nil},
+		{"PostToolUseFailure", map[string]any{"error": "Exit code 256"}, nil, nil, nil},
+		{"PostToolUseFailure", map[string]any{"error": "Exit code 12abc"}, nil, nil, nil},
+		{"PostToolUseFailure", map[string]any{"error": "Exit code -1"}, nil, nil, nil},
+		{"PostToolUseFailure", map[string]any{"error": "exit 1"}, nil, nil, nil},
+		{"PostToolUseFailure", map[string]any{"error": "Command timed out after 2m 0s"}, nil, nil, nil},
+		{"PostToolUseFailure", map[string]any{"error": "Exit code 130\nInterrupted", "is_interrupt": true}, nil, nil, nil},
+		{"PostToolUseFailure", map[string]any{"error": 7}, nil, nil, "unreadable"},
+		{"PostToolUseFailure", map[string]any{}, nil, nil, "unreadable"},
+		{"PostToolUse", map[string]any{"tool_response": map[string]any{"stdout": 7}}, float64(0), "success", "unreadable"},
+		{"PostToolUse", map[string]any{"tool_response": "text"}, float64(0), "success", "unreadable"},
+	} {
+		call := evidenceBash(fmt.Sprintf("u%d", i), "go test ./x", "/no/repo")
+		toolHook(t, e, "PreToolUse", call)
+		toolHook(t, e, c.event, evidenceWith(call, c.extra))
+		rows := toolLedgerRows(t, root, e.agent)
+		ev := evidenceOf(t, rows[len(rows)-1])
+		if ev["exitCode"] != c.code || ev["exitSource"] != c.source || ev["outputSkip"] != c.skip || (c.skip == nil) == (ev["outputDigest"] == nil) {
+			t.Errorf("%s %v: evidence %v; want code %v from %v, skip %v", c.event, c.extra, ev, c.code, c.source, c.skip)
+		}
+	}
+	// A background start: what returned is the start, not the command's end.
+	call := evidenceBash("bg", "go test ./x", "/no/repo")
+	call["tool_input"] = map[string]any{"command": "go test ./x", "run_in_background": true}
+	toolHook(t, e, "PreToolUse", call)
+	toolHook(t, e, "PostToolUse", evidenceWith(call, map[string]any{"tool_response": map[string]any{"stdout": "", "backgroundTaskId": "b1"}}))
+	rows := toolLedgerRows(t, root, e.agent)
+	want := map[string]any{"kinds": []any{"go-test"}, "command": "go test ./x", "outputSkip": "background"}
+	if ev := evidenceOf(t, rows[len(rows)-1]); fmt.Sprint(ev) != fmt.Sprint(want) {
+		t.Fatalf("background evidence = %v; want %v", ev, want)
+	}
+	// Output past its budget is not decoded; a PostToolUse still means 0.
+	setToolLedger(t, &toolEvidenceOutputBudget, 0)
+	call = evidenceBash("late", "go test ./x", "/no/repo")
+	toolHook(t, e, "PostToolUse", evidenceWith(call, map[string]any{"tool_response": map[string]any{"stdout": "ok"}}))
+	rows = toolLedgerRows(t, root, e.agent)
+	if ev := evidenceOf(t, rows[len(rows)-1]); ev["outputSkip"] != "timeout" || ev["outputDigest"] != nil || ev["exitCode"] != float64(0) {
+		t.Fatalf("late evidence = %v", ev)
+	}
+	for _, c := range []struct {
+		text string
+		code int
+		ok   bool
+	}{{"Exit code 0", 0, true}, {"Exit code 1 ", 1, true}, {"Error: Exit code 2\r\n", 2, true}, {"Exit code 0001", 0, false}, {"Exit code ", 0, false}, {"Error: Error: Exit code 1", 0, false}, {"  Exit code 1", 0, false}} {
+		if code, ok := toolEvidenceExitCode(c.text); code != c.code || ok != c.ok {
+			t.Errorf("toolEvidenceExitCode(%q) = %d, %v", c.text, code, ok)
+		}
+	}
+}
+
+// a6: the hook contract holds for evidence calls: stdin held open and 4 MiB
+// of output return inside the bound, silently and with nil; the pending
+// entry stays within its 512 bytes, the commit dropped before the start.
+func TestToolLedgerEvidenceWithinBound(t *testing.T) {
+	repo, head := evidenceRepo(t, filepath.Join(t.TempDir(), "repo"), "--object-format=sha256")
+	call := evidenceBash("u1", "go test ./... -count=1", repo)
+	big := evidenceWith(call, map[string]any{"tool_response": map[string]any{"stdout": strings.Repeat("ok\tpkg\t0.1s\n", (4<<20)/12), "stderr": ""}})
+	var last toolHookRun
+	for attempt := 0; attempt < 3; attempt++ {
+		time.Sleep(time.Duration(attempt) * toolLedgerBound)
+		e, root := toolLedgerSandbox(t)
+		// Held stdin: half a pre, never closed.
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		pre := toolPayload("PreToolUse", call)
+		_, _ = w.WriteString(pre[:len(pre)/2])
+		held := runToolHook(t, e, "tool", "", r)
+		w.Close()
+		r.Close()
+		if held.err != nil || held.out != "" {
+			t.Fatalf("held stdin: %+v", held)
+		}
+		toolHook(t, e, "PreToolUse", call)
+		last = runToolHook(t, e, "tool", toolPayload("PostToolUse", big), nil)
+		if last.err != nil || last.out != "" {
+			t.Fatalf("4 MiB post = %v, output %q", last.err, last.out)
+		}
+		if held.elapsed >= toolLedgerBound || last.elapsed >= toolLedgerBound {
+			last.elapsed = max(last.elapsed, held.elapsed)
+			continue // a timing miss
+		}
+		rows := toolLedgerRows(t, root, e.agent)
+		if last.elapsed >= toolLedgerDeadline && len(rows) == 0 {
+			continue // reached its own deadline and dropped the row, by design
+		}
+		if len(rows) != 1 {
+			t.Fatalf("rows = %v", rows)
+		}
+		// The digest is only expected from a hook that decoded in time.
+		if ev := evidenceOf(t, rows[0]); ev["commit"] != head || ev["outputDigest"] == nil && ev["outputSkip"] != "timeout" {
+			t.Fatalf("evidence = %v", ev)
+		}
+		break
+	}
+	if last.elapsed >= toolLedgerBound {
+		t.Fatalf("hook took %v three times; want under %v", last.elapsed, toolLedgerBound)
+	}
+
+	// The pending entry: with a SHA-256 commit and ordinary ids it holds the
+	// commit; with ids at their 128-byte bound that JSON escapes to twice the
+	// length it would pass 512 bytes, so it is written without the commit and
+	// the post reads the commit itself.
+	e, root := toolLedgerSandbox(t)
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second)
+	long := evidenceWith(call, map[string]any{"session_id": strings.Repeat(`"`, 100), "tool_use_id": strings.Repeat("u", 128)})
+	toolHook(t, e, "PreToolUse", call)
+	toolHook(t, e, "PreToolUse", long)
+	withCommit := 0
+	for _, entry := range toolPendingFiles(t, root, e.agent) {
+		data, err := os.ReadFile(filepath.Join(root, e.agent, "pending", entry.Name()))
+		if err != nil || len(data) > toolLedgerPendingBytes {
+			t.Fatalf("pending entry of %d bytes: %v", len(data), err)
+		}
+		if bytes.Contains(data, []byte(head)) {
+			withCommit++
+		}
+	}
+	if withCommit != 1 || len(toolPendingFiles(t, root, e.agent)) != 2 {
+		t.Fatalf("%d of %d pending entries hold the commit; want 1 of 2", withCommit, len(toolPendingFiles(t, root, e.agent)))
+	}
+	toolHook(t, e, "PostToolUse", evidenceWith(long, map[string]any{"tool_response": map[string]any{"stdout": "ok"}}))
+	toolHook(t, e, "PostToolUse", evidenceWith(call, map[string]any{"tool_response": map[string]any{"stdout": "ok"}}))
+	rows := toolLedgerRows(t, root, e.agent)
+	if len(rows) != 2 || rows[0]["durationSource"] != "measured" || evidenceOf(t, rows[0])["commitSource"] != "post" || evidenceOf(t, rows[1])["commitSource"] != "pre" {
+		t.Fatalf("rows = %v", rows)
+	}
+	for _, row := range rows {
+		if evidenceOf(t, row)["commit"] != head {
+			t.Fatalf("row = %v", row)
+		}
 	}
 }

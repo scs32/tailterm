@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/sha256"
 	"encoding/json"
@@ -8,7 +9,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -39,6 +42,14 @@ import (
 // whose Bash command is a work-item write through tt, a non-GET call to the
 // hub or direct sqlite3 access to the hub database leaves one extra row per
 // rule, tagged with who ran it. It prints nothing and denies nothing.
+//
+// Verification evidence (feature wi_95d33b4e3248bac5) is local evidence
+// only. A Bash call that runs a recognised verification command (go test,
+// go vet, npm test, node --test, verify-matrix.mjs) gets one more field on
+// its own row: the command text with secrets replaced, the exit code Claude
+// Code reports, a SHA-256 of the output and the commit HEAD named when the
+// call started. The output, the cwd and the repository path are never
+// stored, and no process is started. See docs/claude-mods-evidence-capture.md.
 //
 // The owner helper's session has no agent identity in its environment. Its
 // calls are ledgered under the helper registered from that exact runtime
@@ -106,13 +117,17 @@ type toolLedger struct {
 	name   string // the agent's name, or the helper file's
 	helper bool   // the identity came from the owner helper's file
 	hub    string
+	// Verification evidence: the output is not decoded after this, from the start.
+	evidenceBudget time.Duration
 }
 
 // toolHookInput holds only the fields the ledger uses. tool_response, error
 // and transcript_path are skipped by the decoder and never kept. cwd is
 // kept raw, so a cwd of the wrong type cannot fail the decode, read as a
-// string for the owned-paths report and never stored. Secret redaction
-// decodes tool_response itself, and only when it is switched on.
+// string for the owned-paths report and the evidence commit and never
+// stored. Secret redaction decodes tool_response itself, and only when it is
+// switched on; verification evidence decodes tool_response or error itself,
+// only for a verification command's post, and stores only their digest.
 type toolHookInput struct {
 	Event       string          `json:"hook_event_name"`
 	Session     string          `json:"session_id"`
@@ -156,6 +171,8 @@ type toolLedgerRow struct {
 	ReportTag     string `json:"reportTag,omitempty"`
 	ReportSummary string `json:"reportSummary,omitempty"`
 	AgentName     string `json:"agentName,omitempty"`
+	// Only on the post row of a verification command (toolEvidenceKinds).
+	Evidence *toolEvidence `json:"evidence,omitempty"`
 }
 
 type toolLedgerPending struct {
@@ -164,6 +181,7 @@ type toolLedgerPending struct {
 	ToolUseID string `json:"toolUseId"`
 	Tool      string `json:"tool"`
 	Digest    string `json:"digest"`
+	Commit    string `json:"commit,omitempty"` // a verification command's HEAD at its start
 }
 
 // toolLedgerRoot is the directory holding one ledger directory per agent.
@@ -214,6 +232,7 @@ func toolLedgerHook(e env, _ []string) {
 		token: e.token, redactBudget: toolRedactScanBudget, redactMax: toolRedactMaxBytes, stdout: os.Stdout,
 		deny: toolDenyCheck, denyMax: toolDenyMaxCommand, scope: toolScopeCheck,
 		gate: toolGateOn, name: e.agentName, hub: os.Getenv("TAILTERM_HUB"),
+		evidenceBudget: toolEvidenceOutputBudget,
 	}
 	in := os.Stdin
 	done := make(chan struct{})
@@ -258,16 +277,23 @@ func (l toolLedger) record(in io.Reader) {
 	}
 	row.Session, row.Tool, row.ToolUseID = toolLedgerCut(p.Session), toolLedgerCut(p.Tool), toolLedgerCut(p.ToolUseID)
 	row.ArgsDigest = toolArgsDigest(p.Input)
+	// The cwd stays empty when it is absent or not a string. It is read,
+	// never stored.
+	var cwd string
+	_ = json.Unmarshal(p.Cwd, &cwd)
+	verify := l.evidenceInput(p.Tool, p.Input)
 	switch p.Event {
 	case "PreToolUse":
-		l.pre(row, p.Session)
+		commit := ""
+		if verify.kinds != nil {
+			commit = toolEvidenceCommit(cwd)
+		}
+		l.pre(row, p.Session, commit)
 		// After the pending entry is written, so the check cannot lose the pairing.
 		if l.deny != nil {
 			l.deny(l, row, p.Tool, p.Input)
 		}
 		if l.scope != nil {
-			var cwd string // stays empty when cwd is absent or not a string
-			_ = json.Unmarshal(p.Cwd, &cwd)
 			l.scope(l, row, p.Tool, p.Input, cwd)
 		}
 		return
@@ -299,6 +325,9 @@ func (l toolLedger) record(in io.Reader) {
 			ms = 0
 		}
 		row.DurationMs, row.DurationSource = &ms, "measured"
+	}
+	if verify.kinds != nil {
+		row.Evidence = l.evidence(verify, p, data, entry.Commit, cwd)
 	}
 	l.append(row)
 }
@@ -351,7 +380,11 @@ func toolPendingQueuePrefix(session string) string {
 // pre evicts what the bound requires, then records the call's start. While
 // the rows' writes fail nothing is removed, so once a batch of entries beyond
 // the bound has built up it records no start; its post still writes the row.
-func (l toolLedger) pre(row toolLedgerRow, session string) {
+//
+// commit is a verification command's HEAD. An entry too large with it is
+// written without it, so the start is still recorded and the post reads the
+// commit itself.
+func (l toolLedger) pre(row toolLedgerRow, session, commit string) {
 	if err := os.MkdirAll(l.pendingDir(), 0700); err != nil {
 		return
 	}
@@ -359,7 +392,12 @@ func (l toolLedger) pre(row toolLedgerRow, session string) {
 		return
 	}
 	start := l.now()
-	data, err := json.Marshal(toolLedgerPending{Start: start.UnixNano(), Session: row.Session, ToolUseID: row.ToolUseID, Tool: row.Tool, Digest: row.ArgsDigest})
+	entry := toolLedgerPending{Start: start.UnixNano(), Session: row.Session, ToolUseID: row.ToolUseID, Tool: row.Tool, Digest: row.ArgsDigest, Commit: commit}
+	data, err := json.Marshal(entry)
+	if err == nil && len(data) > toolLedgerPendingBytes && commit != "" {
+		entry.Commit = ""
+		data, err = json.Marshal(entry)
+	}
 	if err != nil || len(data) > toolLedgerPendingBytes {
 		return // the post still writes the row from its own input
 	}
@@ -595,4 +633,401 @@ func (l toolLedger) lock() func() {
 		}
 		time.Sleep(toolLedgerLockRetry)
 	}
+}
+
+// Verification evidence (feature wi_95d33b4e3248bac5): the command text, exit
+// code, output digest and commit of a recognised verification command, on
+// the call's own post row. Local evidence only.
+
+const (
+	toolEvidenceCommandBytes = 16 << 10 // longest command whose text is stored
+	toolEvidenceFileBytes    = 4 << 10  // largest .git, HEAD, ref or commondir file read
+	toolEvidencePackedBytes  = 8 << 20  // largest packed-refs file read
+	toolEvidenceRefDepth     = 5        // symbolic refs followed from HEAD
+	toolEvidenceWrappers     = 2        // host-lock exec wrappers looked through
+)
+
+// From the handler's start; after it the output is not decoded. A variable so
+// tests can change it; a hook call copies it before its goroutine starts.
+var toolEvidenceOutputBudget = 120 * time.Millisecond
+
+type toolEvidence struct {
+	Kinds           []string `json:"kinds"`
+	Command         string   `json:"command,omitempty"`
+	CommandRedacted int      `json:"commandRedacted,omitempty"`
+	CommandSkip     string   `json:"commandSkip,omitempty"` // oversize | timeout, only when no text
+	ExitCode        *int     `json:"exitCode,omitempty"`
+	ExitSource      string   `json:"exitSource,omitempty"` // success | error-text
+	OutputDigest    string   `json:"outputDigest,omitempty"`
+	OutputSource    string   `json:"outputSource,omitempty"` // stdout+stderr | error
+	OutputSkip      string   `json:"outputSkip,omitempty"`   // background | unreadable | timeout, only when no digest
+	Commit          string   `json:"commit,omitempty"`
+	CommitSource    string   `json:"commitSource,omitempty"` // pre | post
+}
+
+// toolEvidenceCall is what a Bash call's input says: the verification kinds
+// its command runs, none for every other call.
+type toolEvidenceCall struct {
+	kinds      []string
+	command    string
+	background bool
+}
+
+func (l toolLedger) evidenceInput(tool string, input json.RawMessage) toolEvidenceCall {
+	// As wouldDeny: a larger input cannot hold a command within the cap.
+	if tool != "Bash" || len(input) > 6*l.denyMax+4096 {
+		return toolEvidenceCall{}
+	}
+	var in struct {
+		Command    string          `json:"command"`
+		Background json.RawMessage `json:"run_in_background"`
+	}
+	if json.Unmarshal(input, &in) != nil {
+		return toolEvidenceCall{}
+	}
+	kinds := toolEvidenceKinds(in.Command, l.denyMax)
+	if kinds == nil {
+		return toolEvidenceCall{}
+	}
+	return toolEvidenceCall{kinds, in.Command, string(bytes.TrimSpace(in.Background)) == "true"}
+}
+
+// toolEvidenceKinds lists the verification kinds a command runs, each once
+// in first-seen order, or nil. It reads the simple commands the would-deny
+// parser finds, substitutions included, so quoted text and arguments are
+// never commands. Text given to a nested bash -c, sh -c or eval is not
+// followed. A command over max bytes, or one the parser cannot follow, has
+// none.
+func toolEvidenceKinds(command string, max int) []string {
+	if command == "" || len(command) > max {
+		return nil
+	}
+	p := toolDenyParser{s: command}
+	p.parse(0, 0, 0)
+	if p.failed {
+		return nil
+	}
+	var kinds []string
+	for _, words := range p.cmds {
+		kind := toolEvidenceKind(words, 0)
+		if kind != "" && !slices.Contains(kinds, kind) {
+			kinds = append(kinds, kind)
+		}
+	}
+	return kinds
+}
+
+// toolEvidenceKind classifies one simple command after its assignments and
+// wrapper commands are dropped.
+func toolEvidenceKind(words []string, wrapped int) string {
+	words = toolDenyCommandWords(words)
+	if len(words) == 0 {
+		return ""
+	}
+	name, args := toolDenyBase(words[0]), words[1:]
+	switch name {
+	case "go":
+		if len(args) > 1 && args[0] == "-C" {
+			args = args[2:]
+		} else if len(args) > 0 && strings.HasPrefix(args[0], "-C=") {
+			args = args[1:]
+		}
+		if len(args) > 0 && args[0] == "test" {
+			return "go-test"
+		}
+		if len(args) > 0 && args[0] == "vet" {
+			return "go-vet"
+		}
+	case "npm", "pnpm", "yarn", "bun":
+		args = toolEvidenceNpmOptions(args)
+		if len(args) > 0 && (args[0] == "test" || args[0] == "t") {
+			return "npm-test"
+		}
+		if len(args) > 0 && (args[0] == "run" || args[0] == "run-script") {
+			args = toolEvidenceNpmOptions(args[1:])
+			if len(args) > 0 && (args[0] == "test" || strings.HasPrefix(args[0], "test:")) {
+				return "npm-test"
+			}
+		}
+	case "node":
+		return toolEvidenceNode(args, wrapped)
+	case "verify-matrix.mjs":
+		return "verify-matrix"
+	}
+	return ""
+}
+
+// toolEvidenceNpmOptions drops leading package manager options, with the
+// value of those that take one, as the would-deny check reads them.
+func toolEvidenceNpmOptions(args []string) []string {
+	for len(args) > 0 && strings.HasPrefix(args[0], "-") {
+		a := args[0]
+		args = args[1:]
+		if _, _, attached := strings.Cut(a, "="); !attached && toolDenyNpmValued[a] && len(args) > 0 {
+			args = args[1:]
+		}
+	}
+	return args
+}
+
+// toolEvidenceNode reads node's options up to the script. --test among them
+// is node-test; a script named verify-matrix.mjs is verify-matrix; and the
+// host-lock wrapper's exec runs the command after its first "--", which is
+// classified the same way.
+func toolEvidenceNode(args []string, wrapped int) string {
+	test := false
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if strings.HasPrefix(a, "-") && len(a) > 1 {
+			switch a {
+			case "--check", "-c", "-e", "--eval", "-p", "--print":
+				return "" // a syntax check or an inline script
+			case "--test":
+				test = true
+			}
+			if toolDenyNodeValued[a] {
+				i++
+			}
+			continue
+		}
+		if test {
+			return "node-test"
+		}
+		switch toolDenyBase(a) {
+		case "verify-matrix.mjs":
+			return "verify-matrix"
+		case "verify-matrix-host-lock.mjs":
+			if i+1 >= len(args) || args[i+1] != "exec" || wrapped >= toolEvidenceWrappers {
+				return ""
+			}
+			for j := i + 2; j < len(args); j++ {
+				if args[j] == "--" {
+					return toolEvidenceKind(args[j+1:], wrapped+1)
+				}
+			}
+		}
+		return ""
+	}
+	if test {
+		return "node-test" // node --test with no file finds its own
+	}
+	return ""
+}
+
+// evidence builds the field for a verification command's post row. commit
+// is the one its pre recorded, if any.
+func (l toolLedger) evidence(call toolEvidenceCall, p toolHookInput, data []byte, commit, cwd string) *toolEvidence {
+	ev := &toolEvidence{Kinds: call.kinds}
+	if len(call.command) > toolEvidenceCommandBytes {
+		ev.CommandSkip = "oversize"
+	} else if text, n, ok := toolEvidenceRedact(call.command, toolRedactExact(l.token), l.started.Add(l.redactBudget)); ok {
+		ev.Command, ev.CommandRedacted = text, n
+	} else {
+		ev.CommandSkip = "timeout"
+	}
+	switch {
+	case call.background:
+		ev.OutputSkip = "background" // what returned is the start, not the command's end
+	case time.Since(l.started) >= l.evidenceBudget:
+		ev.OutputSkip = "timeout"
+		if p.Event == "PostToolUse" {
+			ev.ExitCode, ev.ExitSource = new(int), "success"
+		}
+	default:
+		ev.output(p, data)
+	}
+	if commit != "" {
+		ev.Commit, ev.CommitSource = commit, "pre"
+	} else if commit = toolEvidenceCommit(cwd); commit != "" {
+		ev.Commit, ev.CommitSource = commit, "post"
+	}
+	return ev
+}
+
+// output sets the exit code and the output digest from the post's payload.
+// Claude Code gives no numeric exit code: a call that ends with status 0 is
+// a PostToolUse, any other a PostToolUseFailure whose error text names it.
+func (ev *toolEvidence) output(p toolHookInput, data []byte) {
+	var out struct {
+		Response json.RawMessage `json:"tool_response"`
+		Error    json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal(data, &out) != nil {
+		ev.OutputSkip = "unreadable"
+		return
+	}
+	if p.Event == "PostToolUse" {
+		ev.ExitCode, ev.ExitSource = new(int), "success"
+		var resp struct {
+			Stdout, Stderr json.RawMessage
+		}
+		var stdout, stderr string
+		if json.Unmarshal(out.Response, &resp) != nil || json.Unmarshal(resp.Stdout, &stdout) != nil ||
+			len(resp.Stderr) > 0 && string(resp.Stderr) != "null" && json.Unmarshal(resp.Stderr, &stderr) != nil {
+			ev.OutputSkip = "unreadable"
+			return
+		}
+		sum := sha256.New()
+		_, _ = io.WriteString(sum, stdout)
+		_, _ = sum.Write([]byte{0})
+		_, _ = io.WriteString(sum, stderr)
+		ev.OutputDigest, ev.OutputSource = fmt.Sprintf("%x", sum.Sum(nil)), "stdout+stderr"
+		return
+	}
+	var msg string
+	if json.Unmarshal(out.Error, &msg) != nil {
+		ev.OutputSkip = "unreadable"
+		return
+	}
+	ev.OutputDigest, ev.OutputSource = fmt.Sprintf("%x", sha256.Sum256([]byte(msg))), "error"
+	if code, ok := toolEvidenceExitCode(msg); ok && !p.IsInterrupt {
+		ev.ExitCode, ev.ExitSource = &code, "error-text"
+	}
+}
+
+// toolEvidenceExitCode reads "Exit code N" or "Error: Exit code N" at the
+// start of a failure's text, N from 0 to 255 and followed by the end of the
+// text or a space. Any other text has no exit code.
+func toolEvidenceExitCode(text string) (int, bool) {
+	rest, ok := strings.CutPrefix(strings.TrimPrefix(text, "Error: "), "Exit code ")
+	if !ok {
+		return 0, false
+	}
+	n := 0
+	for n < len(rest) && n < 4 && rest[n] >= '0' && rest[n] <= '9' {
+		n++
+	}
+	if n == 0 || n > 3 || n < len(rest) && strings.IndexByte(" \t\r\n", rest[n]) < 0 {
+		return 0, false
+	}
+	code, err := strconv.Atoi(rest[:n])
+	if err != nil || code > 255 {
+		return 0, false
+	}
+	return code, true
+}
+
+// toolEvidenceRedact replaces every span the secret scan finds, groups A, B
+// and C alike, with [redacted] and counts them. A scan that did not finish
+// gives no text.
+func toolEvidenceRedact(text string, exact []string, deadline time.Time) (string, int, bool) {
+	rewrite, counted, ok := redactScan(text, exact, deadline)
+	if !ok {
+		return "", 0, false
+	}
+	spans := redactMerge(append(rewrite, counted...))
+	var out strings.Builder
+	at := 0
+	for _, span := range spans {
+		out.WriteString(text[at:span.start])
+		out.WriteString("[redacted]")
+		at = span.end
+	}
+	out.WriteString(text[at:])
+	return out.String(), len(spans), true
+}
+
+// toolEvidenceCommit is the commit HEAD names in the repository holding cwd,
+// read from files alone, as git rev-parse HEAD finds it: the .git directory
+// or gitdir file, HEAD, the loose ref in the worktree's git directory then
+// the common one, then packed-refs. Only a full lower-case hex id is
+// returned; anything else, an unborn branch included, gives "".
+func toolEvidenceCommit(cwd string) string {
+	if cwd == "" || !filepath.IsAbs(cwd) {
+		return ""
+	}
+	root := toolScopeRoot(filepath.Clean(cwd))
+	if root == "" {
+		return ""
+	}
+	gitdir := filepath.Join(root, ".git")
+	info, err := os.Stat(gitdir)
+	if err != nil {
+		return ""
+	}
+	if !info.IsDir() {
+		line, ok := toolEvidenceLine(gitdir)
+		target, found := strings.CutPrefix(line, "gitdir: ")
+		if !ok || !found || target == "" {
+			return ""
+		}
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(root, target)
+		}
+		gitdir = filepath.Clean(target)
+	}
+	common := gitdir
+	if line, ok := toolEvidenceLine(filepath.Join(gitdir, "commondir")); ok && line != "" {
+		if !filepath.IsAbs(line) {
+			line = filepath.Join(gitdir, line)
+		}
+		common = filepath.Clean(line)
+	}
+	head, ok := toolEvidenceLine(filepath.Join(gitdir, "HEAD"))
+	for depth := 0; ok && depth < toolEvidenceRefDepth; depth++ {
+		ref, symbolic := strings.CutPrefix(head, "ref: ")
+		if !symbolic {
+			break
+		}
+		head, ok = toolEvidenceRef(gitdir, common, strings.TrimSpace(ref))
+	}
+	if !ok || !toolEvidenceHash(head) {
+		return ""
+	}
+	return head
+}
+
+// toolEvidenceLine is a small file's first line without surrounding space.
+func toolEvidenceLine(path string) (string, bool) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", false
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, toolEvidenceFileBytes+1))
+	if err != nil || len(data) > toolEvidenceFileBytes {
+		return "", false
+	}
+	line, _, _ := strings.Cut(string(data), "\n")
+	return strings.TrimSpace(line), true
+}
+
+// toolEvidenceRef reads a ref's value: loose in the worktree's git directory,
+// then in the common one, then from packed-refs.
+func toolEvidenceRef(gitdir, common, ref string) (string, bool) {
+	if !strings.HasPrefix(ref, "refs/") || path.Clean(ref) != ref || strings.ContainsAny(ref, "\x00\\") || strings.Contains(ref, "..") {
+		return "", false
+	}
+	for _, dir := range []string{gitdir, common} {
+		if line, ok := toolEvidenceLine(filepath.Join(dir, filepath.FromSlash(ref))); ok {
+			return line, true
+		}
+	}
+	f, err := os.Open(filepath.Join(common, "packed-refs"))
+	if err != nil {
+		return "", false
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(io.LimitReader(f, toolEvidencePackedBytes))
+	sc.Buffer(nil, toolEvidenceFileBytes)
+	for sc.Scan() {
+		line := sc.Text()
+		if hash, name, ok := strings.Cut(line, " "); ok && name == ref && !strings.HasPrefix(line, "#") && !strings.HasPrefix(line, "^") {
+			return hash, true
+		}
+	}
+	return "", false
+}
+
+// toolEvidenceHash reports whether s is a full SHA-1 or SHA-256 object id.
+func toolEvidenceHash(s string) bool {
+	if len(s) != 40 && len(s) != 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
