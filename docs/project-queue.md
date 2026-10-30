@@ -1053,10 +1053,11 @@ exit if later, is older than the stall grace (5 minutes) is now a
 `nothing-running` stall of its own. An earlier team's exit alone never dates
 it, so a relaunched item is not stalled at its claim. A launch the project
 agent cap holds is no stall: its reason is `Launch held at the project agent
-cap: ...` (see [Project agent cap](#project-agent-cap)). A launching entry is
-also dated from the project's first agent close or exit after its last write,
-when that is later, so once a seat frees a launch the cap held gets its
-backed-off retry before the stall shows (`wi_dbb1529b84b724ae`). The list shows
+cap: ...` (see [Project agent cap](#project-agent-cap)). Once a seat frees,
+such a launch is dated from the latest agent close or exit after its last
+write that freed a seat while the project was at the cap, so its backed-off
+retry runs before the stall shows; a close below the cap never moves a stall
+(`wi_dbb1529b84b724ae`). The list shows
 it on the entry: `reason=Stalled: tqe_ID (wi_ID): an entry holds its slot,
 handler lease and ownership with nothing running for it. Fix: ...`, and
 `--json` has `stall` with the entry as its blocker. Entries queued behind it
@@ -1869,9 +1870,9 @@ member and none of its members is live, it is no stall: its reason is
 `Launch held at the project agent cap: N open + 1 seats > CAP`, and the work
 behind it waits as behind any working team. Once a seat frees and still no
 member is live, it shows as the `nothing-running` stall a stall grace after
-the first agent close or exit following the launch's last write, not its old
-write, so the runner's backed-off retry comes first; the stall notice then
-carries the text above as the last launch error.
+the latest agent close or exit since the launch's last write that freed a seat
+at the full cap, not its old write, so the runner's backed-off retry comes
+first; the stall notice then carries the text above as the last launch error.
 
 **Interaction with the concurrency limit.** The limit is a ceiling on teams,
 the cap is a ceiling on agents in the project, and host capacity is a third,

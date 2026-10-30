@@ -121,9 +121,9 @@ func (s *Store) classifyStallBlockerHeld(ctx context.Context, q queryRower, e ap
 		if e.State == "launching" {
 			// A launch the cap held retries on its backoff once a seat
 			// frees, and refused attempts write nothing, so it is dated from
-			// the first agent close or exit after its last write
+			// the latest seat freed at the full cap after its last write
 			// (wi_dbb1529b84b724ae).
-			freed, err := firstSeatFreedAfter(ctx, q, e.TaskID, parseStallTime(e.UpdatedAt))
+			freed, err := s.capSeatFreedAfter(ctx, q, e.TaskID, parseStallTime(e.UpdatedAt))
 			if err != nil {
 				return nil, "", err
 			}
@@ -222,29 +222,95 @@ func (s *Store) classifyStallBlockerHeld(ctx context.Context, q queryRower, e ap
 	return &stallBlocker{cause: api.StallIdleEntry, since: since, fix: fmt.Sprintf("if its candidate shipped, %s; otherwise narrow it to what it changed: tt team queue scope --task %s --entry %s --owns PATH", shipped, e.TaskID, e.ID)}, "", nil
 }
 
-// firstSeatFreedAfter is the time of the project's first closed or exited
-// event after after, or zero. Events are never rewritten, so a repeated close
-// or a later exit cannot move it; times are compared parsed, because ts trims
+// capSeatFreedAfter is the time of the project's latest agent close or exit
+// after after that freed a seat while the project was at its agent cap, so a
+// launch's next member could not register just before it; zero when none did.
+// The open count just before each close is rebuilt from the agents' creation
+// times and the closed and exited events after after, which are never
+// rewritten, so an unrelated close below the cap, a repeated close or a later
+// exit does not date a launch. Times are compared parsed, because ts trims
 // trailing zeros.
-func firstSeatFreedAfter(ctx context.Context, q queryRower, task string, after time.Time) (time.Time, error) {
-	rows, err := q.QueryContext(ctx, `SELECT created_at FROM events WHERE task_id=? AND kind IN (?,?) ORDER BY seq DESC`, task, api.EventClosed, api.EventExited)
+func (s *Store) capSeatFreedAfter(ctx context.Context, q queryRower, task string, after time.Time) (time.Time, error) {
+	type exit struct {
+		agent string
+		at    time.Time
+	}
+	rows, err := q.QueryContext(ctx, `SELECT agent_id,created_at FROM events WHERE task_id=? AND kind IN (?,?) ORDER BY seq DESC`, task, api.EventClosed, api.EventExited)
 	if err != nil {
 		return time.Time{}, err
 	}
-	defer rows.Close()
-	var first time.Time
+	var exits []exit // newest first
 	for rows.Next() {
+		var x exit
 		var created string
-		if err := rows.Scan(&created); err != nil {
+		if err := rows.Scan(&x.agent, &created); err != nil {
+			rows.Close()
 			return time.Time{}, err
 		}
-		at := parseStallTime(created)
-		if !at.After(after) {
+		if x.at = parseStallTime(created); !x.at.After(after) {
 			break
 		}
-		first = at
+		exits = append(exits, x)
 	}
-	return first, rows.Err()
+	err = rows.Err()
+	rows.Close()
+	if err != nil || len(exits) == 0 {
+		return time.Time{}, err
+	}
+	closes := map[string][]time.Time{}
+	for _, x := range exits {
+		closes[x.agent] = append(closes[x.agent], x.at)
+	}
+	type agent struct {
+		id      string
+		created time.Time
+		open    bool
+	}
+	var agents []agent
+	rows, err = q.QueryContext(ctx, `SELECT id,created_at,status FROM agents WHERE task_id=?`, task)
+	if err != nil {
+		return time.Time{}, err
+	}
+	for rows.Next() {
+		var a agent
+		var created, status string
+		if err := rows.Scan(&a.id, &created, &status); err != nil {
+			rows.Close()
+			return time.Time{}, err
+		}
+		a.created, a.open = parseStallTime(created), status != api.AgentClosed && status != api.AgentExited
+		agents = append(agents, a)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return time.Time{}, err
+	}
+	for _, x := range exits {
+		// Open just before x: created before it, not closed or exited since
+		// after but before it, and still open or closed at or after it.
+		open := 0
+		for _, a := range agents {
+			if !a.created.Before(x.at) {
+				continue
+			}
+			earlier, later := false, false
+			for _, at := range closes[a.id] {
+				if at.Before(x.at) {
+					earlier = true
+				} else {
+					later = true
+				}
+			}
+			if !earlier && (a.open || later) {
+				open++
+			}
+		}
+		if projectAgentCapReason(open, 0, 1, s.MaxAgents) != "" {
+			return x.at, nil
+		}
+	}
+	return time.Time{}, nil
 }
 
 var stallCauseText = map[string]string{

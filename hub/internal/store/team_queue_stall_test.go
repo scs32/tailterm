@@ -374,7 +374,7 @@ func TestQueueStallCapHeldLaunchIsNotStalled(t *testing.T) {
 }
 
 // wi_dbb1529b84b724ae h1: a launch the project agent cap held is dated from
-// the first seat freeing after its last write, not from that old write, so
+// the seat freed at the full cap after its last write, not that old write, so
 // neither it nor the work behind it shows the nothing-running stall (or can
 // post its notice) until a grace after the seat frees, which the runner's
 // backed-off retry needs. Later closes and exits do not defer it further.
@@ -470,6 +470,35 @@ func TestQueueStallFreedCapHeldLaunchDatedFromSeat(t *testing.T) {
 		advance(3 * time.Minute)
 		stalled(t, f, a, b, seat)
 	})
+}
+
+// wi_dbb1529b84b724ae review b1 (#51624): a stuck launch the cap never held
+// keeps a stall already shown, with its Since, when an unrelated agent in the
+// project closes.
+func TestQueueStallShownLaunchStallKeptAfterUnrelatedClose(t *testing.T) {
+	f := newChoresQueue(t, 2, 1, 0)
+	advance := f.clock(t)
+	a, err := claimEntry(f.s, f.task, f.add(t, 0, "src"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := f.add(t, 1, "src/b")
+	other := capFiller(t, f.s, f.task, "unrelated-worker")
+	advance(6 * time.Minute)
+	fix := "tt team queue fail --task " + f.task.ID + " --entry " + a.ID
+	assertStall(t, f, a.ID, api.StallNothingRunning, a.ID, fix)
+	assertStall(t, f, b.ID, api.StallNothingRunning, a.ID, fix)
+	shown := listedEntry(t, f.s, f.task.ID, a.ID).Stall.Since
+	advance(10 * time.Minute)
+	if _, err := f.s.CloseAgent(context.Background(), other.ID, f.by); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{a.ID, b.ID} {
+		assertStall(t, f, id, api.StallNothingRunning, a.ID, fix)
+		if got := listedEntry(t, f.s, f.task.ID, id).Stall.Since; got != shown {
+			t.Fatalf("%s since %s after an unrelated close, was %s", id, got, shown)
+		}
+	}
 }
 
 const moveHint = "; move it: tt team queue scope --task "
