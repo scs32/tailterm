@@ -93,10 +93,12 @@ function normalize(raw, time, { maxEntries, maxBytes, maxAgeMs }) {
 // reads never reload it or wait for a save, and writes update memory and join
 // one coalesced save. A put or clear resolves only after the save holding its
 // change finishes; if that save fails it rejects, and the change stays in
-// memory for the next save. A failed load is retried by the next call.
+// memory for the next save. A failed load is retried by the next call. The
+// persistence's optional check runs before memory is used.
 export function createHubReadCache({
   load,
   save,
+  check = () => {},
   now = Date.now,
   maxEntries = HUB_READ_CACHE_MAX_ENTRIES,
   maxBytes = HUB_READ_CACHE_MAX_BYTES,
@@ -104,6 +106,8 @@ export function createHubReadCache({
 }) {
   if (typeof load !== "function" || typeof save !== "function")
     throw new TypeError("Hub cache load and save functions are required.");
+  if (typeof check !== "function")
+    throw new TypeError("Hub cache check must be a function.");
   if (!Number.isInteger(maxEntries) || maxEntries < 1)
     throw new TypeError("Hub cache maxEntries must be a positive integer.");
   if (!Number.isInteger(maxBytes) || maxBytes < 1)
@@ -128,6 +132,12 @@ export function createHubReadCache({
   const requireActive = () => {
     if (disposed) throw new Error("Hub read cache is disposed.");
   };
+  // The persistence may refuse access (for example after its vault locks)
+  // even though memory still holds entries.
+  const requireAccess = () => {
+    requireActive();
+    check();
+  };
   const time = () => {
     const value = Number(now());
     if (!Number.isFinite(value) || value < 0)
@@ -135,7 +145,7 @@ export function createHubReadCache({
     return Math.trunc(value);
   };
   const ready = async () => {
-    requireActive();
+    requireAccess();
     if (!loading) {
       const attempt = (async () => {
         const raw = await load();
@@ -148,7 +158,7 @@ export function createHubReadCache({
       });
     }
     await loading;
-    requireActive();
+    requireAccess();
     const at = time();
     records = records.filter(({ entry }) => at - entry.savedAt < maxAgeMs);
   };

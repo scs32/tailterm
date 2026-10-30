@@ -325,3 +325,23 @@ test("hub read cache default cap evicts by total bytes at 8 MiB", async () => {
     false,
   );
 });
+
+test("hub read cache rejects every call when its persistence check throws", async () => {
+  const storage = memory();
+  let locked = false;
+  const cache = createHubReadCache({
+    ...storage,
+    check: () => {
+      if (locked) throw new Error("Unlock your local vault first.");
+    },
+    now: () => 100,
+  });
+  await cache.put("scope", "key", { n: 1 });
+  assert.ok(await cache.get("scope", "key"));
+  locked = true;
+  await assert.rejects(cache.get("scope", "key"), /Unlock your local vault/);
+  await assert.rejects(cache.put("scope", "key", 2), /Unlock your local vault/);
+  await assert.rejects(cache.clear(), /Unlock your local vault/);
+  await assert.rejects(cache.clear("scope"), /Unlock your local vault/);
+  assert.equal(storage.saved().entries[0].value.n, 1);
+});

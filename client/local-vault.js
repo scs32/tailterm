@@ -455,6 +455,9 @@ export function hubReadCachePersistence() {
       );
   };
   return {
+    // Cheap synchronous check, so a cache serving from memory still refuses
+    // reads and writes after a lock or a different unlock.
+    check: requireSameVault,
     load: async () => {
       await queue;
       requireSameVault();

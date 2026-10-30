@@ -289,6 +289,7 @@ async function fixturePage({ latency, refreshMs }) {
   const persistence = vault.hubReadCachePersistence();
   const persisted = { loads: 0, saving: 0, saves: 0 };
   const cache = createHubReadCache({
+    check: persistence.check,
     load: () => {
       persisted.loads++;
       return persistence.load();
