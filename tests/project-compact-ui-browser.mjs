@@ -27,16 +27,22 @@ const ids=['tsk_1111111111111111','tsk_2222222222222222','tsk_3333333333333333']
 const state={online:true,failWrites:false,calls:[],notices:[],writes:0,held:false,waiting:[]};
 const tasks=scenario==='empty'?[]:ids.map((id,i)=>({id,name:scenario==='long'?long+' '+(i+1):['Alpha project','Beta project','Closed project'][i],goal:'Synthetic goal '+(i+1),status:i===2?'closed':'open',cleanupPending:i===2?1:0,closedAt:i===2?'2026-09-08T12:00:00Z':undefined,orchestrator:'fixture-lead',createdAt:'2026-09-08T11:00:00Z'}));
 const originalAgents=id=>[{id:'agt_'+id.slice(4),name:'fixture-lead',role:'orchestrator',status:tasks.find(t=>t.id===id)?.status==='closed'?'closed':'running',host:'fixture.invalid',session:'synthetic-session',runtime:'codex',readUpTo:0}];
-const agents=id=>needs&&id===ids[0]?needs.agents:Array.from({length:state.teamCount??Number(new URLSearchParams(location.search).get('count')||12)},(_,i)=>({...originalAgents(id)[0],id:'agt_'+String(i+1).padStart(16,'0'),name:'fixture-agent-'+i,status:i===1?'needs_input':i===2?'retired':i===3?'closed':'running',...(i===1?{blockedReason:'permission'}:{})}));
+const agents=id=>needsFor(id)?needsFor(id).agents:Array.from({length:state.teamCount??Number(new URLSearchParams(location.search).get('count')||12)},(_,i)=>({...originalAgents(id)[0],id:'agt_'+String(i+1).padStart(16,'0'),name:'fixture-agent-'+i,status:i===1?'needs_input':i===2?'retired':i===3?'closed':'running',...(i===1?{blockedReason:'permission'}:{})}));
 // Owner-waiting fixture: A plain needs_input, B login-blocked, C running with an
 // open owner request, D with an unanswered decision, E with only a closed request.
+// X (open project) and Y, Z (closed project) are closed agents with an open
+// request or unanswered decision; a closed agent never needs the owner.
 const needAgent=(key,name,status,extra={})=>({id:'agt_need00000000000'+key,name,status,host:'fixture.invalid',session:'synthetic-session',runtime:'codex',readUpTo:0,...extra});
 const from=key=>({agentId:'agt_need00000000000'+key,node:'fixture',user:'fixture'});
 const needs=params.get('needs')?{
- agents:[needAgent('l','need-lead','running'),needAgent('a','need-a-plain','needs_input'),needAgent('b','need-b-login','needs_input',{blockedReason:'authentication',blockedText:'Synthetic login expired'}),needAgent('c','need-c-request','running'),needAgent('d','need-d-decision','needs_input'),needAgent('e','need-e-closed','needs_input')],
- obligations:[{id:'obl_0000000000000c01',recipientKind:'owner',state:'delivered',taskId:ids[0],messageSeq:5,subject:'Synthetic owner request',sourceKind:'request',needs:'ack_outcome',createdAt:'2026-09-08T12:00:00Z',dueAt:'2026-09-08T12:30:00Z',request:{seq:5,taskId:ids[0],from:from('c'),text:'REQUEST: Synthetic owner request',createdAt:'2026-09-08T12:00:00Z'}},{id:'obl_0000000000000e01',recipientKind:'owner',state:'closed',outcome:'result',taskId:ids[0],messageSeq:4,subject:'Synthetic closed request',sourceKind:'request',needs:'ack_outcome',createdAt:'2026-09-08T11:50:00Z',dueAt:'2026-09-08T12:20:00Z',request:{seq:4,taskId:ids[0],from:from('e'),text:'REQUEST: Synthetic closed request',createdAt:'2026-09-08T11:50:00Z'}}],
- decisions:[{request:{seq:6,taskId:ids[0],from:from('d'),text:'Synthetic decision',createdAt:'2026-09-08T12:00:00Z',decisionRequest:{question:'Synthetic decision?',options:[{id:'keep',label:'Keep',description:'Synthetic keep'},{id:'drop',label:'Drop',description:'Synthetic drop'}],recommendedOptionId:'keep',recommendationReason:'Synthetic reason'}}}]
+ agents:[needAgent('l','need-lead','running'),needAgent('a','need-a-plain','needs_input'),needAgent('b','need-b-login','needs_input',{blockedReason:'authentication',blockedText:'Synthetic login expired'}),needAgent('c','need-c-request','running'),needAgent('d','need-d-decision','needs_input'),needAgent('e','need-e-closed','needs_input'),needAgent('x','need-x-closed','closed')],
+ obligations:[{id:'obl_0000000000000c01',recipientKind:'owner',state:'delivered',taskId:ids[0],messageSeq:5,subject:'Synthetic owner request',sourceKind:'request',needs:'ack_outcome',createdAt:'2026-09-08T12:00:00Z',dueAt:'2026-09-08T12:30:00Z',request:{seq:5,taskId:ids[0],from:from('c'),text:'REQUEST: Synthetic owner request',createdAt:'2026-09-08T12:00:00Z'}},{id:'obl_0000000000000e01',recipientKind:'owner',state:'closed',outcome:'result',taskId:ids[0],messageSeq:4,subject:'Synthetic closed request',sourceKind:'request',needs:'ack_outcome',createdAt:'2026-09-08T11:50:00Z',dueAt:'2026-09-08T12:20:00Z',request:{seq:4,taskId:ids[0],from:from('e'),text:'REQUEST: Synthetic closed request',createdAt:'2026-09-08T11:50:00Z'}},{id:'obl_0000000000000x01',recipientKind:'owner',state:'delivered',taskId:ids[0],messageSeq:3,subject:'Synthetic closed agent request',sourceKind:'request',needs:'ack_outcome',createdAt:'2026-09-08T11:40:00Z',dueAt:'2026-09-08T12:10:00Z',request:{seq:3,taskId:ids[0],from:from('x'),text:'REQUEST: Synthetic closed agent request',createdAt:'2026-09-08T11:40:00Z'}}],
+ decisions:[{request:{seq:6,taskId:ids[0],from:from('d'),text:'Synthetic decision',createdAt:'2026-09-08T12:00:00Z',decisionRequest:{question:'Synthetic decision?',options:[{id:'keep',label:'Keep',description:'Synthetic keep'},{id:'drop',label:'Drop',description:'Synthetic drop'}],recommendedOptionId:'keep',recommendationReason:'Synthetic reason'}}},{request:{seq:8,taskId:ids[0],from:from('x'),text:'Synthetic closed agent decision',createdAt:'2026-09-08T11:45:00Z',decisionRequest:{question:'Synthetic closed agent decision?',options:[{id:'keep',label:'Keep',description:'Synthetic keep'}],recommendedOptionId:'keep',recommendationReason:'Synthetic reason'}}}],
+ closed:{agents:[needAgent('y','need-y-closed','closed'),needAgent('z','need-z-closed','closed')],
+  obligations:[{id:'obl_0000000000000z01',recipientKind:'owner',state:'delivered',taskId:ids[2],messageSeq:10,subject:'Synthetic archived request',sourceKind:'request',needs:'ack_outcome',createdAt:'2026-09-08T11:30:00Z',dueAt:'2026-09-08T12:00:00Z',request:{seq:10,taskId:ids[2],from:from('z'),text:'REQUEST: Synthetic archived request',createdAt:'2026-09-08T11:30:00Z'}}],
+  decisions:[{request:{seq:9,taskId:ids[2],from:from('y'),text:'Synthetic archived decision',createdAt:'2026-09-08T11:30:00Z',decisionRequest:{question:'Synthetic archived decision?',options:[{id:'keep',label:'Keep',description:'Synthetic keep'}],recommendedOptionId:'keep',recommendationReason:'Synthetic reason'}}}]}
 }:null;
+const needsFor=id=>needs&&(id===ids[0]?needs:id===ids[2]?needs.closed:null);
 const items=tasks.flatMap(task=>['bug','feature'].map(kind=>({id:kind+'-'+task.id,taskId:task.id,kind,title:scenario==='long'?long+' '+kind:task.name+' '+kind,description:'Synthetic description',priority:'normal',status:'open',revision:1})));
 const messages=new Map(ids.map(id=>[id,[{seq:1,from:{user:'fixture'},text:'Synthetic message for '+id,createdAt:'2026-09-08T12:00:00Z'}]]));
 const response=(body,status=200)=>new Response(JSON.stringify(body),{status,headers:{'Content-Type':'application/json'}});
@@ -54,8 +60,8 @@ async function transport(url,init){
  const match=p.match(/^\\/v1\\/tasks\\/([^/]+)(.*)$/);if(!match)throw Error('Unexpected synthetic route '+p);
  const [,id,tail]=match,task=tasks.find(t=>t.id===id);
  if(!tail)return response({task,agents:agents(id)});
- if(tail==='/obligations')return response({obligations:needs&&id===ids[0]?needs.obligations:[]});
- if(tail==='/decisions'){if(needs&&params.get('decisions')==='fail')return response({error:'Synthetic older hub without decisions'},404);return response({decisions:needs&&id===ids[0]?needs.decisions:[],nextAfter:0})}
+ if(tail==='/obligations')return response({obligations:needsFor(id)?.obligations||[]});
+ if(tail==='/decisions'){if(needs&&params.get('decisions')==='fail')return response({error:'Synthetic older hub without decisions'},404);return response({decisions:needsFor(id)?.decisions||[],nextAfter:0})}
  if(tail==='/messages'){
    if(method==='POST'){if(state.holdPost)await new Promise(resolve=>state.releasePost=resolve);const list=messages.get(id);const row={...body,from:{user:'fixture'},seq:list.length+1,createdAt:'2026-09-08T12:00:00Z'};list.push(row);return response(row)}
    return response({messages:messages.get(id).filter(m=>m.seq>Number(u.searchParams.get('after')||0))});
@@ -222,6 +228,17 @@ async function needsScenario(browser, engine, decisions = "") {
         qa.client.invalidate();
       });
       await expect.poll(() => ids(mode)).toEqual(owner.map(needId));
+      if (mode !== "board") continue;
+      // A closed project's Board keeps its closed agents in the roster only,
+      // even with a loaded unanswered decision and an open owner request.
+      await page.locator(".board-closed summary").click();
+      await page.locator('[data-board-task="tsk_3333333333333333"]').click();
+      await expect(page.locator('[data-decision-request="9"]')).toBeVisible();
+      await expect(page.locator('[data-owner-request="obl_0000000000000z01"]')).toBeVisible();
+      await expect(page.locator(".project-team-attention")).toHaveCount(0);
+      await expect(page.locator("[data-team-roster] .board-agent")).toHaveCount(2);
+      await expect(page.locator("[data-team-roster]")).toContainText("need-y-closed");
+      await expect(page.locator("[data-team-roster]")).toContainText("need-z-closed");
     }
     assert.deepEqual(errors, []);
     console.log("PASS", prefix);

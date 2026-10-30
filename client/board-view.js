@@ -39,20 +39,24 @@ export const blockedLabels = {
 };
 // An agent waits for the owner only with a blocker, an open owner request or an
 // unanswered decision; any other needs_input agent waits on its team or host.
-// Projects (tasks-view.js) uses the same rule.
+// A closed agent never waits, including on a closed project's Board. Projects
+// (tasks-view.js) uses the same rule.
 export const ownerWaiters = (agents, obligations = [], decisions = []) =>
   new Set(
     agents
       .filter(
         (a) =>
-          (a.status === "needs_input" && blockedLabels[a.blockedReason]) ||
-          obligations.some(
-            (o) =>
-              o.recipientKind === "owner" &&
-              o.state !== "closed" &&
-              o.request?.from?.agentId === a.id,
-          ) ||
-          decisions.some((d) => !d.answer && d.request?.from?.agentId === a.id),
+          a.status !== "closed" &&
+          ((a.status === "needs_input" && blockedLabels[a.blockedReason]) ||
+            obligations.some(
+              (o) =>
+                o.recipientKind === "owner" &&
+                o.state !== "closed" &&
+                o.request?.from?.agentId === a.id,
+            ) ||
+            decisions.some(
+              (d) => !d.answer && d.request?.from?.agentId === a.id,
+            )),
       )
       .map((a) => a.id),
   );
