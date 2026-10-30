@@ -4463,6 +4463,9 @@ type relayVisitFixture struct {
 	onAgentRead atomic.Pointer[func(agent string)]
 	// onVisit, when set, runs inside each visit before the real one.
 	onVisit atomic.Pointer[func(agent string)]
+	// onEnd, when set, runs inside each visit after the real one has saved
+	// its progress and been counted ended, before the pool frees the binding.
+	onEnd atomic.Pointer[func(agent string)]
 
 	mu                      sync.Mutex
 	started, ended, running map[string]int
@@ -4540,6 +4543,9 @@ func newRelayVisitFixture(t *testing.T, n, workers int, wait time.Duration, paus
 		f.concurrent--
 		f.ended[b.Agent]++
 		f.mu.Unlock()
+		if hook := f.onEnd.Load(); hook != nil {
+			(*hook)(b.Agent)
+		}
 	}
 	return f
 }
@@ -4561,6 +4567,7 @@ func TestRelayVisitsOtherBindingsWhileOneHubCallBlocks(t *testing.T) {
 	var blockedStarted, blockedEnded int
 	var progressWhileBlocked bool
 	var otherMin, startedAtRelease int
+	var releasedAt time.Time
 	deadline := time.Now().Add(15 * time.Second)
 	pause := func() bool {
 		passes++
@@ -4593,6 +4600,7 @@ func TestRelayVisitsOtherBindingsWhileOneHubCallBlocks(t *testing.T) {
 			progressWhileBlocked = err == nil
 			startedAtRelease = f.started[blocked.Agent]
 			released = true
+			releasedAt = time.Now()
 			unblock()
 			return true
 		}
@@ -4617,11 +4625,36 @@ func TestRelayVisitsOtherBindingsWhileOneHubCallBlocks(t *testing.T) {
 		}
 	}
 	f.onAgentRead.Store(&hook)
+	// At the blocked visit's end, before the pool frees its binding for a
+	// later visit, the progress file can only hold that visit's save.
+	var firstEndMtime time.Time
+	endedAtFirstEnd := -1
+	var endOnce sync.Once
+	endHook := func(agent string) {
+		if agent != blockedAgent {
+			return
+		}
+		endOnce.Do(func() {
+			f.mu.Lock()
+			endedAtFirstEnd = f.ended[agent]
+			f.mu.Unlock()
+			if info, err := os.Stat(f.progressPath(f.bindings[0])); err == nil {
+				firstEndMtime = info.ModTime()
+			}
+		})
+	}
+	f.onEnd.Store(&endHook)
 	if err := cmdRelay(nil); err != nil {
 		t.Fatal(err)
 	}
 	if !released {
 		t.Fatal("the blocked read was never released")
+	}
+	if endedAtFirstEnd != 1 {
+		t.Fatalf("blocked binding visits ended at its first end = %d, want 1", endedAtFirstEnd)
+	}
+	if firstEndMtime.IsZero() || firstEndMtime.Before(releasedAt) {
+		t.Fatalf("blocked binding progress at its first end saved at %v, want a save from the blocked visit after its release at %v", firstEndMtime, releasedAt)
 	}
 	if otherMin < 3 {
 		t.Fatalf("other bindings visited at least %d times while one blocked, want 3", otherMin)
@@ -4642,6 +4675,116 @@ func TestRelayVisitsOtherBindingsWhileOneHubCallBlocks(t *testing.T) {
 	}
 	if _, err := os.Stat(f.progressPath(f.bindings[0])); err != nil {
 		t.Fatalf("the blocked visit saved no progress after release: %v", err)
+	}
+}
+
+// A visit detached past relayVisitWait holds the loop's session cleanup.
+// After relayCleanupSkipBound skipped passes in a row the loop starts no new
+// visit; cleanup runs once the visit ends, never beside a visit, and logs one
+// line for the whole run of skips (wi_1328c6bd412ea61d).
+func TestRelayCleanupSkipBoundHoldsVisitsForDetachedVisit(t *testing.T) {
+	var f *relayVisitFixture
+	entered, release := make(chan struct{}), make(chan struct{})
+	var enterOnce, releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	// The visit stays blocked this many passes past the bound.
+	const pastBound = 4
+	var passes, releasedAfter, cleanupsAtRelease int
+	var startedAfter []int  // visits started in all, after each pass
+	var cleanupPasses []int // the pass each cleanup ran in
+	var cleanupBesideVisit bool
+	deadline := time.Now().Add(15 * time.Second)
+	oldCleanup := relayLoopCleanup
+	t.Cleanup(func() { relayLoopCleanup = oldCleanup })
+	relayLoopCleanup = func() {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if f.concurrent > 0 {
+			cleanupBesideVisit = true
+		}
+		cleanupPasses = append(cleanupPasses, passes+1)
+	}
+	pause := func() bool {
+		passes++
+		if time.Now().After(deadline) {
+			t.Errorf("pass %d timed out: cleanups in passes %v", passes, cleanupPasses)
+			return false
+		}
+		f.mu.Lock()
+		total := 0
+		for _, n := range f.started {
+			total += n
+		}
+		startedAfter = append(startedAfter, total)
+		cleanups := len(cleanupPasses)
+		f.mu.Unlock()
+		switch {
+		case passes == 1:
+			select {
+			case <-entered:
+			case <-time.After(10 * time.Second):
+				t.Error("the blocked visit never started")
+				return false
+			}
+		case releasedAfter == 0 && passes == relayCleanupSkipBound+1+pastBound:
+			releasedAfter, cleanupsAtRelease = passes, cleanups
+			unblock()
+		case releasedAfter > 0 && cleanups > cleanupsAtRelease:
+			// The pass after cleanup ran again has visited; stop.
+			return false
+		case releasedAfter > 0:
+			time.Sleep(5 * time.Millisecond)
+		}
+		return true
+	}
+	f = newRelayVisitFixture(t, 3, 2, 50*time.Millisecond, pause)
+	t.Cleanup(unblock)
+	blockedAgent := f.bindings[0].Agent
+	hook := func(agent string) {
+		if agent != blockedAgent {
+			return
+		}
+		first := false
+		enterOnce.Do(func() { first = true; close(entered) })
+		if first {
+			<-release
+		}
+	}
+	f.onAgentRead.Store(&hook)
+	stderr, err := captureRelayOutput(t, true, func() error { return cmdRelay(nil) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if releasedAfter == 0 {
+		t.Fatalf("the blocked visit was never released after %d passes", passes)
+	}
+	if cleanupBesideVisit {
+		t.Fatal("session cleanup ran while a visit was running")
+	}
+	if cleanupsAtRelease != 1 || len(cleanupPasses) != 2 || cleanupPasses[0] != 1 {
+		t.Fatalf("cleanups ran in passes %v, %d before release, want pass 1 only before release and one after", cleanupPasses, cleanupsAtRelease)
+	}
+	bound := relayCleanupSkipBound
+	if startedAfter[bound-1] <= startedAfter[0] {
+		t.Fatalf("visits started after each pass %v, want the other bindings visited before the bound", startedAfter)
+	}
+	// Passes bound+1 until cleanup ran again started no visit.
+	for p := bound + 1; p < cleanupPasses[1]; p++ {
+		if startedAfter[p-1] != startedAfter[bound-1] {
+			t.Fatalf("visits started after each pass %v, want none started from pass %d until cleanup in pass %d", startedAfter, bound+1, cleanupPasses[1])
+		}
+	}
+	if len(startedAfter) < cleanupPasses[1] || startedAfter[cleanupPasses[1]-1] <= startedAfter[bound-1] {
+		t.Fatalf("visits started after each pass %v, want visits again in pass %d once cleanup ran", startedAfter, cleanupPasses[1])
+	}
+	skipped := cleanupPasses[1] - cleanupPasses[0] - 1
+	if skipped <= bound {
+		t.Fatalf("cleanup skipped %d passes, want more than the bound %d", skipped, bound)
+	}
+	line := regexp.MustCompile(`(?m)^\[tt relay\] \S+ session cleanup skipped (\d+) passes$`)
+	lines := line.FindAllStringSubmatch(stderr, -1)
+	if len(lines) != 1 || lines[0][1] != strconv.Itoa(skipped) {
+		t.Fatalf("skip lines = %q, want one counting %d passes:\n%s", lines, skipped, stderr)
 	}
 }
 

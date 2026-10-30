@@ -1334,6 +1334,9 @@ var (
 	// relayVisitWait how long a pass waits for one visit before detaching it.
 	relayVisitWorkers = 4
 	relayVisitWait    = 10 * time.Second
+	// relayCleanupSkipBound is how many passes in a row may skip the loop's
+	// session cleanup before the loop holds new visits and passes for it.
+	relayCleanupSkipBound = 5
 	// relayVisitRun is one binding's visit.
 	relayVisitRun = relayVisit
 	// relayHubReachStart starts the hub reachability watch and returns its stop.
@@ -1759,11 +1762,13 @@ func cmdRelay(args []string) error {
 	var sweep relaySweepPass
 	var slowPasses relaySlowLimiter
 	var visitPool relayVisitPool
+	var cleanupSkips int
 	promptDeps := nativeRuntimePromptDeps()
 	var lastClaudeRetry, lastPendingBind, lastWindowSize time.Time
 	var claudeRetryCursor int
 	for {
 		pass := newRelayPassTiming()
+		holdForCleanup := false
 		if !*status {
 			rotation.collect(&queueBackoff, false)
 			queue.collect(&queueBackoff, false)
@@ -1771,17 +1776,26 @@ func cmdRelay(args []string) error {
 			// and a team queue pass stops sessions too; the loop cleanup waits
 			// until both are collected, so two never stop one session at once.
 			// It waits for a detached binding visit too, which may wake or
-			// retire a session.
+			// retire a session. After relayCleanupSkipBound skipped passes in a
+			// row the loop starts no visit, team queue pass or rotation pass
+			// until the ones in flight end and cleanup runs.
 			if !rotation.inFlight() && !queue.inFlight() && !visitPool.inFlight() {
+				if cleanupSkips > 0 {
+					fmt.Fprintf(os.Stderr, "[tt relay] %s session cleanup skipped %d passes\n", relayPassClock().UTC().Format(time.RFC3339), cleanupSkips)
+					cleanupSkips = 0
+				}
 				relayLoopCleanup()
+			} else {
+				cleanupSkips++
 			}
+			holdForCleanup = cleanupSkips >= relayCleanupSkipBound
 			pass.lap("cleanup")
 			inspectStartupPrompts()
 			pass.lap("startup prompts")
 			// The team queue tick runs in its own pass under its two-minute
 			// budget, so a slow tick no longer delays every binding's visit.
 			// Under --once it still finishes before rotation and the wakes.
-			if queueBackoff.ready(time.Now()) {
+			if !holdForCleanup && queueBackoff.ready(time.Now()) {
 				queue.start()
 			}
 			if *once {
@@ -1790,7 +1804,7 @@ func cmdRelay(args []string) error {
 			pass.lap("team queue")
 			// Handler and steward rotation share the queue's request budget and
 			// backoff, but run off the wake path; one pass is in flight at most.
-			if queueBackoff.ready(time.Now()) {
+			if !holdForCleanup && queueBackoff.ready(time.Now()) {
 				rotation.start()
 			}
 			if *once {
@@ -1865,6 +1879,11 @@ func cmdRelay(args []string) error {
 		// visit past relayVisitWait is detached, except under --once.
 		visits := visitPool.pass(!*once)
 		for _, path := range paths {
+			// A held pass starts no visit, so the detached ones can end and
+			// the next pass can clean up.
+			if holdForCleanup {
+				break
+			}
 			// A binding whose detached visit still runs is visited again
 			// once that visit ends, never twice at once.
 			if visitPool.busy(path) {
