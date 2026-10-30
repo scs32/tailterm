@@ -82,6 +82,7 @@ What does not count:
 | `outputSkip` | only when there is no digest: `background`, `unreadable` or `timeout` |
 | `commit` | 40 or 64 lower-case hex characters; absent outside a repository |
 | `commitSource` | `pre` (read when the call started) or `post` (read at the post) |
+| `commitSkip` | `changed-directory` when the command may run elsewhere than `cwd` (below); then there is no `commit` |
 
 The digests:
 
@@ -111,10 +112,27 @@ refs are stored as a reftable give no commit.
 
 The commit is read when the call starts and kept in its pending file, so a
 command that commits or checks out still records the commit it started on
-(`commitSource: "pre"`). When there is no pending entry, because the pre was
-cut off, the pending bound was reached or the entry would pass its 512 bytes
-with the commit in it, the post reads the commit itself (`commitSource:
-"post"`).
+(`commitSource: "pre"`). The post reads the commit itself (`commitSource:
+"post"`) whenever its pending entry holds none: when there is no pending
+entry, because the pre was cut off, the pending bound was reached or the entry
+would pass its 512 bytes with the commit in it, and also when the pre found no
+commit, for example because its `cwd` was in no repository or on an unborn
+branch, or its read was given up.
+
+The read is given up 50 ms after the hook starts. A file system under `cwd`
+that stalls, such as a hung network mount, then costs the call its commit and
+nothing else: the pending entry and the row are still written within the
+hook's deadline.
+
+The commit is the one of the call's `cwd`. A verification command that may run
+somewhere else records no commit and `commitSkip: "changed-directory"`: one
+that comes after a `cd`, `pushd` or `popd` in the same call (`cd hub && go test
+./...`, a subshell included), and one that names its own directory with
+`go -C DIR` or a package manager's `--prefix`, `-C`, `--dir` or `--cwd`. A
+`cd` after the verification command changes nothing. The check reads the same
+simple commands as the classifier, so a directory change hidden in a nested
+shell, a script, `env -C` or a tool's own configuration is not seen, and then
+the recorded commit is still the `cwd`'s.
 
 **Whether the tree was dirty is not recorded.** That needs a `git` process, and
 the hook starts none. A commit says which tree the command started from, not
@@ -205,6 +223,12 @@ git repositories and no live session:
   background and unreadable failures.
 - `TestToolLedgerEvidenceWithinBound`: held stdin and 4 MiB of output return
   inside the 200 ms bound, silently; the pending entry stays within 512 bytes.
+- `TestToolLedgerEvidenceChangedDirectory`: `cd`, `pushd`, `popd`, `go -C`
+  and the package manager directory options give no commit and
+  `commitSkip: "changed-directory"`, and the pre reads none.
+- `TestToolLedgerEvidenceCommitStalls`: with a `HEAD` whose read blocks (a
+  FIFO), the pre and the post return inside the deadline and leave the row,
+  with a measured duration and no commit.
 
 Not checked: a live Claude Code session's hook payload (see exit codes above),
 and Codex sessions, which this does not cover.

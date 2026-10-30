@@ -119,8 +119,10 @@ type toolLedger struct {
 	name   string // the agent's name, or the helper file's
 	helper bool   // the identity came from the owner helper's file
 	hub    string
-	// Verification evidence: the output is not decoded after this, from the start.
+	// Verification evidence: the output is not decoded after evidenceBudget,
+	// and the commit read is given up after commitBudget, both from the start.
 	evidenceBudget time.Duration
+	commitBudget   time.Duration
 }
 
 // toolHookInput holds only the fields the ledger uses. tool_response, error
@@ -234,7 +236,7 @@ func toolLedgerHook(e env, _ []string) {
 		token: e.token, redactBudget: toolRedactScanBudget, redactMax: toolRedactMaxBytes, stdout: os.Stdout,
 		deny: toolDenyCheck, denyMax: toolDenyMaxCommand, scope: toolScopeCheck,
 		gate: toolGateOn, name: e.agentName, hub: os.Getenv("TAILTERM_HUB"),
-		evidenceBudget: toolEvidenceOutputBudget,
+		evidenceBudget: toolEvidenceOutputBudget, commitBudget: toolEvidenceCommitBudget,
 	}
 	in := os.Stdin
 	done := make(chan struct{})
@@ -287,8 +289,8 @@ func (l toolLedger) record(in io.Reader) {
 	switch p.Event {
 	case "PreToolUse":
 		commit := ""
-		if verify.kinds != nil {
-			commit = toolEvidenceCommit(cwd)
+		if verify.kinds != nil && !verify.moved {
+			commit = l.awaitCommit(startEvidenceCommit(cwd))
 		}
 		l.pre(row, p.Session, commit)
 		// After the pending entry is written, so the check cannot lose the pairing.
@@ -649,9 +651,15 @@ const (
 	toolEvidenceWrappers     = 2        // host-lock exec wrappers looked through
 )
 
-// From the handler's start; after it the output is not decoded. A variable so
-// tests can change it; a hook call copies it before its goroutine starts.
-var toolEvidenceOutputBudget = 120 * time.Millisecond
+// Variables so tests can change them; a hook call copies them before its
+// goroutine starts. Both run from the handler's start.
+var (
+	toolEvidenceOutputBudget = 120 * time.Millisecond // then the output is not decoded
+	// Then the commit read is given up, so a stalled file system under cwd
+	// (a hung network mount) still leaves the pending entry and the row
+	// inside the deadline, with no commit.
+	toolEvidenceCommitBudget = 50 * time.Millisecond
+)
 
 type toolEvidence struct {
 	Kinds           []string `json:"kinds"`
@@ -665,12 +673,15 @@ type toolEvidence struct {
 	OutputSkip      string   `json:"outputSkip,omitempty"`   // background | unreadable | timeout, only when no digest
 	Commit          string   `json:"commit,omitempty"`
 	CommitSource    string   `json:"commitSource,omitempty"` // pre | post
+	CommitSkip      string   `json:"commitSkip,omitempty"`   // changed-directory, the only reason given
 }
 
 // toolEvidenceCall is what a Bash call's input says: the verification kinds
-// its command runs, none for every other call.
+// its command runs, none for every other call, and whether one of them may
+// run in another directory than the call's cwd.
 type toolEvidenceCall struct {
 	kinds      []string
+	moved      bool
 	command    string
 	background bool
 }
@@ -687,103 +698,131 @@ func (l toolLedger) evidenceInput(tool string, input json.RawMessage) toolEviden
 	if json.Unmarshal(input, &in) != nil {
 		return toolEvidenceCall{}
 	}
-	kinds := toolEvidenceKinds(in.Command, l.denyMax)
+	kinds, moved := toolEvidenceClassify(in.Command, l.denyMax)
 	if kinds == nil {
 		return toolEvidenceCall{}
 	}
-	return toolEvidenceCall{kinds, in.Command, string(bytes.TrimSpace(in.Background)) == "true"}
+	return toolEvidenceCall{kinds, moved, in.Command, string(bytes.TrimSpace(in.Background)) == "true"}
 }
 
 // toolEvidenceKinds lists the verification kinds a command runs, each once
-// in first-seen order, or nil. It reads the simple commands the would-deny
-// parser finds, substitutions included, so quoted text and arguments are
-// never commands. Text given to a nested bash -c, sh -c or eval is not
-// followed. A command over max bytes, or one the parser cannot follow, has
-// none.
+// in first-seen order, or nil.
 func toolEvidenceKinds(command string, max int) []string {
+	kinds, _ := toolEvidenceClassify(command, max)
+	return kinds
+}
+
+// toolEvidenceClassify returns the kinds, and moved: a verification command
+// is preceded in the call by cd, pushd or popd, or names its own directory
+// (go -C, a package manager's --prefix, -C, --dir or --cwd), so the commit of
+// the call's cwd may not be the one it ran at. It reads the simple commands
+// the would-deny parser finds, substitutions included, so quoted text and
+// arguments are never commands. Text given to a nested bash -c, sh -c or
+// eval is not followed. A command over max bytes, or one the parser cannot
+// follow, has none.
+func toolEvidenceClassify(command string, max int) (kinds []string, moved bool) {
 	if command == "" || len(command) > max {
-		return nil
+		return nil, false
 	}
 	p := toolDenyParser{s: command}
 	p.parse(0, 0, 0)
 	if p.failed {
-		return nil
+		return nil, false
 	}
-	var kinds []string
+	changed := false // a directory change came before
 	for _, words := range p.cmds {
-		kind := toolEvidenceKind(words, 0)
-		if kind != "" && !slices.Contains(kinds, kind) {
+		if run := toolDenyCommandWords(words); len(run) > 0 {
+			switch toolDenyBase(run[0]) {
+			case "cd", "pushd", "popd":
+				changed = true
+				continue
+			}
+		}
+		kind, own := toolEvidenceKind(words, 0)
+		if kind == "" {
+			continue
+		}
+		moved = moved || changed || own
+		if !slices.Contains(kinds, kind) {
 			kinds = append(kinds, kind)
 		}
 	}
-	return kinds
+	return kinds, moved
 }
 
 // toolEvidenceKind classifies one simple command after its assignments and
-// wrapper commands are dropped.
-func toolEvidenceKind(words []string, wrapped int) string {
+// wrapper commands are dropped. own reports a directory option of its own.
+func toolEvidenceKind(words []string, wrapped int) (kind string, own bool) {
 	words = toolDenyCommandWords(words)
 	if len(words) == 0 {
-		return ""
+		return "", false
 	}
 	name, args := toolDenyBase(words[0]), words[1:]
 	switch name {
 	case "go":
 		if len(args) > 1 && args[0] == "-C" {
-			args = args[2:]
+			args, own = args[2:], true
 		} else if len(args) > 0 && strings.HasPrefix(args[0], "-C=") {
-			args = args[1:]
+			args, own = args[1:], true
 		}
 		if len(args) > 0 && args[0] == "test" {
-			return "go-test"
+			return "go-test", own
 		}
 		if len(args) > 0 && args[0] == "vet" {
-			return "go-vet"
+			return "go-vet", own
 		}
 	case "npm", "pnpm", "yarn", "bun":
-		args = toolEvidenceNpmOptions(args)
+		args, own = toolEvidenceNpmOptions(args)
 		if len(args) > 0 && (args[0] == "test" || args[0] == "t") {
-			return "npm-test"
+			return "npm-test", own
 		}
 		if len(args) > 0 && (args[0] == "run" || args[0] == "run-script") {
-			args = toolEvidenceNpmOptions(args[1:])
+			var after bool
+			args, after = toolEvidenceNpmOptions(args[1:])
 			if len(args) > 0 && (args[0] == "test" || strings.HasPrefix(args[0], "test:")) {
-				return "npm-test"
+				return "npm-test", own || after
 			}
 		}
 	case "node":
 		return toolEvidenceNode(args, wrapped)
 	case "verify-matrix.mjs":
-		return "verify-matrix"
+		return "verify-matrix", false
 	}
-	return ""
+	return "", false
 }
 
+// toolEvidenceNpmDir holds the package manager options that name the
+// directory a script runs in.
+var toolEvidenceNpmDir = map[string]bool{"--prefix": true, "-C": true, "--dir": true, "--cwd": true}
+
 // toolEvidenceNpmOptions drops leading package manager options, with the
-// value of those that take one, as the would-deny check reads them.
-func toolEvidenceNpmOptions(args []string) []string {
+// value of those that take one, as the would-deny check reads them. dir
+// reports an option that names the directory.
+func toolEvidenceNpmOptions(args []string) (rest []string, dir bool) {
 	for len(args) > 0 && strings.HasPrefix(args[0], "-") {
 		a := args[0]
 		args = args[1:]
-		if _, _, attached := strings.Cut(a, "="); !attached && toolDenyNpmValued[a] && len(args) > 0 {
+		opt, _, attached := strings.Cut(a, "=")
+		dir = dir || toolEvidenceNpmDir[opt]
+		if !attached && toolDenyNpmValued[a] && len(args) > 0 {
 			args = args[1:]
 		}
 	}
-	return args
+	return args, dir
 }
 
 // toolEvidenceNode reads node's options up to the script. --test among them
 // is node-test; a script named verify-matrix.mjs is verify-matrix; and the
 // host-lock wrapper's exec runs the command after its first "--", which is
 // classified the same way.
-func toolEvidenceNode(args []string, wrapped int) string {
+func toolEvidenceNode(args []string, wrapped int) (string, bool) {
 	test := false
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		if strings.HasPrefix(a, "-") && len(a) > 1 {
 			switch a {
 			case "--check", "-c", "-e", "--eval", "-p", "--print":
-				return "" // a syntax check or an inline script
+				return "", false // a syntax check or an inline script
 			case "--test":
 				test = true
 			}
@@ -793,14 +832,14 @@ func toolEvidenceNode(args []string, wrapped int) string {
 			continue
 		}
 		if test {
-			return "node-test"
+			return "node-test", false
 		}
 		switch toolDenyBase(a) {
 		case "verify-matrix.mjs":
-			return "verify-matrix"
+			return "verify-matrix", false
 		case "verify-matrix-host-lock.mjs":
 			if i+1 >= len(args) || args[i+1] != "exec" || wrapped >= toolEvidenceWrappers {
-				return ""
+				return "", false
 			}
 			for j := i + 2; j < len(args); j++ {
 				if args[j] == "--" {
@@ -808,18 +847,23 @@ func toolEvidenceNode(args []string, wrapped int) string {
 				}
 			}
 		}
-		return ""
+		return "", false
 	}
 	if test {
-		return "node-test" // node --test with no file finds its own
+		return "node-test", false // node --test with no file finds its own
 	}
-	return ""
+	return "", false
 }
 
 // evidence builds the field for a verification command's post row. commit
 // is the one its pre recorded, if any.
 func (l toolLedger) evidence(call toolEvidenceCall, p toolHookInput, data []byte, commit, cwd string) *toolEvidence {
 	ev := &toolEvidence{Kinds: call.kinds}
+	// Read beside the scans below, and waited for only until its budget.
+	var read <-chan string
+	if commit == "" && !call.moved {
+		read = startEvidenceCommit(cwd)
+	}
 	if len(call.command) > toolEvidenceCommandBytes {
 		ev.CommandSkip = "oversize"
 	} else if text, n, ok := toolEvidenceRedact(call.command, toolRedactExact(l.token), l.started.Add(l.redactBudget)); ok {
@@ -838,12 +882,51 @@ func (l toolLedger) evidence(call toolEvidenceCall, p toolHookInput, data []byte
 	default:
 		ev.output(p, data)
 	}
-	if commit != "" {
+	switch {
+	case call.moved:
+		ev.CommitSkip = "changed-directory" // cwd's commit may not be the one it ran at
+	case commit != "":
 		ev.Commit, ev.CommitSource = commit, "pre"
-	} else if commit = toolEvidenceCommit(cwd); commit != "" {
-		ev.Commit, ev.CommitSource = commit, "post"
+	}
+	if read != nil {
+		if commit = l.awaitCommit(read); commit != "" {
+			ev.Commit, ev.CommitSource = commit, "post"
+		}
 	}
 	return ev
+}
+
+// startEvidenceCommit reads the commit in a goroutine of its own. A read that
+// blocks keeps only that goroutine, which ends with the process.
+func startEvidenceCommit(cwd string) <-chan string {
+	read := make(chan string, 1)
+	go func() {
+		defer func() { _ = recover() }()
+		read <- toolEvidenceCommit(cwd)
+	}()
+	return read
+}
+
+// awaitCommit waits for the read until the commit budget, counted from the
+// handler's start, has passed. A read not finished by then gives no commit.
+func (l toolLedger) awaitCommit(read <-chan string) string {
+	wait := time.Until(l.started.Add(l.commitBudget))
+	if wait <= 0 {
+		select {
+		case commit := <-read:
+			return commit
+		default:
+			return ""
+		}
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case commit := <-read:
+		return commit
+	case <-timer.C:
+		return ""
+	}
 }
 
 // output sets the exit code and the output digest from the post's payload.

@@ -1745,6 +1745,7 @@ func TestToolLedgerEvidenceCommit(t *testing.T) {
 func TestToolLedgerEvidenceRow(t *testing.T) {
 	e, root := toolLedgerSandbox(t)
 	setToolLedger(t, &toolLedgerDeadline, 30*time.Second) // the row is the subject here, not timing
+	setToolLedger(t, &toolEvidenceCommitBudget, 30*time.Second)
 	setToolLedger(t, &toolRedactScanBudget, 30*time.Second)
 	repo, head := evidenceRepo(t, filepath.Join(t.TempDir(), "repo"))
 	command := "go test ./x -count=1"
@@ -1782,6 +1783,7 @@ func TestToolLedgerEvidenceRow(t *testing.T) {
 func TestToolLedgerEvidenceOnlyVerification(t *testing.T) {
 	e, root := toolLedgerSandbox(t)
 	setToolLedger(t, &toolLedgerDeadline, 30*time.Second) // the rows are the subject here, not timing
+	setToolLedger(t, &toolEvidenceCommitBudget, 30*time.Second)
 	repo, _ := evidenceRepo(t, filepath.Join(t.TempDir(), "repo"))
 	base := "agent,argsDigest,outcome,run,session,task,time,tool,toolUseId,v"
 	for i, c := range []struct {
@@ -1822,6 +1824,7 @@ func TestToolLedgerEvidenceOnlyVerification(t *testing.T) {
 func TestToolLedgerEvidenceStoresNoOutput(t *testing.T) {
 	e, root := toolLedgerSandbox(t)
 	setToolLedger(t, &toolLedgerDeadline, 30*time.Second) // the stored content is the subject here, not timing
+	setToolLedger(t, &toolEvidenceCommitBudget, 30*time.Second)
 	setToolLedger(t, &toolRedactScanBudget, 30*time.Second)
 	repo, head := evidenceRepo(t, filepath.Join(t.TempDir(), "MARK-ROOT"))
 	cwd := filepath.Join(repo, "MARK-CWD")
@@ -1922,7 +1925,8 @@ func TestToolLedgerEvidenceRedactsCommand(t *testing.T) {
 func TestToolLedgerEvidenceRedactTimeout(t *testing.T) {
 	e, root := toolLedgerSandbox(t)
 	setToolLedger(t, &toolLedgerDeadline, 30*time.Second) // the stored text is the subject here, not timing
-	setToolLedger(t, &toolRedactScanBudget, 0)            // already spent when the scan starts
+	setToolLedger(t, &toolEvidenceCommitBudget, 30*time.Second)
+	setToolLedger(t, &toolRedactScanBudget, 0) // already spent when the scan starts
 	repo, head := evidenceRepo(t, filepath.Join(t.TempDir(), "repo"))
 	call := evidenceBash("u1", "go test ./x -count=1", repo)
 	toolHook(t, e, "PreToolUse", call)
@@ -1941,6 +1945,7 @@ func TestToolLedgerEvidenceRedactTimeout(t *testing.T) {
 func TestToolLedgerEvidenceCommitAtStart(t *testing.T) {
 	e, root := toolLedgerSandbox(t)
 	setToolLedger(t, &toolLedgerDeadline, 30*time.Second) // the commit is the subject here, not timing
+	setToolLedger(t, &toolEvidenceCommitBudget, 30*time.Second)
 	repo, first := evidenceRepo(t, filepath.Join(t.TempDir(), "repo"))
 	path := os.Getenv("PATH")
 	t.Setenv("PATH", t.TempDir())
@@ -2076,8 +2081,9 @@ func TestToolLedgerEvidenceWithinBound(t *testing.T) {
 		if len(rows) != 1 {
 			t.Fatalf("rows = %v", rows)
 		}
-		// The digest is only expected from a hook that decoded in time.
-		if ev := evidenceOf(t, rows[0]); ev["commit"] != head || ev["outputDigest"] == nil && ev["outputSkip"] != "timeout" {
+		// The digest and the commit are only expected from a hook that read
+		// them within their budgets.
+		if ev := evidenceOf(t, rows[0]); ev["commit"] != head && ev["commit"] != nil || ev["outputDigest"] == nil && ev["outputSkip"] != "timeout" {
 			t.Fatalf("evidence = %v", ev)
 		}
 		break
@@ -2092,6 +2098,7 @@ func TestToolLedgerEvidenceWithinBound(t *testing.T) {
 	// the post reads the commit itself.
 	e, root := toolLedgerSandbox(t)
 	setToolLedger(t, &toolLedgerDeadline, 30*time.Second)
+	setToolLedger(t, &toolEvidenceCommitBudget, 30*time.Second)
 	long := evidenceWith(call, map[string]any{"session_id": strings.Repeat(`"`, 100), "tool_use_id": strings.Repeat("u", 128)})
 	toolHook(t, e, "PreToolUse", call)
 	toolHook(t, e, "PreToolUse", long)
@@ -2117,6 +2124,133 @@ func TestToolLedgerEvidenceWithinBound(t *testing.T) {
 	for _, row := range rows {
 		if evidenceOf(t, row)["commit"] != head {
 			t.Fatalf("row = %v", row)
+		}
+	}
+}
+
+// a6, review blocker b1: a commit read that blocks (a FIFO HEAD here, a hung
+// network mount on a host) is given up at its budget. The pre still writes
+// its pending entry and the post its row, with no commit, inside the bound,
+// as before the evidence existed; a call that is no verification command is
+// never slowed.
+func TestToolLedgerEvidenceCommitStalls(t *testing.T) {
+	repo := filepath.Join(t.TempDir(), "repo")
+	if err := os.MkdirAll(filepath.Join(repo, ".git"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	head := filepath.Join(repo, ".git", "HEAD")
+	if err := syscall.Mkfifo(head, 0600); err != nil {
+		t.Fatal(err)
+	}
+	// Release the blocked reads at the end: a writer's open lets every
+	// waiting reader's open return, and they read nothing.
+	t.Cleanup(func() {
+		if f, err := os.OpenFile(head, os.O_WRONLY|syscall.O_NONBLOCK, 0); err == nil {
+			f.Close()
+		}
+	})
+	out := map[string]any{"tool_response": map[string]any{"stdout": "ok"}}
+	var slowest time.Duration
+	for attempt := 0; attempt < 3; attempt++ {
+		time.Sleep(time.Duration(attempt) * toolLedgerBound)
+		e, root := toolLedgerSandbox(t)
+		slowest = 0
+		for _, command := range []string{"ls -la", "go test ./x"} {
+			call := evidenceBash("u-"+command[:2], command, repo)
+			for _, event := range []struct {
+				name    string
+				payload map[string]any
+			}{{"PreToolUse", call}, {"PostToolUse", evidenceWith(call, out)}} {
+				r := runToolHook(t, e, "tool", toolPayload(event.name, event.payload), nil)
+				if r.err != nil || r.out != "" {
+					t.Fatalf("%s %q = %v, output %q", event.name, command, r.err, r.out)
+				}
+				slowest = max(slowest, r.elapsed)
+			}
+		}
+		if slowest >= toolLedgerDeadline {
+			continue // a stalled host, not the read: the read gives up at 50 ms
+		}
+		rows := toolLedgerRows(t, root, e.agent)
+		if len(rows) != 2 || rows[0]["evidence"] != nil || rows[1]["durationSource"] != "measured" {
+			t.Fatalf("rows = %v", rows)
+		}
+		ev := evidenceOf(t, rows[1])
+		if ev["commit"] != nil || ev["commitSource"] != nil || ev["exitCode"] != float64(0) || ev["command"] != "go test ./x" {
+			t.Fatalf("evidence = %v", ev)
+		}
+		return
+	}
+	t.Fatalf("hooks took up to %v three times; want under the %v deadline", slowest, toolLedgerDeadline)
+}
+
+// f1 (review RESULT #51430): a verification command that may run in another
+// directory than the call's cwd, after cd, pushd or popd or with a directory
+// option of its own, records no commit: commitSkip says why. The pre does not
+// read one either.
+func TestToolLedgerEvidenceChangedDirectory(t *testing.T) {
+	for _, c := range []struct {
+		command string
+		moved   bool
+	}{
+		{"cd hub && go test ./cmd/tt", true},
+		{"(cd hub && go test ./x)", true},
+		{"pushd hub; go vet ./...; popd", true},
+		{"popd; npm test", true},
+		{"go -C hub test ./cmd/tt", true},
+		{"go -C=hub vet ./...", true},
+		{"npm --prefix hub test", true},
+		{"npm --prefix=hub test", true},
+		{"npm run --prefix hub test", true},
+		{"pnpm -C hub test", true},
+		{"pnpm --dir hub test", true},
+		{"yarn --cwd hub test", true},
+		{"node scripts/verify-matrix-host-lock.mjs exec --item X -- go -C hub test ./x", true},
+		{"cd /tmp; ls; go test ./x", true},
+		{"go test ./x", false},
+		{"go test ./x && cd /tmp", false},
+		{"npm test", false},
+		{"npm --silent test", false},
+		{`echo "cd hub" && go test ./x`, false},
+		{"git -C hub status && go test ./x", false},
+		{"node scripts/verify-matrix-host-lock.mjs exec --item X -- go test ./x", false},
+	} {
+		kinds, moved := toolEvidenceClassify(c.command, toolDenyMaxCommand)
+		if len(kinds) == 0 || moved != c.moved {
+			t.Errorf("toolEvidenceClassify(%q) = %v, %v; want moved %v", c.command, kinds, moved, c.moved)
+		}
+	}
+	// No verification command: not moved, whatever came before.
+	if kinds, moved := toolEvidenceClassify("cd hub && ls", toolDenyMaxCommand); kinds != nil || moved {
+		t.Fatalf("cd then ls = %v, %v", kinds, moved)
+	}
+
+	e, root := toolLedgerSandbox(t)
+	setToolLedger(t, &toolLedgerDeadline, 30*time.Second) // the commit is the subject here, not timing
+	setToolLedger(t, &toolEvidenceCommitBudget, 30*time.Second)
+	repo, head := evidenceRepo(t, filepath.Join(t.TempDir(), "repo"))
+	out := map[string]any{"tool_response": map[string]any{"stdout": "ok"}}
+	for i, command := range []string{"cd sub && go test ./...", "go -C sub test ./...", "go test ./..."} {
+		call := evidenceBash(fmt.Sprintf("u%d", i), command, repo)
+		toolHook(t, e, "PreToolUse", call)
+		for _, entry := range toolPendingFiles(t, root, e.agent) {
+			data, err := os.ReadFile(filepath.Join(root, e.agent, "pending", entry.Name()))
+			if err != nil || bytes.Contains(data, []byte(`"commit"`)) != (i == 2) {
+				t.Fatalf("%q pending entry %s: %v", command, data, err)
+			}
+		}
+		toolHook(t, e, "PostToolUse", evidenceWith(call, out))
+	}
+	toolHook(t, e, "PostToolUse", evidenceWith(evidenceBash("nopre", "cd sub && go test ./...", repo), out))
+	rows := toolLedgerRows(t, root, e.agent)
+	if len(rows) != 4 {
+		t.Fatalf("rows = %v", rows)
+	}
+	for i, want := range []struct{ commit, source, skip any }{
+		{nil, nil, "changed-directory"}, {nil, nil, "changed-directory"}, {head, "pre", nil}, {nil, nil, "changed-directory"},
+	} {
+		if ev := evidenceOf(t, rows[i]); ev["commit"] != want.commit || ev["commitSource"] != want.source || ev["commitSkip"] != want.skip || ev["exitCode"] != float64(0) {
+			t.Errorf("row %d evidence = %v; want commit %v from %v, skip %v", i, ev, want.commit, want.source, want.skip)
 		}
 	}
 }
