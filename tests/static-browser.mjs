@@ -38,6 +38,7 @@ import { openVault } from "../client/vault-crypto.js";
 import { attachSFTP } from "./sftp-fixture.mjs";
 import { createFixtureHub } from "./fixture-hub.mjs";
 import { exerciseTasks, exerciseTaskRestore } from "./tasks-browser.mjs";
+import { exerciseTabSwitch } from "./tab-switch-browser.mjs";
 const fixtureHub = createFixtureHub();
 import { exerciseImageUpload } from "./upload-browser.mjs";
 import { finishRestoration } from "./restore-browser.mjs";
@@ -695,6 +696,7 @@ try {
   await exerciseFetchUnload(browser);
   if (process.env.TAILTERM_FETCH_UNLOAD_ONLY)
     throw new FocusedFetchUnloadComplete();
+  await exerciseTabSwitch(browser);
   const context = await browser.newContext({
     viewport: { width: 1440, height: 1100 },
     permissions:

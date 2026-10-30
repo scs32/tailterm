@@ -189,7 +189,7 @@ uses fill, hover uses outline, and the history checkbox stays beside its label.
 
 Previously visited hub views use an encrypted local read cache and refresh in
 the background, including small incremental Board message reads. The cache is
-bounded to 100 entries/4 MiB/seven days and isolated by hub credential. Saved data
+bounded to 100 entries/8 MiB/seven days and isolated by hub credential. Saved data
 remains readable while the hub is offline; hub mutations are never queued.
 Terminal lifecycle operations continue using live authoritative reads.
 

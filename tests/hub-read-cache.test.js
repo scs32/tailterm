@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createHubReadCache } from "../client/hub-read-cache.js";
+import {
+  createHubReadCache,
+  HUB_READ_CACHE_MAX_BYTES,
+} from "../client/hub-read-cache.js";
 
 function memory(initial = null) {
   let saved = initial;
@@ -180,4 +183,145 @@ test("disposing invalidates pending and future cache operations", async () => {
   await assert.rejects(cache.get("scope", "key"), /disposed/);
   await assert.rejects(cache.put("scope", "key", 2), /disposed/);
   await assert.rejects(cache.clear(), /disposed/);
+});
+
+test("hub read cache loads persisted state once", async () => {
+  const storage = memory();
+  let loads = 0;
+  const cache = createHubReadCache({
+    ...storage,
+    load: async () => {
+      loads++;
+      return storage.load();
+    },
+    now: () => 100,
+  });
+  for (let i = 0; i < 20; i++) {
+    if (i % 3 === 0) await cache.put("scope", `key-${i}`, { i });
+    else if (i % 3 === 1) await cache.get("scope", `key-${i - 1}`);
+    else await cache.clear("other");
+  }
+  assert.equal(loads, 1);
+});
+
+test("hub read cache coalesces concurrent puts into at most two saves", async () => {
+  const saves = [];
+  const cache = createHubReadCache({
+    load: async () => null,
+    save: async (value) => {
+      const copy = structuredClone(value);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      saves.push(copy);
+    },
+    now: () => 100,
+  });
+  const keys = Array.from({ length: 10 }, (_, i) => `key-${i}`);
+  const settled = keys.map((key) =>
+    cache
+      .put("scope", key, { key })
+      .then((ok) => ({ key, ok, at: saves.length })),
+  );
+  for (const { key, ok, at } of await Promise.all(settled)) {
+    assert.equal(ok, true);
+    assert.ok(
+      saves
+        .slice(0, at)
+        .some((saved) => saved.entries.some((entry) => entry.key === key)),
+      `${key} resolved before a save containing it`,
+    );
+  }
+  assert.ok(saves.length <= 2, `${saves.length} saves`);
+  assert.deepEqual(
+    saves
+      .at(-1)
+      .entries.map((entry) => entry.key)
+      .sort(),
+    [...keys].sort(),
+  );
+});
+
+test("hub read cache reads do not wait for a pending save", async () => {
+  let releaseSave;
+  const held = new Promise((resolve) => {
+    releaseSave = resolve;
+  });
+  let saves = 0;
+  const cache = createHubReadCache({
+    load: async () => null,
+    save: async () => {
+      if (++saves === 2) await held;
+    },
+    now: () => 100,
+  });
+  await cache.put("scope", "kept", { n: 1 });
+  let putDone = false;
+  const pending = cache.put("scope", "later", { n: 2 }).then(() => {
+    putDone = true;
+  });
+  assert.deepEqual(await cache.get("scope", "kept"), {
+    value: { n: 1 },
+    savedAt: 100,
+  });
+  assert.equal(putDone, false);
+  releaseSave();
+  await pending;
+  assert.equal(putDone, true);
+});
+
+test("disposing during a held save rejects the pending put and later calls", async () => {
+  let entered;
+  const saving = new Promise((resolve) => {
+    entered = resolve;
+  });
+  let releaseSave;
+  const held = new Promise((resolve) => {
+    releaseSave = resolve;
+  });
+  const cache = createHubReadCache({
+    load: async () => null,
+    save: async () => {
+      entered();
+      await held;
+    },
+  });
+  const pending = cache.put("scope", "key", 1);
+  const queued = (async () => {
+    await saving;
+    return cache.put("scope", "queued", 2);
+  })();
+  await saving;
+  cache.dispose();
+  releaseSave();
+  await assert.rejects(pending, /disposed/);
+  await assert.rejects(queued, /disposed/);
+  await assert.rejects(cache.get("scope", "key"), /disposed/);
+  await assert.rejects(cache.put("scope", "key", 3), /disposed/);
+  await assert.rejects(cache.clear(), /disposed/);
+});
+
+test("hub read cache default cap evicts by total bytes at 8 MiB", async () => {
+  assert.equal(HUB_READ_CACHE_MAX_BYTES, 8 * 1024 * 1024);
+  const storage = memory();
+  let now = 1_000;
+  const cache = createHubReadCache({ ...storage, now: () => now++ });
+  const text = "x".repeat(1024 * 1024);
+  for (let i = 0; i < 9; i++)
+    assert.equal(await cache.put("scope", `big-${i}`, { text }), true);
+  const bytes = new TextEncoder().encode(
+    JSON.stringify(storage.saved()),
+  ).byteLength;
+  assert.ok(bytes <= HUB_READ_CACHE_MAX_BYTES, `${bytes} bytes saved`);
+  assert.ok(bytes > HUB_READ_CACHE_MAX_BYTES - 2 * 1024 * 1024);
+  assert.equal(await cache.get("scope", "big-0"), null);
+  assert.ok(await cache.get("scope", "big-8"));
+  assert.deepEqual(
+    storage.saved().entries.map((entry) => entry.key),
+    ["big-2", "big-3", "big-4", "big-5", "big-6", "big-7", "big-8"],
+  );
+  assert.equal(
+    await cache.put("scope", "oversized", {
+      text: "y".repeat(HUB_READ_CACHE_MAX_BYTES),
+    }),
+    false,
+  );
 });

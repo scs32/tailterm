@@ -1,7 +1,7 @@
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 export const HUB_READ_CACHE_MAX_ENTRIES = 100;
-export const HUB_READ_CACHE_MAX_BYTES = 4 * 1024 * 1024;
+export const HUB_READ_CACHE_MAX_BYTES = 8 * 1024 * 1024;
 export const HUB_READ_CACHE_MAX_AGE_MS = 7 * DAY_MS;
 
 const encoder = new TextEncoder();
@@ -36,6 +36,23 @@ function byteLength(entries) {
 }
 const EMPTY_STATE_BYTES = byteLength([]);
 
+// One persisted entry's share of the saved state: its JSON plus the
+// separating comma. Summed over entries this slightly overcounts, so the
+// running total never under-reports the saved size.
+function entrySize(entry) {
+  return encoder.encode(JSON.stringify(entry)).byteLength + 1;
+}
+
+function evict(records, { maxEntries, maxBytes }) {
+  let total = records.reduce((sum, record) => sum + record.size, 0);
+  while (
+    records.length &&
+    (records.length > maxEntries || EMPTY_STATE_BYTES + total > maxBytes)
+  )
+    total -= records.shift().size;
+  return records;
+}
+
 function normalize(raw, time, { maxEntries, maxBytes, maxAgeMs }) {
   if (raw?.version !== 1 || !Array.isArray(raw.entries)) return [];
   const unique = new Map();
@@ -66,17 +83,17 @@ function normalize(raw, time, { maxEntries, maxBytes, maxAgeMs }) {
     if (!previous || previous.savedAt <= entry.savedAt)
       unique.set(identity, entry);
   }
-  const entries = [...unique.values()].sort(
-    (left, right) => left.savedAt - right.savedAt,
-  );
-  while (
-    entries.length &&
-    (entries.length > maxEntries || byteLength(entries) > maxBytes)
-  )
-    entries.shift();
-  return entries;
+  const records = [...unique.values()]
+    .sort((left, right) => left.savedAt - right.savedAt)
+    .map((entry) => ({ entry, size: entrySize(entry) }));
+  return evict(records, { maxEntries, maxBytes });
 }
 
+// The persisted state is loaded and normalized once, then kept in memory:
+// reads never reload it or wait for a save, and writes update memory and join
+// one coalesced save. A put or clear resolves only after the save holding its
+// change finishes; if that save fails it rejects, and the change stays in
+// memory for the next save. A failed load is retried by the next call.
 export function createHubReadCache({
   load,
   save,
@@ -100,21 +117,16 @@ export function createHubReadCache({
   maxEntries = Math.min(maxEntries, HUB_READ_CACHE_MAX_ENTRIES);
   maxBytes = Math.min(maxBytes, HUB_READ_CACHE_MAX_BYTES);
   maxAgeMs = Math.min(maxAgeMs, HUB_READ_CACHE_MAX_AGE_MS);
+  const bounds = { maxEntries, maxBytes, maxAgeMs };
 
   let disposed = false;
-  let operations = Promise.resolve();
+  // records: oldest-first { entry, size }, or null until loaded.
+  let records = null;
+  let loading = null;
+  let saving = null;
+  let next = null;
   const requireActive = () => {
     if (disposed) throw new Error("Hub read cache is disposed.");
-  };
-  const serial = (fn) => {
-    if (disposed)
-      return Promise.reject(new Error("Hub read cache is disposed."));
-    const task = operations.then(async () => {
-      requireActive();
-      return fn();
-    });
-    operations = task.catch(() => {});
-    return task;
   };
   const time = () => {
     const value = Number(now());
@@ -122,69 +134,89 @@ export function createHubReadCache({
       throw new TypeError("Hub cache clock returned an invalid time.");
     return Math.trunc(value);
   };
-  const read = async (at) => {
-    const raw = await load();
+  const ready = async () => {
     requireActive();
-    return normalize(raw, at, { maxEntries, maxBytes, maxAgeMs });
+    if (!loading) {
+      const attempt = (async () => {
+        const raw = await load();
+        requireActive();
+        records = normalize(raw, time(), bounds);
+      })();
+      loading = attempt;
+      attempt.catch(() => {
+        if (loading === attempt) loading = null;
+      });
+    }
+    await loading;
+    requireActive();
+    const at = time();
+    records = records.filter(({ entry }) => at - entry.savedAt < maxAgeMs);
+  };
+  const write = async () => {
+    requireActive();
+    await save(state(records.map(({ entry }) => entry)));
+    requireActive();
+  };
+  const persist = () => {
+    if (!saving) {
+      saving = write().finally(() => {
+        saving = null;
+      });
+      return saving;
+    }
+    // Changes made while a save is in flight share the one save after it.
+    next ||= saving
+      .catch(() => {})
+      .then(() => {
+        next = null;
+        return persist();
+      });
+    return next;
   };
 
   return {
-    get(scope, key) {
+    async get(scope, key) {
       requirePart(scope, "Hub cache scope");
       requirePart(key, "Hub cache key");
-      return serial(async () => {
-        const entries = await read(time());
-        const found = entries.find(
-          (entry) => entry.scope === scope && entry.key === key,
-        );
-        return found
-          ? { value: cloneJSON(found.value), savedAt: found.savedAt }
-          : null;
-      });
+      await ready();
+      const found = records.find(
+        ({ entry }) => entry.scope === scope && entry.key === key,
+      )?.entry;
+      return found
+        ? { value: cloneJSON(found.value), savedAt: found.savedAt }
+        : null;
     },
 
-    put(scope, key, value) {
+    async put(scope, key, value) {
       requirePart(scope, "Hub cache scope");
       requirePart(key, "Hub cache key");
       const copy = cloneJSON(value);
-      return serial(async () => {
-        const at = time();
-        const candidate = { scope, key, value: copy, savedAt: at };
-        if (byteLength([candidate]) > maxBytes) return false;
-        const entries = (await read(at)).filter(
-          (entry) => entry.scope !== scope || entry.key !== key,
-        );
-        entries.push(candidate);
-        entries.sort((left, right) => left.savedAt - right.savedAt);
-        while (
-          entries.length &&
-          (entries.length > maxEntries || byteLength(entries) > maxBytes)
-        )
-          entries.shift();
-        if (!entries.includes(candidate)) return false;
-        requireActive();
-        await save(state(cloneJSON(entries)));
-        requireActive();
-        return true;
-      });
+      await ready();
+      const entry = { scope, key, value: copy, savedAt: time() };
+      const candidate = { entry, size: entrySize(entry) };
+      if (EMPTY_STATE_BYTES + candidate.size > maxBytes) return false;
+      const kept = records.filter(
+        (record) => record.entry.scope !== scope || record.entry.key !== key,
+      );
+      kept.push(candidate);
+      kept.sort((left, right) => left.entry.savedAt - right.entry.savedAt);
+      records = evict(kept, bounds);
+      if (!records.includes(candidate)) return false;
+      await persist();
+      return true;
     },
 
-    clear(scope) {
+    async clear(scope) {
       if (scope !== undefined) requirePart(scope, "Hub cache scope");
-      return serial(async () => {
-        const entries = await read(time());
-        const kept =
-          scope === undefined
-            ? []
-            : entries.filter((entry) => entry.scope !== scope);
-        const removed = entries.length - kept.length;
-        if (scope === undefined || removed) {
-          requireActive();
-          await save(state(cloneJSON(kept)));
-          requireActive();
-        }
-        return removed;
-      });
+      await ready();
+      const kept =
+        scope === undefined
+          ? []
+          : records.filter((record) => record.entry.scope !== scope);
+      const removed = records.length - kept.length;
+      records = kept;
+      if (scope === undefined || removed) await persist();
+      return removed;
     },
 
     dispose() {
