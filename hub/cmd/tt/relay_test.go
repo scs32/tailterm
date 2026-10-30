@@ -4613,6 +4613,11 @@ func TestRelayVisitsOtherBindingsWhileOneHubCallBlocks(t *testing.T) {
 	}
 	f = newRelayVisitFixture(t, 8, 2, 50*time.Millisecond, pause)
 	t.Cleanup(unblock)
+	// This test is about the pool, not the cleanup bound: the hold must not
+	// stop the other bindings' visits while the blocked one runs.
+	oldBound := relayCleanupSkipBound
+	t.Cleanup(func() { relayCleanupSkipBound = oldBound })
+	relayCleanupSkipBound = 1000
 	blockedAgent := f.bindings[0].Agent
 	hook := func(agent string) {
 		if agent != blockedAgent {
