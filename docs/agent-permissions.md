@@ -92,9 +92,11 @@ tt event needs_input --reason tool --text "The browser tool is unavailable."
 ```
 
 Tasks and Board display **Permission blocked**, **Login required**, or **Tool
-unavailable**, with the explanation in the agent tooltip. Ordinary questions
-remain **Needs you**. The reason and explanation persist on the hub and clear on
-an explicit running/done transition. Runtime stop hooks do not erase a blocker.
+unavailable**, with the explanation in the agent tooltip. An agent with an open
+owner request or unanswered decision shows **Needs you**; any other needs_input
+agent shows **Waiting** and stays out of the Needs you list. The reason and
+explanation persist on the hub and clear on an explicit running/done transition.
+Runtime stop hooks do not erase a blocker.
 Claude's configured notification hook classifies permission prompts automatically.
 The host relay also detects the visible Codex directory-trust startup prompt in
 Tailterm-owned panes and reports it without accepting trust or sending terminal input.

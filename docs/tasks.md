@@ -25,7 +25,9 @@ network address. It does not run or configure Tailscale. See
    automatically when their sessions start. **Terminals** on the board opens
    that group; it never attaches the task to an unrelated tab.
 5. Use **Board** for announcements and targeted replies. **Needs you** lists
-   agents reporting that they need input. Click an agent to reopen its pane.
+   only agents waiting on you: a permission, login or tool blocker, an open owner
+   request, or an unanswered decision. Agents waiting on their team, a handler or
+   the host show **Waiting**. Click an agent to reopen its pane.
 
 **Model** accepts a model name or alias for Codex, Claude, Aider, or Gemini.
 Leave it blank to keep that app’s configured default on the selected server.

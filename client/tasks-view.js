@@ -9,6 +9,8 @@ import { pauseStateLabel, projectPauseState } from "./project-pause.js";
 import { createViewRefreshPresentation } from "./view-refresh-presentation.js";
 import { renderTeamDelivery } from "./team-delivery-view.js";
 import { activityDetail, activityLabel } from "./activity-format.js";
+import { readAllDecisions } from "./board-decisions.js";
+import { blockedLabels, ownerWaiters } from "./board-view.js";
 
 const cacheFeedback = (label = "") =>
   label === "Saved data" || label === "Saved data · refreshing"
@@ -78,7 +80,8 @@ export function createTasksView({
   let teamClient = null;
   const teamChoices = new Map();
   const deliveries = new Map(),
-    ownerRequests = new Map();
+    ownerRequests = new Map(),
+    decisions = new Map();
   let stopOwnerClock;
   let deliveryGeneration = 0,
     deliveryTask = null;
@@ -94,6 +97,7 @@ export function createTasksView({
     if (!taskId) return;
     if (deliveryTask !== taskId) {
       ownerRequests.clear();
+      decisions.clear();
       deliveryTask = taskId;
     }
     const update = () => {
@@ -120,6 +124,19 @@ export function createTasksView({
       ownerRequests.delete(taskId);
     }
     update();
+    // Unanswered decisions also mark an agent as waiting on the owner. The
+    // read is optional: a missing or failed read only drops those entries.
+    try {
+      const records = actionClient.listDecisions
+        ? await readAllDecisions(actionClient, taskId)
+        : [];
+      if (!current()) return;
+      decisions.set(taskId, records);
+    } catch {
+      if (!current()) return;
+      decisions.delete(taskId);
+    }
+    update();
   }
   function teamExpanded(task, count) {
     if (teamClient !== client()) {
@@ -127,6 +144,7 @@ export function createTasksView({
       teamChoices.clear();
       deliveries.clear();
       ownerRequests.clear();
+      decisions.clear();
     }
     const epoch = JSON.stringify([
       task.createdAt,
@@ -176,6 +194,7 @@ export function createTasksView({
       teamChoices.clear();
       deliveries.clear();
       ownerRequests.clear();
+      decisions.clear();
     }
     if (!client()) {
       presentation.interrupt();
@@ -281,17 +300,13 @@ export function createTasksView({
     const group = taskHub.groupOf(taskId);
     return group ? getTabs().find((t) => t.id === group.active) : null;
   }
-  const agentState = (a) => {
+  const agentState = (a, owner = false) => {
     const label =
       {
         done: "Turn complete",
         retired: "Retired",
         needs_input:
-          {
-            permission: "Permission blocked",
-            authentication: "Login required",
-            tool: "Tool unavailable",
-          }[a.blockedReason] || "Needs you",
+          blockedLabels[a.blockedReason] || (owner ? "Needs you" : "Waiting"),
         exited: "Exited",
       }[a.status] || a.status;
     const seen = Date.parse(a.lastSeenAt);
@@ -346,13 +361,18 @@ export function createTasksView({
                 : "Pause status unavailable · lifecycle actions are blocked because this hub did not return complete projectPause v1 state.";
         return `<div class="board-head"><div class="view-heading"><div><span class="eyebrow">PROJECT</span><h2>${esc(task.name)}</h2></div><div class="view-actions">${cacheFeedback(client()?.cacheStatus?.().label) ? `<span class="fine hub-sync-status" role="status">${esc(cacheFeedback(client()?.cacheStatus?.().label))}</span>` : ""}<button data-task-board="${esc(task.id)}">Open board →</button>${pauseState === "cleanup_pending" ? `<button data-task-pause-handoff="${esc(task.id)}" data-testid="resolve-pause-handoff">Resolve service handoff…</button><button data-task-pause-cleanup="${esc(task.id)}" data-testid="pause-cleanup-pending">Retry exact cleanup</button>` : ""}${pauseState === "paused" || pauseState === "resuming" ? `<button data-task-resume="${esc(task.id)}" class="primary" data-testid="${pauseState === "resuming" ? "continue-project-resume" : "resume-project"}">${pauseState === "resuming" ? "Continue resume…" : "Resume…"}</button>` : ""}</div></div><p class="fine project-pause-state" role="status" data-testid="${pauseState === "paused" ? "project-paused" : pauseState === "cleanup_pending" ? "project-pause-cleanup-pending" : pauseState === "resuming" ? "project-resuming" : "project-pause-unknown"}">${esc(stateText)}</p></div><article class="task-card task-detail-card" data-task-card="${esc(task.id)}"><header><h3>Project retained</h3><span class="fine">Lifecycle generation ${Number.isSafeInteger(task.lifecycleGeneration) ? task.lifecycleGeneration : "unknown"}</span></header>${task.goal ? `<p class="task-goal">${esc(task.goal)}</p>` : ""}<footer class="task-actions"><span class="fine">${pauseState === "resuming" ? "Fresh team admission pending" : "Team dismissed · unfinished items unchanged"}</span>${openWorkItems ? `<button data-project-bugs="${esc(task.id)}">Bugs</button><button data-project-features="${esc(task.id)}">Features</button>` : ""}<div class="task-more"><button type="button" data-task-more="${esc(task.id)}" aria-expanded="false" aria-controls="task-menu-${esc(task.id)}">More</button><div id="task-menu-${esc(task.id)}" class="task-menu" popover="auto" aria-label="More project actions"><button data-task-close="${esc(task.id)}" class="danger">Close project</button></div></div></footer></article>`;
       }
-      const needs = agents.filter((a) => a.status === "needs_input");
+      const waiters = ownerWaiters(
+        agents.filter((a) => a.status !== "closed"),
+        ownerRequests.get(task.id),
+        decisions.get(task.id),
+      );
+      const needs = agents.filter((a) => waiters.has(a.id));
       const handler = agents.find((a) => a.role === "database_handler");
       return `<div class="board-head"><div class="view-heading"><div><span class="eyebrow">PROJECT</span><h2>${esc(task.name)}</h2></div><div class="view-actions">${cacheFeedback(client()?.cacheStatus?.().label) ? `<span class="fine hub-sync-status" role="status">${esc(cacheFeedback(client()?.cacheStatus?.().label))}</span>` : ""}${resumePending ? `<button data-task-resume="${esc(task.id)}" class="primary" data-testid="continue-project-resume">Continue resume…</button>` : ""}</div></div><p class="fine">${esc(task.goal || taskRollup(agents))}</p></div>${needs.length ? `<section class="needs-you"><div class="view-heading"><h3>Needs you</h3><span class="count-badge">${needs.length}</span></div>${needs.map((agent) => `<button class="attention-row" data-task-agent="${esc(agent.id)}"><strong>${esc(agent.name)}</strong><span>${esc(agent.host)}</span><span>Open →</span></button>`).join("")}</section>` : ""}<article class="task-card task-detail-card" data-task-card="${esc(task.id)}"><header class="project-team-heading"><h3>Team</h3>${agents.some((a) => a.status !== "closed") ? `<button type="button" class="project-team-toggle" data-team-toggle data-view-control="team" aria-label="${teamExpanded(task, agents.filter((a) => a.status !== "closed").length) ? "Hide team" : "Show team"}" aria-expanded="${teamExpanded(task, agents.filter((a) => a.status !== "closed").length)}" aria-controls="project-team-roster"><span class="project-team-chevron" aria-hidden="true">›</span><span>${agents.filter((a) => a.status !== "closed").length}</span></button>` : ""}<span class="fine">${esc(taskRollup(agents))}</span></header><div id="project-team-roster" class="task-agents" data-team-roster ${teamExpanded(task, agents.filter((a) => a.status !== "closed").length) ? "" : "hidden"}>${agents
         .filter((a) => a.status !== "closed")
         .map(
           (a) =>
-            `<button class="board-agent" data-task-agent="${esc(a.id)}" title="${esc((a.blockedText || a.host + " · " + a.session) + " · " + activityDetail(a.activity))}"><span class="status-dot ${STATUS_DOT[a.status] || ""}"></span><span>${esc(a.name)}${esc(rosterRole(a))}</span><span class="fine">${esc(agentState(a))} · ${esc(rosterActivity(a))} · ${esc(a.host)}</span></button>`,
+            `<button class="board-agent" data-task-agent="${esc(a.id)}" title="${esc((a.blockedText || a.host + " · " + a.session) + " · " + activityDetail(a.activity))}"><span class="status-dot ${a.status === "needs_input" && !waiters.has(a.id) ? "" : STATUS_DOT[a.status] || ""}"></span><span>${esc(a.name)}${esc(rosterRole(a))}</span><span class="fine">${esc(agentState(a, waiters.has(a.id)))} · ${esc(rosterActivity(a))} · ${esc(a.host)}</span></button>`,
         )
         .join(
           "",

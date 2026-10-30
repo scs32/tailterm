@@ -1,4 +1,5 @@
 // Builder acceptance for wi_929b036151c7f488 order8454 Start8502 release8504.
+// Needs you scenario: wi_772031e5c0a5b70f order 51712.
 // Only disposable synthetic browser,
 // vault, and hub transport state; no live hub/profile/SSH/tmux access.
 import { chromium, webkit, expect } from "@playwright/test";
@@ -19,13 +20,23 @@ import {createTasksView} from '/client/tasks-view.js';
 import {createTeamsView} from '/client/teams-view.js';
 import {createWorkItemsView} from '/client/work-items-view.js';
 import {setupModes} from '/client/modes.js';
-const scenario=new URLSearchParams(location.search).get('scenario')||'populated';
+const params=new URLSearchParams(location.search);
+const scenario=params.get('scenario')||'populated';
 const long='A very long synthetic project label with enough words to exercise truncation and wrapping across narrow screens';
 const ids=['tsk_1111111111111111','tsk_2222222222222222','tsk_3333333333333333'];
 const state={online:true,failWrites:false,calls:[],notices:[],writes:0,held:false,waiting:[]};
 const tasks=scenario==='empty'?[]:ids.map((id,i)=>({id,name:scenario==='long'?long+' '+(i+1):['Alpha project','Beta project','Closed project'][i],goal:'Synthetic goal '+(i+1),status:i===2?'closed':'open',cleanupPending:i===2?1:0,closedAt:i===2?'2026-09-08T12:00:00Z':undefined,orchestrator:'fixture-lead',createdAt:'2026-09-08T11:00:00Z'}));
 const originalAgents=id=>[{id:'agt_'+id.slice(4),name:'fixture-lead',role:'orchestrator',status:tasks.find(t=>t.id===id)?.status==='closed'?'closed':'running',host:'fixture.invalid',session:'synthetic-session',runtime:'codex',readUpTo:0}];
-const agents=id=>Array.from({length:state.teamCount??Number(new URLSearchParams(location.search).get('count')||12)},(_,i)=>({...originalAgents(id)[0],id:'agt_'+String(i+1).padStart(16,'0'),name:'fixture-agent-'+i,status:i===1?'needs_input':i===2?'retired':i===3?'closed':'running'}));
+const agents=id=>needs&&id===ids[0]?needs.agents:Array.from({length:state.teamCount??Number(new URLSearchParams(location.search).get('count')||12)},(_,i)=>({...originalAgents(id)[0],id:'agt_'+String(i+1).padStart(16,'0'),name:'fixture-agent-'+i,status:i===1?'needs_input':i===2?'retired':i===3?'closed':'running',...(i===1?{blockedReason:'permission'}:{})}));
+// Owner-waiting fixture: A plain needs_input, B login-blocked, C running with an
+// open owner request, D with an unanswered decision, E with only a closed request.
+const needAgent=(key,name,status,extra={})=>({id:'agt_need00000000000'+key,name,status,host:'fixture.invalid',session:'synthetic-session',runtime:'codex',readUpTo:0,...extra});
+const from=key=>({agentId:'agt_need00000000000'+key,node:'fixture',user:'fixture'});
+const needs=params.get('needs')?{
+ agents:[needAgent('l','need-lead','running'),needAgent('a','need-a-plain','needs_input'),needAgent('b','need-b-login','needs_input',{blockedReason:'authentication',blockedText:'Synthetic login expired'}),needAgent('c','need-c-request','running'),needAgent('d','need-d-decision','needs_input'),needAgent('e','need-e-closed','needs_input')],
+ obligations:[{id:'obl_0000000000000c01',recipientKind:'owner',state:'delivered',taskId:ids[0],messageSeq:5,subject:'Synthetic owner request',sourceKind:'request',needs:'ack_outcome',createdAt:'2026-09-08T12:00:00Z',dueAt:'2026-09-08T12:30:00Z',request:{seq:5,taskId:ids[0],from:from('c'),text:'REQUEST: Synthetic owner request',createdAt:'2026-09-08T12:00:00Z'}},{id:'obl_0000000000000e01',recipientKind:'owner',state:'closed',outcome:'result',taskId:ids[0],messageSeq:4,subject:'Synthetic closed request',sourceKind:'request',needs:'ack_outcome',createdAt:'2026-09-08T11:50:00Z',dueAt:'2026-09-08T12:20:00Z',request:{seq:4,taskId:ids[0],from:from('e'),text:'REQUEST: Synthetic closed request',createdAt:'2026-09-08T11:50:00Z'}}],
+ decisions:[{request:{seq:6,taskId:ids[0],from:from('d'),text:'Synthetic decision',createdAt:'2026-09-08T12:00:00Z',decisionRequest:{question:'Synthetic decision?',options:[{id:'keep',label:'Keep',description:'Synthetic keep'},{id:'drop',label:'Drop',description:'Synthetic drop'}],recommendedOptionId:'keep',recommendationReason:'Synthetic reason'}}}]
+}:null;
 const items=tasks.flatMap(task=>['bug','feature'].map(kind=>({id:kind+'-'+task.id,taskId:task.id,kind,title:scenario==='long'?long+' '+kind:task.name+' '+kind,description:'Synthetic description',priority:'normal',status:'open',revision:1})));
 const messages=new Map(ids.map(id=>[id,[{seq:1,from:{user:'fixture'},text:'Synthetic message for '+id,createdAt:'2026-09-08T12:00:00Z'}]]));
 const response=(body,status=200)=>new Response(JSON.stringify(body),{status,headers:{'Content-Type':'application/json'}});
@@ -43,8 +54,8 @@ async function transport(url,init){
  const match=p.match(/^\\/v1\\/tasks\\/([^/]+)(.*)$/);if(!match)throw Error('Unexpected synthetic route '+p);
  const [,id,tail]=match,task=tasks.find(t=>t.id===id);
  if(!tail)return response({task,agents:agents(id)});
- if(tail==='/obligations')return response({obligations:[]});
- if(tail==='/decisions')return response({decisions:[],nextAfter:0});
+ if(tail==='/obligations')return response({obligations:needs&&id===ids[0]?needs.obligations:[]});
+ if(tail==='/decisions'){if(needs&&params.get('decisions')==='fail')return response({error:'Synthetic older hub without decisions'},404);return response({decisions:needs&&id===ids[0]?needs.decisions:[],nextAfter:0})}
  if(tail==='/messages'){
    if(method==='POST'){if(state.holdPost)await new Promise(resolve=>state.releasePost=resolve);const list=messages.get(id);const row={...body,from:{user:'fixture'},seq:list.length+1,createdAt:'2026-09-08T12:00:00Z'};list.push(row);return response(row)}
    return response({messages:messages.get(id).filter(m=>m.seq>Number(u.searchParams.get('after')||0))});
@@ -63,7 +74,9 @@ if(scenario!=='empty')for(let i=0;i<2;i++)await vault.localAPI('/teams','POST',{
 const live=createHubClient({baseURL:'http://synthetic-layout.invalid',token:'synthetic-only',fetchImpl:transport});
 // Explicit invalidations below exercise refresh continuity without a timed
 // poll replacing a control between the keyboard press and its native click.
-let client=createCachedHubClient({client:live,cache:createHubReadCache(vault.hubReadCachePersistence()),online:()=>state.online,refreshMs:60000});
+// decisions=missing models an older client build without listDecisions.
+const withoutDecisions=c=>params.get('decisions')==='missing'?new Proxy(c,{get:(t,k)=>k==='listDecisions'?undefined:t[k]}):c;
+let client=withoutDecisions(createCachedHubClient({client:live,cache:createHubReadCache(vault.hubReadCachePersistence()),online:()=>state.online,refreshMs:60000}));
 const notice=t=>{state.notices.push(t);const el=document.querySelector('#notice');el.textContent=t;el.hidden=false};
 const record=(action,id)=>{state.calls.push({action,id})};
 const dialog=(title,body)=>{const d=document.querySelector('#dialog');if(d.open)d.close();d.innerHTML='<div class="dialog-head"><h2>'+title+'</h2><button id="dialog-close" type="button">×</button></div>'+body;d.querySelector('#dialog-close').onclick=closeDialog;d.showModal()};
@@ -79,8 +92,8 @@ views={
  features:createWorkItemsView({...common,kind:'feature',dialog,closeDialog})
 };
 modes=setupModes({header:document.querySelector('main > header'),main:document.querySelector('main'),onChange:(mode,container)=>{Object.values(views).forEach(v=>v.hide());container.replaceChildren();if(views[mode]){views[mode].mount(container);window.rendered=views[mode].show()}}});
-window.qa={state,views,modes,tasks,items,ids,vault,get client(){return client},
- replaceClient(){client.dispose();client=createCachedHubClient({client:live,cache:createHubReadCache(vault.hubReadCachePersistence()),online:()=>state.online,refreshMs:60000})},
+window.qa={state,views,modes,tasks,items,ids,vault,needs,get client(){return client},
+ replaceClient(){client.dispose();client=withoutDecisions(createCachedHubClient({client:live,cache:createHubReadCache(vault.hubReadCachePersistence()),online:()=>state.online,refreshMs:60000}))},
  async show(mode){modes.set(mode);await window.rendered},
  async offline(value=true){state.online=!value;await client.refreshConnection()},
  release(){state.held=false;state.waiting.splice(0).forEach(r=>r())}
@@ -109,6 +122,119 @@ await server.listen();
 const origin = `http://127.0.0.1:${server.httpServer.address().port}`;
 await mkdir(".build/project-compact-ui", { recursive: true });
 const results = [];
+const needId = (key) => "agt_need00000000000" + key;
+// Needs you lists only agents waiting on the owner (wi_772031e5c0a5b70f).
+async function needsScenario(browser, engine, decisions = "") {
+  const context = await browser.newContext({
+    viewport: { width: 1440, height: 900 },
+  });
+  await context.route("**/*", (r) =>
+    new URL(r.request().url()).origin === origin ? r.continue() : r.abort(),
+  );
+  const page = await context.newPage(),
+    errors = [];
+  page.setDefaultTimeout(10000);
+  page.on("pageerror", (e) => {
+    errors.push(e.message);
+    console.error(e.message);
+  });
+  const prefix = `${engine.name()}-needs${decisions ? "-" + decisions : ""}`;
+  const attention = {
+    board: ".project-team-attention [data-board-agent]",
+    tasks: ".needs-you [data-task-agent]",
+  };
+  const agentAttr = { board: "data-board-agent", tasks: "data-task-agent" };
+  const ids = (mode) =>
+    page
+      .locator(attention[mode])
+      .evaluateAll(
+        (els, attr) => els.map((el) => el.getAttribute(attr)).sort(),
+        agentAttr[mode],
+      );
+  const inRoster = (mode, key) =>
+    page.locator(`[data-team-roster] [${agentAttr[mode]}="${needId(key)}"]`);
+  try {
+    await page.goto(
+      `${origin}/compact-fixture?count=12&needs=1${decisions ? "&decisions=" + decisions : ""}`,
+    );
+    await page.waitForFunction(() => !!window.qa);
+    for (const mode of decisions ? ["tasks"] : ["board", "tasks"]) {
+      await page.evaluate((mode) => qa.show(mode), mode);
+      await page
+        .locator(mode === "board" ? "[data-board-task]" : "[data-task-select]")
+        .first()
+        .click();
+      await page.waitForFunction(
+        () => qa.client.cacheStatus().label === "Saved data",
+      );
+      const owner = decisions ? ["b", "c"] : ["b", "c", "d"];
+      await expect.poll(() => ids(mode)).toEqual(owner.map(needId));
+      if (mode === "tasks")
+        await expect(page.locator(".needs-you .count-badge")).toHaveText(
+          String(owner.length),
+        );
+      const toggle = page.locator("[data-team-toggle]");
+      await expect(toggle).toContainText("6");
+      if ((await toggle.getAttribute("aria-expanded")) === "false")
+        await toggle.click();
+      for (const key of decisions ? ["a", "d", "e"] : ["a", "e"]) {
+        const row = inRoster(mode, key);
+        await expect(row).toHaveCount(1);
+        await expect(row).toContainText("Waiting");
+        await expect(row).not.toContainText("Needs you");
+        await expect(row.locator(".status-dot")).not.toHaveClass(/attention/);
+      }
+      const label = (key) =>
+        mode === "board"
+          ? page.locator(`${attention.board}[data-board-agent="${needId(key)}"]`)
+          : inRoster(mode, key);
+      await expect(label("b")).toContainText("Login required");
+      await expect(label("c")).toContainText("running");
+      if (!decisions) await expect(label("d")).toContainText("Needs you");
+      if (mode === "board") {
+        // Every live agent shows once: owner waiters above, the rest below.
+        await expect(inRoster(mode, "c")).toHaveCount(0);
+        await expect(page.locator(".board-agent")).toHaveCount(6);
+      } else
+        await expect(page.locator("[data-team-roster] .board-agent")).toHaveCount(6);
+      await page.screenshot({
+        path: `.build/project-compact-ui/${prefix}-${mode}.png`,
+      });
+      if (decisions) continue;
+      // Answering the decision and closing the request leave only the blocker.
+      await page.evaluate(() => {
+        qa.needs.decisions[0].answer = {
+          seq: 7,
+          from: { node: "fixture", user: "owner" },
+          text: "Keep",
+          decisionAnswer: { optionId: "keep" },
+          createdAt: "2026-09-08T12:05:00Z",
+        };
+        qa.needs.obligations[0].state = "closed";
+        qa.client.invalidate();
+      });
+      await expect.poll(() => ids(mode)).toEqual([needId("b")]);
+      await expect(inRoster(mode, "d")).toContainText("Waiting");
+      await expect(inRoster(mode, "c")).toHaveCount(1);
+      await page.evaluate(() => {
+        delete qa.needs.decisions[0].answer;
+        qa.needs.obligations[0].state = "delivered";
+        qa.client.invalidate();
+      });
+      await expect.poll(() => ids(mode)).toEqual(owner.map(needId));
+    }
+    assert.deepEqual(errors, []);
+    console.log("PASS", prefix);
+  } catch (error) {
+    console.error("FIXTURE DOM", await page.locator("body").innerText());
+    await page.screenshot({
+      path: ".build/project-compact-ui/" + prefix + "-failure.png",
+    });
+    throw error;
+  } finally {
+    await context.close();
+  }
+}
 try {
   for (const engine of [chromium, webkit]) {
     const browser = await engine.launch();
@@ -513,6 +639,8 @@ try {
             await context.close();
           }
         }
+      for (const decisions of ["", "fail", "missing"])
+        await needsScenario(browser, engine, decisions);
     } finally {
       await browser.close();
     }

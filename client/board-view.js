@@ -32,17 +32,37 @@ const esc = (s) =>
         c
       ],
   );
-const status = (a) => {
+export const blockedLabels = {
+  permission: "Permission blocked",
+  authentication: "Login required",
+  tool: "Tool unavailable",
+};
+// An agent waits for the owner only with a blocker, an open owner request or an
+// unanswered decision; any other needs_input agent waits on its team or host.
+// Projects (tasks-view.js) uses the same rule.
+export const ownerWaiters = (agents, obligations = [], decisions = []) =>
+  new Set(
+    agents
+      .filter(
+        (a) =>
+          (a.status === "needs_input" && blockedLabels[a.blockedReason]) ||
+          obligations.some(
+            (o) =>
+              o.recipientKind === "owner" &&
+              o.state !== "closed" &&
+              o.request?.from?.agentId === a.id,
+          ) ||
+          decisions.some((d) => !d.answer && d.request?.from?.agentId === a.id),
+      )
+      .map((a) => a.id),
+  );
+const status = (a, owner = false) => {
   const label =
     {
       done: "Turn complete",
       retired: "Retired",
       needs_input:
-        {
-          permission: "Permission blocked",
-          authentication: "Login required",
-          tool: "Tool unavailable",
-        }[a.blockedReason] || "Needs you",
+        blockedLabels[a.blockedReason] || (owner ? "Needs you" : "Waiting"),
       exited: "Exited",
     }[a.status] || a.status;
   const seen = Date.parse(a.lastSeenAt);
@@ -1129,8 +1149,13 @@ export function createBoardView({
           : '<div class="board-item-compose"><button type="button" id="board-message-item-mode">Message about a bug or feature</button></div>'
         : "";
     const roster = agents.filter((a) => archived || a.status !== "closed");
+    const waiters = ownerWaiters(
+      roster,
+      ownerRequestTask === selected ? ownerRequests : [],
+      decisionsTask === selected ? decisions : [],
+    );
     const rosterAgent = (a) =>
-      `<button class="board-agent" ${archived ? "disabled" : `data-board-agent="${esc(a.id)}" data-view-control="agent:${esc(a.id)}"`} title="${esc(a.blockedText || a.host + " · " + a.session)}"><span class="status-dot ${a.status === "running" ? "online" : a.status === "needs_input" ? "attention" : ""}"></span>${esc(a.name)}<span class="fine">${esc(status(a))}</span></button>`;
+      `<button class="board-agent" ${archived ? "disabled" : `data-board-agent="${esc(a.id)}" data-view-control="agent:${esc(a.id)}"`} title="${esc(a.blockedText || a.host + " · " + a.session)}"><span class="status-dot ${a.status === "running" ? "online" : a.status === "needs_input" && waiters.has(a.id) ? "attention" : ""}"></span>${esc(a.name)}<span class="fine">${esc(status(a, waiters.has(a.id)))}</span></button>`;
     const headActions = `${exportSupported ? '<button id="board-audit-export" data-view-control="audit-export">Export audit</button>' : '<button id="board-download" data-view-control="download">Legacy JSON · non-snapshot</button>'}${archived ? `<span class="fine">Closed · ${esc(new Date(detail.task.closedAt).toLocaleDateString())}</span>${exportSupported ? '<button id="board-download" data-view-control="download">Legacy JSON · non-snapshot</button>' : ""}` : '<button id="board-attach" data-view-control="attach">Terminals</button><button id="board-settings" data-view-control="settings" title="Project settings">Settings</button>'}`;
     renderedTask = selected;
     renderedClient = client();
@@ -1142,14 +1167,14 @@ export function createBoardView({
       )}${closedTasks.length ? `<details class="board-closed" data-view-disclosure="closed" ${archived ? "open" : ""}><summary data-view-control="closed-projects">Closed projects · ${closedTasks.length}</summary>${closedTasks.map(taskButton).join("")}</details>` : ""}</aside><section class="board-thread">${
       detail
         ? `<div class="board-head"><div class="view-heading"><div><span class="eyebrow">BOARD</span><h2>${esc(detail.task.name)}</h2></div><div class="view-actions">${headActions}</div></div><p class="fine">${esc(detail.task.goal)}</p>${cacheFeedback(client()?.cacheStatus?.().label) ? `<span class="fine hub-sync-status" role="status">${esc(cacheFeedback(client()?.cacheStatus?.().label))}</span>` : ""}<div class="project-team-heading">${roster.length ? `<button type="button" class="project-team-toggle" data-team-toggle data-view-control="team" aria-label="${teamExpanded(detail.task, roster.length) ? "Hide team" : "Show team"}" aria-expanded="${teamExpanded(detail.task, roster.length)}" aria-controls="board-team-roster"><span class="project-team-chevron" aria-hidden="true">›</span><span>Team · ${roster.length}</span></button>` : ""}${archived ? "" : '<button id="board-add-agent" data-view-control="add-agent">＋ Agent</button>'}</div>${
-            roster.some((a) => a.status === "needs_input")
+            waiters.size
               ? `<div class="board-agents-row project-team-attention" aria-label="Needs you">${roster
-                  .filter((a) => a.status === "needs_input")
+                  .filter((a) => waiters.has(a.id))
                   .map(rosterAgent)
                   .join("")}</div>`
               : ""
           }<div id="board-team-roster" class="board-agents-row" data-team-roster ${teamExpanded(detail.task, roster.length) ? "" : "hidden"}>${roster
-            .filter((a) => a.status !== "needs_input")
+            .filter((a) => !waiters.has(a.id))
             .map(rosterAgent)
             .join(
               "",
