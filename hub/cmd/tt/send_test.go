@@ -1,16 +1,21 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
 )
@@ -457,5 +462,271 @@ func TestSendReplyInheritsParentItemLink(t *testing.T) {
 	}
 	if got := last(); got.ReplyTo != plain.Seq || len(got.WorkItems) != 0 || got.WorkOrderMessage != nil {
 		t.Fatalf("unlinked parent inherited a link: %+v", got)
+	}
+}
+
+// claimHub is a stand-in hub that records every request. A strict hub fails
+// the test on any request at all.
+type claimHub struct {
+	url    string
+	mu     sync.Mutex
+	bodies [][]byte
+	paths  []string
+}
+
+func newClaimHub(t *testing.T, strict bool) *claimHub {
+	t.Helper()
+	h := &claimHub{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strict {
+			t.Errorf("hub contacted: %s %s", r.Method, r.URL.Path)
+		}
+		body, _ := io.ReadAll(r.Body)
+		h.mu.Lock()
+		h.paths = append(h.paths, r.Method+" "+r.URL.Path)
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/messages") {
+			h.bodies = append(h.bodies, body)
+		}
+		h.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"seq":7,"taskId":"tsk_0000000000000001"}`))
+	}))
+	t.Cleanup(srv.Close)
+	h.url = srv.URL
+	return h
+}
+
+func (h *claimHub) posts() [][]byte {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return slices.Clone(h.bodies)
+}
+
+// claimSend runs one send and returns its stdout, stderr and error.
+func claimSend(t *testing.T, e env, args ...string) (string, string, error) {
+	t.Helper()
+	var stderr strings.Builder
+	restore := captureStderr(t, &stderr)
+	out, err := captureCLIOutput(t, func() error { return cmdSend(e, args) })
+	restore()
+	return out, stderr.String(), err
+}
+
+// claimLedgerSnapshot lists every file under the ledger root with its size
+// and modification time.
+func claimLedgerSnapshot(t *testing.T, root string) string {
+	t.Helper()
+	var b strings.Builder
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(&b, "%s %d %d %s\n", path, info.Size(), info.ModTime().UnixNano(), info.Mode())
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b.String()
+}
+
+// The rows a checked send in these tests is compared with: one failing run
+// of the cited command, so the report has something to say.
+func claimSendLedger(t *testing.T) string {
+	t.Helper()
+	return claimLedgerDir(t, claimEvidenceRow("go test ./cmd/tt", claimExit(1), claimCommitA, time.Now()))
+}
+
+// Criterion a1: a checked RESULT and a lead's accept print the report on
+// stderr and post the same request body as a send with an empty ledger.
+func TestSendClaimCheckWarnsAndPostsUnchanged(t *testing.T) {
+	review := filepath.Join(t.TempDir(), "review.json")
+	if err := os.WriteFile(review, []byte(`{"mode":"disposition","candidate":"`+claimCommitA+`","disposition":"accept"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for name, args := range map[string][]string{
+		"result": {"--kind", "result", "--subject", "Tests pass for the claim checker", "--outcome", "done", "--status", "a1=pass",
+			"--evidence", "e1: go test ./cmd/tt -> ok", "--ref", "commit=" + claimCommitA[:8]},
+		"accept": {"--kind", "notice", "--subject", "Accept the claim checker candidate", "--text", "Accept",
+			"--review-file", review},
+	} {
+		e := env{task: "tsk_0000000000000001", agent: claimTestAgent}
+		empty := filepath.Join(t.TempDir(), "empty-ledger")
+		t.Setenv("TAILTERM_TOOL_LEDGER_DIR", empty)
+		hub := newClaimHub(t, false)
+		e.hub = hub.url
+		out, stderr, err := claimSend(t, e, args...)
+		if err != nil || stderr != "" || out != "posted #7\n" {
+			t.Fatalf("%s, empty ledger: %q %q %v", name, out, stderr, err)
+		}
+		claimSendLedger(t)
+		out, stderr, err = claimSend(t, e, args...)
+		// The result's command contradicts the failing run; the accept's
+		// candidate matches the run's commit.
+		want := map[string]string{"result": "claim check (your local tool ledger; warning only, the message is sent unchanged):\n  contradicted  e1 go test ./cmd/tt -> ok",
+			"accept": "claim check: 1 cited claim matches your tool ledger\n"}[name]
+		if err != nil || out != "posted #7\n" || !strings.HasPrefix(stderr, want) {
+			t.Fatalf("%s, with a ledger: %q %q %v", name, out, stderr, err)
+		}
+		posts := hub.posts()
+		if len(posts) != 2 || !bytes.Equal(posts[0], posts[1]) || !bytes.Contains(posts[0], []byte(`"requestId"`)) {
+			t.Fatalf("%s: posted bodies differ:\n%s\n%s", name, posts[0], posts[len(posts)-1])
+		}
+	}
+}
+
+// Criterion a5: ledger-less senders and other kinds see nothing and post what
+// they post today, and no send touches the ledger directory.
+func TestSendClaimCheckSkipsLedgerlessAndOtherKinds(t *testing.T) {
+	result := []string{"--kind", "result", "--subject", "Tests pass for the claim checker", "--outcome", "done", "--status", "a1=pass",
+		"--evidence", "e1: go test ./cmd/tt -> ok", "--ref", "commit=" + claimCommitA[:8]}
+	review := filepath.Join(t.TempDir(), "review.json")
+	if err := os.WriteFile(review, []byte(`{"mode":"disposition","candidate":"`+claimCommitA+`","disposition":"follow-ups"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	kinds := map[string][]string{
+		"assign": {"--kind", "assign", "--subject", "Build the claim checker now", "--objective", "Build it", "--owns", "hub/cmd/tt/claim_check.go",
+			"--acceptance", "a1=go test ./cmd/tt passes", "--ref", "commit=" + claimCommitA[:8]},
+		"request":  {"--kind", "request", "--subject", "Confirm the claim checker order", "--ask", "Confirm it", "--ref", "commit=" + claimCommitA[:8]},
+		"review":   {"--kind", "review", "--subject", "Review the claim checker candidate", "--candidate", claimCommitA, "--scope", "all", "--acceptance", "a1=tests pass"},
+		"question": {"--kind", "question", "--subject", "Which ledger does the check read", "--question", "Whose ledger?"},
+		"notice":   {"--kind", "notice", "--subject", "Follow ups for the claim checker", "--text", "Follow-ups", "--review-file", review},
+		"plain":    {"--kind", "notice", "--subject", "The claim checker is under way", "--text", "go test ./cmd/tt -> ok"},
+	}
+	baseline := func(args []string) []byte {
+		t.Helper()
+		t.Setenv("TAILTERM_TOOL_LEDGER_DIR", filepath.Join(t.TempDir(), "empty-ledger"))
+		hub := newClaimHub(t, false)
+		if _, _, err := claimSend(t, env{hub: hub.url, task: "tsk_0000000000000001", agent: claimTestAgent}, args...); err != nil {
+			t.Fatal(err)
+		}
+		return hub.posts()[0]
+	}
+	check := func(name string, e env, args []string, want []byte) {
+		t.Helper()
+		hub := newClaimHub(t, false)
+		e.hub = hub.url
+		out, stderr, err := claimSend(t, e, args...)
+		if err != nil || stderr != "" || out != "posted #7\n" {
+			t.Errorf("%s: %q %q %v", name, out, stderr, err)
+			return
+		}
+		if posts := hub.posts(); len(posts) != 1 || !bytes.Equal(posts[0], want) {
+			t.Errorf("%s: posted body differs from today's", name)
+		}
+	}
+	wants := map[string][]byte{"result": baseline(result)}
+	for name, args := range kinds {
+		wants[name] = baseline(args)
+	}
+	root := claimSendLedger(t)
+	before := claimLedgerSnapshot(t, root)
+	e := env{task: "tsk_0000000000000001", agent: claimTestAgent}
+	for name, args := range kinds {
+		check(name, e, args, wants[name])
+	}
+	// The checked send itself reads the ledger and leaves it as it was.
+	if _, stderr, err := claimSend(t, env{hub: newClaimHub(t, false).url, task: e.task, agent: claimTestAgent}, result...); err != nil || stderr == "" {
+		t.Fatalf("checked send: %q %v", stderr, err)
+	}
+	// Ledger-less: another agent with no files under the root.
+	other := e
+	other.agent = "agt_0000000000000d0e"
+	t.Setenv("TAILTERM_TOOL_LEDGER_DIR", filepath.Join(t.TempDir(), "empty-ledger"))
+	otherWant := func() []byte {
+		hub := newClaimHub(t, false)
+		if _, _, err := claimSend(t, env{hub: hub.url, task: e.task, agent: other.agent}, result...); err != nil {
+			t.Fatal(err)
+		}
+		return hub.posts()[0]
+	}()
+	t.Setenv("TAILTERM_TOOL_LEDGER_DIR", root)
+	check("no ledger files", other, result, otherWant)
+	// Not even a timeout is reported to a sender with no ledger.
+	old := claimCheckBudget
+	claimCheckBudget = time.Nanosecond
+	check("no ledger files, 1 ns budget", other, result, otherWant)
+	claimCheckBudget = old
+	// No agent identity at all.
+	t.Setenv("TAILTERM_TOOL_LEDGER_DIR", filepath.Join(t.TempDir(), "empty-ledger"))
+	anonymousWant := func() []byte {
+		hub := newClaimHub(t, false)
+		if _, _, err := claimSend(t, env{hub: hub.url, task: e.task}, result...); err != nil {
+			t.Fatal(err)
+		}
+		return hub.posts()[0]
+	}()
+	t.Setenv("TAILTERM_TOOL_LEDGER_DIR", root)
+	check("no agent", env{task: e.task}, result, anonymousWant)
+	if after := claimLedgerSnapshot(t, root); after != before {
+		t.Fatalf("a send changed the ledger directory:\n%s\nbefore:\n%s", after, before)
+	}
+}
+
+// Criterion a6, the dry run: --claims-only contacts no hub, prints the report
+// on stdout and exits 1 when any claim is not matched or on timeout.
+func TestSendClaimsOnly(t *testing.T) {
+	hub := newClaimHub(t, true)
+	e := env{hub: hub.url, task: "tsk_0000000000000001", agent: claimTestAgent}
+	at := time.Now()
+	claimLedgerDir(t,
+		claimEvidenceRow("go test ./cmd/tt", claimExit(0), claimCommitA, at),
+		claimEvidenceRow("go vet ./cmd/tt", nil, claimCommitA, at))
+	send := func(extra ...string) []string {
+		return append([]string{"--claims-only", "--kind", "result", "--subject", "Tests pass for the claim checker", "--outcome", "done",
+			"--status", "a1=pass", "--ref", "commit=" + claimCommitA[:8]}, extra...)
+	}
+	exitCode := func(err error) int {
+		var coded *exitError
+		if err == nil {
+			return 0
+		}
+		if errors.As(err, &coded) {
+			return coded.code
+		}
+		return -1
+	}
+	out, stderr, err := claimSend(t, e, send("--evidence", "e1: go test ./cmd/tt -> ok")...)
+	if exitCode(err) != 0 || stderr != "" || out != "claim check: 2 cited claims match your tool ledger\n" {
+		t.Fatalf("all matched: %q %q %v", out, stderr, err)
+	}
+	out, _, err = claimSend(t, e, send("--evidence", "e1: go test ./cmd/tt -> ok", "--evidence", "e2: go vet ./cmd/tt -> clean")...)
+	if exitCode(err) != 1 || !strings.Contains(out, "dry run, nothing is sent") || !strings.Contains(out, "unproven      e2 go vet ./cmd/tt -> clean: exit not recorded") ||
+		!strings.Contains(out, "matched       e1 go test ./cmd/tt -> ok") {
+		t.Fatalf("one unproven claim prints the full list: %q %v", out, err)
+	}
+	out, _, err = claimSend(t, e, send("--evidence", "e1: go test ./internal/store -> ok")...)
+	if exitCode(err) != 1 || !strings.Contains(out, "unmatched     e1 go test ./internal/store -> ok") {
+		t.Fatalf("unmatched: %q %v", out, err)
+	}
+	// With --file, the same dry run.
+	file := filepath.Join(t.TempDir(), "msg.json")
+	msg := `{"kind":"result","subject":"Tests pass for the claim checker","refs":{"commit":"` + claimCommitA[:8] + `"},` +
+		`"body":{"outcome":"done","status":{"a1":"pass"}},"evidence":{"e1":{"type":"command","value":"go test ./cmd/tt","outcome":"FAIL"}}}`
+	if err := os.WriteFile(file, []byte(msg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, _, err = claimSend(t, e, "--file", file, "--claims-only")
+	if exitCode(err) != 1 || !strings.Contains(out, "contradicted  e1 go test ./cmd/tt -> FAIL: your latest run exited 0") {
+		t.Fatalf("--file: %q %v", out, err)
+	}
+	// A kind that is not checked, and an agent with no ledger, exit 0.
+	out, _, err = claimSend(t, e, "--claims-only", "--kind", "question", "--subject", "Which ledger does the check read", "--question", "Whose?")
+	if exitCode(err) != 0 || !strings.Contains(out, "is not checked") {
+		t.Fatalf("question: %q %v", out, err)
+	}
+	none := e
+	none.agent = "agt_0000000000000d0e"
+	out, _, err = claimSend(t, none, send("--evidence", "e1: go test ./cmd/tt -> ok")...)
+	if exitCode(err) != 0 || !strings.Contains(out, "no tool ledger") {
+		t.Fatalf("no ledger: %q %v", out, err)
+	}
+	// Timeout: nothing was proven.
+	old := claimCheckBudget
+	claimCheckBudget = time.Nanosecond
+	defer func() { claimCheckBudget = old }()
+	out, _, err = claimSend(t, e, send("--evidence", "e1: go test ./cmd/tt -> ok")...)
+	if exitCode(err) != 1 || out != "claim check skipped: over 1ns\n" {
+		t.Fatalf("timeout: %q %v", out, err)
 	}
 }

@@ -21,6 +21,7 @@ func cmdSend(e env, args []string) error {
 	fs.Usage = func() {
 		fmt.Fprintln(fs.Output(), "Usage: tt send --kind KIND --subject \"plain English\" [--to AGENT] [fields...]")
 		fmt.Fprintln(fs.Output(), "       tt send --file message.json   (a JSON envelope; - reads stdin)")
+		fmt.Fprintln(fs.Output(), "       tt send ... --claims-only     (check cited claims against your tool ledger; nothing is sent)")
 		fmt.Fprintln(fs.Output(), "Kinds: "+strings.Join(api.EnvelopeKinds, ", ")+". See docs/message-broker.md.")
 		fmt.Fprintln(fs.Output(), "Example: tt send --kind result --to lead --subject \"Tests pass for empty recipient check\" \\")
 		fmt.Fprintln(fs.Output(), "           --outcome done --status a1=pass --evidence \"e1: go test ./cmd/tt -> ok\" --ref commit=abc1234")
@@ -32,6 +33,7 @@ func cmdSend(e env, args []string) error {
 	to := fs.String("to", "", "recipient agent name or id")
 	reply := fs.Int64("reply-to", 0, "message sequence being answered")
 	links := registerLinkFlags(fs)
+	claimsOnly := fs.Bool("claims-only", false, "check the commits, commands and receipts a RESULT or accept cites against your own tool ledger, print the report and send nothing; exit 1 when any claim is not matched")
 	requestID := fs.String("request-id", "", "stable retry identity; when omitted it is derived from the message, so an identical resend returns the original")
 	var env api.Envelope
 	fs.StringVar(&env.Kind, "kind", "", "message kind")
@@ -69,7 +71,7 @@ func cmdSend(e env, args []string) error {
 		var extra []string
 		fs.Visit(func(f *flag.Flag) {
 			switch f.Name {
-			case "file", "task", "to", "reply-to", "request-id",
+			case "file", "task", "to", "reply-to", "request-id", "claims-only",
 				"work-item-task", "work-item", "work-item-revision", "work-order-task", "work-order-message", "related":
 			default:
 				extra = append(extra, "--"+f.Name)
@@ -143,6 +145,14 @@ func cmdSend(e env, args []string) error {
 	if problems := api.ValidateEnvelope(env); problems != nil {
 		return &exitError{2, problemsError(problems)}
 	}
+	// The claim checker (claim_check.go) reads env and never changes it, so
+	// the request id derived below is the one an unchecked send would use.
+	if *claimsOnly {
+		return claimsOnlyReport(e.agent, env)
+	}
+	if report, ok := claimCheck(e.agent, env); ok {
+		writeClaimReport(os.Stderr, report, false)
+	}
 
 	if *task == "" {
 		return errors.New("no task")
@@ -191,6 +201,26 @@ func cmdSend(e env, args []string) error {
 	}
 	recordUsageContext(e, *task, "post", m.Seq)
 	fmt.Printf("posted #%d\n", m.Seq)
+	return nil
+}
+
+// claimsOnlyReport is send --claims-only: the report on stdout, no hub
+// contact, exit 1 when any checkable claim is not matched or the check ran
+// out of time.
+func claimsOnlyReport(agent string, env api.Envelope) error {
+	if !claimCheckable(env) {
+		fmt.Printf("claim check: a %s is not checked; only a result and a lead's accept disposition are\n", env.Kind)
+		return nil
+	}
+	report, ok := claimCheck(agent, env)
+	if !ok {
+		fmt.Println("claim check: no tool ledger for this agent; nothing checked")
+		return nil
+	}
+	writeClaimReport(os.Stdout, report, true)
+	if report.failed() {
+		return &exitError{1, errors.New("claim check: some cited claims are not matched by your tool ledger")}
+	}
 	return nil
 }
 

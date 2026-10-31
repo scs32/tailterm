@@ -4,6 +4,22 @@ Mods kept in this repository live under `tools/claude-mods/`. Each is a plain
 plugin folder. Nothing installs them and nothing loads them: a mod runs only in
 a Claude Code session that someone starts with `--plugin-dir`.
 
+## Pages
+
+Clean view is described below. Each later Claude Code mod has its own page:
+
+- [Token meter mod](claude-mods-token-meter.md): the tokens of the last turn
+  and the session, in a status line. A plugin folder.
+- [Secret redaction mod for Claude sessions](claude-mods-secret-redaction.md):
+  closes the gaps of the secret redaction settings hook. A plugin folder.
+- [Verification evidence capture for Claude sessions](claude-mods-evidence-capture.md):
+  the command, exit code, output digest and commit of each verification run,
+  on its tool-call ledger row. Part of `tt hook tool`, not a plugin folder.
+- [Claim checker for Claude sessions](claude-mods-claim-checker.md): before
+  `tt send` posts a RESULT or an accept, a warning when its cited commits,
+  commands or receipts do not match the sender's own ledger. Part of
+  `tt send`, not a plugin folder.
+
 ## Clean view
 
 `tools/claude-mods/clean-view` is a viewing aid for the owner's own session. It
