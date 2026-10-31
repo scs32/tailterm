@@ -1655,6 +1655,48 @@ func TestHandlerDeathRunnerAbortsWhenSecondProbeIsNotGone(t *testing.T) {
 	}
 }
 
+// A dead-primary rotation probes the old handler a second time only when its
+// successor may be ready (bug wi_e09e377485f7f21a, review #52084 follow-up
+// 1): while the successor is starting, ticks ask the hub without evidence,
+// so a probe that would answer unknown under load is never read and nothing
+// is aborted. Once the successor posts, one probe confirms and it commits.
+func TestHandlerRotationDeadPrimaryProbesOnceReady(t *testing.T) {
+	f, p := deadRotationCLI(t, 11*time.Minute, handlerProbeGone, handlerProbeUnknown)
+	f.unready = true
+	f.request(t, f.old.Name, "Fixture request held by the dead handler")
+	f.lastHeard(t, 11*time.Minute)
+	for i := 0; i < 3; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		err := f.runner().tick(ctx, f.e, f.c, "fixture")
+		cancel()
+		if err != nil && !errors.Is(err, errSuccessorNotReady) {
+			t.Fatalf("tick %d while the successor starts: %v", i+1, err)
+		}
+	}
+	rotations := f.rotations(t)
+	if len(rotations) != 1 || rotations[0].State != api.HandlerRotationPrepared || p.calls != 1 || f.spawns != 1 {
+		t.Fatalf("while the successor starts: rotations=%+v probes=%d spawns=%d", rotations, p.calls, f.spawns)
+	}
+	successor, err := f.c.GetAgent(context.Background(), f.task.ID, rotations[0].SuccessorAgentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := api.Envelope{Kind: api.EnvelopeKindNotice, To: f.old.Name, Subject: "Successor identity verified and waiting for the handoff", Body: api.EnvelopeBody{Text: "Waiting for the handoff NOTICE."}}
+	if _, err := f.c.PostMessage(context.Background(), f.task.ID, api.PostMessageRequest{Envelope: &env, Text: api.RenderText(env), To: f.old.ID, AgentID: successor.ID, RunID: successor.RunID}); err != nil {
+		t.Fatal(err)
+	}
+	p.answers = []string{handlerProbeGone}
+	f.tick(t, f.runner())
+	got, err := f.c.GetHandlerRotation(context.Background(), f.task.ID, rotations[0].ID)
+	if err != nil || got.State != api.HandlerRotationCommitted || got.CommitDeathEvidence == nil || p.calls != 2 {
+		t.Fatalf("after the post: %+v probes=%d %v", got, p.calls, err)
+	}
+	detail, err := f.c.GetTask(context.Background(), f.task.ID)
+	if err != nil || detail.Task.PrimaryHandlerID != successor.ID {
+		t.Fatalf("primary: %+v %v", detail.Task, err)
+	}
+}
+
 // relayTickDueCalls runs the relay's own rotation tick, with the fixture's
 // dependencies in place of the production ones, and counts its due requests.
 func relayTickDueCalls(t *testing.T, f *rotationCLI) int32 {

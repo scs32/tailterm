@@ -1562,8 +1562,30 @@ func (s *Store) commitHandlerRotation(ctx context.Context, tx *sql.Tx, t api.Tas
 	if err != nil {
 		return zero, err
 	}
+	// A successor that is not ready is told so before anything about the old
+	// handler (bug wi_e09e377485f7f21a): a busy primary is a wait only for a
+	// ready successor, so the host's readiness bound still counts while the
+	// primary works, and a dead primary's host may ask without evidence and
+	// probe once only when the answer is something else.
+	unready := func() (*api.HandlerRotationRefusal, error) {
+		successor, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND id=?`, t.ID, r.SuccessorAgentID))
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		} else if err != nil {
+			return nil, err
+		}
+		if ready, err := successorReady(ctx, tx, t.ID, successor, r.CreatedAt); err != nil || ready {
+			return nil, err
+		}
+		return successorNotReadyRefusal(successor, old), nil
+	}
 	var deadPolicy api.HandlerRotationPolicy
 	if dead {
+		if refusal, err := unready(); err != nil {
+			return zero, err
+		} else if refusal != nil {
+			return zero, refusal
+		}
 		// A second, later observation from the host, and nothing recorded from
 		// the run since prepare; otherwise the rotation stays prepared and the
 		// runner aborts it.
@@ -1571,17 +1593,10 @@ func (s *Store) commitHandlerRotation(ctx context.Context, tx *sql.Tx, t api.Tas
 			return zero, err
 		}
 	} else if refusal := busy.refusal(r.Trigger); refusal != nil {
-		// A busy primary is a wait only for a successor that is ready. One
-		// that is not is told so, so the host's readiness bound still counts
-		// while the primary works (bug wi_e09e377485f7f21a).
-		if successor, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND id=?`, t.ID, r.SuccessorAgentID)); err == nil {
-			if ready, err := successorReady(ctx, tx, t.ID, successor, r.CreatedAt); err != nil {
-				return zero, err
-			} else if !ready {
-				return zero, successorNotReadyRefusal(successor, old)
-			}
-		} else if !errors.Is(err, sql.ErrNoRows) {
+		if notReady, err := unready(); err != nil {
 			return zero, err
+		} else if notReady != nil {
+			return zero, notReady
 		}
 		return zero, refusal
 	}

@@ -272,7 +272,12 @@ a person. Online is therefore not readiness.
 - **The host routine** asks the hub on each poll by attempting the commit; a
   refused commit writes nothing. `tt handler rotate` polls every 10 seconds;
   the runner tries once per tick. A dead-primary rotation runs its second
-  death probe before each attempt.
+  death probe once a pass, and only for a successor that may be ready: its
+  activity shows a completed turn or any output, or the hub, asked to commit
+  without evidence, answers something other than `successor_not_ready`. The
+  hub checks readiness before the death evidence, so that ask is answered
+  without a probe, and an unknown probe under load cannot abort a rotation
+  whose successor is still starting.
 - **Until 10 minutes after the launch** (`spawnedAt` in the journal; a journal
   without it starts the 10 minutes at its first resume) a successor that is
   not ready is a wait: the rotation stays prepared, the runner neither counts
