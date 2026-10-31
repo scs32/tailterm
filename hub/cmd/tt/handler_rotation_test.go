@@ -4050,6 +4050,8 @@ type successorWaitRotation struct {
 	clock  time.Time
 	start  time.Time
 	handle api.HandlerRotation
+	// busy, when set, reports the old handler working before every tick.
+	busy func()
 }
 
 func newSuccessorWaitRotation(t *testing.T) *successorWaitRotation {
@@ -4072,7 +4074,15 @@ func newSuccessorWaitRotation(t *testing.T) *successorWaitRotation {
 // at advances the runner's clock and runs one tick.
 func (f *successorWaitRotation) at(d time.Duration) error {
 	f.clock = f.clock.Add(d)
+	if f.busy != nil {
+		f.busy()
+	}
 	return f.try(f.r)
+}
+
+// primaryWorking keeps the old handler working at every later tick.
+func (f *successorWaitRotation) primaryWorking(t *testing.T) {
+	f.busy = func() { f.activity(t, f.old, "working", "", 1) }
 }
 
 func (f *successorWaitRotation) successor(t *testing.T) api.Agent {
@@ -4145,16 +4155,20 @@ func (f *successorWaitRotation) waitsThenStuck(t *testing.T) {
 // successor posted that it was waiting for the handoff, but the relay sampled
 // it working at every report and never idle, so the hub refused every commit
 // until the bound. A post by the successor's exact run since the prepare is
-// now readiness. The second arm has no activity report at all.
+// now readiness. The second arm has no activity report at all; in the third
+// the primary works past the bound, which is an uncounted wait.
 func TestHandlerRotationSuccessorPostIsReady(t *testing.T) {
 	for _, arm := range []struct {
-		name    string
-		working bool
-	}{{"working at every sample", true}, {"no activity report", false}} {
+		name          string
+		working, busy bool
+	}{{"working at every sample", true, false}, {"no activity report", false, false}, {"busy primary", true, true}} {
 		t.Run(arm.name, func(t *testing.T) {
 			f := newSuccessorWaitRotation(t)
 			if arm.working {
 				f.working(t)
+			}
+			if arm.busy {
+				f.primaryWorking(t)
 			}
 			// Working with output, and no post: still a wait.
 			if err := f.at(time.Minute); err != nil {
@@ -4165,6 +4179,21 @@ func TestHandlerRotationSuccessorPostIsReady(t *testing.T) {
 			f.post(t, successor, f.old, "Successor identity verified and waiting for the handoff")
 			if arm.working {
 				f.working(t)
+			}
+			if arm.busy {
+				// Ready, with the primary working past the bound: an uncounted
+				// wait, until the first tick that finds the primary idle.
+				for _, d := range []time.Duration{time.Minute, 10 * time.Minute, time.Minute} {
+					if err := f.at(d); err != nil {
+						t.Fatalf("busy primary at %s: %v", f.clock.Sub(f.start), err)
+					}
+				}
+				f.assertHeld(t)
+				if j := f.journal(t); j.ResumeFailures != 0 || len(f.stuckNotices(t)) != 0 {
+					t.Fatalf("busy primary: failures=%d notices=%d", j.ResumeFailures, len(f.stuckNotices(t)))
+				}
+				f.busy = nil
+				f.activity(t, f.old, "idle", "", 1)
 			}
 			if err := f.at(time.Minute); err != nil {
 				t.Fatalf("tick after the post: %v", err)
@@ -4196,8 +4225,9 @@ func TestHandlerRotationSuccessorPostIsReady(t *testing.T) {
 // Only the successor's own exact run counts, and not while its provider
 // refuses it (bug wi_e09e377485f7f21a, criteria r1 and r3): the old
 // handler's post, another agent's post to the successor and the successor's
-// post while provider_blocked leave the rotation prepared to the bound, as
-// does a successor that never posts and is never sampled idle.
+// post while provider_blocked or after a provider error ended its turn leave
+// the rotation prepared to the bound, as does a successor that never posts
+// and is never sampled idle, with the primary idle or working.
 func TestHandlerRotationSuccessorPostIdentity(t *testing.T) {
 	t.Run("other agents post", func(t *testing.T) {
 		f := newSuccessorWaitRotation(t)
@@ -4207,16 +4237,35 @@ func TestHandlerRotationSuccessorPostIdentity(t *testing.T) {
 		f.post(t, f.worker, successor, "Worker fixture notice addressed to the successor")
 		f.waitsThenStuck(t)
 	})
-	t.Run("successor posts while provider blocked", func(t *testing.T) {
+	// A post does not count while the run's current activity is provider
+	// blocked or is a turn a provider error ended.
+	for _, arm := range []struct {
+		name     string
+		activity func(now time.Time) api.AgentActivity
+	}{
+		{"successor posts while provider blocked", func(now time.Time) api.AgentActivity {
+			block := api.ProviderBlock{Provider: "openai", Runtime: "codex", Model: "gpt-6-astra", Class: api.ProviderBlockRateLimited, Code: "response_too_many_failed_attempts", Status: 429, Since: now}
+			return api.AgentActivity{State: "provider_blocked", ObservedAt: now, LastEventAt: now, Provider: &block, Tokens: api.TokenTotals{Output: 12, Total: 12}}
+		}},
+		{"successor posts before a provider error ends its turn", func(now time.Time) api.AgentActivity {
+			return api.AgentActivity{State: "idle", ObservedAt: now, LastEventAt: now, Reason: api.ProviderErrorTurnReasonPrefix + ": 429", Tokens: api.TokenTotals{Output: 12, Total: 12}}
+		}},
+	} {
+		t.Run(arm.name, func(t *testing.T) {
+			f := newSuccessorWaitRotation(t)
+			successor := f.successor(t)
+			f.post(t, successor, f.old, "Successor identity verified and waiting for the handoff")
+			if _, err := f.c.ReportActivity(context.Background(), f.task.ID, successor.ID, api.ActivityReport{RequestID: api.NewID("act"), RunID: successor.RunID, Activity: arm.activity(time.Now().UTC())}); err != nil {
+				t.Fatal(err)
+			}
+			f.waitsThenStuck(t)
+		})
+	}
+	// A working primary does not hide the bound (review #52084, b1).
+	t.Run("no post with the primary working", func(t *testing.T) {
 		f := newSuccessorWaitRotation(t)
-		successor := f.successor(t)
-		now := time.Now().UTC()
-		block := api.ProviderBlock{Provider: "openai", Runtime: "codex", Model: "gpt-6-astra", Class: api.ProviderBlockRateLimited, Code: "response_too_many_failed_attempts", Status: 429, Since: now}
-		if _, err := f.c.ReportActivity(context.Background(), f.task.ID, successor.ID, api.ActivityReport{RequestID: api.NewID("act"), RunID: successor.RunID,
-			Activity: api.AgentActivity{State: "provider_blocked", ObservedAt: now, LastEventAt: now, Provider: &block, Tokens: api.TokenTotals{Output: 12, Total: 12}}}); err != nil {
-			t.Fatal(err)
-		}
-		f.post(t, successor, f.old, "Successor identity verified and waiting for the handoff")
+		f.working(t)
+		f.primaryWorking(t)
 		f.waitsThenStuck(t)
 	})
 	t.Run("no post and never idle", func(t *testing.T) {

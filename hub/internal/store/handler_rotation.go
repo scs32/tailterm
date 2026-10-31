@@ -1571,6 +1571,18 @@ func (s *Store) commitHandlerRotation(ctx context.Context, tx *sql.Tx, t api.Tas
 			return zero, err
 		}
 	} else if refusal := busy.refusal(r.Trigger); refusal != nil {
+		// A busy primary is a wait only for a successor that is ready. One
+		// that is not is told so, so the host's readiness bound still counts
+		// while the primary works (bug wi_e09e377485f7f21a).
+		if successor, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND id=?`, t.ID, r.SuccessorAgentID)); err == nil {
+			if ready, err := successorReady(ctx, tx, t.ID, successor, r.CreatedAt); err != nil {
+				return zero, err
+			} else if !ready {
+				return zero, successorNotReadyRefusal(successor, old)
+			}
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return zero, err
+		}
 		return zero, refusal
 	}
 	successor, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND id=?`, t.ID, r.SuccessorAgentID))
@@ -1599,7 +1611,7 @@ func (s *Store) commitHandlerRotation(ctx context.Context, tx *sql.Tx, t api.Tas
 	if ready, err := successorReady(ctx, tx, t.ID, successor, r.CreatedAt); err != nil {
 		return zero, err
 	} else if !ready {
-		return zero, &api.HandlerRotationRefusal{Code: api.HandlerRotationRefusedSuccessorNotReady, Detail: fmt.Sprintf("successor %s has not completed a turn with a model reply or posted a message since the prepare; %s keeps its obligations until it does", successor.Name, old.Name)}
+		return zero, successorNotReadyRefusal(successor, old)
 	}
 	handoff, err := s.snapshotHandlerHandoff(ctx, tx, t, old, busy)
 	if err != nil {
@@ -1859,31 +1871,43 @@ func successorReady(ctx context.Context, q queryRower, task string, successor ap
 	return successorPosted(ctx, q, task, successor, since)
 }
 
+func successorNotReadyRefusal(successor, old api.Agent) *api.HandlerRotationRefusal {
+	return &api.HandlerRotationRefusal{Code: api.HandlerRotationRefusedSuccessorNotReady, Detail: fmt.Sprintf("successor %s has not completed a turn with a model reply or posted a message since the prepare; %s keeps its obligations until it does", successor.Name, old.Name)}
+}
+
 // successorPosted reports whether the successor's exact run posted a message
-// at or after since, and its current activity is not provider_blocked: a run
-// its provider refuses cannot take the obligations whatever it said earlier.
+// at or after since, and its current activity is neither provider_blocked nor
+// a turn a provider error ended: a run its provider refuses cannot take the
+// obligations whatever it said earlier. The hub stamps messages in seq order,
+// so the task's messages are read newest first by the (task_id, seq) index
+// and the scan stops at the first one before since; a clock step back can only
+// end it early, which leaves the successor not ready.
 func successorPosted(ctx context.Context, q queryRower, task string, successor api.Agent, since time.Time) (bool, error) {
-	var state string
-	err := q.QueryRowContext(ctx, `SELECT state FROM agent_activity WHERE task_id=? AND agent_id=? AND run_id=?`, task, successor.ID, successor.RunID).Scan(&state)
+	var payload string
+	err := q.QueryRowContext(ctx, `SELECT payload FROM agent_activity WHERE task_id=? AND agent_id=? AND run_id=?`, task, successor.ID, successor.RunID).Scan(&payload)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return false, err
 	}
-	if state == "provider_blocked" {
-		return false, nil
+	if payload != "" {
+		var a api.AgentActivity
+		if json.Unmarshal([]byte(payload), &a) != nil || a.State == "provider_blocked" || a.Provider != nil || strings.HasPrefix(a.Reason, api.ProviderErrorTurnReasonPrefix) {
+			return false, nil
+		}
 	}
-	// Timestamps are not stored in a sortable form, so they are compared here
-	// rather than in SQL.
-	rows, err := q.QueryContext(ctx, `SELECT created_at FROM messages WHERE task_id=? AND from_agent=? AND from_run_id=? AND from_node<>?`, task, successor.ID, successor.RunID, api.BrokerNode)
+	rows, err := q.QueryContext(ctx, `SELECT from_agent,from_run_id,from_node,created_at FROM messages WHERE task_id=? ORDER BY seq DESC`, task)
 	if err != nil {
 		return false, err
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var raw string
-		if err := rows.Scan(&raw); err != nil {
+		var agent, run, node, raw string
+		if err := rows.Scan(&agent, &run, &node, &raw); err != nil {
 			return false, err
 		}
-		if !parseTS(raw).Before(since) {
+		if parseTS(raw).Before(since) {
+			break
+		}
+		if agent == successor.ID && run == successor.RunID && node != api.BrokerNode {
 			return true, nil
 		}
 	}

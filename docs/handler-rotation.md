@@ -257,14 +257,18 @@ a person. Online is therefore not readiness.
     reason that is not a provider error (`turn ended by provider error`), and
     output tokens above zero; or
   - a post: a message it posted at or after the prepare (bug
-    `wi_e09e377485f7f21a`), while its current activity is not
-    `provider_blocked`. Hub broker messages never count. A post is a model
-    reply even when the relay never samples the turn idle.
+    `wi_e09e377485f7f21a`), while its current activity is neither
+    `provider_blocked` nor a turn that ended `turn ended by provider error`.
+    Hub broker messages never count. A post is a model reply even when the
+    relay never samples the turn idle. The hub reads the project's messages
+    newest first and stops at the first one older than the prepare.
 
   Receipts and messages are read by agent and run, so the old handler's
   activity or posts, another agent's message to the successor and an earlier
   run of the successor never count. This applies to every reason, a dead
-  primary included.
+  primary included. A busy old handler refuses the commit only for a ready
+  successor; one that is not ready is refused `successor_not_ready` whatever
+  the old handler is doing, so the bound below still counts.
 - **The host routine** asks the hub on each poll by attempting the commit; a
   refused commit writes nothing. `tt handler rotate` polls every 10 seconds;
   the runner tries once per tick. A dead-primary rotation runs its second
