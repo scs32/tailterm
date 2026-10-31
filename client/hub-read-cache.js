@@ -27,6 +27,17 @@ function cloneJSON(value) {
   return JSON.parse(text);
 }
 
+// Entries are frozen once they are in memory. The save receives them
+// directly, so nothing, including a persistence that serializes later, can
+// change a cached or saved value through a shared reference.
+function freeze(value) {
+  if (value && typeof value === "object") {
+    Object.freeze(value);
+    for (const child of Object.values(value)) freeze(child);
+  }
+  return value;
+}
+
 function state(entries) {
   return { version: 1, entries };
 }
@@ -63,21 +74,18 @@ function normalize(raw, time, { maxEntries, maxBytes, maxAgeMs }) {
       !validPart(candidate.key) ||
       !Number.isFinite(candidate.savedAt) ||
       candidate.savedAt < 0 ||
-      time - candidate.savedAt >= maxAgeMs
+      time - candidate.savedAt >= maxAgeMs ||
+      candidate.value === undefined
     )
       continue;
-    let value;
-    try {
-      value = cloneJSON(candidate.value);
-    } catch {
-      continue;
-    }
-    const entry = {
+    // The loaded state is the persistence's own parsed copy, so its values
+    // are kept and frozen rather than copied again.
+    const entry = freeze({
       scope: candidate.scope,
       key: candidate.key,
-      value,
+      value: candidate.value,
       savedAt: Math.min(Math.trunc(candidate.savedAt), time),
-    };
+    });
     const identity = JSON.stringify([entry.scope, entry.key]);
     const previous = unique.get(identity);
     if (!previous || previous.savedAt <= entry.savedAt)
@@ -91,10 +99,12 @@ function normalize(raw, time, { maxEntries, maxBytes, maxAgeMs }) {
 
 // The persisted state is loaded and normalized once, then kept in memory:
 // reads never reload it or wait for a save, and writes update memory and join
-// one coalesced save. A put or clear resolves only after the save holding its
+// one coalesced save. Once loaded, a put changes memory and starts its save
+// before it returns. A put or clear resolves only after the save holding its
 // change finishes; if that save fails it rejects, and the change stays in
 // memory for the next save. A failed load is retried by the next call. The
-// persistence's optional check runs before memory is used.
+// persistence's optional check runs before memory is used. The value load
+// returns is kept by the cache.
 export function createHubReadCache({
   load,
   save,
@@ -158,6 +168,9 @@ export function createHubReadCache({
       });
     }
     await loading;
+    expire();
+  };
+  const expire = () => {
     requireAccess();
     const at = time();
     records = records.filter(({ entry }) => at - entry.savedAt < maxAgeMs);
@@ -188,21 +201,24 @@ export function createHubReadCache({
     async get(scope, key) {
       requirePart(scope, "Hub cache scope");
       requirePart(key, "Hub cache key");
-      await ready();
+      // Synchronous once loaded: no await, not even of a settled value.
+      if (records) expire();
+      else await ready();
       const found = records.find(
         ({ entry }) => entry.scope === scope && entry.key === key,
       )?.entry;
       return found
-        ? { value: cloneJSON(found.value), savedAt: found.savedAt }
+        ? { value: structuredClone(found.value), savedAt: found.savedAt }
         : null;
     },
 
     async put(scope, key, value) {
       requirePart(scope, "Hub cache scope");
       requirePart(key, "Hub cache key");
-      const copy = cloneJSON(value);
-      await ready();
-      const entry = { scope, key, value: copy, savedAt: time() };
+      const copy = freeze(cloneJSON(value));
+      if (records) expire();
+      else await ready();
+      const entry = freeze({ scope, key, value: copy, savedAt: time() });
       const candidate = { entry, size: entrySize(entry) };
       if (EMPTY_STATE_BYTES + candidate.size > maxBytes) return false;
       const kept = records.filter(
@@ -218,7 +234,8 @@ export function createHubReadCache({
 
     async clear(scope) {
       if (scope !== undefined) requirePart(scope, "Hub cache scope");
-      await ready();
+      if (records) expire();
+      else await ready();
       const kept =
         scope === undefined
           ? []

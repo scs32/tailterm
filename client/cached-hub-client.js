@@ -1,5 +1,9 @@
 import { HubError } from "./hub-client.js";
 
+// The page size of the hub client's subscribe loop. A full page means more
+// retained events are waiting behind it.
+const FEED_PAGE = 100;
+
 // Cache only presentation reads. The underlying client remains authoritative
 // for terminal reconciliation, launches, cleanup and every mutation.
 export function createCachedHubClient({
@@ -36,10 +40,20 @@ export function createCachedHubClient({
           url.searchParams.get("owner") === "1"))
     );
   };
+  // A dirty path waits for the network on its next read: a confirmed write
+  // changed it. A stale path serves its saved entry at once and refreshes in
+  // the background: a feed event says something changed somewhere.
   const paths = new Set(),
     dirty = new Set(),
+    stale = new Set(),
     touched = new Map(),
-    stops = new Set();
+    stops = new Set(),
+    feeds = new Map();
+  let staleGeneration = 0;
+  const deferred = new Set();
+  let capabilityMemo = null,
+    capabilityRead = null,
+    capabilityChecked = 0;
   const scope = crypto.subtle
     .digest(
       "SHA-256",
@@ -115,6 +129,8 @@ export function createCachedHubClient({
     }
     checked.set(path, now());
     const requestedRevision = revision;
+    const staleAtStart = staleGeneration;
+    let again = false;
     const optionalAuthAtStart = optionalAuthenticationError;
     const checkOptionalAuthentication = () => {
       if (
@@ -154,6 +170,9 @@ export function createCachedHubClient({
             };
           else data = await client.request(path, { timeoutMs: 15000 });
         } else data = await client.request(path, { timeoutMs: 15000 });
+        // Resolved before the checks below, so nothing runs between them and
+        // the bookkeeping after them.
+        const key = await scope;
         if (disposed) throw new Error("Workspace is locked.");
         // A concurrent ordinary success must not erase an authentication
         // rejection from the newly independent owner read. A later explicit
@@ -164,21 +183,30 @@ export function createCachedHubClient({
           notify(true);
           return data;
         }
-        let retained = false;
-        try {
-          retained = await cache.put(await scope, path, { data });
-        } catch {
-          cacheFailed = true;
-        }
-        if (disposed) throw new Error("Workspace is locked.");
-        checkOptionalAuthentication();
-        saved ||= retained;
+        // The caller gets the data without waiting for the encrypted save.
+        // The cache takes the entry into memory before put returns, and
+        // refuses it once the vault locks or this client is disposed.
+        cache.put(key, path, { data }).then(
+          (retained) => {
+            if (disposed || !retained || saved) return;
+            saved = true;
+            notify();
+          },
+          () => {
+            if (disposed) return;
+            cacheFailed = true;
+            notify();
+          },
+        );
         const recoveredOptional = optionalFailures.delete(path);
         staleOptionalPaths.delete(path);
         failed = false;
         authenticationError = null;
         optionalAuthenticationError = null;
         dirty.delete(path);
+        // An event during the request may not be in this response.
+        if (staleGeneration === staleAtStart) stale.delete(path);
+        else again = true;
         if (
           recoveredOptional ||
           JSON.stringify(old?.value.data) !== JSON.stringify(data)
@@ -214,11 +242,31 @@ export function createCachedHubClient({
       } finally {
         pending.delete(path);
         notify();
+        if (again && !disposed && now() - touched.get(path) < refreshMs * 2)
+          void refresh(path).catch(() => {});
       }
     })();
     pending.set(path, work);
     notify();
     return work;
+  }
+  // A background refresh of a served entry starts after the next frame, so
+  // its response, parsing and save never land between the view's render and
+  // its paint. The timeout covers documents that are not painting.
+  function refreshAfterPaint(path) {
+    if (deferred.has(path) || pending.has(path)) return;
+    deferred.add(path);
+    let started = false;
+    const start = () => {
+      if (started) return;
+      started = true;
+      clearTimeout(fallback);
+      deferred.delete(path);
+      if (!disposed) void refresh(path).catch(() => {});
+    };
+    const painting = typeof requestAnimationFrame === "function";
+    const fallback = setTimeout(start, painting ? 250 : 0);
+    if (painting) requestAnimationFrame(() => setTimeout(start, 0));
   }
   async function read(path) {
     if (disposed) throw new Error("Workspace is locked.");
@@ -242,8 +290,12 @@ export function createCachedHubClient({
         (failed && now() - (checked.get(path) || 0) < refreshMs))
     ) {
       saved = true;
-      if (!checked.has(path) || now() - checked.get(path) >= refreshMs)
-        void refresh(path).catch(() => {});
+      if (
+        (stale.has(path) && !failed) ||
+        !checked.has(path) ||
+        now() - checked.get(path) >= refreshMs
+      )
+        refreshAfterPaint(path);
       notify();
       return unwrap(entry);
     }
@@ -267,6 +319,60 @@ export function createCachedHubClient({
       checked.delete(path);
     }
     notify(true);
+  }
+  function markStale() {
+    staleGeneration++;
+    for (const task of new Set([...auditEpochs.keys(), ...auditMemory.keys()]))
+      auditEpochs.set(task, (auditEpochs.get(task) || 0) + 1);
+    for (const path of paths) stale.add(path);
+  }
+  // One hub feed per project for the life of this client. Views attach and
+  // detach; a later view resumes from the kept cursor instead of replaying
+  // every retained event, and a catch-up marks reads stale once, at its end.
+  // Views ignore event payloads, so they hear only the last page of it.
+  function sharedFeed(task, after = 0) {
+    if (feeds.has(task)) return feeds.get(task);
+    const shared = { views: new Set() };
+    let changes = false;
+    shared.feed = client.subscribe(
+      task,
+      (events, cursor) => {
+        changes ||= events.some((event) => event.kind !== "heartbeat");
+        if (events.length >= FEED_PAGE) return;
+        if (changes) markStale();
+        changes = false;
+        for (const view of shared.views)
+          Promise.resolve()
+            .then(() => view.onEvents(events, cursor))
+            .catch(view.onError);
+      },
+      {
+        after,
+        onError: (error) => {
+          failed = true;
+          notify();
+          for (const view of shared.views) view.onError(error);
+        },
+      },
+    );
+    feeds.set(task, shared);
+    return shared;
+  }
+  function readCapabilities() {
+    capabilityRead ||= (async () => {
+      capabilityChecked = now();
+      try {
+        const value = await client.capabilities();
+        if (!disposed) capabilityMemo = structuredClone(value);
+        return value;
+      } catch (error) {
+        capabilityMemo = null;
+        throw error;
+      } finally {
+        capabilityRead = null;
+      }
+    })();
+    return capabilityRead;
   }
   function invalidateDecisions(task) {
     revision++;
@@ -470,7 +576,16 @@ export function createCachedHubClient({
     // Capability negotiation must reflect the connected hub. Persisting a 404
     // would strand this client on the legacy path after a hub upgrade, while
     // serving stale success offline could expose controls the hub cannot honor.
-    capabilities: () => client.capabilities(),
+    // So the last answer is kept in memory for this client only: returned at
+    // once while online and refreshed in the background, dropped on any
+    // failure and on dispose.
+    capabilities: async () => {
+      if (disposed) throw new Error("Workspace is locked.");
+      if (!online() || !capabilityMemo) return readCapabilities();
+      if (now() - capabilityChecked >= refreshMs)
+        void readCapabilities().catch(() => {});
+      return structuredClone(capabilityMemo);
+    },
     listOwnerObligations: async (task, params = {}) =>
       (
         await read(
@@ -593,21 +708,9 @@ export function createCachedHubClient({
           .catch(options.onError || (() => {}));
       };
       listeners.add(changed);
-      const feed = client.subscribe(
-        task,
-        (events, cursor) => {
-          if (events.some((event) => event.kind !== "heartbeat")) invalidate();
-          return onEvents(events, cursor);
-        },
-        {
-          ...options,
-          onError: (error) => {
-            failed = true;
-            notify();
-            options.onError?.(error);
-          },
-        },
-      );
+      const view = { onEvents, onError: options.onError || (() => {}) };
+      const shared = sharedFeed(task, options.after);
+      shared.views.add(view);
       const timer = setInterval(() => {
         if (online())
           for (const path of paths)
@@ -619,18 +722,21 @@ export function createCachedHubClient({
       }, refreshMs);
       const stop = () => {
         listeners.delete(changed);
-        feed.stop();
+        shared.views.delete(view);
         clearInterval(timer);
         stops.delete(stop);
       };
       stops.add(stop);
-      return { stop, cursor: feed.cursor };
+      return { stop, cursor: shared.feed.cursor };
     },
     dispose() {
       disposed = true;
       for (const task of auditEpochs.keys())
         auditEpochs.set(task, (auditEpochs.get(task) || 0) + 1);
       for (const stop of stops) stop();
+      for (const shared of feeds.values()) shared.feed.stop();
+      feeds.clear();
+      capabilityMemo = null;
       listeners.clear();
       clearTimeout(notification);
       stopMutation?.();

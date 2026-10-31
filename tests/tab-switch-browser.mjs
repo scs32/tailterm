@@ -1,5 +1,6 @@
 // verify-matrix: browser-helper
-// Top-level tab switch timing on a synthetic hub of realistic size. Only
+// Top-level tab switch timing on a synthetic hub sized like the live one,
+// with a long retained event feed and a live event about every second. Only
 // disposable synthetic browser, vault and in-page hub transport state; no live
 // hub, profile, network or tmux access. Run directly for Chromium and WebKit;
 // tests/static-browser.mjs runs it once per TEST_BROWSER engine.
@@ -12,16 +13,23 @@ import { viteCacheDir } from "./vite-cache.mjs";
 const TARGET_MS = 200;
 const LATENCY_MS = 80;
 const ROUNDS = 5;
-const TABS = [
+// Retained global events the feed replays from the start, and the interval of
+// new live events while the page is open.
+const BACKLOG_EVENTS = 30000;
+const LIVE_EVENT_MS = 1000;
+// Time spent on a tab before leaving it in the revisit case.
+const DWELL_MS = 1000;
+// Bugs first: the owner reported it as the slowest.
+const DATA_TABS = [
+  "bugs",
   "board",
   "tasks",
   "agents",
   "teams",
-  "bugs",
   "features",
   "queue",
-  "terminals",
 ];
+const TABS = [...DATA_TABS, "terminals"];
 const SELECTORS = {
   board: "#mode-view #board-messages .board-message",
   tasks: "#mode-view [data-task-select]",
@@ -35,7 +43,7 @@ const SELECTORS = {
 
 // Runs in the page, serialized with toString, so it may only use its
 // arguments and dynamic imports.
-async function fixturePage({ latency, refreshMs }) {
+async function fixturePage({ latency, refreshMs, backlog, liveEventMs }) {
   const vault = await import("/client/local-vault.js");
   const { createHubClient } = await import("/client/hub-client.js");
   const { createCachedHubClient } =
@@ -49,8 +57,10 @@ async function fixturePage({ latency, refreshMs }) {
   const { createQueueView } = await import("/client/queue-view.js");
   const { setupModes } = await import("/client/modes.js");
 
-  // Fixture: 30 projects (6 open); the first has 3,182 agents (3,155 closed);
-  // 200 long messages per project, 1,400 long work items, 30 queue entries.
+  // Fixture sized like the live hub: 16 projects (2 open); the first has 3,199
+  // agents (3,173 closed); 200 long messages per project; 1,336 work items
+  // (1,089 bugs, 247 features, 35 open) with descriptions of about 2,900
+  // characters and every 20th 8,039; 10 queue entries; 4 saved teams.
   const hex = (n, w = 16) => n.toString(16).padStart(w, "0");
   const words =
     "synthetic fixture board message about queue lanes verification matrix reviewer builder planner handler release order criteria evidence".split(
@@ -62,17 +72,17 @@ async function fixturePage({ latency, refreshMs }) {
       s += words[(i * 7 + seed) % words.length] + " ";
     return s.slice(0, n);
   };
-  const tasks = Array.from({ length: 30 }, (_, i) => ({
+  const tasks = Array.from({ length: 16 }, (_, i) => ({
     id: "tsk_" + hex(i + 1),
     name: i === 0 ? "Synthetic large project" : "Synthetic project " + i,
     goal: lorem(160, i),
-    status: i < 6 ? "open" : "closed",
+    status: i < 2 ? "open" : "closed",
     pauseState: "active",
     allowAgentSpawn: true,
     orchestrator: "fixture-lead",
     cleanupPending: 0,
     createdAt: "2026-09-01T00:00:00Z",
-    closedAt: i < 6 ? null : "2026-09-20T00:00:00Z",
+    closedAt: i < 2 ? null : "2026-09-20T00:00:00Z",
     createdBy: { node: "workspace", user: "fixture" },
   }));
   const agent = (taskId, n, status) => {
@@ -104,7 +114,8 @@ async function fixturePage({ latency, refreshMs }) {
   };
   const agentsByTask = new Map(
     tasks.map((task, ti) => {
-      const count = ti === 0 ? 3182 : task.status === "open" ? 40 : 30;
+      const count = ti === 0 ? 3199 : task.status === "open" ? 40 : 30;
+      const needsInput = ti === 0 ? 20 : 17;
       return [
         task.id,
         Array.from({ length: count }, (_, n) => {
@@ -114,9 +125,9 @@ async function fixturePage({ latency, refreshMs }) {
             status =
               left <= 6
                 ? "running"
-                : left <= 17
+                : left <= needsInput
                   ? "needs_input"
-                  : left <= 27
+                  : left <= needsInput + 6
                     ? "done"
                     : "closed";
           return agent(task.id, n + ti * 10000, status);
@@ -144,20 +155,23 @@ async function fixturePage({ latency, refreshMs }) {
       ];
     }),
   );
-  const items = Array.from({ length: 1400 }, (_, i) => ({
+  const items = Array.from({ length: 1336 }, (_, i) => ({
     id: "wi_" + hex(i + 1),
     taskId: tasks[i % 5 === 4 ? 1 : 0].id,
-    kind: i % 3 === 2 ? "feature" : "bug",
+    kind: (i * 247) % 1336 < 247 ? "feature" : "bug",
     title: "Synthetic work item " + i + " " + lorem(60, i),
-    description: lorem(1500, i),
+    description: lorem(
+      i % 20 === 0 ? 8039 : i % 2 ? 2905 + (i % 7) * 300 : 1500 + (i % 9) * 150,
+      i,
+    ),
     priority: ["normal", "high", "low"][i % 3],
-    status: ["open", "done", "in_progress", "blocked", "closed"][i % 5],
+    status: i % 39 === 0 ? "open" : i % 5 < 3 ? "done" : "dismissed",
     revision: 1 + (i % 4),
     itemSeq: i + 1,
     createdAt: "2026-10-01T00:00:00Z",
     updatedAt: "2026-10-02T00:00:00Z",
   }));
-  const queueEntries = Array.from({ length: 30 }, (_, i) => ({
+  const queueEntries = Array.from({ length: 10 }, (_, i) => ({
     id: "tqe_" + hex(i + 1),
     taskId: tasks[0].id,
     itemTaskId: tasks[0].id,
@@ -176,13 +190,45 @@ async function fixturePage({ latency, refreshMs }) {
     revision: 1,
     eligible: true,
     queuePriority: "normal",
-    state: ["waiting", "running", "completed"][i % 3],
+    state: i % 2 ? "waiting" : "running",
     template: "planned",
     createdAt: "2026-10-30T00:00:00Z",
     updatedAt: "2026-10-30T00:00:00Z",
   }));
 
-  const stats = { requested: new Set(), unknown: new Set(), writes: 0 };
+  const stats = {
+    requested: new Set(),
+    unknown: new Set(),
+    writes: 0,
+    eventReads: 0,
+  };
+  // The global feed: a retained backlog, then a live event every interval.
+  // Events are generated from their sequence number, so the backlog costs no
+  // memory. A waiting read returns on a new event or after 25 s.
+  let eventSeq = backlog;
+  const waiters = new Set();
+  setInterval(() => {
+    eventSeq++;
+    for (const wake of waiters) wake();
+    waiters.clear();
+  }, liveEventMs);
+  const eventAt = (seq) => ({
+    seq,
+    taskId: tasks[seq % 2].id,
+    kind: "message",
+    agentId: "",
+    text: "synthetic event " + seq,
+    by: { node: "workspace", user: "fixture" },
+    createdAt: "2026-10-30T10:00:00Z",
+  });
+  const eventsAfter = (task, after, limit) => {
+    const out = [];
+    for (let seq = after + 1; seq <= eventSeq && out.length < limit; seq++) {
+      const event = eventAt(seq);
+      if (!task || event.taskId === task) out.push(event);
+    }
+    return out;
+  };
   const response = (body, status = 200) =>
     new Response(JSON.stringify(body), {
       status,
@@ -195,7 +241,29 @@ async function fixturePage({ latency, refreshMs }) {
     const u = new URL(url);
     const p = u.pathname;
     const method = init.method || "GET";
-    if (p.endsWith("/events") || p.endsWith("/changes")) {
+    if (p === "/v1/events" || /^\/v1\/tasks\/[^/]+\/events$/.test(p)) {
+      stats.eventReads++;
+      await sleep(latency);
+      const task = p.startsWith("/v1/tasks/") ? p.split("/")[3] : "";
+      const after = Number(u.searchParams.get("after") || 0);
+      const limit = Math.min(1000, Number(u.searchParams.get("limit") || 100));
+      let events = eventsAfter(task, after, limit);
+      if (!events.length && u.searchParams.get("wait")) {
+        await new Promise((resolve) => {
+          waiters.add(resolve);
+          setTimeout(() => {
+            waiters.delete(resolve);
+            resolve();
+          }, 25000);
+        });
+        events = eventsAfter(task, after, limit);
+      }
+      return response({
+        events,
+        next: events.length ? events.at(-1).seq : after,
+      });
+    }
+    if (p.endsWith("/changes")) {
       if (u.searchParams.get("wait")) await new Promise(() => {});
       return response({
         events: [],
@@ -268,19 +336,21 @@ async function fixturePage({ latency, refreshMs }) {
   await vault.localAPI("/unlock", "POST", {
     password: "Synthetic tab switch QA passphrase",
   });
-  for (let i = 0; i < 4; i++)
-    await vault.localAPI("/teams", "POST", {
-      name: "Synthetic team " + i,
-      orchestrator: "fixture-lead",
-      members: [
-        {
-          name: "fixture-lead",
-          runtime: "codex",
-          role: "Coordinator",
-          prompt: "Synthetic instructions",
-        },
-      ],
-    });
+  // A reload unlocks the same vault; its saved teams are already there.
+  if (!vault.localData().teams?.length)
+    for (let i = 0; i < 4; i++)
+      await vault.localAPI("/teams", "POST", {
+        name: "Synthetic team " + i,
+        orchestrator: "fixture-lead",
+        members: [
+          {
+            name: "fixture-lead",
+            runtime: "codex",
+            role: "Coordinator",
+            prompt: "Synthetic instructions",
+          },
+        ],
+      });
   const live = createHubClient({
     baseURL: "http://synthetic-tabs.invalid",
     token: "synthetic-only",
@@ -463,6 +533,7 @@ async function fixturePage({ latency, refreshMs }) {
         missing: wanted.filter((path) => !keys.has(path)),
         unknown: [...stats.unknown],
         writes: stats.writes,
+        eventReads: stats.eventReads,
         filesTabs: document.querySelectorAll('header [data-mode="files"]')
           .length,
       };
@@ -481,7 +552,7 @@ const median = (values) => {
   return sorted[Math.floor(sorted.length / 2)];
 };
 
-async function measure(browser, origin, name, { refreshMs, changeItems }) {
+async function measure(browser, origin, engine) {
   const context = await browser.newContext({
     viewport: { width: 1440, height: 900 },
   });
@@ -489,68 +560,105 @@ async function measure(browser, origin, name, { refreshMs, changeItems }) {
     const page = await context.newPage();
     const errors = [];
     page.on("pageerror", (error) => errors.push(error.message));
+    const ready = async () => {
+      await page.waitForFunction(
+        () => window.ready || window.fixtureError,
+        null,
+        { timeout: 60000 },
+      );
+      const fixtureError = await page.evaluate(() => window.fixtureError);
+      assert.equal(fixtureError, undefined, fixtureError);
+    };
     await page.goto(
       `${origin}/tab-switch-test?` +
-        new URLSearchParams({ latency: LATENCY_MS, refreshMs }),
+        new URLSearchParams({
+          latency: LATENCY_MS,
+          refreshMs: 20000,
+          backlog: BACKLOG_EVENTS,
+          liveEventMs: LIVE_EVENT_MS,
+        }),
     );
-    await page.waitForFunction(
-      () => window.ready || window.fixtureError,
-      null,
-      {
-        timeout: 60000,
-      },
-    );
-    const fixtureError = await page.evaluate(() => window.fixtureError);
-    assert.equal(fixtureError, undefined, fixtureError);
+    await ready();
     const switchTo = (mode) =>
       page.evaluate(
         ([m, s]) => window.qa.switchTo(m, s),
         [mode, SELECTORS[mode]],
       );
-    // First visit since unlock fills the cache; it is not timed.
-    for (const mode of TABS)
-      assert.notEqual(
-        await switchTo(mode),
-        -1,
-        `${name}: ${mode} never painted`,
-      );
+    const samples = {};
+    const record = (name, mode, ms) =>
+      ((samples[name] ||= {})[mode] ||= []).push(ms);
+    // The first visit with an empty cache has to wait for the network, so it
+    // is recorded but not held to the target; it fills the saved cache.
+    for (const mode of TABS) record("cold-first", mode, await switchTo(mode));
     await page.evaluate(() => window.qa.idle());
-    const samples = Object.fromEntries(TABS.map((mode) => [mode, []]));
+    // The owner's usual first visit: a reload, the same vault unlocked again
+    // with its saved cache, and a feed that replays the backlog from the start.
+    await page.reload();
+    await ready();
+    for (const mode of TABS) {
+      record("warm-first", mode, await switchTo(mode));
+      await page.waitForTimeout(DWELL_MS);
+    }
+    // wi_6fad's case: rounds through every tab while the data changes.
     for (let round = 1; round <= ROUNDS; round++) {
-      if (changeItems)
-        await page.evaluate((r) => window.qa.changeItem(r), round);
+      await page.evaluate((r) => window.qa.changeItem(r), round);
       for (const mode of TABS) {
-        samples[mode].push(await switchTo(mode));
+        record("repeat", mode, await switchTo(mode));
         await page.waitForTimeout(100);
+      }
+    }
+    // A revisit after two other tabs, each with a real dwell.
+    for (const mode of DATA_TABS) {
+      const others = DATA_TABS.filter((other) => other !== mode);
+      await switchTo(mode);
+      for (let round = 0; round < ROUNDS; round++) {
+        for (const other of [
+          others[round % others.length],
+          others[(round + 3) % others.length],
+        ]) {
+          await page.waitForTimeout(DWELL_MS);
+          await switchTo(other);
+        }
+        await page.waitForTimeout(DWELL_MS);
+        record("revisit-after-two", mode, await switchTo(mode));
       }
     }
     await page.evaluate(() => window.qa.idle());
     const persisted = await page.evaluate(() => window.qa.persisted);
     const coverage = await page.evaluate(() => window.qa.coverage());
-    const medians = Object.fromEntries(
-      TABS.map((mode) => [mode, median(samples[mode])]),
-    );
-    console.log(
-      `${name}: median ms ${JSON.stringify(medians)} samples ${JSON.stringify(samples)} saves ${persisted.saves}`,
-    );
-    assert.deepEqual(errors, [], `${name}: page errors`);
-    for (const mode of TABS) {
-      assert.ok(
-        samples[mode].every((ms) => ms >= 0),
-        `${name}: ${mode} did not paint in a round: ${samples[mode]}`,
+    const failures = [];
+    for (const [name, byMode] of Object.entries(samples)) {
+      const medians = Object.fromEntries(
+        Object.entries(byMode).map(([mode, ms]) => [mode, median(ms)]),
       );
-      assert.ok(
-        medians[mode] <= TARGET_MS,
-        `${name}: ${mode} median ${medians[mode]} ms exceeds ${TARGET_MS} ms (${samples[mode]})`,
+      console.log(
+        `${engine} ${name}: median ms ${JSON.stringify(medians)} samples ${JSON.stringify(byMode)}`,
       );
+      for (const [mode, ms] of Object.entries(byMode)) {
+        if (!ms.every((value) => value >= 0))
+          failures.push(`${name} ${mode} did not paint: ${ms}`);
+        else if (name !== "cold-first" && medians[mode] > TARGET_MS)
+          failures.push(
+            `${name} ${mode} median ${medians[mode]} ms exceeds ${TARGET_MS} ms (${ms})`,
+          );
+      }
     }
-    assert.equal(persisted.loads, 1, `${name}: cache loads`);
-    assert.ok(coverage.wanted.length > 2, `${name}: ${coverage.wanted}`);
-    assert.deepEqual(coverage.missing, [], `${name}: working set evicted`);
-    assert.deepEqual(coverage.unknown, [], `${name}: unexpected routes`);
-    assert.equal(coverage.writes, 0, `${name}: hub writes`);
-    assert.equal(coverage.filesTabs, 0, `${name}: Files tab is visible`);
-    if (changeItems) assert.ok(persisted.saves > 0, `${name}: no saves`);
+    console.log(
+      `${engine}: saves ${persisted.saves} cache loads ${persisted.loads} event reads ${coverage.eventReads}`,
+    );
+    assert.deepEqual(errors, [], `${engine}: page errors`);
+    assert.deepEqual(failures, [], `${engine}: tab switches`);
+    assert.equal(persisted.loads, 1, `${engine}: cache loads after reload`);
+    assert.ok(persisted.saves > 0, `${engine}: no saves`);
+    assert.ok(
+      coverage.eventReads > BACKLOG_EVENTS / 100,
+      `${engine}: the feed did not replay its backlog (${coverage.eventReads} reads)`,
+    );
+    assert.ok(coverage.wanted.length > 2, `${engine}: ${coverage.wanted}`);
+    assert.deepEqual(coverage.missing, [], `${engine}: working set evicted`);
+    assert.deepEqual(coverage.unknown, [], `${engine}: unexpected routes`);
+    assert.equal(coverage.writes, 0, `${engine}: hub writes`);
+    assert.equal(coverage.filesTabs, 0, `${engine}: Files tab is visible`);
   } finally {
     await context.close();
   }
@@ -575,6 +683,8 @@ export async function exerciseTabSwitch(browser) {
               html({
                 latency: Number(query.get("latency")),
                 refreshMs: Number(query.get("refreshMs")),
+                backlog: Number(query.get("backlog")),
+                liveEventMs: Number(query.get("liveEventMs")),
               }),
             );
           });
@@ -585,15 +695,7 @@ export async function exerciseTabSwitch(browser) {
   await server.listen();
   try {
     const origin = `http://127.0.0.1:${server.httpServer.address().port}`;
-    const engine = browser.browserType().name();
-    await measure(browser, origin, `${engine} cached`, {
-      refreshMs: 20000,
-      changeItems: false,
-    });
-    await measure(browser, origin, `${engine} refreshing`, {
-      refreshMs: 300,
-      changeItems: true,
-    });
+    await measure(browser, origin, browser.browserType().name());
   } finally {
     await server.close();
   }

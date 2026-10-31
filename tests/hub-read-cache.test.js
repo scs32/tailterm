@@ -345,3 +345,74 @@ test("hub read cache rejects every call when its persistence check throws", asyn
   await assert.rejects(cache.clear("scope"), /Unlock your local vault/);
   assert.equal(storage.saved().entries[0].value.n, 1);
 });
+
+test("a save never holds live cache entries that a later mutation could change", async () => {
+  const received = [];
+  let persisted = null,
+    release;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  // A persistence that keeps the reference it is given and serializes it
+  // only later, so any shared live entry would leak into the saved value.
+  const cache = createHubReadCache({
+    load: async () => null,
+    save: async (value) => {
+      received.push(value);
+      await held;
+      persisted = JSON.stringify(value);
+    },
+    now: () => 100,
+  });
+  const source = { rows: [{ id: "kept", open: true }] };
+  const putting = cache.put("scope", "key", source);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(received.length, 1, "the save was called");
+  const entry = received[0].entries[0];
+  source.rows[0].open = false;
+  assert.throws(() => {
+    entry.value.rows[0].open = false;
+  }, TypeError);
+  assert.throws(() => {
+    entry.value.rows.push({ id: "added" });
+  }, TypeError);
+  assert.throws(() => {
+    entry.savedAt = 0;
+  }, TypeError);
+  const read = await cache.get("scope", "key");
+  read.value.rows[0].open = false;
+  release();
+  assert.equal(await putting, true);
+  assert.deepEqual(JSON.parse(persisted).entries, [
+    {
+      scope: "scope",
+      key: "key",
+      value: { rows: [{ id: "kept", open: true }] },
+      savedAt: 100,
+    },
+  ]);
+  assert.deepEqual((await cache.get("scope", "key")).value, {
+    rows: [{ id: "kept", open: true }],
+  });
+});
+
+test("loaded values stay private to the cache", async () => {
+  const raw = {
+    version: 1,
+    entries: [
+      { scope: "scope", key: "key", value: { rows: [{ n: 1 }] }, savedAt: 90 },
+      { scope: "scope", key: "gone", value: undefined, savedAt: 90 },
+    ],
+  };
+  const cache = createHubReadCache({
+    load: async () => raw,
+    save: async () => {},
+    now: () => 100,
+  });
+  const first = await cache.get("scope", "key");
+  first.value.rows[0].n = 2;
+  assert.deepEqual((await cache.get("scope", "key")).value, {
+    rows: [{ n: 1 }],
+  });
+  assert.equal(await cache.get("scope", "gone"), null);
+});

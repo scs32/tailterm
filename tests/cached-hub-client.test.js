@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createHubClient } from "../client/hub-client.js";
+import { createHubClient, HubError } from "../client/hub-client.js";
 import { createHubReadCache } from "../client/hub-read-cache.js";
 import { createCachedHubClient } from "../client/cached-hub-client.js";
 
@@ -655,5 +655,313 @@ test("Usage saves presentation reads offline and optional old-hub errors leave P
     assert.doesNotMatch(old.cacheStatus().label, /offline/);
   } finally {
     old.dispose();
+  }
+});
+
+// A hub client whose feed is driven by the test: deliver(task, events) hands
+// a page to every underlying subscription of that task.
+function feedClient(live) {
+  const feeds = [];
+  return {
+    feeds,
+    client: {
+      ...live,
+      subscribe(task, onEvents, options = {}) {
+        const feed = { task, onEvents, options, stopped: false, cursor: 0 };
+        feeds.push(feed);
+        return {
+          stop() {
+            feed.stopped = true;
+          },
+          cursor: () => feed.cursor,
+        };
+      },
+    },
+    async deliver(task, count, kind = "message") {
+      for (const feed of feeds.filter((f) => f.task === task && !f.stopped)) {
+        const events = Array.from({ length: count }, () => ({
+          seq: ++feed.cursor,
+          kind,
+        }));
+        await feed.onEvents(events, feed.cursor);
+      }
+    },
+  };
+}
+
+const within = (promise, ms, label) =>
+  Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(
+        () => reject(Error(`${label} waited longer than ${ms} ms`)),
+        ms,
+      ),
+    ),
+  ]);
+
+test("a feed event serves saved data at once and refreshes it in the background", async () => {
+  const f = fixture(),
+    feed = feedClient(f.live),
+    view = f.make(feed.client);
+  try {
+    assert.equal((await view.listTasks())[0].name, "Saved project");
+    await settle();
+    let reloads = 0;
+    view.subscribe("", () => reloads++);
+    await feed.deliver("", 1);
+    let finish;
+    f.hold(
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+    );
+    const before = f.requests.length;
+    const value = await within(view.listTasks(), 250, "stale read");
+    assert.equal(value[0].name, "Saved project");
+    await settle(() => f.requests.length > before);
+    assert.equal(f.requests.length, before + 1, "one background refresh");
+    await view.listTasks();
+    assert.equal(f.requests.length, before + 1, "the refresh is shared");
+    finish({ tasks: [{ id: "one", name: "Event update" }] });
+    await settle(() => reloads >= 2);
+    assert.equal((await view.listTasks())[0].name, "Event update");
+    assert.equal(f.requests.length, before + 1, "fresh data is not refetched");
+  } finally {
+    view.dispose();
+  }
+});
+
+test("an event during a refresh keeps the path stale and refreshes it again", async () => {
+  const f = fixture(),
+    feed = feedClient(f.live),
+    view = f.make(feed.client);
+  try {
+    await view.listTasks();
+    view.subscribe("", () => {});
+    await feed.deliver("", 1);
+    let finish;
+    f.hold(
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+    );
+    const before = f.requests.length;
+    await view.listTasks();
+    await settle(() => f.requests.length > before);
+    await feed.deliver("", 1);
+    f.hold(null);
+    f.response({ tasks: [{ id: "one", name: "After the second event" }] });
+    finish({ tasks: [{ id: "one", name: "Before the second event" }] });
+    await settle(() => f.requests.length > before + 1);
+    assert.equal(f.requests.length, before + 2, "one follow-up refresh");
+    assert.equal((await view.listTasks())[0].name, "After the second event");
+  } finally {
+    view.dispose();
+  }
+});
+
+test("heartbeats alone leave saved reads fresh", async () => {
+  const f = fixture(),
+    feed = feedClient(f.live),
+    view = f.make(feed.client);
+  try {
+    await view.listTasks();
+    view.subscribe("", () => {});
+    await feed.deliver("", 1, "heartbeat");
+    const before = f.requests.length;
+    await view.listTasks();
+    await settle();
+    assert.equal(f.requests.length, before);
+  } finally {
+    view.dispose();
+  }
+});
+
+test("a read returns before its encrypted save finishes", async () => {
+  const f = fixture();
+  let disk = null,
+    saving = 0,
+    release;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  const view = f.make(f.live, {
+    cache: createHubReadCache({
+      load: async () => disk,
+      save: async (value) => {
+        saving++;
+        const copy = structuredClone(value);
+        await held;
+        disk = copy;
+        saving--;
+      },
+    }),
+  });
+  try {
+    const value = await within(view.listTasks(), 250, "network read");
+    assert.equal(value[0].name, "Saved project");
+    assert.equal(saving, 1, "the save is still running");
+    assert.equal(disk, null);
+    assert.equal((await view.listTasks())[0].name, "Saved project");
+    release();
+    await settle(() => saving === 0);
+    assert.equal(disk.entries.length, 1);
+    await settle(() => view.cacheStatus().label === "Saved data");
+  } finally {
+    release();
+    view.dispose();
+  }
+});
+
+test("a feed catch-up marks saved reads stale once, after its last full page", async () => {
+  const f = fixture(),
+    feed = feedClient(f.live),
+    view = f.make(feed.client);
+  try {
+    await view.listTasks();
+    await settle();
+    let reloads = 0;
+    view.subscribe("", () => reloads++);
+    const before = f.requests.length;
+    for (let page = 0; page < 3; page++) {
+      await feed.deliver("", 100);
+      await view.listTasks();
+    }
+    await settle();
+    assert.equal(reloads, 0, "full catch-up pages do not reload views");
+    assert.equal(f.requests.length, before, "catch-up pages do not refetch");
+    await feed.deliver("", 4);
+    await view.listTasks();
+    await settle();
+    assert.equal(reloads, 1, "the end of the catch-up reloads views once");
+    assert.equal(f.requests.length, before + 1, "and refreshes once");
+    await feed.deliver("", 1);
+    await view.listTasks();
+    await settle();
+    assert.equal(reloads, 2, "later live events still reach views");
+    assert.equal(f.requests.length, before + 2, "and still mark reads stale");
+  } finally {
+    view.dispose();
+  }
+});
+
+test("views share one feed per project that keeps its cursor", async () => {
+  const f = fixture(),
+    feed = feedClient(f.live),
+    view = f.make(feed.client);
+  try {
+    const seen = { first: 0, second: 0 };
+    const first = view.subscribe("", () => seen.first++, { after: 0 });
+    await feed.deliver("", 3);
+    first.stop();
+    assert.equal(feed.feeds[0].stopped, false, "the feed outlives its view");
+    const second = view.subscribe("", () => seen.second++, { after: 0 });
+    assert.equal(feed.feeds.length, 1, "a later view does not replay");
+    assert.equal(second.cursor(), 3);
+    const other = view.subscribe("tsk_other", () => {});
+    assert.equal(feed.feeds.length, 2, "each project has its own feed");
+    await feed.deliver("", 1);
+    await settle();
+    assert.deepEqual(seen, { first: 1, second: 1 });
+    other.stop();
+    second.stop();
+    view.dispose();
+    assert.ok(
+      feed.feeds.every((f) => f.stopped),
+      "disposing stops every feed",
+    );
+  } finally {
+    view.dispose();
+  }
+});
+
+test("feed errors reach every attached view", async () => {
+  const f = fixture(),
+    feed = feedClient(f.live),
+    view = f.make(feed.client);
+  try {
+    const errors = [];
+    view.subscribe("", () => {}, { onError: (e) => errors.push(1 + e.n) });
+    view.subscribe("", () => {}, { onError: (e) => errors.push(2 + e.n) });
+    feed.feeds[0].options.onError({ n: 10 });
+    assert.deepEqual(errors, [11, 12]);
+  } finally {
+    view.dispose();
+  }
+});
+
+test("capabilities are kept in memory for this client only", async () => {
+  const f = fixture();
+  let calls = 0,
+    answer = () => ({ queue: { versions: [1] } });
+  const client = {
+    ...f.live,
+    capabilities: async () => {
+      calls++;
+      return answer();
+    },
+  };
+  let clock = 0;
+  const view = f.make(client, { now: () => clock, refreshMs: 1000 });
+  try {
+    assert.deepEqual(await view.capabilities(), { queue: { versions: [1] } });
+    let finish;
+    answer = () =>
+      new Promise((resolve) => {
+        finish = resolve;
+      });
+    clock = 1000;
+    const kept = await within(view.capabilities(), 250, "capabilities");
+    assert.deepEqual(kept, { queue: { versions: [1] } });
+    kept.queue.versions.push(99);
+    assert.equal(calls, 2, "a background refresh started");
+    assert.deepEqual(await view.capabilities(), { queue: { versions: [1] } });
+    assert.equal(calls, 2, "the refresh is shared and recent");
+    finish({ queue: { versions: [1, 2] } });
+    await settle();
+    assert.deepEqual(await view.capabilities(), {
+      queue: { versions: [1, 2] },
+    });
+
+    answer = () => {
+      throw new HubError(401, "Expired credential");
+    };
+    clock = 2000;
+    await view.capabilities();
+    await settle();
+    await assert.rejects(view.capabilities(), /Expired credential/);
+    answer = () => ({ queue: { versions: [3] } });
+    assert.deepEqual(await view.capabilities(), { queue: { versions: [3] } });
+  } finally {
+    view.dispose();
+  }
+  const fresh = f.make(client);
+  try {
+    const before = calls;
+    await fresh.capabilities();
+    assert.equal(calls, before + 1, "a new client never reuses the memo");
+  } finally {
+    fresh.dispose();
+  }
+});
+
+test("capabilities are not served from memory offline", async () => {
+  const f = fixture(),
+    view = f.make({
+      ...f.live,
+      capabilities: async () => {
+        if (offline) throw new Error("Synthetic offline");
+        return { queue: { versions: [1] } };
+      },
+    });
+  let offline = false;
+  try {
+    await view.capabilities();
+    offline = true;
+    f.offline();
+    await assert.rejects(view.capabilities(), /Synthetic offline/);
+  } finally {
+    view.dispose();
   }
 });
