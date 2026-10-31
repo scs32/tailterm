@@ -1280,3 +1280,46 @@ test("a slow catch-up of full pages marks reads stale once, at its first short p
     view.dispose();
   }
 });
+
+test("a decisions read after a confirmed write skips data a failed refresh left stale", async () => {
+  const f = fixture();
+  let state = "before write",
+    failing = false,
+    deliver,
+    mutate;
+  const client = {
+    base: "http://fixture",
+    token: "first",
+    async request(path) {
+      if (failing && path.includes("/decisions"))
+        throw new HubError(500, "Synthetic failure");
+      return { decisions: [{ id: "decision", state }] };
+    },
+    subscribe(task, onEvents) {
+      deliver = onEvents;
+      return { stop() {}, cursor: () => 0 };
+    },
+    onMutation(listener) {
+      mutate = listener;
+      return () => {};
+    },
+  };
+  const view = f.make(client);
+  const decision = async () => (await view.listDecisions("one")).decisions[0];
+  try {
+    assert.equal((await decision()).state, "before write");
+    view.subscribe("one", () => {});
+    failing = true;
+    await deliver([{ seq: 1, kind: "message" }], 1);
+    // The stale entry is served and its background refresh fails.
+    assert.equal((await decision()).state, "before write");
+    await settle(() => view.cacheStatus().label === "Saved data · stale");
+    assert.equal(view.cacheStatus().label, "Saved data · stale");
+    failing = false;
+    state = "after write";
+    mutate();
+    assert.equal((await decision()).state, "after write");
+  } finally {
+    view.dispose();
+  }
+});

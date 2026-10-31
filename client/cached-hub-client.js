@@ -344,9 +344,12 @@ export function createCachedHubClient({
     capabilityRead = null;
     for (const task of new Set([...auditEpochs.keys(), ...auditMemory.keys()]))
       auditEpochs.set(task, (auditEpochs.get(task) || 0) + 1);
+    // A failure before the write must not keep serving pre-write data; one
+    // after it does, through the refresh it makes.
     for (const path of paths) {
       dirty.add(path);
       checked.delete(path);
+      staleOptionalPaths.delete(path);
     }
     notify(true);
   }
@@ -447,6 +450,7 @@ export function createCachedHubClient({
       if (new URL(path, client.base).pathname === prefix) {
         dirty.add(path);
         checked.delete(path);
+        staleOptionalPaths.delete(path);
       }
     notify(true);
   }
