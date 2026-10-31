@@ -362,10 +362,10 @@ export function createCachedHubClient({
   // One hub feed per project for the life of this client. Views attach and
   // detach; a later view resumes from the kept cursor instead of replaying
   // every retained event. The initial catch-up marks reads stale once, at its
-  // end: its first short page, or a quiet full page that the hub confirms no
-  // event follows. A slow next page alone never ends it. After that every page
-  // marks reads stale. Views ignore event payloads, so they hear only the last
-  // page of the catch-up.
+  // end: its first short page, a quiet full page that the hub confirms no
+  // event follows, or a feed error. A slow next page alone never ends it.
+  // After that every page marks reads stale. Views ignore event payloads, so
+  // they hear only the last page of the catch-up.
   function sharedFeed(task, after = 0) {
     if (feeds.has(task)) return feeds.get(task);
     const shared = { views: new Set(), quiet: null };
@@ -417,6 +417,9 @@ export function createCachedHubClient({
           failed = true;
           notify();
           for (const view of shared.views) view.onError(error);
+          // A failing feed ends a catch-up still waiting for its next page,
+          // as a failed probe does, rather than hold reads fresh forever.
+          if (!caughtUp && last) flush();
         },
       },
     );

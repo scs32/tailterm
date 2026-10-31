@@ -1323,3 +1323,56 @@ test("a decisions read after a confirmed write skips data a failed refresh left 
     view.dispose();
   }
 });
+
+test("a catch-up ends once when the feed fails after a probe sees more events", async () => {
+  const f = fixture(),
+    feed = feedClient(f.live),
+    probes = [];
+  const view = f.make({
+    ...feed.client,
+    // The hub still holds events behind the full page, so the probe alone
+    // never ends the catch-up.
+    async events(task, options) {
+      probes.push(options);
+      return { events: [{ seq: options.after + 1, kind: "message" }] };
+    },
+  });
+  try {
+    await view.listTasks();
+    await settle();
+    // Status changes reach views as empty notifications; a flush delivers
+    // the catch-up's last page itself.
+    const pages = [],
+      errors = [];
+    view.subscribe("", (events) => events.length && pages.push(events), {
+      onError: (e) => errors.push(e),
+    });
+    const before = f.requests.length;
+    await feed.deliver("", 100);
+    await settle(() => probes.length >= 1, 1000);
+    assert.equal(probes.length, 1, "the quiet full page asked the hub");
+    assert.equal(pages.length, 0, "a probe that sees events keeps waiting");
+    // The subscribe loop then keeps failing.
+    const failure = Error("Synthetic feed failure");
+    feed.feeds[0].options.onError(failure);
+    await settle(() => pages.length >= 1, 500);
+    assert.equal(pages.length, 1, "the feed error ends the catch-up");
+    assert.equal(pages[0].length, 100, "with its last page");
+    assert.deepEqual(errors, [failure], "and still reaches the view");
+    feed.feeds[0].options.onError(failure);
+    await tick(400);
+    assert.equal(pages.length, 1, "a later failure does not end it again");
+    assert.equal(probes.length, 1, "nor probe again");
+    // A failed client holds stale reads until the hub answers again.
+    await view.listAgents("one");
+    await view.listTasks();
+    await settle(() => f.requests.length >= before + 2, 1000);
+    assert.equal(
+      f.requests.length,
+      before + 2,
+      "then the read the catch-up marked stale refreshes once",
+    );
+  } finally {
+    view.dispose();
+  }
+});
