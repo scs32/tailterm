@@ -19,6 +19,8 @@ const BACKLOG_EVENTS = 30000;
 const LIVE_EVENT_MS = 1000;
 // Time spent on a tab before leaving it in the revisit case.
 const DWELL_MS = 1000;
+// After client.dispose() no long poll may stay open longer than this.
+const DISPOSE_MS = 500;
 // Bugs first: the owner reported it as the slowest.
 const DATA_TABS = [
   "bugs",
@@ -40,6 +42,9 @@ const SELECTORS = {
   queue: "#mode-view .queue-row",
   terminals: ".terminal-shell:not([hidden])",
 };
+// Tabs that render from the local vault at once and paint no loading shell
+// ([data-view-shell]); every other tab must show one on an empty cache.
+const SHELL_FREE = new Set(["agents", "teams", "terminals"]);
 
 // Runs in the page, serialized with toString, so it may only use its
 // arguments and dynamic imports.
@@ -201,6 +206,9 @@ async function fixturePage({ latency, refreshMs, backlog, liveEventMs }) {
     unknown: new Set(),
     writes: 0,
     eventReads: 0,
+    // Long polls (feed reads that may wait) in flight now and at most.
+    openPolls: 0,
+    maxOpenPolls: 0,
   };
   // The global feed: a retained backlog, then a live event every interval.
   // Events are generated from their sequence number, so the backlog costs no
@@ -242,26 +250,53 @@ async function fixturePage({ latency, refreshMs, backlog, liveEventMs }) {
     const p = u.pathname;
     const method = init.method || "GET";
     if (p === "/v1/events" || /^\/v1\/tasks\/[^/]+\/events$/.test(p)) {
+      // Feed reads honor init.signal as window.fetch does: an abort ends the
+      // read at once with an AbortError.
+      const signal = init.signal;
+      const abortError = () =>
+        new DOMException("The operation was aborted.", "AbortError");
+      if (signal?.aborted) throw abortError();
+      const poll = !!u.searchParams.get("wait");
       stats.eventReads++;
-      await sleep(latency);
-      const task = p.startsWith("/v1/tasks/") ? p.split("/")[3] : "";
-      const after = Number(u.searchParams.get("after") || 0);
-      const limit = Math.min(1000, Number(u.searchParams.get("limit") || 100));
-      let events = eventsAfter(task, after, limit);
-      if (!events.length && u.searchParams.get("wait")) {
-        await new Promise((resolve) => {
-          waiters.add(resolve);
-          setTimeout(() => {
-            waiters.delete(resolve);
-            resolve();
-          }, 25000);
+      if (poll)
+        stats.maxOpenPolls = Math.max(stats.maxOpenPolls, ++stats.openPolls);
+      try {
+        const hold = (ms, wake) =>
+          new Promise((resolve, reject) => {
+            const done = () => {
+              clearTimeout(timer);
+              waiters.delete(done);
+              signal?.removeEventListener("abort", stop);
+              resolve();
+            };
+            const stop = () => {
+              clearTimeout(timer);
+              waiters.delete(done);
+              reject(abortError());
+            };
+            const timer = setTimeout(done, ms);
+            if (wake) waiters.add(done);
+            signal?.addEventListener("abort", stop, { once: true });
+          });
+        await hold(latency, false);
+        const task = p.startsWith("/v1/tasks/") ? p.split("/")[3] : "";
+        const after = Number(u.searchParams.get("after") || 0);
+        const limit = Math.min(
+          1000,
+          Number(u.searchParams.get("limit") || 100),
+        );
+        let events = eventsAfter(task, after, limit);
+        if (!events.length && poll) {
+          await hold(25000, true);
+          events = eventsAfter(task, after, limit);
+        }
+        return response({
+          events,
+          next: events.length ? events.at(-1).seq : after,
         });
-        events = eventsAfter(task, after, limit);
+      } finally {
+        if (poll) stats.openPolls--;
       }
-      return response({
-        events,
-        next: events.length ? events.at(-1).seq : after,
-      });
     }
     if (p.endsWith("/changes")) {
       if (u.searchParams.get("wait")) await new Promise(() => {});
@@ -476,25 +511,53 @@ async function fixturePage({ latency, refreshMs, backlog, liveEventMs }) {
   });
   window.qa = {
     persisted,
+    // Returns the time from the click to the first visible shell or data,
+    // the time to data, the shell's structure when one was seen, and whether
+    // a shell was left behind once data painted.
     async switchTo(mode, selector) {
       const t0 = performance.now();
+      const shellSelector = "#mode-view [data-view-shell]";
+      let shell = null,
+        firstSeen = false,
+        resolveFirst;
+      const first = new Promise((resolve) => (resolveFirst = resolve));
+      const settle = (resolve) =>
+        requestAnimationFrame(() =>
+          setTimeout(() => resolve(Math.round(performance.now() - t0)), 0),
+        );
+      const look = () => {
+        const node = document.querySelector(shellSelector);
+        if (node && !shell)
+          shell = {
+            heading: !!node.querySelector("h2")?.textContent.trim(),
+            control: !!node.querySelector("button, input, select"),
+            status: !!node.querySelector('[role="status"]')?.textContent.trim(),
+          };
+        const data = !!document.querySelector(selector);
+        if (!firstSeen && (node || data)) {
+          firstSeen = true;
+          settle(resolveFirst);
+        }
+        return data;
+      };
       document.querySelector(`header [data-mode="${mode}"]`).click();
+      let shellAfterData = false;
       const painted = await new Promise((resolve) => {
         const done = () => {
           observer.disconnect();
           clearTimeout(timer);
-          requestAnimationFrame(() =>
-            setTimeout(() => resolve(performance.now() - t0), 0),
-          );
+          shellAfterData = !!document.querySelector(shellSelector);
+          settle(resolve);
         };
         const observer = new MutationObserver(() => {
-          if (document.querySelector(selector)) done();
+          if (look()) done();
         });
         const timer = setTimeout(() => {
           observer.disconnect();
+          if (!firstSeen) resolveFirst(-1);
           resolve(-1);
         }, 30000);
-        if (document.querySelector(selector)) done();
+        if (look()) done();
         else
           observer.observe(document.body, {
             childList: true,
@@ -504,7 +567,20 @@ async function fixturePage({ latency, refreshMs, backlog, liveEventMs }) {
           });
       });
       await window.rendered;
-      return Math.round(painted);
+      shellAfterData ||= !!document.querySelector(shellSelector);
+      return { first: await first, data: painted, shell, shellAfterData };
+    },
+    polls: () => ({ open: stats.openPolls, max: stats.maxOpenPolls }),
+    // Disposes the read client and returns how long its long polls took to
+    // close (-1 if any is still open after limitMs).
+    async dispose(limitMs) {
+      const t0 = performance.now();
+      client.dispose();
+      while (stats.openPolls > 0) {
+        if (performance.now() - t0 > limitMs) return -1;
+        await sleep(10);
+      }
+      return Math.round(performance.now() - t0);
     },
     async idle() {
       while (persisted.saving) await sleep(20);
@@ -579,17 +655,39 @@ async function measure(browser, origin, engine) {
         }),
     );
     await ready();
-    const switchTo = (mode) =>
-      page.evaluate(
+    const shellFailures = [];
+    let warmShells = 0,
+      warmSwitches = 0;
+    const visit = async (mode, cold = false) => {
+      const result = await page.evaluate(
         ([m, s]) => window.qa.switchTo(m, s),
         [mode, SELECTORS[mode]],
       );
+      if (result.shell) {
+        const { heading, control, status } = result.shell;
+        if (!heading || !control || !status)
+          shellFailures.push(`${mode} shell ${JSON.stringify(result.shell)}`);
+        if (!cold) warmShells++;
+      }
+      if (!cold) warmSwitches++;
+      if (result.shellAfterData)
+        shellFailures.push(`${mode} shell remained after data painted`);
+      return result;
+    };
+    const switchTo = async (mode) => (await visit(mode)).data;
     const samples = {};
     const record = (name, mode, ms) =>
       ((samples[name] ||= {})[mode] ||= []).push(ms);
-    // The first visit with an empty cache has to wait for the network, so it
-    // is recorded but not held to the target; it fills the saved cache.
-    for (const mode of TABS) record("cold-first", mode, await switchTo(mode));
+    // The first visit with an empty cache has to wait for the network for
+    // its data, so cold-first is recorded but not held to the target; it
+    // fills the saved cache. Its shell (or data) is: cold-shell.
+    for (const mode of TABS) {
+      const result = await visit(mode, true);
+      record("cold-first", mode, result.data);
+      record("cold-shell", mode, result.first);
+      if (DATA_TABS.includes(mode) && !SHELL_FREE.has(mode) && !result.shell)
+        shellFailures.push(`${mode} painted no shell on an empty cache`);
+    }
     await page.evaluate(() => window.qa.idle());
     // The owner's usual first visit: a reload, the same vault unlocked again
     // with its saved cache, and a feed that replays the backlog from the start.
@@ -626,6 +724,11 @@ async function measure(browser, origin, engine) {
     await page.evaluate(() => window.qa.idle());
     const persisted = await page.evaluate(() => window.qa.persisted);
     const coverage = await page.evaluate(() => window.qa.coverage());
+    const polls = await page.evaluate(() => window.qa.polls());
+    const disposed = await page.evaluate(
+      (limit) => window.qa.dispose(limit),
+      DISPOSE_MS,
+    );
     const failures = [];
     for (const [name, byMode] of Object.entries(samples)) {
       const medians = Object.fromEntries(
@@ -646,8 +749,20 @@ async function measure(browser, origin, engine) {
     console.log(
       `${engine}: saves ${persisted.saves} cache loads ${persisted.loads} event reads ${coverage.eventReads}`,
     );
+    console.log(
+      `${engine}: shells on warm switches ${warmShells}/${warmSwitches} (information only); most open long polls ${polls.max}; long polls closed ${disposed} ms after dispose`,
+    );
     assert.deepEqual(errors, [], `${engine}: page errors`);
     assert.deepEqual(failures, [], `${engine}: tab switches`);
+    assert.deepEqual(shellFailures, [], `${engine}: loading shells`);
+    assert.ok(
+      polls.max <= 1,
+      `${engine}: ${polls.max} long polls were open at once`,
+    );
+    assert.ok(
+      disposed >= 0,
+      `${engine}: long polls still open ${DISPOSE_MS} ms after dispose`,
+    );
     assert.equal(persisted.loads, 1, `${engine}: cache loads after reload`);
     assert.ok(persisted.saves > 0, `${engine}: no saves`);
     assert.ok(

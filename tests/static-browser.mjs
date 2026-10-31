@@ -368,7 +368,7 @@ const http = createServer(async (req, res) => {
     if (url.pathname.startsWith("/fixture-hub/"))
       return fixtureHub.handle(req, res, url);
     if (url.pathname.startsWith("/fixture-fetch/"))
-      return serveFetchFixture(res, url);
+      return serveFetchFixture(res, url, req);
     const name = url.pathname === "/" ? "/index.html" : url.pathname;
     const root = path.resolve("dist-static");
     const file = path.resolve(root, "." + name);
@@ -567,10 +567,12 @@ async function exerciseFooterFit(page) {
 // A bare page that loads the test WASM and calls its fetch, which uses the
 // browser's fetch because the fixture has no tailnet dialer. /held sends its
 // headers and part of its body and then waits; /cut drops the connection
-// after part of its body.
+// after part of its body; /hang never answers and counts its requests.
 const heldFetchBodies = new Set();
+const hangingFetches = new Set();
+let hangingFetchCount = 0;
 let fetchFixtureWasm;
-function serveFetchFixture(res, url) {
+function serveFetchFixture(res, url, req) {
   const body = "partial body ";
   const partial = { "Content-Type": "text/plain", "Content-Length": "4096" };
   switch (url.pathname) {
@@ -589,6 +591,14 @@ function serveFetchFixture(res, url) {
       globalThis.fetchStatus = r.status;
       return "body: " + (await r.text());
     }).catch((e) => "rejected: " + e);
+  globalThis.readAbortable = (url, signal) =>
+    ipn.fetch(url, { signal }).then(async (r) => {
+      globalThis.fetchStatus = r.status;
+      return "body: " + (await r.text());
+    }).catch((e) => "rejected: " + (e?.name || e));
+  // A read that has not settled within ms reports "pending" instead of hanging.
+  globalThis.within = (promise, ms = 5000) =>
+    Promise.race([promise, new Promise((r) => setTimeout(() => r("pending"), ms))]);
 </script>`);
     case "/fixture-fetch/wasm_exec.js":
       res.writeHead(200, { "Content-Type": "text/javascript" });
@@ -602,6 +612,11 @@ function serveFetchFixture(res, url) {
       res.write(body);
       heldFetchBodies.add(res);
       res.on("close", () => heldFetchBodies.delete(res));
+      return;
+    case "/fixture-fetch/hang":
+      hangingFetchCount++;
+      hangingFetches.add(req);
+      res.on("close", () => hangingFetches.delete(req));
       return;
     case "/fixture-fetch/cut":
       res.writeHead(200, partial);
@@ -676,6 +691,79 @@ async function exerciseFetchUnload(browser) {
   );
   await context.close();
 }
+// ipn.fetch honors init.signal (wi_0b8f0005264a8360): an abort closes the
+// request on the server and rejects with the signal's AbortError, whether it
+// comes before the headers or during the body read; an already-aborted signal
+// sends nothing; an abort after the body was read changes nothing.
+async function exerciseFetchAbort(browser) {
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  const errors = [];
+  page.on("pageerror", (e) => errors.push(e.message));
+  await page.goto(origin + "/fixture-fetch/");
+  await page.waitForFunction(() => globalThis.ipn);
+  for (let i = 0; i < 3; i++) {
+    const before = hangingFetchCount;
+    await page.evaluate(() => {
+      globalThis.controller = new AbortController();
+      globalThis.pending = readAbortable(
+        "/fixture-fetch/hang",
+        controller.signal,
+      );
+    });
+    await wait(() => hangingFetches.size === 1);
+    assert.equal(hangingFetchCount, before + 1);
+    await page.evaluate(() => controller.abort());
+    assert.equal(
+      await page.evaluate(() => within(pending)),
+      "rejected: AbortError",
+      `Abort ${i + 1} before the headers rejects`,
+    );
+    await wait(() => hangingFetches.size === 0);
+  }
+  const sent = hangingFetchCount;
+  assert.equal(
+    await page.evaluate(() =>
+      within(readAbortable("/fixture-fetch/hang", AbortSignal.abort())),
+    ),
+    "rejected: AbortError",
+    "An already-aborted signal rejects",
+  );
+  await page.waitForTimeout(250);
+  assert.equal(hangingFetchCount, sent, "An aborted signal sends nothing");
+  await page.evaluate(() => {
+    globalThis.fetchStatus = 0;
+    globalThis.controller = new AbortController();
+    globalThis.pending = readAbortable(
+      "/fixture-fetch/held",
+      controller.signal,
+    );
+  });
+  await page.waitForFunction(() => globalThis.fetchStatus === 200);
+  await wait(() => heldFetchBodies.size === 1);
+  await page.evaluate(() => controller.abort());
+  assert.equal(
+    await page.evaluate(() => within(pending)),
+    "rejected: AbortError",
+    "Abort during the body read rejects",
+  );
+  await wait(() => heldFetchBodies.size === 0);
+  const done = await page.evaluate(async () => {
+    const controller = new AbortController();
+    const body = await within(
+      readAbortable("/fixture-fetch/", controller.signal),
+    );
+    controller.abort();
+    return body.slice(0, 21);
+  });
+  assert.equal(done, "body: <!doctype html>", "A finished read ignores abort");
+  await page.waitForTimeout(250);
+  assert.deepEqual(errors, [], "Fetch aborts leave no page error");
+  console.log(
+    "WASM fetch abort: before headers, during body and pre-aborted reject with AbortError; server requests closed",
+  );
+  await context.close();
+}
 const launcherCards = (page) =>
   page.evaluate(() =>
     [...document.querySelectorAll("[data-launch-server]")].map((n) => ({
@@ -694,6 +782,7 @@ try {
     ],
   });
   await exerciseFetchUnload(browser);
+  await exerciseFetchAbort(browser);
   if (process.env.TAILTERM_FETCH_UNLOAD_ONLY)
     throw new FocusedFetchUnloadComplete();
   await exerciseTabSwitch(browser);

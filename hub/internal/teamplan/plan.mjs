@@ -1630,8 +1630,12 @@ function createHubClient({ fetchImpl, baseURL, token = "" }) {
   const base = normalizeHubURL(baseURL);
   if (!base) throw new Error("Hub URL must be http(s)://host[:port]");
   const mutationListeners = new Set();
-  async function request(path, { method = "GET", body, timeoutMs } = {}) {
+  async function request(
+    path,
+    { method = "GET", body, timeoutMs, signal } = {},
+  ) {
     const init = { method, headers: {}, timeoutMs };
+    if (signal) init.signal = signal;
     if (token) init.headers.Authorization = "Bearer " + token;
     if (body !== undefined) {
       init.body = JSON.stringify(body);
@@ -1914,32 +1918,40 @@ function createHubClient({ fetchImpl, baseURL, token = "" }) {
       request(`/v1/tasks/${task}/messages/read`, { method: "POST", body }),
     postEvent: (task, body) =>
       request(`/v1/tasks/${task}/events`, { method: "POST", body }),
-    events: (task, { after = 0, wait, limit } = {}) =>
+    events: (task, { after = 0, wait, limit, signal } = {}) =>
       request(
         (task ? `/v1/tasks/${task}/events` : "/v1/events") +
           q({ after, wait, limit }),
         {
           timeoutMs: wait ? 40000 : undefined,
+          signal,
         },
       ),
     // subscribe long-polls a feed until stop() is called. onEvents receives
     // each non-empty batch; onError receives failures (the loop backs off).
+    // stop() aborts the waiting request and ends a backoff sleep at once, so
+    // no poll is left open after it.
     subscribe(task, onEvents, { after = 0, onError = () => {} } = {}) {
       let stopped = false,
         cursor = after,
         backoff = 1000,
-        timer = null;
+        timer = null,
+        wake = null,
+        controller = null;
       const sleep = (ms) =>
         new Promise((resolve) => {
+          wake = resolve;
           timer = setTimeout(resolve, ms);
         });
       (async () => {
         while (!stopped) {
           try {
+            controller = new AbortController();
             const list = await client.events(task, {
               after: cursor,
               wait: "25s",
               limit: 100,
+              signal: controller.signal,
             });
             if (stopped) return;
             backoff = 1000;
@@ -1961,8 +1973,11 @@ function createHubClient({ fetchImpl, baseURL, token = "" }) {
       })();
       return {
         stop() {
+          if (stopped) return;
           stopped = true;
           clearTimeout(timer);
+          wake?.();
+          controller?.abort();
         },
         cursor: () => cursor,
       };

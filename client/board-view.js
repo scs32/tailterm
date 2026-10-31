@@ -752,6 +752,12 @@ export function createBoardView({
       root.querySelector("#board-configure").onclick = configure;
       return;
     }
+    // An empty root means a fresh tab switch. Paint the loading shell before
+    // the first await, so the tab shows at once even with nothing cached; the
+    // first render, error or no-client markup replaces it.
+    if (!root.firstElementChild)
+      root.innerHTML =
+        '<div class="board mode-board" data-view-shell aria-busy="true"><aside class="board-rail"><div class="board-rail-head"><span class="eyebrow">PROJECTS</span><button type="button" title="New project" aria-label="New project" disabled>＋</button></div></aside><section class="board-thread"><div class="board-head"><div class="view-heading"><div><span class="eyebrow">BOARD</span><h2>Board</h2></div></div><p class="fine" role="status">Loading the board…</p></div></section></div>';
     const actionClient = client();
     const requestedContext = itemContext && { ...itemContext };
     const loaded = await reload(token, () => {

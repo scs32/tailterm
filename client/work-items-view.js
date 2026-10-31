@@ -103,11 +103,19 @@ export function createWorkItemsView({
   async function show(taskId) {
     if (taskId !== undefined) scope = taskId || "";
     visible = true;
+    // An empty root means a fresh tab switch. Paint the loading shell before
+    // the first await, so the tab shows at once even with nothing cached; the
+    // first render, error or no-client markup replaces it.
+    if (client() && root && !root.firstElementChild) paintShell();
     await reload();
     if (visible && client() && !subscription)
       subscription = client().subscribe("", () => reload(), {
         onError: () => {},
       });
+  }
+  function paintShell() {
+    const noun = plural.toLowerCase();
+    root.innerHTML = `<div class="board mode-board work-items-view" data-view-shell aria-busy="true"><aside class="board-rail work-items-rail" aria-label="Projects"><div class="board-rail-head"><span class="eyebrow">PROJECTS</span><button type="button" title="New ${singular.toLowerCase()}" aria-label="New ${singular.toLowerCase()}" disabled>＋</button></div></aside><section class="board-thread work-items-main"><div class="board-head work-items-head${kind === "feature" ? " feature-head" : ""}"><div class="view-heading"><div class="work-items-heading"><span class="eyebrow">${scope ? "PROJECT" : "ALL PROJECTS"}</span><h2>${plural}</h2></div><div class="work-items-controls"><label class="work-items-search"><span class="sr-only">Search ${noun}</span><input type="search" value="${esc(query)}" placeholder="Search ${noun}" autocomplete="off" disabled></label><label class="work-items-project-select"><span>Project</span><select disabled><option>All projects</option></select></label><label class="work-items-status-select"><span>Status</span><select disabled><option>${esc(statuses[state] || "All statuses")}</option></select></label><button class="primary" disabled>＋ New ${singular.toLowerCase()}</button></div></div><p class="fine" role="status">Loading ${noun}…</p></div></section></div>`;
   }
   async function reload() {
     if (!visible || !root) return;

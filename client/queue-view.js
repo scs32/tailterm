@@ -99,6 +99,11 @@ export function createQueueView({
     visible = true;
     stopOwnerClock?.();
     stopOwnerClock = startOwnerAgeClock(root);
+    // An empty root means a fresh tab switch. Paint the loading shell before
+    // the first await, so the tab shows at once even with nothing cached; the
+    // first render, error or no-client markup replaces it.
+    if (client() && !root.firstElementChild)
+      root.innerHTML = `<div class="board mode-board work-items-view queue-view" data-view-shell aria-busy="true"><aside class="board-rail work-items-rail" aria-label="Projects"><div class="board-rail-head"><span class="eyebrow">PROJECTS</span></div></aside><section class="board-thread queue-main"><div class="board-head"><div class="view-heading"><div><span class="eyebrow">QUEUE</span><h2>Queue</h2></div><label class="queue-history-toggle"><input type="checkbox" disabled ${includeTerminal ? "checked" : ""}><span>Terminal history</span></label></div><p class="fine" role="status">Loading the queue…</p></div></section></div>`;
     await reload();
   }
   async function reload() {

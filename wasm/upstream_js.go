@@ -23,6 +23,7 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall/js"
 	"time"
 
@@ -434,11 +435,18 @@ func (s *jsSSHSession) Resize(rows, cols int) error {
 
 // fetch performs an HTTP request over the tailnet. init mirrors a subset of the
 // browser Request init: {method, headers: {name: value}, body: string,
-// timeoutMs}. The response exposes status, statusText, headers, and text().
+// timeoutMs, signal}. The response exposes status, statusText, headers, and
+// text(). An aborted signal cancels the request, or its body read, and the
+// promise rejects with the signal's reason; an already-aborted signal sends
+// nothing.
 func (i *jsIPN) fetch(url string, init js.Value) js.Value {
 	method, body, timeout := "GET", "", 30*time.Second
 	headers := map[string]string{}
+	signal := js.Undefined()
 	if init.Type() == js.TypeObject {
+		if v := init.Get("signal"); v.Type() == js.TypeObject {
+			signal = v
+		}
 		if v := init.Get("method"); v.Type() == js.TypeString && v.String() != "" {
 			method = strings.ToUpper(v.String())
 		}
@@ -470,8 +478,34 @@ func (i *jsIPN) fetch(url string, init js.Value) js.Value {
 			i.httpTransport.DialContext = i.dialer.UserDial
 		}
 	})
+	if !signal.IsUndefined() && signal.Get("aborted").Truthy() {
+		return js.Global().Get("Promise").Call("reject", signal.Get("reason"))
+	}
+	// The context and the abort listener exist before the promise returns, so
+	// an abort right after this call still reaches the request. The listener
+	// is removed and released once the request is over: its body read, an
+	// error, the timeout or the abort itself.
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	var aborted atomic.Bool
+	if !signal.IsUndefined() {
+		onAbort := js.FuncOf(func(js.Value, []js.Value) any {
+			aborted.Store(true)
+			cancel()
+			return nil
+		})
+		signal.Call("addEventListener", "abort", onAbort)
+		context.AfterFunc(ctx, func() {
+			signal.Call("removeEventListener", "abort", onAbort)
+			onAbort.Release()
+		})
+	}
+	failed := func(err error) error {
+		if aborted.Load() {
+			return jsRejection{signal.Get("reason")}
+		}
+		return err
+	}
 	return makePromise(func() (any, error) {
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		req, err := http.NewRequestWithContext(ctx, method, url, strings.NewReader(body))
 		if err != nil {
 			cancel()
@@ -484,8 +518,16 @@ func (i *jsIPN) fetch(url string, init js.Value) js.Value {
 		res, err := c.Do(req)
 		if err != nil {
 			cancel()
-			return nil, err
+			return nil, failed(err)
 		}
+		// Without a dialer, Go's browser transport stops watching the context
+		// once headers arrive, so an abort closes the body itself; that ends
+		// a pending read.
+		context.AfterFunc(ctx, func() {
+			if aborted.Load() {
+				res.Body.Close()
+			}
+		})
 		responseHeaders := map[string]any{}
 		for k, v := range res.Header {
 			if len(v) > 0 {
@@ -506,6 +548,10 @@ func (i *jsIPN) fetch(url string, init js.Value) js.Value {
 						buf := new(bytes.Buffer)
 						_, readErr = buf.ReadFrom(io.LimitReader(res.Body, 8<<20))
 						out = buf.String()
+						// A body closed by an abort may end as a clean EOF.
+						if aborted.Load() {
+							out, readErr = "", context.Canceled
+						}
 						// Without a dialer the body is the browser's response
 						// stream, and closing it calls the stream reader's
 						// cancel() without handling the promise it returns.
@@ -517,6 +563,9 @@ func (i *jsIPN) fetch(url string, init js.Value) js.Value {
 							res.Body.Close()
 						}
 					})
+					if readErr != nil {
+						readErr = failed(readErr)
+					}
 					return out, readErr
 				})
 			}),
@@ -619,6 +668,12 @@ func generateHostname() string {
 	return fmt.Sprintf("%s-%s", tail, scale)
 }
 
+// jsRejection rejects a promise with a JS value (such as an abort signal's
+// reason) instead of an error message string.
+type jsRejection struct{ value js.Value }
+
+func (r jsRejection) Error() string { return "aborted" }
+
 // makePromise handles the boilerplate of wrapping goroutines with JS promises.
 // f is run on a goroutine and its return value is used to resolve the promise
 // (or reject it if an error is returned).
@@ -629,6 +684,8 @@ func makePromise(f func() (any, error)) js.Value {
 		go func() {
 			if res, err := f(); err == nil {
 				resolve.Invoke(res)
+			} else if r, ok := err.(jsRejection); ok {
+				reject.Invoke(r.value)
 			} else {
 				reject.Invoke(err.Error())
 			}
