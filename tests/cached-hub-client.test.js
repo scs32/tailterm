@@ -966,6 +966,81 @@ test("capabilities are not served from memory offline", async () => {
   }
 });
 
+test("an invalidation drops the capabilities memo and any read in flight", async () => {
+  const f = fixture();
+  let answer = () => ({ queue: { versions: [1] } });
+  let clock = 0;
+  const view = f.make(
+    { ...f.live, capabilities: async () => answer() },
+    { now: () => clock, refreshMs: 60000 },
+  );
+  try {
+    assert.deepEqual(await view.capabilities(), { queue: { versions: [1] } });
+    answer = () => ({ queue: { versions: [2] } });
+    view.invalidate();
+    assert.deepEqual(await view.capabilities(), { queue: { versions: [2] } });
+
+    let finish;
+    answer = () =>
+      new Promise((resolve) => {
+        finish = resolve;
+      });
+    clock = 60000;
+    await view.capabilities();
+    view.invalidate();
+    answer = () => ({ queue: { versions: [3] } });
+    assert.deepEqual(await view.capabilities(), { queue: { versions: [3] } });
+    finish({ queue: { versions: [2] } });
+    await settle();
+    assert.deepEqual(
+      await view.capabilities(),
+      { queue: { versions: [3] } },
+      "a read from before the invalidation never becomes the memo",
+    );
+  } finally {
+    view.dispose();
+  }
+});
+
+test("a change to served data before any view subscribes reaches the first subscriber", async () => {
+  const f = fixture(),
+    feed = feedClient(f.live);
+  const first = f.make(feed.client);
+  await first.listTasks();
+  await settle();
+  first.dispose();
+  const view = f.make(feed.client);
+  try {
+    f.response({ tasks: [{ id: "one", name: "Changed while unheard" }] });
+    const before = f.requests.length;
+    assert.equal((await view.listTasks())[0].name, "Saved project");
+    await settle(() => f.requests.length > before);
+    let reloads = 0;
+    const one = view.subscribe("", () => reloads++);
+    await settle(() => reloads > 0);
+    assert.equal(reloads, 1, "the subscriber reloads once");
+    assert.equal((await view.listTasks())[0].name, "Changed while unheard");
+    let later = 0;
+    const two = view.subscribe("", () => later++);
+    await settle();
+    assert.equal(later, 0, "the missed change is delivered once");
+
+    // Data read while a view listened, changing after every view left, does
+    // not reload the next view.
+    one.stop();
+    two.stop();
+    f.response({ tasks: [{ id: "one", name: "Changed after views left" }] });
+    await view.refreshConnection();
+    await settle();
+    let next = 0;
+    view.subscribe("", () => next++);
+    await settle();
+    assert.equal(next, 0, "an unrelated later view is not reloaded");
+  } finally {
+    view.dispose();
+  }
+});
+
 test("an unchanged refresh skips the encrypted save until the entry ages", async () => {
   const f = fixture();
   let clock = 1000,

@@ -59,7 +59,13 @@ export function createCachedHubClient({
   const deferred = new Set();
   let capabilityMemo = null,
     capabilityRead = null,
-    capabilityChecked = 0;
+    capabilityChecked = 0,
+    capabilityGeneration = 0;
+  // A view can paint a saved entry and subscribe only after its other reads.
+  // A change to an entry served while no view listened, landing before any
+  // view subscribes, reaches the next view that does instead of no one.
+  const unlistened = new Set();
+  let unheard = false;
   const scope = crypto.subtle
     .digest(
       "SHA-256",
@@ -217,6 +223,7 @@ export function createCachedHubClient({
         if (staleGeneration === staleAtStart) stale.delete(path);
         else again = true;
         if (recoveredOptional || changed) notify(true);
+        if (changed && unlistened.has(path) && !listeners.size) unheard = true;
         return data;
       } catch (error) {
         if (disposed) throw error;
@@ -295,6 +302,7 @@ export function createCachedHubClient({
         (failed && now() - (checked.get(path) || 0) < refreshMs))
     ) {
       saved = true;
+      if (!listeners.size) unlistened.add(path);
       if (
         (stale.has(path) && !failed) ||
         !checked.has(path) ||
@@ -317,6 +325,9 @@ export function createCachedHubClient({
   }
   function invalidate() {
     revision++;
+    capabilityGeneration++;
+    capabilityMemo = null;
+    capabilityRead = null;
     for (const task of new Set([...auditEpochs.keys(), ...auditMemory.keys()]))
       auditEpochs.set(task, (auditEpochs.get(task) || 0) + 1);
     for (const path of paths) {
@@ -378,18 +389,22 @@ export function createCachedHubClient({
     feeds.set(task, shared);
     return shared;
   }
+  // An invalidation drops the memo and any read already in flight, so the
+  // next caller asks the hub again.
   function readCapabilities() {
     capabilityRead ||= (async () => {
+      const generation = capabilityGeneration;
       capabilityChecked = now();
       try {
         const value = await client.capabilities();
-        if (!disposed) capabilityMemo = structuredClone(value);
+        if (!disposed && generation === capabilityGeneration)
+          capabilityMemo = structuredClone(value);
         return value;
       } catch (error) {
-        capabilityMemo = null;
+        if (generation === capabilityGeneration) capabilityMemo = null;
         throw error;
       } finally {
-        capabilityRead = null;
+        if (generation === capabilityGeneration) capabilityRead = null;
       }
     })();
     return capabilityRead;
@@ -728,6 +743,11 @@ export function createCachedHubClient({
           .catch(options.onError || (() => {}));
       };
       listeners.add(changed);
+      unlistened.clear();
+      if (unheard) {
+        unheard = false;
+        changed();
+      }
       const view = { onEvents, onError: options.onError || (() => {}) };
       const shared = sharedFeed(task, options.after);
       shared.views.add(view);
