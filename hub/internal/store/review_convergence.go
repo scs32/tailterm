@@ -1237,6 +1237,18 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 			if meta.TreeDiffers && !rebase {
 				return reviewConflict("treeDiffers verification names no blocker IDs; verify unresolved blockers by ID")
 			}
+			// A changed criterion settled on a candidate other than the
+			// reviewed one needs the delta or equivalence attestation that the
+			// change since round two is tests and documentation only. With
+			// blockerIds, or criterionIds alone on a candidate whose blockers
+			// verified, the RESULT carries neither.
+			namesChanged := false
+			for _, id := range meta.CriterionIDs {
+				namesChanged = namesChanged || changed[id]
+			}
+			if namesChanged && meta.Candidate != reviewed && (!rebase || settlesOnVerifiedCandidate(state, meta.Candidate, meta.BlockerIDs, meta.CriterionIDs, meta.TreeDiffers)) {
+				return reviewConflict("changed criteria " + strings.Join(amend.delta, ", ") + " on a candidate other than the reviewed " + reviewed + " need a treeDiffers or rebase request with no blockerIds, whose delta or equivalence attests the change is tests and documentation only; " + amendedRouteText(amend))
+			}
 			settle := meta.Candidate == reviewed && !meta.TreeDiffers && len(meta.CriterionIDs) > 0
 			if rebase && !settle && !settlesOnVerifiedCandidate(state, meta.Candidate, meta.BlockerIDs, meta.CriterionIDs, meta.TreeDiffers) {
 				if meta.Candidate == reviewed {

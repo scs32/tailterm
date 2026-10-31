@@ -274,8 +274,17 @@ the per-criterion passes on the round-two candidate) also attests that the
 change since the reviewed candidate touches only tests and documentation. A
 verifier who finds a product behaviour change reports `delta: fail`. The hub
 does not read the diff; that attestation is the control, as for any
-`treeDiffers` fix. After a passing record, an ordinary `accept` and the done
-check proceed.
+`treeDiffers` fix. So on any candidate other than the round-two one, a request
+naming a changed criterion must be one that carries that attestation: a
+`treeDiffers` or rebase request with no `blockerIds`. The hub refuses one that
+names `blockerIds`, and `criterionIds` alone on a candidate whose blockers
+were verified there, because their RESULT carries no `delta` or `equivalence`.
+A candidate that carries a round-two blocker fix cannot attest that its change
+since the reviewed candidate is tests and documentation only, so its changed
+criteria take the owner route.
+After a passing record, an ordinary `accept` and the done check proceed. An
+amendment that adds only verification-owned criteria needs no focused record:
+the round-two candidate is accepted on its exact passing receipt.
 
 **Owner route.** A removed criterion, a `delta: fail`, or a change the lead
 knows alters behaviour keeps the owner route: an owner-decision disposition

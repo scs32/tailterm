@@ -5907,3 +5907,74 @@ func TestReviewConvergenceAmendedClassification(t *testing.T) {
 		}
 	}
 }
+
+// f1 (review #52945): with a round-two blocker open, a changed criterion is
+// never settled on a new candidate by a record that carries no delta or
+// equivalence attestation: neither beside blockerIds, nor by criterionIds
+// alone once the blockers verified there. The owner route still closes it.
+func TestReviewConvergenceAmendedChangedCriterionNeedsAttestation(t *testing.T) {
+	f := newConvergenceFixture(t)
+	b := api.ReviewFinding{ID: "b1", Criterion: "a1", Title: "Retry failure", File: "fixture.go", Line: 7}
+	failed := map[string]string{"a1": "fail", "a2": "pass"}
+	f.generalRound(t, candidateA, failed, api.ReviewMetadata{Blockers: []api.ReviewFinding{b}})
+	f.generalRound(t, candidateB, failed, api.ReviewMetadata{Blockers: []api.ReviewFinding{b}})
+	f.rescope(t, "Fixture, amended after round two")
+	f.criteria = addedA3
+	if err := f.assign(addedA3, nil); err != nil {
+		t.Fatal(err)
+	}
+	seedPassingVerification(t, f.s, f.item, candidateD)
+	attested := "changed criteria a3 on a candidate other than the reviewed " + candidateB + " need a treeDiffers or rebase request with no blockerIds"
+	_, err := f.focusedRequest(focusedMeta(t, `{"candidate":"`+candidateD+`","fix":"Restore retry and add the a3 test","blockerIds":["b1"],"criterionIds":["a3"]}`))
+	refusedWith(t, "blockerIds with a changed criterion", err, attested)
+	amendedRouteRefused(t, "blockerIds with a changed criterion", err, "changed criteria a3", true)
+	f.focusedCheck(t, focusedMeta(t, `{"candidate":"`+candidateD+`","fix":"Restore retry","blockerIds":["b1"]}`), map[string]string{"b1": "pass"}, receiptProof(candidateD))
+	_, err = f.focusedRequest(focusedMeta(t, `{"candidate":"`+candidateD+`","fix":"The a3 test","criterionIds":["a3"]}`))
+	refusedWith(t, "criterionIds alone after the blocker verified", err, attested)
+	amendedRouteRefused(t, "criterionIds alone after the blocker verified", err, "changed criteria a3", true)
+	if _, err = f.focusedRequest(focusedMeta(t, `{"candidate":"`+candidateD+`","fix":"`+deltaFix(candidateB)+`","treeDiffers":true,"criterionIds":["a3"]}`)); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("treeDiffers past an unresolved round-two blocker", err)
+	}
+	if st := f.state(t); len(st.Focused) != 1 || !reflect.DeepEqual(st.Focused[0].BlockerIDs, []string{"b1"}) {
+		t.Fatal("a refused request was stored", st.Focused)
+	}
+	amendedRouteRefused(t, "accept with a3 unattested", f.acceptCandidate(candidateD, api.Agent{}), "changed criteria a3", true)
+	if _, err = f.dispose("owner-decision", candidateD, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.dispose("owner-accept", candidateD, nil); err != nil {
+		t.Fatal("owner route on an unattested change:", err)
+	}
+	if err = f.doneSave(); err != nil {
+		t.Fatal("owner-accepted amended scope failed the done check:", err)
+	}
+}
+
+// f2 (review #52945): an amendment adding only a verification-owned criterion
+// accepts the round-two candidate with no focused record, but only on the
+// exact passing receipt, and passes the done save.
+func TestReviewConvergenceAmendedVerificationOwnedOnlyNeedsReceipt(t *testing.T) {
+	f := newConvergenceFixture(t)
+	f.generalRound(t, candidateA, passConvergence, api.ReviewMetadata{})
+	f.generalRound(t, candidateB, passConvergence, api.ReviewMetadata{})
+	f.rescope(t, "Fixture, a verification-owned criterion added after round two")
+	f.criteria, f.verificationCriteria = addedA3, []string{"a3"}
+	if err := f.assign(addedA3, []string{"a3"}); err != nil {
+		t.Fatal(err)
+	}
+	err := f.acceptCandidate(candidateB, api.Agent{})
+	if !errors.Is(err, api.ErrConflict) || strings.Contains(err.Error(), "scope amended") {
+		t.Fatal("accept with no receipt", err)
+	}
+	refusedWith(t, "accept with no receipt", err, "passing receipt for current scope and exact accepted candidate required")
+	if err = f.reviewErr(candidateB); err == nil || !strings.HasSuffix(err.Error(), "third general review refused; use disposition or exact focused verification") {
+		t.Fatal("third review on an owned-only amendment", err)
+	}
+	seedPassingVerification(t, f.s, f.item, candidateC)
+	refusedWith(t, "accept on another candidate's receipt", f.acceptCandidate(candidateB, api.Agent{}), "passing receipt for current scope and exact accepted candidate required")
+	seedPassingVerification(t, f.s, f.item, candidateB)
+	f.amendedAcceptedWithoutOwner(t, candidateB)
+	if st := f.state(t); len(st.Focused) != 0 {
+		t.Fatal("owned-only amendment needed a focused record", st.Focused)
+	}
+}
