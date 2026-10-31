@@ -143,7 +143,9 @@ async function open(mode, width = 1440, clockTime) {
   page.setDefaultTimeout(6000);
   await page.goto(`${origin}/?mode=${mode}`);
   await page.waitForFunction(() => !!window.qa);
-  await expect(page.locator(".board")).toBeVisible();
+  // A cold load may paint the loading shell (.board[data-view-shell]) first;
+  // wait for the loaded view, not the shell.
+  await expect(page.locator(".board:not([data-view-shell])")).toBeVisible();
   if (mode === "tasks") {
     await page.locator(`[data-task-select="${data.alpha.task.id}"]`).click();
     await expect(page.locator(".task-detail-card")).toHaveAttribute("data-task-card", data.alpha.task.id);
