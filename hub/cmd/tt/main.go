@@ -70,6 +70,7 @@ Commands
   owner extend|answer|cancel OBLIGATION_ID ...  the owner's controls over an obligation
   owner intervene --task ID --kind K --item ID [--product-item ID] --text T [--actor owner|helper]  record an owner intervention
   owner interventions --task ID [--tz ZONE]  owner interventions per day and kind
+  owner report hourly|morning|evening [--task ID] [--tz ZONE] [--host H] [--now T] [--since T]  the owner's progress report from one fixed template (docs/owner-report.md)
   operational-record get       read a legacy operational record (writes retired in phase 3)
   current-assignment [--item ID --action-key KEY] [--json]  read a legacy directive
   delivery coverage [--json]   read legacy directive coverage (writes retired in phase 3)
@@ -275,7 +276,7 @@ func main() {
 	case "delivery":
 		err = cmdDelivery(e, args)
 	case "owner":
-		err = cmdOwner(e, args)
+		err = dispatchOwner(e, args)
 	case "helper":
 		err = cmdHelper(e, args)
 	case "spawn":
@@ -315,6 +316,15 @@ func main() {
 	if err != nil {
 		die(err)
 	}
+}
+
+// dispatchOwner sends the read-only report past cmdOwner's agent-session
+// refusal: the owner helper, an agent session, renders it.
+func dispatchOwner(e env, args []string) error {
+	if len(args) > 0 && args[0] == "report" {
+		return cmdOwnerReport(e, args[1:])
+	}
+	return cmdOwner(e, args)
 }
 
 func ctxTimeout(d time.Duration) (context.Context, context.CancelFunc) {
