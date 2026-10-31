@@ -724,6 +724,42 @@ func reviewCompletion(ctx context.Context, tx *sql.Tx, item api.WorkItem, candid
 	return err
 }
 
+// ownerAcceptCorrection checks an owner-accept that re-binds a cleared
+// acceptance to its verified correction: meta.CorrectionOf is the candidate
+// of this stage's newest accept or owner-accept, a new verification plan has
+// cleared it, and meta.Candidate is another commit with its own passing
+// current receipt. It needs no owner-decision first. The hub runs no git:
+// the CLI done save proves CorrectionOf is an ancestor of Candidate.
+func ownerAcceptCorrection(ctx context.Context, tx *sql.Tx, item api.WorkItem, state api.ReviewConvergence, meta api.ReviewMetadata) error {
+	if item.Status == "done" {
+		return reviewConflict("a done item takes no correction")
+	}
+	if !validGitCommit(meta.Candidate) {
+		return reviewConflict("exact disposition candidate required")
+	}
+	if meta.CorrectionOf == meta.Candidate {
+		return reviewConflict("a correction names another candidate")
+	}
+	if state.Disposition != nil && (state.Disposition.Kind == "accept" || state.Disposition.Kind == "owner-accept") {
+		return reviewConflict("an acceptance stands; a new verification plan clears it first")
+	}
+	var start int64
+	if len(state.Stages) > 0 {
+		start = state.Stages[len(state.Stages)-1].AssignmentSeq
+	}
+	cleared := ""
+	for _, d := range state.Dispositions {
+		if d.MessageSeq >= start && (d.Kind == "accept" || d.Kind == "owner-accept") {
+			cleared = d.Candidate
+		}
+	}
+	if cleared == "" || cleared != meta.CorrectionOf {
+		return reviewConflict("correctionOf must name the cleared acceptance of this stage")
+	}
+	_, err := exactReceipt(ctx, tx, item, meta.Candidate)
+	return err
+}
+
 // applyReviewConvergence runs after immutable receipt replay and message insertion,
 // before obligation outcomes in the SAME transaction. Any refusal rolls back all writes.
 func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Message, req api.PostMessageRequest, target api.Agent, by api.Caller) error {
@@ -805,6 +841,9 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 	}
 	if meta != nil && len(meta.FixedFollowUpIDs) > 0 && meta.Mode != "disposition" {
 		return reviewConflict("fixedFollowUpIds is for a lead disposition")
+	}
+	if meta != nil && meta.CorrectionOf != "" && (meta.Mode != "disposition" || meta.Disposition != "owner-accept") {
+		return reviewConflict("correctionOf is for an owner-accept")
 	}
 	if e.Kind == "assign" {
 		if err = reviewLead(ctx, tx, m.TaskID, item.ID, req.AgentID, req.RunID); err != nil {
@@ -926,10 +965,15 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 		if len(state.Rounds) == 0 || state.Rounds[len(state.Rounds)-1].ResultSeq == 0 {
 			return reviewConflict("completed review required for disposition")
 		}
-		if ownerAccept && (state.Disposition == nil || (state.Disposition.Kind != "owner-decision" && state.Disposition.Kind != "follow-ups")) {
+		correction := ownerAccept && meta.CorrectionOf != ""
+		if correction {
+			if err = ownerAcceptCorrection(ctx, tx, item, state, *meta); err != nil {
+				return err
+			}
+		} else if ownerAccept && (state.Disposition == nil || (state.Disposition.Kind != "owner-decision" && state.Disposition.Kind != "follow-ups")) {
 			return reviewConflict("owner-accept resolves an owner-decision or follow-ups disposition")
 		}
-		if ownerAccept {
+		if ownerAccept && !correction {
 			if err = verificationReady(ctx, tx, item, meta.Candidate); err != nil {
 				return err
 			}
@@ -988,7 +1032,7 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 		} else if !validGitCommit(meta.Candidate) {
 			return reviewConflict("exact disposition candidate required")
 		}
-		state.Disposition = &api.ReviewDisposition{Kind: meta.Disposition, Candidate: meta.Candidate, MessageSeq: m.Seq, AgentID: req.AgentID, RunID: req.RunID}
+		state.Disposition = &api.ReviewDisposition{Kind: meta.Disposition, Candidate: meta.Candidate, CorrectionOf: meta.CorrectionOf, MessageSeq: m.Seq, AgentID: req.AgentID, RunID: req.RunID}
 		state.Dispositions = append(state.Dispositions, *state.Disposition)
 		if err = saveReviewStage(ctx, tx, m.TaskID, earlier, state); err != nil {
 			return err

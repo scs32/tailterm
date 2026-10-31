@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"time"
 
@@ -2478,7 +2479,7 @@ func (s *Store) teamQueueAction(ctx context.Context, task string, req api.TeamQu
 	// Acceptance with a native exact-SHA receipt durably enqueues delivery in
 	// the same transaction. Legacy acceptance remains visibly unreleased.
 	if req.Operation == "accept" {
-		if err = enqueueAcceptedRelease(ctx, tx, t, &e, now); err != nil {
+		if err = enqueueAcceptedRelease(ctx, tx, t, &e, req.HandlerAgentID, req.HandlerRunID, now); err != nil {
 			return zero, err
 		}
 	}
@@ -3150,7 +3151,10 @@ func acceptanceOutsideOwnership(changed, ownership []string, reason string, leas
 // acceptance must already be written. Legacy acceptance remains visibly
 // unreleased. An entry hold saved before acceptance creates the job held in
 // this transaction, so no claim can precede it; now is the acceptance time.
-func enqueueAcceptedRelease(ctx context.Context, tx *sql.Tx, t api.Task, e *api.TeamQueueEntry, now string) error {
+// Otherwise a recorded hand release that already shipped the accepted commit
+// settles the job superseded by it at once, so the deployer never claims a
+// duplicate; agentID and runID name the accepting run.
+func enqueueAcceptedRelease(ctx context.Context, tx *sql.Tx, t api.Task, e *api.TeamQueueEntry, agentID, runID, now string) error {
 	records, err := verificationRecords(ctx, tx, t.ID, e.ItemID)
 	if err != nil {
 		return err
@@ -3167,6 +3171,17 @@ func enqueueAcceptedRelease(ctx context.Context, tx *sql.Tx, t api.Task, e *api.
 	if err = applyEntryReleaseHold(ctx, tx, t.ID, &j, parseTS(now)); err != nil {
 		return err
 	}
+	var hand *api.HandRelease
+	if j.State == "verified" {
+		if hand, err = handReleaseCovering(ctx, tx, t.ID, j.Commit); err != nil {
+			return err
+		}
+	}
+	if hand != nil {
+		j.Supersession = &api.ReleaseSupersession{ReleasedCommit: hand.ReleasedCommit, Release: hand.Release, HandReleaseID: hand.ID, Targets: hand.Targets, AgentID: agentID, RunID: runID}
+		j.SettledAt = hand.CreatedAt
+		j.State = "superseded"
+	}
 	b, err := json.Marshal(j)
 	if err != nil {
 		return err
@@ -3175,7 +3190,34 @@ func enqueueAcceptedRelease(ctx context.Context, tx *sql.Tx, t api.Task, e *api.
 		return err
 	}
 	e.Release = &j
+	if hand != nil {
+		return liftReleaseHolds(ctx, tx, t.ID, j.ID, parseTS(now))
+	}
 	return nil
+}
+
+// handReleaseCovering returns the newest recorded hand release whose commits
+// include commit, or nil.
+func handReleaseCovering(ctx context.Context, q queryRower, task, commit string) (*api.HandRelease, error) {
+	rows, err := q.QueryContext(ctx, `SELECT record_json FROM release_hand_releases WHERE task_id=? ORDER BY rowid DESC`, task)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var raw string
+		var h api.HandRelease
+		if err = rows.Scan(&raw); err != nil {
+			return nil, err
+		}
+		if err = json.Unmarshal([]byte(raw), &h); err != nil {
+			return nil, err
+		}
+		if slices.Contains(h.Commits, commit) {
+			return &h, nil
+		}
+	}
+	return nil, rows.Err()
 }
 
 // sameTeamAcceptance reports whether a submitted acceptance names the saved
@@ -3343,5 +3385,5 @@ func acceptTeamQueueOnDoneSave(ctx context.Context, tx *sql.Tx, t api.Task, e *a
 	if rows, rowsErr := result.RowsAffected(); rowsErr != nil || rows != 1 {
 		return fmt.Errorf("%w: entry revision changed", api.ErrConflict)
 	}
-	return enqueueAcceptedRelease(ctx, tx, t, e, now)
+	return enqueueAcceptedRelease(ctx, tx, t, e, agentID, runID, now)
 }

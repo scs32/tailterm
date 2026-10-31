@@ -1165,6 +1165,7 @@ that notice stays unread until they next read their inbox.
 | Release failed and requires recovery | `wake=attention` |
 | Deployer is not claiming releases: ..., for every reason | `wake=attention` |
 | A release job is skipped because ..., the Board copy sent when a recipient was not reached | `wake=attention` |
+| A release job you unheld has reached a final state (hub-authored, directed) | none; a directed message wakes its recipient |
 
 - A routine notice repeats what the handler already has or needs no action. For
   the two routine fence waits the handler holds the deployer's directed request
@@ -1177,6 +1178,27 @@ that notice stays unread until they next read their inbox.
   broadcast, an owner post or another agent's notice. The directed copies of
   the held claim notice carry no `wake` ref; a directed message wakes its
   recipient.
+- **The unholder hears when its job settles (wi_c7a7b97e72fc151b).** When a
+  release job enters a final state, `released`, `rolled_back`, `refused` (by
+  the deployer or a handler reconcile) or `superseded`, the hub posts "A release
+  job you unheld has reached a final state" in the same transaction. It is a
+  directed NOTICE to the agent of the job's newest handler unhold (`tt
+  deployment unhold`, a `holdHistory` release event with cause `handler`),
+  with refs `job`, `state`, `item`, `entry`, `generation` and `receipt` (the
+  request id of the settling write); its text names the receipt's commit and
+  release, or the hand release that superseded it, and when and why the agent
+  unheld the job. Batch members settled with their lead count. When that agent
+  is closed or exited, the notice goes to the primary database handler and says
+  so; with no primary handler open, nothing is sent and the settling write
+  still succeeds. Nothing is sent for a job no agent unheld (never held, or
+  lifted only by its named items, its not-before time, a supersede or an entry
+  hold released before the job existed), for a job superseded at acceptance
+  (Superseding jobs released by hand, below), or when the unholder makes the
+  final write itself. `blocked`, `merged` and `claimed` are not final. A replay
+  returns the saved receipt and sends nothing, so each job sends at most one
+  notice per final state; a refused or rolled-back job later superseded sends
+  one more. An agent waiting on a job it did not unhold, such as one that
+  bound inputs or imported verification, is not woken by this notice.
 - A restart is routine whether or not "Deployer now runs the published scripts"
   follows. A deployer that does not come back after its restart notice is
   reported by the hub instead (A silent deployer, below). A restart the
@@ -1544,6 +1566,19 @@ cannot claim it in between. The same request ID replays. The targets the record
 shipped advance to its released commit in the baselines. Claim, the runner and
 the project fence skip the job. Each use needs its own recorded order; there is
 no standing order to supersede.
+
+**Supersede at acceptance (wi_c7a7b97e72fc151b).** A queue acceptance, by the
+lead's or handler's done save or by `tt team queue accept`, whose accepted
+commit a recorded hand release already lists in its commits creates the entry's
+job `superseded` at once instead of `verified`: the supersession names the
+newest such record (`releasedCommit`, `release`, `handReleaseId`, `targets`,
+and the accepting run as `agentId` and `runId`), `settledAt` is the record's
+time, and a hold whose named items are now all released or superseded lifts as
+after any supersede. No verified duplicate waits for the deployer and no
+handler supersede is needed. A standing entry hold still creates the job
+`held`; the handler supersedes it as above. Without a covering record the job
+is `verified` as before. A commit the deployer already released, with no hand
+release record, is not detected: the duplicate job is handled as before.
 
 Restoration is the handler's inspection, not something the hub can observe: the
 hub has no view of the hosts, so a reconcile that records `restored` is trusted

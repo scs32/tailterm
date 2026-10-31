@@ -818,6 +818,9 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 	var batch *ReleaseBatch
 	var batchState string
 	var settled []api.ReleaseJob
+	// priorState is the loaded job's state before this write, for the
+	// final-state wake; a new job has none.
+	var priorState string
 	if req.Operation == "enqueue" {
 		if err = requireScopeHandler(tx, ctx, task, req.AgentID, req.RunID); err != nil {
 			return zero, err
@@ -847,6 +850,7 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 		if err != nil {
 			return zero, err
 		}
+		priorState = j.State
 		// The project's one active batch, when this job is its lead or one of
 		// its members. A member is written only by its lead's settlement.
 		if batch, err = activeReleaseBatch(ctx, tx, task, j.ID); err != nil {
@@ -1290,6 +1294,16 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 			return zero, err
 		}
 	}
+	// The agent that unheld a job hears once when it reaches a final state;
+	// members settled with their lead were in its batch, never final.
+	if err = s.releaseTerminalWake(ctx, tx, task, j, priorState, req.AgentID, req.RequestID); err != nil {
+		return zero, err
+	}
+	for _, m := range settled {
+		if err = s.releaseTerminalWake(ctx, tx, task, m, "", req.AgentID, req.RequestID); err != nil {
+			return zero, err
+		}
+	}
 	if (req.Operation == "finish" && j.State == "released") || req.Operation == "supersede" {
 		if err = liftReleaseHolds(ctx, tx, task, j.ID, s.now()); err != nil {
 			return zero, err
@@ -1327,6 +1341,80 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 	}
 	s.notify(task)
 	return j, nil
+}
+
+// releaseTerminalWakeSubject is the directed notice an unholder receives.
+const releaseTerminalWakeSubject = "A release job you unheld has reached a final state"
+
+// releaseTerminalWake posts one directed notice when job j enters a final
+// state (released, rolled_back, refused or superseded) from another state.
+// Its recipient is the agent of the job's newest handler unhold (tt
+// deployment unhold); a closed or exited unholder's notice goes to the
+// primary handler instead. Nothing is sent for a job no agent unheld, when
+// the recipient makes this write itself, or when no recipient is open. A
+// replay returns its saved receipt before any write, so each final state
+// sends at most once. receipt is the request ID of the settling write.
+func (s *Store) releaseTerminalWake(ctx context.Context, tx *sql.Tx, task string, j api.ReleaseJob, prior, actor, receipt string) error {
+	if j.State == prior || !slices.Contains([]string{"released", "rolled_back", "refused", "superseded"}, j.State) {
+		return nil
+	}
+	var unhold *api.ReleaseHoldEvent
+	for i := range j.HoldHistory {
+		if ev := &j.HoldHistory[i]; ev.Action == "release" && ev.Cause == "handler" && ev.AgentID != "" {
+			unhold = ev
+		}
+	}
+	if unhold == nil || unhold.AgentID == actor {
+		return nil
+	}
+	t, err := scanTask(tx.QueryRowContext(ctx, `SELECT `+taskCols+` FROM tasks WHERE id=?`, task))
+	if err != nil {
+		return err
+	}
+	to, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND id=?`, task, unhold.AgentID))
+	if errors.Is(err, sql.ErrNoRows) {
+		to, err = api.Agent{Status: api.AgentClosed}, nil
+	}
+	if err != nil {
+		return err
+	}
+	unholder := to.Name
+	if unholder == "" {
+		unholder = unhold.AgentID
+	}
+	fallback := ""
+	if status := to.Status; status == api.AgentClosed || status == api.AgentExited {
+		if to, err = primaryHandler(ctx, tx, t); errors.Is(err, sql.ErrNoRows) {
+			return nil
+		} else if err != nil {
+			return err
+		}
+		fallback = fmt.Sprintf(" The unholder %s (agent %s) is %s, so this goes to the primary handler.", unholder, unhold.AgentID, status)
+	}
+	if to.ID == "" || to.ID == actor {
+		return nil
+	}
+	shipped := ""
+	switch {
+	case j.Receipt != nil:
+		var releases []string
+		for _, target := range j.Receipt.Targets {
+			if target.Release != "" && !slices.Contains(releases, target.Release) {
+				releases = append(releases, target.Release)
+			}
+		}
+		shipped = " Receipt commit " + j.Receipt.Commit
+		if len(releases) > 0 {
+			shipped += ", release " + strings.Join(releases, ", ")
+		}
+		shipped += "."
+	case j.Supersession != nil:
+		shipped = " Superseded by hand release " + j.Supersession.HandReleaseID + " (release " + j.Supersession.Release + ", commit " + j.Supersession.ReleasedCommit + ")."
+	}
+	text := fmt.Sprintf("Release job %s for item %s (entry %s) is %s at generation %d.%s %s unheld it at %s: %s.%s",
+		j.ID, j.ItemID, j.EntryID, j.State, j.Generation, shipped, unholder, unhold.At, strings.TrimRight(unhold.Reason, "."), fallback)
+	refs := map[string]string{"job": j.ID, "state": j.State, "item": j.ItemID, "entry": j.EntryID, "generation": fmt.Sprint(j.Generation), "receipt": receipt}
+	return s.postBrokerNotice(ctx, tx, t, to, "", releaseTerminalWakeSubject, releaseTerminalWakeSubject, text, refs)
 }
 
 // validateReleaseBatchDropped checks the batch exclusions a finish carries

@@ -23,6 +23,10 @@ type ReviewMetadata struct {
 	// this review stage that the item fixed; the hub settles them as round
 	// two would.
 	FixedFollowUpIDs []string `json:"fixedFollowUpIds,omitempty"`
+	// CorrectionOf, on an owner-accept, names the accepted candidate of this
+	// stage that a new verification plan cleared; Candidate is the verified
+	// correction the acceptance is re-bound to.
+	CorrectionOf string `json:"correctionOf,omitempty"`
 }
 
 type ReviewFinding struct {
@@ -107,12 +111,15 @@ type FocusedReview struct {
 	Passed             bool     `json:"passed"`
 }
 
+// ReviewDisposition's CorrectionOf is set on an owner-accept that re-binds a
+// cleared acceptance to its verified correction Candidate.
 type ReviewDisposition struct {
-	Kind       string `json:"kind"`
-	Candidate  string `json:"candidate"`
-	MessageSeq int64  `json:"messageSeq"`
-	AgentID    string `json:"agentId"`
-	RunID      string `json:"runId"`
+	Kind         string `json:"kind"`
+	Candidate    string `json:"candidate"`
+	CorrectionOf string `json:"correctionOf,omitempty"`
+	MessageSeq   int64  `json:"messageSeq"`
+	AgentID      string `json:"agentId"`
+	RunID        string `json:"runId"`
 }
 
 type ReviewReconciliation struct {

@@ -452,6 +452,9 @@ func cmdWorkItemUpdate(e env, args []string) error {
 			if err = verifyAcceptedGit(ctx, entry.Repository, base, realWorktree, *branch, *commit); err != nil {
 				return fmt.Errorf("accepted Git tuple failed worktree verification: %v", err)
 			}
+			if err = verifyCorrectionDescent(ctx, c, project, entry.ItemID, entry.Repository, *commit); err != nil {
+				return err
+			}
 		} else {
 			base = entry.Acceptance.BaseCommit
 		}
@@ -490,6 +493,27 @@ func cmdWorkItemUpdate(e env, args []string) error {
 		fmt.Printf("%s revision %d receipt %s\n", result.Revision.ItemID, result.Revision.Revision, result.Receipt.ID)
 		if entry != nil {
 			fmt.Printf("queue acceptance recorded: entry %s revision %d commit %s\n", accepted.ID, accepted.Revision, accepted.Acceptance.Commit)
+		}
+	}
+	return nil
+}
+
+// verifyCorrectionDescent proves, for an acceptance the owner re-bound to a
+// verified correction (owner-accept with correctionOf), that the cleared
+// accepted candidate is an ancestor of the commit being saved done. The hub
+// runs no git and trusts this check, as it does for hand releases.
+func verifyCorrectionDescent(ctx context.Context, c *api.Client, project, itemID, repository, commit string) error {
+	reviews, err := c.ListReviewConvergence(ctx, project)
+	if err != nil {
+		return fmt.Errorf("read the review state for the correction check: %w", err)
+	}
+	for _, r := range reviews {
+		if r.ItemID != itemID || r.Disposition == nil || r.Disposition.CorrectionOf == "" {
+			continue
+		}
+		accepted := r.Disposition.CorrectionOf
+		if err = exec.CommandContext(ctx, "git", "--git-dir="+repository, "merge-base", "--is-ancestor", accepted, commit).Run(); err != nil {
+			return fmt.Errorf("the acceptance was re-bound as a correction of %s, but commit %s does not descend from it; nothing was saved", accepted, commit)
 		}
 	}
 	return nil

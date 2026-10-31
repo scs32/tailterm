@@ -520,3 +520,86 @@ func TestDoneSaveRefusesChangedFilesOutsideOwnership(t *testing.T) {
 		t.Fatalf("retry or recovery changed the entry: %+v %v jobs %d", after, err, f.releaseJobs(t))
 	}
 }
+
+// correct commits a correction in the fixture worktree on a new branch from
+// parent, saves its passing receipt as a new verification plan, which clears
+// the acceptance of f.commit, and has the owner re-bind the acceptance to it
+// with correctionOf (wi_c7a7b97e72fc151b a1-a3). It returns the correction.
+func (f *leadDoneSave) correct(t *testing.T, branch, parent string) string {
+	t.Helper()
+	ctx := context.Background()
+	gitFixtureCommand(t, f.worktree, "checkout", "-q", "-b", branch, parent)
+	if err := os.WriteFile(filepath.Join(f.worktree, "src", "a.txt"), []byte("corrected from "+parent[:7]+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitFixtureCommand(t, f.worktree, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-q", "-am", "correction")
+	correction := gitFixtureCommand(t, f.worktree, "rev-parse", "HEAD")
+	history, err := f.c.VerificationHistory(ctx, f.task.ID, f.item.ID, f.handler.ID, f.handler.RunID)
+	if err != nil || len(history) == 0 || history[0].Plan == nil {
+		t.Fatalf("verification history: %+v %v", history, err)
+	}
+	p := *history[0].Plan
+	p.OperationKey, p.Commit = "correction-"+strings.ReplaceAll(branch, "/", "-"), correction
+	g := int64(len(history))
+	if _, err = f.c.SaveVerification(ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: p.OperationKey + "-plan", AgentID: f.handler.ID, RunID: f.handler.RunID, ExpectedGeneration: g, Plan: &p}); err != nil {
+		t.Fatal("correction plan", err)
+	}
+	r := *history[1].Receipt
+	r.OperationKey, r.Commit, r.PlanDigest = p.OperationKey, correction, cliDigest(p)
+	if _, err = f.c.SaveVerification(ctx, f.task.ID, f.item.ID, api.VerificationRequest{RequestID: p.OperationKey + "-receipt", AgentID: f.handler.ID, RunID: f.handler.RunID, ExpectedGeneration: g + 1, Receipt: &r}); err != nil {
+		t.Fatal("correction receipt", err)
+	}
+	links := []api.MessageWorkItem{{ItemTaskID: f.task.ID, ItemID: f.item.ID, ItemRevision: f.current.Revision, Relationship: "primary"}}
+	if _, err = f.c.PostMessage(ctx, f.task.ID, api.PostMessageRequest{RequestID: "correction-accept-" + strings.ReplaceAll(branch, "/", "-"), WorkItems: links, Envelope: &api.Envelope{Kind: "notice", Subject: "Re-bind the acceptance to its verified correction", Body: api.EnvelopeBody{Text: "Fixture only"}, Review: &api.ReviewMetadata{Mode: "disposition", Disposition: "owner-accept", Candidate: correction, CorrectionOf: f.commit}}}); err != nil {
+		t.Fatal("owner-accept correction", err)
+	}
+	return correction
+}
+
+// a2, a3 (c1, c2): the lead's done save on a correction that descends from
+// the accepted candidate records queue acceptance on the correction, with no
+// re-verification of the original and no second acceptance.
+func TestLeadDoneSaveCorrectionDescends(t *testing.T) {
+	f := newLeadDoneSave(t)
+	ctx := context.Background()
+	correction := f.correct(t, "feature/correction", f.commit)
+	out, err := f.save(t, f.lead, "--worktree", f.worktree, "--branch", "feature/correction", "--commit", correction)
+	if err != nil {
+		t.Fatalf("done save on the descending correction: %v\n%s", err, out)
+	}
+	item, err := f.c.GetWorkItem(ctx, f.task.ID, f.item.ID)
+	if err != nil || item.Status != "done" {
+		t.Fatalf("item after the correction's done save: %+v %v", item, err)
+	}
+	accepted, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, f.queued.ID)
+	if err != nil || accepted.Acceptance == nil || accepted.Acceptance.Commit != correction || accepted.Acceptance.Branch != "feature/correction" {
+		t.Fatalf("queue acceptance not on the correction: %+v %v", accepted.Acceptance, err)
+	}
+	history, err := f.c.VerificationHistory(ctx, f.task.ID, f.item.ID, f.handler.ID, f.handler.RunID)
+	if err != nil || len(history) != 4 {
+		t.Fatalf("the original was re-verified or the correction not recorded once: %d records %v", len(history), err)
+	}
+}
+
+// a2: a correction that does not descend from the accepted candidate is
+// refused locally, naming both commits. The item stays open and no release
+// job exists.
+func TestLeadDoneSaveCorrectionRefusesNonDescendant(t *testing.T) {
+	f := newLeadDoneSave(t)
+	ctx := context.Background()
+	sibling := f.correct(t, "feature/sibling", f.base)
+	out, err := f.save(t, f.lead, "--worktree", f.worktree, "--branch", "feature/sibling", "--commit", sibling)
+	if err == nil || !strings.Contains(err.Error(), f.commit) || !strings.Contains(err.Error(), sibling) || !strings.Contains(err.Error(), "does not descend") {
+		t.Fatalf("done save on a sibling correction: %v\n%s", err, out)
+	}
+	item, err := f.c.GetWorkItem(ctx, f.task.ID, f.item.ID)
+	if err != nil || item.Status == "done" || item.Revision != f.current.Revision {
+		t.Fatalf("item after the refused save: %+v %v", item, err)
+	}
+	if q, err := f.c.GetTeamQueueEntry(ctx, f.task.ID, f.queued.ID); err != nil || q.Acceptance != nil {
+		t.Fatalf("refused save recorded acceptance: %+v %v", q.Acceptance, err)
+	}
+	if n := f.releaseJobs(t); n != 0 {
+		t.Fatalf("refused save created %d release jobs", n)
+	}
+}

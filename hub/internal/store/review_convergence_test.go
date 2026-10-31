@@ -5492,3 +5492,147 @@ func TestReviewDispositionFixedFollowUpsWireDecode(t *testing.T) {
 		t.Fatalf("encode %s %v", raw, err)
 	}
 }
+
+// postCorrection posts an owner-accept of candidate that re-binds the cleared
+// acceptance of correctionOf, from the owner unless from names an agent.
+func (f *convergenceFixture) postCorrection(candidate, correctionOf string, from api.Agent) error {
+	_, err := f.post(api.Envelope{Kind: "notice", Subject: "Re-bind the acceptance to its verified correction", Body: api.EnvelopeBody{Text: "owner-accept"}, Review: &api.ReviewMetadata{Mode: "disposition", Disposition: "owner-accept", Candidate: candidate, CorrectionOf: correctionOf}}, "", 0, from)
+	return err
+}
+
+// correctionFixture accepts candidateA on its passing receipt, then saves a
+// new verification plan for the correction candidateC, which clears the
+// acceptance. The correction's receipt is not saved yet.
+func correctionFixture(t *testing.T) (*convergenceFixture, api.Agent, api.VerificationPlan) {
+	t.Helper()
+	f, h, p := verificationFixture(t)
+	request := f.review(t, p.Commit)
+	if _, err := f.post(f.resultEnv(p.Commit, map[string]string{"a1": "pass", "a2": "pass"}, api.ReviewMetadata{Mode: "general"}), "", request.Seq, f.reviewer); err != nil {
+		t.Fatal(err)
+	}
+	saveFixtureVerification(t, f, h, p, 0)
+	if err := postFixtureDisposition(f, "accept", p.Commit); err != nil {
+		t.Fatal("accept on a passing receipt refused", err)
+	}
+	refusedFor(t, "correction over a standing acceptance", "an acceptance stands; a new verification plan clears it first", f.postCorrection(candidateC, p.Commit, api.Agent{}))
+	fixed := p
+	fixed.OperationKey = "fixture-verification-correction"
+	fixed.Commit = candidateC
+	saveFixturePlan(t, f, h, fixed, 2)
+	return f, h, fixed
+}
+
+// Bug wi_c7a7b97e72fc151b a1 (c1): the owner re-binds an acceptance that a new
+// plan cleared to its verified correction, with no owner-decision first. The
+// saved disposition names both candidates and the history keeps the original.
+// Every refusal saves nothing, and an owner-accept without correctionOf is
+// unchanged.
+func TestReviewConvergenceOwnerAcceptCorrection(t *testing.T) {
+	f, h, fixed := correctionFixture(t)
+	accepted := candidateA
+	before := f.state(t)
+	if before.Disposition != nil || len(before.Dispositions) != 1 || before.Dispositions[0].Candidate != accepted {
+		t.Fatal("fixture acceptance not cleared into history", before.Disposition, before.Dispositions)
+	}
+	unchanged := func(what string) {
+		t.Helper()
+		if after := f.state(t); !reflect.DeepEqual(after.Disposition, before.Disposition) || !reflect.DeepEqual(after.Dispositions, before.Dispositions) {
+			t.Fatal(what+" changed the disposition", after.Disposition, after.Dispositions)
+		}
+	}
+	refusedFor(t, "correction without a receipt", "passing receipt for the current scope and exact candidate "+candidateC+" required", f.postCorrection(candidateC, accepted, api.Agent{}))
+	unchanged("correction without a receipt")
+	saveFixtureReceipt(t, f, h, fixed, 3, true)
+	refusedFor(t, "correction over a failed receipt", "passing receipt for the current scope and exact candidate "+candidateC+" required", f.postCorrection(candidateC, accepted, api.Agent{}))
+	unchanged("correction over a failed receipt")
+	again := fixed
+	again.OperationKey = "fixture-verification-correction-again"
+	saveFixtureVerification(t, f, h, again, 4)
+	for _, c := range []struct {
+		what, reason string
+		err          error
+	}{
+		{"agent-authored correction", "owner-accept requires an owner-authored notice", f.postCorrection(candidateC, accepted, f.reviewer)},
+		{"correctionOf naming no acceptance", "correctionOf must name the cleared acceptance of this stage", f.postCorrection(candidateC, candidateD, api.Agent{})},
+		{"correction of itself", "a correction names another candidate", f.postCorrection(accepted, accepted, api.Agent{})},
+		{"correctionOf on a lead accept", "correctionOf is for an owner-accept", func() error {
+			_, err := f.post(api.Envelope{Kind: "notice", Subject: "Accept the exact verified candidate", Body: api.EnvelopeBody{Text: "accept"}, Review: &api.ReviewMetadata{Mode: "disposition", Disposition: "accept", Candidate: candidateC, CorrectionOf: accepted}}, "", 0, api.Agent{})
+			return err
+		}()},
+		{"correctionOf on an owner-decision", "correctionOf is for an owner-accept", func() error {
+			_, err := f.post(api.Envelope{Kind: "notice", Subject: "Ask the owner to decide the candidate", Body: api.EnvelopeBody{Text: "owner-decision"}, Review: &api.ReviewMetadata{Mode: "disposition", Disposition: "owner-decision", Candidate: candidateC, CorrectionOf: accepted}}, "", 0, api.Agent{})
+			return err
+		}()},
+		{"owner-accept without correctionOf", "owner-accept resolves an owner-decision or follow-ups disposition", postFixtureDisposition(f, "owner-accept", candidateC)},
+	} {
+		refusedFor(t, c.what, c.reason, c.err)
+		unchanged(c.what)
+	}
+	if err := f.postCorrection(candidateC, accepted, api.Agent{}); err != nil {
+		t.Fatal("verified correction refused", err)
+	}
+	after := f.state(t)
+	want := api.ReviewDisposition{Kind: "owner-accept", Candidate: candidateC, CorrectionOf: accepted}
+	if d := after.Disposition; d == nil || d.Kind != want.Kind || d.Candidate != want.Candidate || d.CorrectionOf != want.CorrectionOf || d.MessageSeq == 0 || d.AgentID != "" {
+		t.Fatal("correction not saved", after.Disposition)
+	}
+	if len(after.Dispositions) != 2 || after.Dispositions[0] != before.Dispositions[0] || after.Dispositions[1] != *after.Disposition {
+		t.Fatal("history does not keep the original acceptance", after.Dispositions)
+	}
+	refusedFor(t, "second correction over the re-bound acceptance", "an acceptance stands; a new verification plan clears it first", f.postCorrection(candidateD, candidateC, api.Agent{}))
+	done := "done"
+	item, err := f.s.UpdateWorkItem(f.ctx, f.task.ID, f.item.ID, api.UpdateWorkItemRequest{Revision: 1, Status: &done}, f.by)
+	if err != nil {
+		t.Fatal("done on the re-bound acceptance refused", err)
+	}
+	f.item = item
+	refusedFor(t, "correction of a done item", "a done item takes no correction", f.postCorrection(candidateD, candidateC, api.Agent{}))
+}
+
+// a1, risk R4: correctionOf names only an acceptance of the current review
+// stage; one recorded before the stage's ASSIGN is refused.
+func TestReviewConvergenceOwnerAcceptCorrectionStageBound(t *testing.T) {
+	f, h, p := verificationFixture(t)
+	request := f.review(t, p.Commit)
+	if _, err := f.post(f.resultEnv(p.Commit, map[string]string{"a1": "pass", "a2": "pass"}, api.ReviewMetadata{Mode: "general"}), "", request.Seq, f.reviewer); err != nil {
+		t.Fatal(err)
+	}
+	saveFixtureVerification(t, f, h, p, 0)
+	if err := postFixtureDisposition(f, "accept", p.Commit); err != nil {
+		t.Fatal("accept on a passing receipt refused", err)
+	}
+	f.rescope(t, "Fixture, second order")
+	f.confirmScope(t, h, f.ownerOrder(t, "second-order"), "second-scope")
+	if err := f.assign(f.criteria, nil); err != nil {
+		t.Fatal("second stage ASSIGN refused", err)
+	}
+	f.generalRound(t, candidateC, map[string]string{"a1": "pass", "a2": "pass"}, api.ReviewMetadata{})
+	before := f.state(t)
+	if len(before.Stages) != 2 || before.Disposition != nil {
+		t.Fatal("second stage not opened", before.Stages, before.Disposition)
+	}
+	refusedFor(t, "correction of an earlier stage's acceptance", "correctionOf must name the cleared acceptance of this stage", f.postCorrection(candidateC, p.Commit, api.Agent{}))
+	if after := f.state(t); !reflect.DeepEqual(after.Dispositions, before.Dispositions) || after.Disposition != nil {
+		t.Fatal("refused correction changed the disposition", after.Disposition, after.Dispositions)
+	}
+}
+
+// a3 (c2): the queue gate follows the re-bound acceptance: done on the
+// correction passes on its own receipt, with no re-verification of the
+// original candidate, and done on the original is refused.
+func TestReviewConvergenceOwnerAcceptCorrectionDoneOnCorrection(t *testing.T) {
+	f, h, fixed := correctionFixture(t)
+	saveFixtureReceipt(t, f, h, fixed, 3, false)
+	if err := f.postCorrection(candidateC, candidateA, api.Agent{}); err != nil {
+		t.Fatal("verified correction refused", err)
+	}
+	tx, err := f.s.db.BeginTx(f.ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if err = reviewCompletion(f.ctx, tx, f.item, candidateC); err != nil {
+		t.Fatal("queue gate refused the re-bound correction", err)
+	}
+	refusedFor(t, "queue gate on the original candidate", "passing receipt for current scope and exact accepted candidate required", reviewCompletion(f.ctx, tx, f.item, candidateA))
+}

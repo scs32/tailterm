@@ -603,10 +603,50 @@ acceptance cannot stand over a failed or superseded receipt:
 - The done saves and the queue gate are unchanged. They still refuse a failed
   current receipt, including under an acceptance row saved before this rule.
 
-This fits the re-binding of an acceptance to a verified correction
-(`wi_c7a7b97e72fc151b`): the cleared acceptance stays in the disposition
-history, where that re-bind can read it and bind it to the correction's
-passing receipt.
+### Re-binding an acceptance to a verified correction
+
+Bug `wi_c7a7b97e72fc151b`. When an accepted candidate A needs a verified
+correction B, the owner re-binds the acceptance to B instead of re-verifying A:
+
+1. The handler saves a verification plan for B, which clears A's acceptance
+   into the disposition history (above), and B gets its own passing receipt.
+2. The owner posts an `owner-accept` disposition on B with `correctionOf: A`,
+   from a shell without an agent identity:
+   `env -u TAILTERM_AGENT -u TAILTERM_RUN tt send --kind notice --review-file F`,
+   where F holds `{"mode":"disposition","disposition":"owner-accept","candidate":"B","correctionOf":"A"}`.
+   No lead `owner-decision` comes first.
+3. The item lead saves done on B (`tt work-items update --status done
+   --worktree W --branch X --commit B`), which records queue acceptance on B.
+   A is not verified again and no second acceptance is needed.
+
+The hub saves the disposition `{kind: owner-accept, candidate: B,
+correctionOf: A}`; the history keeps A's entry unchanged. It refuses the
+correction, saving nothing, when:
+
+| Condition | Refusal |
+|---|---|
+| an agent posts it | `owner-accept requires an owner-authored notice` |
+| A is not this review stage's newest accept or owner-accept | `correctionOf must name the cleared acceptance of this stage` |
+| B equals A | `a correction names another candidate` |
+| an acceptance still stands | `an acceptance stands; a new verification plan clears it first` |
+| B has no passing current receipt | `passing receipt for the current scope and exact candidate B required` |
+| the item is done | `a done item takes no correction` |
+| `correctionOf` is on any other disposition or mode | `correctionOf is for an owner-accept` |
+
+An `owner-accept` without `correctionOf` is unchanged: it still resolves only
+an `owner-decision` or `follow-ups` disposition.
+
+**Descent is the CLI's check.** The hub runs no git, so it trusts that B
+descends from A, as it trusts the commits of a hand release. The lead's done
+save checks it: when the item's standing disposition has `correctionOf`, `tt
+work-items update --status done --commit B` runs `git merge-base --is-ancestor
+A B` in the queue entry's repository and, when A is not an ancestor, exits
+non-zero naming A and B, saving nothing: the item stays open and no release job
+exists. A done save from another client, such as the owner's UI, is not
+checked.
+
+If a hand release already shipped B, the acceptance supersedes B's release job
+at once (docs/project-deployment.md, "Superseding jobs released by hand").
 
 ## A receipt carried over an owner scope edit
 

@@ -9015,3 +9015,436 @@ func TestReleaseGetShowsBatchExcluded(t *testing.T) {
 		t.Fatal("an older job's wire form names exclusions", string(raw))
 	}
 }
+
+// a4 (wi_c7a7b97e72fc151b c2, narrowed per D3): an acceptance whose commit a
+// recorded hand release already shipped settles its job superseded by that
+// release at once, so no verified duplicate waits for the deployer, and an
+// untilItems hold naming the item lifts. Without a covering record the job is
+// verified, and a standing entry hold still creates it held.
+func TestReleaseAcceptanceSupersededByHandRelease(t *testing.T) {
+	ctx := context.Background()
+	t.Run("covered", func(t *testing.T) {
+		p, e, d, _ := entryHoldAcceptance(t)
+		h := api.Agent{ID: e.HandlerID, RunID: e.HandlerRunID}
+		waiting, err := p.s.ReleaseAction(ctx, p.task.ID, api.ReleaseRequest{RequestID: "enqueue-waiting", Operation: "enqueue", AgentID: h.ID, RunID: h.RunID, EntryID: releaseEntry(t, p.s, p.task, "waiting item", "waiting")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if waiting, err = p.s.ReleaseAction(ctx, p.task.ID, holdRequest("hold-waiting", h, waiting, "Wait for the accepted item", e.ItemID)); err != nil || waiting.State != "held" {
+			t.Fatal("hold naming the accepted item", waiting.State, err)
+		}
+		hand := recordHandRelease(t, p.s, p.task, "hand", candidateB, []string{candidateA, candidateB})
+		got, err := p.accept(t, "accept", candidateC, candidateB)
+		if err != nil {
+			t.Fatal("acceptance of a hand-released commit", err)
+		}
+		j := got.Release
+		if j == nil || j.State != "superseded" || j.Generation != 1 || j.SettledAt != hand.CreatedAt || j.Supersession == nil {
+			t.Fatalf("accepted job not superseded at acceptance: %+v", j)
+		}
+		if sup := j.Supersession; sup.HandReleaseID != hand.ID || sup.ReleasedCommit != hand.ReleasedCommit || sup.Release != hand.Release || !slices.Equal(sup.Targets, hand.Targets) || sup.AgentID != h.ID || sup.RunID != h.RunID {
+			t.Fatalf("supersession does not name the hand release: %+v", sup)
+		}
+		saved, err := releaseLoad(ctx, p.s.db, p.task.ID, j.ID)
+		if err != nil || saved.State != "superseded" || saved.Supersession == nil || saved.Supersession.HandReleaseID != hand.ID {
+			t.Fatalf("saved job %+v %v", saved, err)
+		}
+		var verified int
+		if err = p.s.db.QueryRow(`SELECT count(*) FROM release_jobs WHERE task_id=? AND entry_id=? AND state<>'superseded'`, p.task.ID, p.entry).Scan(&verified); err != nil || verified != 0 {
+			t.Fatal("a job other than the superseded one exists for the entry", verified, err)
+		}
+		if _, err = p.s.ReleaseAction(ctx, p.task.ID, claimRequest("claim", d, saved)); !errors.Is(err, api.ErrConflict) {
+			t.Fatal("deployer claimed the superseded job", err)
+		}
+		lifted, err := releaseLoad(ctx, p.s.db, p.task.ID, waiting.ID)
+		if err != nil || lifted.State != "verified" || lifted.Hold != nil || len(lifted.HoldHistory) != 2 || lifted.HoldHistory[1].Cause != "items_released" || lifted.HoldHistory[1].TriggerJobID != j.ID {
+			t.Fatalf("hold naming the item did not lift: %+v %v", lifted, err)
+		}
+	})
+	t.Run("uncovered", func(t *testing.T) {
+		p, _, _, _ := entryHoldAcceptance(t)
+		recordHandRelease(t, p.s, p.task, "other", candidateD, []string{candidateD})
+		got, err := p.accept(t, "accept", candidateC, candidateB)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Release == nil || got.Release.State != "verified" || got.Release.Supersession != nil || got.Release.SettledAt != "" {
+			t.Fatalf("uncovered acceptance: %+v", got.Release)
+		}
+	})
+	t.Run("entry held", func(t *testing.T) {
+		p, e, _, _ := entryHoldAcceptance(t)
+		if _, err := p.s.ReleaseAction(ctx, p.task.ID, entryHoldRequest("entry-hold", "hold", e.HandlerID, e.HandlerRunID, p.entry, "Owner: hold this entry", "")); err != nil {
+			t.Fatal(err)
+		}
+		recordHandRelease(t, p.s, p.task, "hand", candidateB, []string{candidateB})
+		got, err := p.accept(t, "accept", candidateC, candidateB)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Release == nil || got.Release.State != "held" || got.Release.Supersession != nil {
+			t.Fatalf("entry-held acceptance: %+v", got.Release)
+		}
+	})
+}
+
+// Final-state wake (wi_c7a7b97e72fc151b w1-w3, a5/a6): the agent that unheld
+// a release job gets one directed notice when the job reaches released,
+// rolled_back, refused or superseded.
+
+// terminalWakes lists the final-state notices in the agent's inbox.
+func terminalWakes(t *testing.T, s *Store, task api.Task, agent string) []api.Message {
+	t.Helper()
+	messages, err := s.ListMessages(context.Background(), task.ID, 0, agent, 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []api.Message
+	for _, m := range messages {
+		if m.Envelope != nil && m.Envelope.Subject == releaseTerminalWakeSubject {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// allTerminalWakes counts every final-state notice in the project.
+func allTerminalWakes(t *testing.T, s *Store, task api.Task) int {
+	t.Helper()
+	var n int
+	if err := s.db.QueryRow(`SELECT count(*) FROM messages WHERE task_id=? AND json_valid(envelope) AND json_extract(envelope,'$.subject')=?`, task.ID, releaseTerminalWakeSubject).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// secondHandler adds another database handler, the unholder of these tests,
+// so the handler or deployer that settles the job is a different agent.
+func secondHandler(t *testing.T, s *Store, task api.Task) api.Agent {
+	t.Helper()
+	a, err := s.AddAgent(context.Background(), task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "unholder", Host: "fixture", Session: "unholder", Role: api.AgentRoleDatabaseHandler}, api.Caller{Node: "fixture", User: "owner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return a
+}
+
+// heldThenUnheld holds j as h and unholds it as by, returning it verified.
+func heldThenUnheld(t *testing.T, s *Store, task api.Task, h, by api.Agent, j api.ReleaseJob) api.ReleaseJob {
+	t.Helper()
+	ctx := context.Background()
+	held, err := s.ReleaseAction(ctx, task.ID, holdRequest(j.ID+"-hold", h, j, "Owner: wait for the measurement"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	unheld, err := s.ReleaseAction(ctx, task.ID, unholdRequest(j.ID+"-unhold", by, held, "Measurement finished"))
+	if err != nil || unheld.State != "verified" {
+		t.Fatal("unhold", unheld.State, err)
+	}
+	return unheld
+}
+
+// wakeStep runs one release operation on j as a.
+func wakeStep(t *testing.T, s *Store, task api.Task, a api.Agent, j api.ReleaseJob, key, op string) api.ReleaseJob {
+	t.Helper()
+	next, err := s.ReleaseAction(context.Background(), task.ID, api.ReleaseRequest{RequestID: key, Operation: op, AgentID: a.ID, RunID: a.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, IntegratedCommit: j.Commit})
+	if err != nil {
+		t.Fatal(op, err)
+	}
+	return next
+}
+
+func rolledBackReceipt(j api.ReleaseJob) *api.ReleaseReceipt {
+	target := api.ReleaseTargetReceipt{Target: "tailos", Release: "tailos-" + j.Commit[:12], ArtifactSHA256: strings.Repeat("a", 64), Outcome: "rolled_back", Rollback: "restored", Reason: "live verification failed"}
+	return &api.ReleaseReceipt{Version: 1, JobID: j.ID, Commit: j.Commit, VerificationDigest: j.VerificationDigest, Outcome: "rolled_back", Targets: []api.ReleaseTargetReceipt{target},
+		Revert: &api.ReleaseRevert{Outcome: "failed"}, Failure: &api.ReleaseFailure{Step: "live-check", Target: "tailos", Reason: "live verification failed"}}
+}
+
+// checkTerminalWake requires exactly one final-state notice to agent naming
+// j in state, with the receipt of the settling request.
+func checkTerminalWake(t *testing.T, s *Store, task api.Task, agent string, j api.ReleaseJob, state, receipt string) api.Message {
+	t.Helper()
+	wakes := terminalWakes(t, s, task, agent)
+	if len(wakes) != 1 {
+		t.Fatalf("want one final-state notice to %s, got %d", agent, len(wakes))
+	}
+	m := wakes[0]
+	want := map[string]string{"job": j.ID, "state": state, "item": j.ItemID, "entry": j.EntryID, "generation": fmt.Sprint(j.Generation), "receipt": receipt}
+	if m.To != agent || m.Envelope.Kind != api.EnvelopeKindNotice || !reflect.DeepEqual(m.Envelope.Refs, want) {
+		t.Fatalf("notice to %s: to %s refs %+v want %+v", agent, m.To, m.Envelope.Refs, want)
+	}
+	if !strings.Contains(m.Envelope.Body.Text, j.ID) || !strings.Contains(m.Envelope.Body.Text, "Measurement finished") {
+		t.Fatalf("notice text %q", m.Envelope.Body.Text)
+	}
+	return m
+}
+
+// a5: released, rolled_back, refused (by the deployer or a reconcile) and
+// superseded each send one directed notice to the unholder, a batch member
+// settled with its lead too; a closed unholder's goes to the primary handler.
+func TestReleaseTerminalWakeToUnholder(t *testing.T) {
+	ctx := context.Background()
+	setup := func(t *testing.T) (*Store, api.Task, api.Agent, api.Agent, api.Agent, api.ReleaseJob) {
+		t.Helper()
+		s, task, h, d, jobs := holdFixture(t, 1)
+		u := secondHandler(t, s, task)
+		return s, task, h, d, u, heldThenUnheld(t, s, task, h, u, jobs[0])
+	}
+	t.Run("released", func(t *testing.T) {
+		s, task, h, d, u, j := setup(t)
+		done := releaseThrough(t, s, task, d, j)
+		m := checkTerminalWake(t, s, task, u.ID, done, "released", j.ID+"-finish")
+		if !strings.Contains(m.Envelope.Body.Text, "release fixture") || !strings.Contains(m.Envelope.Body.Text, done.Receipt.Commit) {
+			t.Fatalf("released notice lacks the receipt's release and commit: %q", m.Envelope.Body.Text)
+		}
+		if n := len(terminalWakes(t, s, task, h.ID)) + len(terminalWakes(t, s, task, d.ID)); n != 0 {
+			t.Fatal("notice sent to an agent that did not unhold the job", n)
+		}
+	})
+	t.Run("rolled_back", func(t *testing.T) {
+		s, task, _, d, u, j := setup(t)
+		j = wakeStep(t, s, task, d, j, "claim", "claim")
+		j = wakeStep(t, s, task, d, j, "merged", "merged")
+		done, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "finish", Operation: "finish", AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, Receipt: rolledBackReceipt(j)})
+		if err != nil || done.State != "rolled_back" {
+			t.Fatal(done.State, err)
+		}
+		checkTerminalWake(t, s, task, u.ID, done, "rolled_back", "finish")
+	})
+	t.Run("refused by the deployer", func(t *testing.T) {
+		s, task, _, d, u, j := setup(t)
+		j = wakeStep(t, s, task, d, j, "claim", "claim")
+		checkTerminalWake(t, s, task, u.ID, wakeStep(t, s, task, d, j, "refuse", "refuse"), "refused", "refuse")
+	})
+	t.Run("refused by a reconcile", func(t *testing.T) {
+		s, task, h, d, u, j := setup(t)
+		for _, op := range []string{"claim", "merged", "block"} {
+			j = wakeStep(t, s, task, d, j, op, op)
+		}
+		if n := allTerminalWakes(t, s, task); n != 0 {
+			t.Fatal("claimed, merged or blocked sent a notice", n)
+		}
+		evidence := recoveryEvidence(t, s, task, h, j)
+		evidence.Disposition, evidence.NoPublication, evidence.JournalState = "refuse", false, "restored"
+		if _, err := s.db.Exec(`UPDATE agents SET status='exited' WHERE id=?`, d.ID); err != nil {
+			t.Fatal(err)
+		}
+		done, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "reconcile", Operation: "reconcile", AgentID: h.ID, RunID: h.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, Reconciliation: &evidence})
+		if err != nil || done.State != "refused" {
+			t.Fatal(done.State, err)
+		}
+		checkTerminalWake(t, s, task, u.ID, done, "refused", "reconcile")
+	})
+	t.Run("superseded", func(t *testing.T) {
+		s, task, h, _, u, j := setup(t)
+		hand := recordHandRelease(t, s, task, "hand", candidateB, []string{candidateB})
+		done, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "supersede", Operation: "supersede", AgentID: h.ID, RunID: h.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, Supersession: &api.ReleaseSupersession{ReleasedCommit: candidateB, HandReleaseID: hand.ID}})
+		if err != nil || done.State != "superseded" {
+			t.Fatal(done.State, err)
+		}
+		m := checkTerminalWake(t, s, task, u.ID, done, "superseded", "supersede")
+		if !strings.Contains(m.Envelope.Body.Text, hand.ID) {
+			t.Fatalf("superseded notice does not name the hand release: %q", m.Envelope.Body.Text)
+		}
+	})
+	t.Run("batch member", func(t *testing.T) {
+		f := newBatchFixture(t, 2)
+		u := secondHandler(t, f.s, f.task)
+		f.members[0] = heldThenUnheld(t, f.s, f.task, f.h, u, f.members[0])
+		f.declare(t)
+		f.publish(t)
+		if _, err := f.finish("released", nil); err != nil {
+			t.Fatal(err)
+		}
+		member := f.load(t, f.members[0].ID)
+		if member.State != "released" {
+			t.Fatal("member not settled", member.State)
+		}
+		wakes := terminalWakes(t, f.s, f.task, u.ID)
+		if len(wakes) != 1 || wakes[0].Envelope.Refs["job"] != member.ID || wakes[0].Envelope.Refs["state"] != "released" || wakes[0].Envelope.Refs["generation"] != fmt.Sprint(member.Generation) {
+			t.Fatalf("batch member notices %+v", wakes)
+		}
+		if n := allTerminalWakes(t, f.s, f.task); n != 1 {
+			t.Fatal("a job no agent unheld sent a notice", n)
+		}
+	})
+	t.Run("closed unholder goes to the primary handler", func(t *testing.T) {
+		s, task, h, d, u, j := setup(t)
+		if _, err := s.db.Exec(`UPDATE agents SET status=? WHERE id=?`, api.AgentClosed, u.ID); err != nil {
+			t.Fatal(err)
+		}
+		done := releaseThrough(t, s, task, d, j)
+		m := checkTerminalWake(t, s, task, h.ID, done, "released", j.ID+"-finish")
+		if !strings.Contains(m.Envelope.Body.Text, "goes to the primary handler") || !strings.Contains(m.Envelope.Body.Text, u.ID) {
+			t.Fatalf("fallback notice does not say why: %q", m.Envelope.Body.Text)
+		}
+		if n := len(terminalWakes(t, s, task, u.ID)); n != 0 {
+			t.Fatal("closed unholder got the notice", n)
+		}
+	})
+	t.Run("closed unholder and no handler", func(t *testing.T) {
+		s, task, h, d, u, j := setup(t)
+		if _, err := s.db.Exec(`UPDATE agents SET status=? WHERE id IN (?,?)`, api.AgentClosed, u.ID, h.ID); err != nil {
+			t.Fatal(err)
+		}
+		if done := releaseThrough(t, s, task, d, j); done.State != "released" {
+			t.Fatal("finish failed", done.State)
+		}
+		if n := allTerminalWakes(t, s, task); n != 0 {
+			t.Fatal("notice sent with no open recipient", n)
+		}
+	})
+}
+
+// a6: one notice per job per final state: a replay adds none, and refused
+// then superseded adds exactly one more.
+func TestReleaseTerminalWakeOncePerState(t *testing.T) {
+	ctx := context.Background()
+	s, task, h, d, jobs := holdFixture(t, 2)
+	u := secondHandler(t, s, task)
+	j := heldThenUnheld(t, s, task, h, u, jobs[0])
+	j = wakeStep(t, s, task, d, j, "claim", "claim")
+	j = wakeStep(t, s, task, d, j, "merged", "merged")
+	finish := api.ReleaseRequest{RequestID: "finish", Operation: "finish", AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation,
+		Receipt: &api.ReleaseReceipt{Version: 1, JobID: j.ID, Commit: j.Commit, VerificationDigest: j.VerificationDigest, Outcome: "released", Targets: []api.ReleaseTargetReceipt{{Target: "tailos", Release: "fixture", ArtifactSHA256: strings.Repeat("a", 64), Outcome: "released"}}}}
+	done, err := s.ReleaseAction(ctx, task.ID, finish)
+	if err != nil || done.State != "released" {
+		t.Fatal(done.State, err)
+	}
+	again, err := s.ReleaseAction(ctx, task.ID, finish)
+	if err != nil || again.Generation != done.Generation {
+		t.Fatal("replay", again.Generation, err)
+	}
+	checkTerminalWake(t, s, task, u.ID, done, "released", "finish")
+
+	k := heldThenUnheld(t, s, task, h, u, jobs[1])
+	k = wakeStep(t, s, task, d, k, "claim-k", "claim")
+	refused := wakeStep(t, s, task, d, k, "refuse-k", "refuse")
+	if _, err = s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "refuse-k", Operation: "refuse", AgentID: d.ID, RunID: d.RunID, JobID: k.ID, ExpectedGeneration: k.Generation, IntegratedCommit: k.Commit}); err != nil {
+		t.Fatal("refuse replay", err)
+	}
+	if n := len(terminalWakes(t, s, task, u.ID)); n != 2 {
+		t.Fatal("refused job notices", n)
+	}
+	hand := recordHandRelease(t, s, task, "hand", candidateB, []string{candidateB})
+	if _, err = s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "supersede-k", Operation: "supersede", AgentID: h.ID, RunID: h.RunID, JobID: refused.ID, ExpectedGeneration: refused.Generation, Supersession: &api.ReleaseSupersession{ReleasedCommit: candidateB, HandReleaseID: hand.ID}}); err != nil {
+		t.Fatal(err)
+	}
+	var states []string
+	for _, m := range terminalWakes(t, s, task, u.ID) {
+		if m.Envelope.Refs["job"] == k.ID {
+			states = append(states, m.Envelope.Refs["state"])
+		}
+	}
+	if !slices.Equal(states, []string{"refused", "superseded"}) {
+		t.Fatal("refused then superseded notices", states)
+	}
+}
+
+// a6: no notice for a job no agent unheld: never held, lifted only by its
+// named items, its not-before time or a supersede, an entry hold released
+// before the job existed, or a final write by the unholder itself.
+func TestReleaseTerminalWakeNoneWithoutUnhold(t *testing.T) {
+	ctx := context.Background()
+	t.Run("never held", func(t *testing.T) {
+		s, task, _, d, jobs := holdFixture(t, 1)
+		secondHandler(t, s, task)
+		releaseThrough(t, s, task, d, jobs[0])
+		if n := allTerminalWakes(t, s, task); n != 0 {
+			t.Fatal(n)
+		}
+	})
+	t.Run("lifted by named items", func(t *testing.T) {
+		s, task, h, d, jobs := holdFixture(t, 2)
+		held, err := s.ReleaseAction(ctx, task.ID, holdRequest("hold", h, jobs[1], "Wait for the first item", jobs[0].ItemID))
+		if err != nil {
+			t.Fatal(err)
+		}
+		releaseThrough(t, s, task, d, jobs[0])
+		lifted, err := releaseLoad(ctx, s.db, task.ID, held.ID)
+		if err != nil || lifted.State != "verified" {
+			t.Fatal("not lifted", lifted.State, err)
+		}
+		releaseThrough(t, s, task, d, lifted)
+		if n := allTerminalWakes(t, s, task); n != 0 {
+			t.Fatal(n)
+		}
+	})
+	t.Run("lifted by its not-before time", func(t *testing.T) {
+		s, task, h, d, jobs := holdFixture(t, 1)
+		clock := time.Now().UTC().Truncate(time.Second)
+		setWindowClock(t, s, d, clock)
+		req := holdRequest("hold", h, jobs[0], "Owner: not before the hour")
+		req.Hold.NotBefore = clock.Add(time.Minute).Format(time.RFC3339)
+		if _, err := s.ReleaseAction(ctx, task.ID, req); err != nil {
+			t.Fatal(err)
+		}
+		setWindowClock(t, s, d, clock.Add(2*time.Minute))
+		if err := s.liftDatedReleaseHolds(ctx, task.ID); err != nil {
+			t.Fatal(err)
+		}
+		lifted, err := releaseLoad(ctx, s.db, task.ID, jobs[0].ID)
+		if err != nil || lifted.State != "verified" {
+			t.Fatal("not lifted", lifted.State, err)
+		}
+		releaseThrough(t, s, task, d, lifted)
+		if n := allTerminalWakes(t, s, task); n != 0 {
+			t.Fatal(n)
+		}
+	})
+	t.Run("lifted by a supersede", func(t *testing.T) {
+		s, task, h, _, jobs := holdFixture(t, 1)
+		held, err := s.ReleaseAction(ctx, task.ID, holdRequest("hold", h, jobs[0], "Owner: hold"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		u := secondHandler(t, s, task)
+		hand := recordHandRelease(t, s, task, "hand", candidateB, []string{candidateB})
+		if _, err = s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "supersede", Operation: "supersede", AgentID: u.ID, RunID: u.RunID, JobID: held.ID, ExpectedGeneration: held.Generation, Supersession: &api.ReleaseSupersession{ReleasedCommit: candidateB, HandReleaseID: hand.ID}}); err != nil {
+			t.Fatal(err)
+		}
+		if n := allTerminalWakes(t, s, task); n != 0 {
+			t.Fatal(n)
+		}
+	})
+	t.Run("entry hold released before the job existed", func(t *testing.T) {
+		p, e, d, _ := entryHoldAcceptance(t)
+		u := secondHandler(t, p.s, p.task)
+		if _, err := p.s.ReleaseAction(ctx, p.task.ID, entryHoldRequest("entry-hold", "hold", e.HandlerID, e.HandlerRunID, p.entry, "Owner: hold this entry", "")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := p.s.ReleaseAction(ctx, p.task.ID, entryHoldRequest("entry-unhold", "unhold", u.ID, u.RunID, p.entry, "Owner: go ahead", "")); err != nil {
+			t.Fatal(err)
+		}
+		got, err := p.accept(t, "accept", candidateC, candidateB)
+		if err != nil || got.Release == nil || got.Release.State != "verified" {
+			t.Fatal("accepted job", got.Release, err)
+		}
+		releaseThrough(t, p.s, p.task, d, *got.Release)
+		if n := allTerminalWakes(t, p.s, p.task); n != 0 {
+			t.Fatal(n)
+		}
+	})
+	t.Run("superseded at acceptance", func(t *testing.T) {
+		p, _, _, _ := entryHoldAcceptance(t)
+		recordHandRelease(t, p.s, p.task, "hand", candidateB, []string{candidateB})
+		if got, err := p.accept(t, "accept", candidateC, candidateB); err != nil || got.Release == nil || got.Release.State != "superseded" {
+			t.Fatal("accepted job", got.Release, err)
+		}
+		if n := allTerminalWakes(t, p.s, p.task); n != 0 {
+			t.Fatal(n)
+		}
+	})
+	t.Run("final write by the unholder", func(t *testing.T) {
+		s, task, h, _, jobs := holdFixture(t, 1)
+		u := secondHandler(t, s, task)
+		j := heldThenUnheld(t, s, task, h, u, jobs[0])
+		hand := recordHandRelease(t, s, task, "hand", candidateB, []string{candidateB})
+		if _, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "supersede", Operation: "supersede", AgentID: u.ID, RunID: u.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, Supersession: &api.ReleaseSupersession{ReleasedCommit: candidateB, HandReleaseID: hand.ID}}); err != nil {
+			t.Fatal(err)
+		}
+		if n := allTerminalWakes(t, s, task); n != 0 {
+			t.Fatal(n)
+		}
+	})
+}
