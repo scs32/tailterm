@@ -1,10 +1,13 @@
 const encoder = new TextEncoder(),
   decoder = new TextDecoder();
 export const VAULT_ITERATIONS = 600000;
+// Chunks keep the binary string's garbage small; a vault with its read cache
+// is several MiB, and one string append per byte left a long GC pause behind.
 const b64 = (bytes) => {
-  let text = "";
-  for (const b of bytes) text += String.fromCharCode(b);
-  return btoa(text);
+  const chunks = [];
+  for (let i = 0; i < bytes.length; i += 0x8000)
+    chunks.push(String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000)));
+  return btoa(chunks.join(""));
 };
 function unbase64(value, length) {
   if (
