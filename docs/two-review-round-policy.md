@@ -35,7 +35,9 @@ reproducible defects remain release gates.
    preserve the review count. Inside one review stage, scope revisions preserve
    the same two-round cap; no new cycle or owner override resets the counter
    (owner decisions #11650/#11651). Only a new owner order opens a new stage with
-   its own two rounds; see [Review stages](#review-stages). Existing qualified
+   its own two rounds; see [Review stages](#review-stages). A scope amended
+   after round two closes without a third review: see
+   [A scope amended after round two](#a-scope-amended-after-round-two). Existing qualified
    releases keep moving; historical reviews without adequate evidence remain
    unknown.
 
@@ -236,3 +238,53 @@ the same candidate-specific unresolved-finding projection. Earlier evidence is
 retained, but does not silently clear failures on an unrelated commit. After all
 required fixes are verified on the final candidate, acceptance and Done can
 proceed without a third general review.
+
+### A scope amended after round two
+
+Bug `wi_898217fc9dec8610`, order #52848, owner principle #51832. A scope
+amendment after round two used to leave only the owner route. Round two had
+judged the old criteria, so `accept` and every focused route found the latest
+general review stale, and a third general review is refused. It happened
+twice for a change that only added tests or documentation: wi_8729 (decision
+request #48692) and wi_dbb1 (decision request #51877, delegated answer #51880).
+
+The hub detects the amendment from the criteria it already stores. The
+current stage has two completed general rounds, the current scope is not a
+verification carry-over of round two's scope, and its criteria or their
+designation differ from round two's. Against round two's criteria:
+
+- the changed criteria are the reviewer-judged ones that round two did not
+  judge in their current wording and designation: added, reworded, or
+  verification-owned then and reviewer-judged now;
+- the removed criteria are round two's criteria that the scope no longer has;
+- added verification-owned criteria are judged by the receipt, as on any scope.
+
+Round two's verdicts still judge the unchanged criteria. They never judge a
+changed one, nor does a focused verdict given under its old wording.
+
+**Focused route, no owner decision.** When no criterion was removed, the lead
+sends a focused REQUEST naming every changed criterion in `criterionIds` to
+the round's reviewer, or to a verifier bound to a linked verification item. On a
+changed candidate it adds `treeDiffers`; on a rebase it sends none, which is an
+equivalence; on the round-two candidate it sends `criterionIds` alone. The
+exact-receipt rule is unchanged: the request, a RESULT that passes the
+criteria and the `accept` all need the hub-saved passing receipt for the
+current scope and that exact candidate. On an amended scope, `delta: pass` (or
+the per-criterion passes on the round-two candidate) also attests that the
+change since the reviewed candidate touches only tests and documentation. A
+verifier who finds a product behaviour change reports `delta: fail`. The hub
+does not read the diff; that attestation is the control, as for any
+`treeDiffers` fix. After a passing record, an ordinary `accept` and the done
+check proceed.
+
+**Owner route.** A removed criterion, a `delta: fail`, or a change the lead
+knows alters behaviour keeps the owner route: an owner-decision disposition
+followed by owner-accept, or a new owner order that opens a new stage. No
+route grants a third general review.
+
+**The hub names the route.** On an amended scope the refusal of a third REVIEW,
+of an `accept` (which the done check repeats), and of a focused request that omits a changed
+criterion each name the changed criterion IDs, the focused route and the owner
+route. When a criterion was removed, they name the removed IDs and the owner
+route only. An amendment after round one is unchanged: round two reviews the
+amended criteria. A scope that is not amended keeps the existing refusal text.

@@ -1917,7 +1917,7 @@ func TestReviewConvergenceRebaseRefusalNamesCause(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err := f.rebaseRequest(candidateC, rebaseFix(candidateB), api.Agent{})
-	refusedWith(t, "rebase after a scope amendment", err, "rebase verification needs a converged review; name unresolved blocker IDs instead, and round-two partials in criterionIds (cause: latest general review is incomplete or stale)")
+	refusedWith(t, "rebase after a scope amendment", err, "rebase verification needs a converged review; name unresolved blocker IDs instead, and round-two partials in criterionIds (cause: scope amended after round two (changed criteria a3): "+amendedFocusedRoute+"a3 in criterionIds (treeDiffers on a changed candidate) to the round's reviewer, on the candidate's passing receipt, then accept; a product behaviour change needs the owner route, "+amendedOwnerRoute+")")
 	if strings.Count(err.Error(), "review convergence:") != 1 {
 		t.Fatal("doubled prefix", err)
 	}
@@ -5635,4 +5635,275 @@ func TestReviewConvergenceOwnerAcceptCorrectionDoneOnCorrection(t *testing.T) {
 		t.Fatal("queue gate refused the re-bound correction", err)
 	}
 	refusedFor(t, "queue gate on the original candidate", "passing receipt for current scope and exact accepted candidate required", reviewCompletion(f.ctx, tx, f.item, candidateA))
+}
+
+// A scope amended after round two (bug wi_898217fc9dec8610, order #52848).
+// Round two converges on B (a1, a2 pass); a revision-checked scope update
+// amends the criteria and the amended scope is ASSIGNed.
+func amendedFixture(t *testing.T, criteria map[string]string) *convergenceFixture {
+	t.Helper()
+	f := newConvergenceFixture(t)
+	f.generalRound(t, candidateA, passConvergence, api.ReviewMetadata{})
+	f.generalRound(t, candidateB, passConvergence, api.ReviewMetadata{})
+	f.rescope(t, "Fixture, amended after round two")
+	if err := f.assign(criteria, nil); err != nil {
+		t.Fatal(err)
+	}
+	f.criteria = criteria
+	return f
+}
+
+var addedA3 = map[string]string{"a1": "works", "a2": "retries", "a3": "reports"}
+
+const amendedFocusedRoute = "a test- or documentation-only change is closed by a focused REQUEST naming "
+const amendedOwnerRoute = "an owner-decision disposition then owner-accept, or a new owner order; no third general review"
+
+// amendedRouteRefused asserts a refusal names the amendment's criterion IDs
+// (named, e.g. "changed criteria a3") and the owner route, and names the
+// focused route exactly when focused is set.
+func amendedRouteRefused(t *testing.T, name string, err error, named string, focused bool) {
+	t.Helper()
+	refusedWith(t, name, err, "scope amended after round two ("+named+")")
+	refusedWith(t, name, err, amendedOwnerRoute)
+	if got := strings.Contains(err.Error(), amendedFocusedRoute); got != focused {
+		t.Fatalf("%s: focused route named=%v, want %v: %v", name, got, focused, err)
+	}
+}
+
+// amendedThirdReviewRefused asserts the third REVIEW keeps its prefix, names
+// the route and stores no round.
+func (f *convergenceFixture) amendedThirdReviewRefused(t *testing.T, candidate, named string, focused bool) {
+	t.Helper()
+	err := f.reviewErr(candidate)
+	refusedWith(t, "third general review", err, "third general review refused; use disposition or exact focused verification; scope amended after round two")
+	amendedRouteRefused(t, "third general review", err, named, focused)
+	if st := f.state(t); len(st.Rounds) != 2 {
+		t.Fatal("round count changed", st)
+	}
+}
+
+// amendedAcceptedWithoutOwner asserts candidate is accepted by the lead, the
+// done save passes, and no owner disposition was needed.
+func (f *convergenceFixture) amendedAcceptedWithoutOwner(t *testing.T, candidate string) {
+	t.Helper()
+	if err := f.acceptCandidate(candidate, api.Agent{}); err != nil {
+		t.Fatal("amended scope not accepted:", err)
+	}
+	if err := f.doneSave(); err != nil {
+		t.Fatal("amended scope failed the done check:", err)
+	}
+	st := f.state(t)
+	if len(st.Rounds) != 2 || st.Disposition == nil || st.Disposition.Kind != "accept" || st.Disposition.Candidate != candidate || len(st.Dispositions) != 1 {
+		t.Fatal("accepted state", st)
+	}
+}
+
+// a1(i): a test-only change C adds criterion a3; treeDiffers plus
+// criterionIds [a3] on C closes it with accept and the done save.
+func TestReviewConvergenceAmendedTreeDiffersCriterionIDs(t *testing.T) {
+	f := amendedFixture(t, addedA3)
+	seedPassingVerification(t, f.s, f.item, candidateC)
+	amendedRouteRefused(t, "accept before focused verification", f.acceptCandidate(candidateC, api.Agent{}), "changed criteria a3", true)
+	f.amendedThirdReviewRefused(t, candidateC, "changed criteria a3", true)
+	omitted := focusedMeta(t, `{"candidate":"`+candidateC+`","fix":"`+deltaFix(candidateB)+`","treeDiffers":true}`)
+	_, err := f.focusedRequest(omitted)
+	refusedWith(t, "treeDiffers request omitting a3", err, "treeDiffers verification needs a converged review")
+	amendedRouteRefused(t, "treeDiffers request omitting a3", err, "changed criteria a3", true)
+	meta := focusedMeta(t, `{"candidate":"`+candidateC+`","fix":"`+deltaFix(candidateB)+`","treeDiffers":true,"criterionIds":["a3"]}`)
+	request, err := f.focusedRequest(meta)
+	if err != nil {
+		t.Fatal("focused request naming a3 refused:", err)
+	}
+	amendedRouteRefused(t, "accept before the focused verdict", f.acceptCandidate(candidateC, api.Agent{}), "changed criteria a3", true)
+	if err = f.focusedResult(request.Seq, meta, map[string]string{"a3": "pass", "delta": "pass"}, deltaProof(candidateB, candidateC)); err != nil {
+		t.Fatal("focused result refused:", err)
+	}
+	f.amendedThirdReviewRefused(t, candidateC, "changed criteria a3", true)
+	if err = f.acceptCandidate(candidateB, api.Agent{}); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("the unverified reviewed candidate was accepted", err)
+	}
+	f.amendedAcceptedWithoutOwner(t, candidateC)
+}
+
+// a1(ii): on the round-two candidate itself, criterionIds [a3] alone.
+func TestReviewConvergenceAmendedCriterionIDsOnReviewedCandidate(t *testing.T) {
+	f := amendedFixture(t, addedA3)
+	seedPassingVerification(t, f.s, f.item, candidateB)
+	amendedRouteRefused(t, "accept before focused verification", f.acceptCandidate(candidateB, api.Agent{}), "changed criteria a3", true)
+	f.focusedCheck(t, focusedMeta(t, `{"candidate":"`+candidateB+`","fix":"Full matrix receipt and the new test cover a3","criterionIds":["a3"]}`), map[string]string{"a3": "pass"}, receiptProof(candidateB))
+	f.amendedAcceptedWithoutOwner(t, candidateB)
+}
+
+// a1(iii): a reworded a2 is not judged by round two's pass on its old wording.
+func TestReviewConvergenceAmendedRewordedCriterionNeedsFocusedPass(t *testing.T) {
+	f := amendedFixture(t, map[string]string{"a1": "works", "a2": "retries, with a documented backoff"})
+	seedPassingVerification(t, f.s, f.item, candidateB)
+	err := f.acceptCandidate(candidateB, api.Agent{})
+	amendedRouteRefused(t, "accept with a reworded criterion", err, "changed criteria a2", true)
+	if strings.Contains(err.Error(), "a1") {
+		t.Fatal("unchanged a1 named as changed", err)
+	}
+	f.amendedThirdReviewRefused(t, candidateB, "changed criteria a2", true)
+	_, err = f.focusedRequest(focusedMeta(t, `{"candidate":"`+candidateB+`","fix":"Receipt covers a1","criterionIds":["a1"]}`))
+	refusedWith(t, "criterionIds naming the unchanged a1", err, "criterionIds must name distinct round-two partial criteria or the scope's changed criteria a2 that are not verification-owned")
+	f.focusedCheck(t, focusedMeta(t, `{"candidate":"`+candidateB+`","fix":"The backoff doc covers a2","criterionIds":["a2"]}`), map[string]string{"a2": "pass"}, receiptProof(candidateB))
+	f.amendedAcceptedWithoutOwner(t, candidateB)
+}
+
+// a1(iii): a focused settlement made under a criterion's old wording does not
+// judge its new wording either.
+func TestReviewConvergenceAmendedRewordOutdatesEarlierSettlement(t *testing.T) {
+	f := newConvergenceFixture(t)
+	f.generalRound(t, candidateA, partialConvergence, api.ReviewMetadata{})
+	f.generalRound(t, candidateB, partialConvergence, api.ReviewMetadata{})
+	seedPassingVerification(t, f.s, f.item, candidateB)
+	f.focusedCheck(t, focusedMeta(t, `{"candidate":"`+candidateB+`","fix":"Full matrix receipt covers a2","criterionIds":["a2"]}`), map[string]string{"a2": "pass"}, receiptProof(candidateB))
+	f.rescope(t, "Fixture, a2 reworded after round two")
+	f.criteria = map[string]string{"a1": "works", "a2": "retries, with a documented backoff"}
+	if err := f.assign(f.criteria, nil); err != nil {
+		t.Fatal(err)
+	}
+	seedPassingVerification(t, f.s, f.item, candidateB)
+	amendedRouteRefused(t, "accept on the old wording's settlement", f.acceptCandidate(candidateB, api.Agent{}), "changed criteria a2", true)
+	f.focusedCheck(t, focusedMeta(t, `{"candidate":"`+candidateB+`","fix":"The backoff doc covers a2","criterionIds":["a2"]}`), map[string]string{"a2": "pass"}, receiptProof(candidateB))
+	f.amendedAcceptedWithoutOwner(t, candidateB)
+}
+
+// a1(iv): a rebase equivalence plus criterionIds [a3] also reaches accept.
+func TestReviewConvergenceAmendedRebaseEquivalence(t *testing.T) {
+	f := amendedFixture(t, addedA3)
+	seedPassingVerification(t, f.s, f.item, candidateC)
+	meta := focusedMeta(t, `{"candidate":"`+candidateC+`","fix":"`+rebaseFix(candidateB)+`","criterionIds":["a3"]}`)
+	request, err := f.focusedRequest(meta)
+	if err != nil {
+		t.Fatal("rebase request naming a3 refused:", err)
+	}
+	if err = f.focusedResult(request.Seq, meta, map[string]string{"a3": "pass", "equivalence": "pass"}, rebaseProof(candidateB, candidateC)); err != nil {
+		t.Fatal("rebase result refused:", err)
+	}
+	f.amendedAcceptedWithoutOwner(t, candidateC)
+}
+
+// a2(i): a verifier who finds a product change reports delta=fail; accept
+// stays refused and the owner route still accepts.
+func TestReviewConvergenceAmendedProductChangeKeepsOwnerRoute(t *testing.T) {
+	f := amendedFixture(t, addedA3)
+	seedPassingVerification(t, f.s, f.item, candidateC)
+	meta := focusedMeta(t, `{"candidate":"`+candidateC+`","fix":"`+deltaFix(candidateB)+`","treeDiffers":true,"criterionIds":["a3"]}`)
+	request, err := f.focusedRequest(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = f.focusedResult(request.Seq, meta, map[string]string{"a3": "pass", "delta": "fail"}, deltaProof(candidateB, candidateC)); err != nil {
+		t.Fatal("failing delta result refused:", err)
+	}
+	amendedRouteRefused(t, "accept after delta=fail", f.acceptCandidate(candidateC, api.Agent{}), "changed criteria a3", true)
+	f.amendedThirdReviewRefused(t, candidateC, "changed criteria a3", true)
+	if _, err = f.dispose("owner-decision", candidateC, nil); err != nil {
+		t.Fatal(err)
+	}
+	refusedWith(t, "done before owner-accept", f.doneSave(), "saved lead acceptance required")
+	if _, err = f.dispose("owner-accept", candidateC, nil); err != nil {
+		t.Fatal("owner-accept on the amended scope:", err)
+	}
+	if err = f.doneSave(); err != nil {
+		t.Fatal("owner-accepted amended scope failed the done check:", err)
+	}
+}
+
+// a2(ii): an amendment that removes a round-two criterion names the owner
+// route only, also when another criterion changed.
+func TestReviewConvergenceAmendedRemovedCriterionNeedsOwnerRoute(t *testing.T) {
+	f := amendedFixture(t, map[string]string{"a1": "works"})
+	seedPassingVerification(t, f.s, f.item, candidateB)
+	amendedRouteRefused(t, "accept with a removed criterion", f.acceptCandidate(candidateB, api.Agent{}), "removed criteria a2", false)
+	f.amendedThirdReviewRefused(t, candidateB, "removed criteria a2", false)
+	seedPassingVerification(t, f.s, f.item, candidateC)
+	_, err := f.rebaseRequest(candidateC, rebaseFix(candidateB), api.Agent{})
+	amendedRouteRefused(t, "rebase with a removed criterion", err, "removed criteria a2", false)
+
+	g := amendedFixture(t, map[string]string{"a1": "works, reworded"})
+	seedPassingVerification(t, g.s, g.item, candidateB)
+	amendedRouteRefused(t, "accept with removed and changed criteria", g.acceptCandidate(candidateB, api.Agent{}), "removed criteria a2; changed criteria a1", false)
+	if _, err = g.dispose("owner-decision", candidateB, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = g.dispose("owner-accept", candidateB, nil); err != nil {
+		t.Fatal("owner route on a removed criterion:", err)
+	}
+}
+
+// a2(iv): an amendment after round one is unchanged: round two reviews the
+// amended criteria, and the staleness text is the existing one.
+func TestReviewConvergenceAmendedAfterRoundOneUnchanged(t *testing.T) {
+	f := newConvergenceFixture(t)
+	f.generalRound(t, candidateA, passConvergence, api.ReviewMetadata{})
+	f.rescope(t, "Fixture, amended after round one")
+	f.criteria = addedA3
+	if err := f.assign(addedA3, nil); err != nil {
+		t.Fatal(err)
+	}
+	seedPassingVerification(t, f.s, f.item, candidateA)
+	err := f.acceptCandidate(candidateA, api.Agent{})
+	refusedWith(t, "accept after round one", err, "latest general review is incomplete or stale")
+	if strings.Contains(err.Error(), "scope amended") {
+		t.Fatal("round-one amendment named the round-two route", err)
+	}
+	f.generalRound(t, candidateB, map[string]string{"a1": "pass", "a2": "pass", "a3": "pass"}, api.ReviewMetadata{})
+	seedPassingVerification(t, f.s, f.item, candidateB)
+	if err = f.acceptCandidate(candidateB, api.Agent{}); err != nil {
+		t.Fatal("round two on the amended criteria not accepted:", err)
+	}
+}
+
+// a3: on a scope that is not amended, the refusals keep their existing text.
+func TestReviewConvergenceAmendedRouteTextOnlyOnAmendedScope(t *testing.T) {
+	f := newConvergenceFixture(t)
+	f.generalRound(t, candidateA, partialConvergence, api.ReviewMetadata{})
+	f.generalRound(t, candidateB, partialConvergence, api.ReviewMetadata{})
+	seedPassingVerification(t, f.s, f.item, candidateB)
+	err := f.reviewErr(candidateB)
+	if err == nil || !strings.HasSuffix(err.Error(), "third general review refused; use disposition or exact focused verification") {
+		t.Fatal("third review text on an unamended scope", err)
+	}
+	if err = f.acceptCandidate(candidateB, api.Agent{}); err == nil || !strings.HasSuffix(err.Error(), "criterion a2 has not passed; a partial with no blocker is settled by focused verification naming it in criterionIds") {
+		t.Fatal("accept text on an unamended scope", err)
+	}
+	_, err = f.focusedRequest(focusedMeta(t, `{"candidate":"`+candidateB+`","fix":"Receipt covers a1","criterionIds":["a1"]}`))
+	if err == nil || !strings.HasSuffix(err.Error(), "criterionIds must name distinct round-two partial criteria that are not verification-owned") {
+		t.Fatal("criterionIds text on an unamended scope", err)
+	}
+	if err = f.acceptCandidate(candidateC, api.Agent{}); err == nil || strings.Contains(err.Error(), "scope amended") {
+		t.Fatal("changed candidate text on an unamended scope", err)
+	}
+}
+
+// The amendment classifies by the criteria diff and ignores a carry-over.
+func TestReviewConvergenceAmendedClassification(t *testing.T) {
+	round := func(criteria map[string]string, owned []string) api.ReviewRound {
+		return api.ReviewRound{Number: 2, ScopeRevision: 1, ResultSeq: 9, Criteria: criteria, VerificationCriteria: owned}
+	}
+	base := map[string]string{"a1": "works", "a2": "retries"}
+	for _, tc := range []struct {
+		name     string
+		scope    api.ReviewScope
+		amended  bool
+		want     scopeAmendment
+		routeHas string
+	}{
+		{"unchanged", api.ReviewScope{ScopeRevision: 2, AssignmentSeq: 20, Criteria: base}, false, scopeAmendment{}, ""},
+		{"added", api.ReviewScope{ScopeRevision: 2, AssignmentSeq: 20, Criteria: addedA3}, true, scopeAmendment{delta: []string{"a3"}}, "changed criteria a3"},
+		{"added owned", api.ReviewScope{ScopeRevision: 2, AssignmentSeq: 20, Criteria: addedA3, VerificationCriteria: []string{"a3"}}, true, scopeAmendment{addedOwned: []string{"a3"}}, ""},
+		{"removed and reworded", api.ReviewScope{ScopeRevision: 2, AssignmentSeq: 20, Criteria: map[string]string{"a1": "works, reworded"}}, true, scopeAmendment{delta: []string{"a1"}, removed: []string{"a2"}}, "removed criteria a2; changed criteria a1"},
+		{"carry-over", api.ReviewScope{ScopeRevision: 2, AssignmentSeq: 10, Criteria: map[string]string{"a1": "works"}}, false, scopeAmendment{}, ""},
+	} {
+		state := api.ReviewConvergence{Scopes: []api.ReviewScope{{ScopeRevision: 1, AssignmentSeq: 10, Criteria: base}, tc.scope}, Rounds: []api.ReviewRound{round(base, nil), round(base, nil)}}
+		got, amended := amendedAfterRoundTwo(&state, &state.Scopes[1])
+		if amended != tc.amended || !reflect.DeepEqual(got, tc.want) {
+			t.Fatalf("%s: got %+v %v, want %+v %v", tc.name, got, amended, tc.want, tc.amended)
+		}
+		if text := amendedRouteText(got); (tc.routeHas == "") != (text == "") || !strings.Contains(text, tc.routeHas) {
+			t.Fatalf("%s: route text %q", tc.name, text)
+		}
+	}
 }

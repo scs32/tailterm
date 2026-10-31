@@ -469,6 +469,79 @@ func scopeFor(state *api.ReviewConvergence, scope int64) *api.ReviewScope {
 	}
 	return nil
 }
+
+// scopeAmendment is how a current scope's criteria differ from those of its
+// stage's completed round two (bug wi_898217fc9dec8610). delta holds the
+// reviewer-judged criteria round two did not judge in their current wording
+// and designation; addedOwned the verification-owned ones; removed the
+// round-two criteria the scope no longer has. Each list is sorted.
+type scopeAmendment struct {
+	delta, removed, addedOwned []string
+}
+
+// amendedAfterRoundTwo reports whether sc was amended after the stage's round
+// two completed, with criteria or designation that differ from the round's. A
+// carry-over is not an amendment: its round still decides.
+func amendedAfterRoundTwo(state *api.ReviewConvergence, sc *api.ReviewScope) (scopeAmendment, bool) {
+	var a scopeAmendment
+	if sc == nil || len(state.Rounds) != 2 || state.Rounds[1].ResultSeq == 0 || carriedScope(state, sc, state.Rounds[1].ScopeRevision) != nil {
+		return a, false
+	}
+	old := roundCriteria(state, state.Rounds[1])
+	oldOwned := roundVerificationCriteria(state, state.Rounds[1])
+	for key, text := range sc.Criteria {
+		owned := verificationOwned(sc.VerificationCriteria, key)
+		if prior, kept := old[key]; kept && prior == text && owned == verificationOwned(oldOwned, key) {
+			continue
+		}
+		if owned {
+			a.addedOwned = append(a.addedOwned, key)
+		} else {
+			a.delta = append(a.delta, key)
+		}
+	}
+	for key := range old {
+		if _, kept := sc.Criteria[key]; !kept {
+			a.removed = append(a.removed, key)
+		}
+	}
+	sort.Strings(a.delta)
+	sort.Strings(a.removed)
+	sort.Strings(a.addedOwned)
+	return a, len(a.delta)+len(a.removed)+len(a.addedOwned) > 0
+}
+
+// amendedRouteText is the one wording every refusal on an amended scope uses
+// to name the route that closes it, or "" when no reviewer-judged criterion
+// changed (added verification-owned criteria are judged by the receipt).
+func amendedRouteText(a scopeAmendment) string {
+	const owner = "an owner-decision disposition then owner-accept, or a new owner order; no third general review"
+	if len(a.removed) > 0 {
+		changed := ""
+		if len(a.delta) > 0 {
+			changed = "; changed criteria " + strings.Join(a.delta, ", ")
+		}
+		return "scope amended after round two (removed criteria " + strings.Join(a.removed, ", ") + changed + "): a removed criterion needs the owner route, " + owner
+	}
+	if len(a.delta) == 0 {
+		return ""
+	}
+	ids := strings.Join(a.delta, ", ")
+	return "scope amended after round two (changed criteria " + ids + "): a test- or documentation-only change is closed by a focused REQUEST naming " + ids + " in criterionIds (treeDiffers on a changed candidate) to the round's reviewer, on the candidate's passing receipt, then accept; a product behaviour change needs the owner route, " + owner
+}
+
+// judgedUnder reports whether the criterion key had its current text and
+// designation in the scope that governed message seq, so a focused verdict
+// given then still judges it.
+func judgedUnder(state *api.ReviewConvergence, seq int64, sc *api.ReviewScope, key string) bool {
+	var governing *api.ReviewScope
+	for i := range state.Scopes {
+		if s := state.Scopes[i]; s.AssignmentSeq < seq && (governing == nil || s.AssignmentSeq >= governing.AssignmentSeq) {
+			governing = &state.Scopes[i]
+		}
+	}
+	return governing != nil && governing.Criteria[key] == sc.Criteria[key] && verificationOwned(governing.VerificationCriteria, key) == verificationOwned(sc.VerificationCriteria, key)
+}
 func outstanding(state api.ReviewConvergence) map[string]api.ReviewFinding {
 	out := map[string]api.ReviewFinding{}
 	for _, r := range state.Rounds {
@@ -551,12 +624,33 @@ func reviewReadySettling(state api.ReviewConvergence, scope int64, candidate str
 		}
 		reviewed = source
 	}
-	if last.ResultSeq == 0 || !reflect.DeepEqual(roundCriteria(&state, last), reviewed.Criteria) || !reflect.DeepEqual(normalizedVerificationCriteria(last.VerificationCriteria), normalizedVerificationCriteria(reviewed.VerificationCriteria)) {
-		return reviewConflict("latest general review is incomplete or stale")
+	stale := reviewConflict("latest general review is incomplete or stale")
+	if last.ResultSeq == 0 {
+		return stale
+	}
+	// A scope amended after round two keeps round two's verdicts on its
+	// unchanged criteria; each changed one is judged only by focused
+	// verification of it under its current wording (bug wi_898217fc9dec8610).
+	var amend scopeAmendment
+	if !reflect.DeepEqual(roundCriteria(&state, last), reviewed.Criteria) || !reflect.DeepEqual(normalizedVerificationCriteria(last.VerificationCriteria), normalizedVerificationCriteria(reviewed.VerificationCriteria)) {
+		var amended bool
+		if amend, amended = amendedAfterRoundTwo(&state, sc); !amended {
+			return stale
+		}
+		if len(amend.removed) > 0 {
+			return reviewConflict(amendedRouteText(amend))
+		}
+	}
+	changed := map[string]bool{}
+	for _, id := range amend.delta {
+		changed[id] = true
 	}
 	verdicts := map[string]string{}
 	for k, v := range last.Verdicts {
 		verdicts[k] = v
+	}
+	for _, id := range amend.addedOwned {
+		verdicts[id] = "pending-verification"
 	}
 	fixable := outstandingWithoutFocused(state)
 	for _, f := range state.Focused {
@@ -583,13 +677,21 @@ func reviewReadySettling(state api.ReviewConvergence, scope int64, candidate str
 			}
 		}
 	}
+	// A pass under a criterion's old wording, by round two or by a blocker
+	// fix, never judges its changed wording.
+	for id := range changed {
+		delete(verdicts, id)
+	}
 	// A focused record settles a partial in this projection only; the round's
 	// own verdict is never rewritten. The latest verdict on the candidate decides.
+	// A changed criterion counts only a record made under its current wording.
 	settled := map[string]bool{}
 	for _, f := range state.Focused {
 		if f.ResultSeq != 0 && f.Candidate == candidate {
 			for _, id := range f.CriterionIDs {
-				settled[id] = f.Passed
+				if !changed[id] || judgedUnder(&state, f.RequestSeq, sc, id) {
+					settled[id] = f.Passed
+				}
 			}
 		}
 	}
@@ -597,11 +699,14 @@ func reviewReadySettling(state api.ReviewConvergence, scope int64, candidate str
 		settled[id] = true
 	}
 	for id, passed := range settled {
-		if passed && verdicts[id] == "partial" {
+		if passed && (verdicts[id] == "partial" || changed[id]) {
 			verdicts[id] = "pass"
 		}
 	}
 	for key := range sc.Criteria {
+		if changed[key] && verdicts[key] != "pass" {
+			return reviewConflict(amendedRouteText(amend))
+		}
 		if verificationOwned(sc.VerificationCriteria, key) {
 			if verdicts[key] != "pending-verification" {
 				return reviewConflict("verification-owned criterion " + key + " was not pending")
@@ -898,7 +1003,11 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 			return reviewConflict("legacy review history is unknown; cannot allocate a fresh lifetime count")
 		}
 		if len(state.Rounds) >= 2 {
-			return reviewConflict("third general review refused; use disposition or exact focused verification")
+			refusal := "third general review refused; use disposition or exact focused verification"
+			if amend, amended := amendedAfterRoundTwo(&state, scopeFor(&state, item.ScopeRevision)); amended && amendedRouteText(amend) != "" {
+				refusal += "; " + amendedRouteText(amend)
+			}
+			return reviewConflict(refusal)
 		}
 		if len(state.Rounds) > 0 && state.Rounds[len(state.Rounds)-1].ResultSeq == 0 {
 			return reviewConflict("previous general review is incomplete")
@@ -1099,8 +1208,18 @@ func (s *Store) applyReviewConvergence(ctx context.Context, tx *sql.Tx, m api.Me
 			}
 			open := outstandingOnCandidate(state, meta.Candidate)
 			settling := map[string]bool{}
+			// On a scope amended after round two, criterionIds may also name
+			// its changed criteria (bug wi_898217fc9dec8610).
+			changed := map[string]bool{}
+			amend, amended := amendedAfterRoundTwo(&state, sc)
+			for _, id := range amend.delta {
+				changed[id] = true
+			}
 			for _, id := range meta.CriterionIDs {
-				if settling[id] || sc.Criteria[id] == "" || verificationOwned(sc.VerificationCriteria, id) || state.Rounds[1].Verdicts[id] != "partial" {
+				if settling[id] || sc.Criteria[id] == "" || verificationOwned(sc.VerificationCriteria, id) || (state.Rounds[1].Verdicts[id] != "partial" && !changed[id]) {
+					if amended && len(amend.delta) > 0 {
+						return reviewConflict("criterionIds must name distinct round-two partial criteria or the scope's changed criteria " + strings.Join(amend.delta, ", ") + " that are not verification-owned")
+					}
 					return reviewConflict("criterionIds must name distinct round-two partial criteria that are not verification-owned")
 				}
 				for _, b := range open {
