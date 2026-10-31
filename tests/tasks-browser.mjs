@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { openVault } from "../client/vault-crypto.js";
+import { openVault, sealVault } from "../client/vault-crypto.js";
 import { leaves } from "../client/pane-layout.js";
 import {
   checkGroupAlone,
@@ -370,6 +370,35 @@ export async function exerciseTasks(page, hub, origin, ssh) {
     );
     return id;
   };
+  // A project with an owner helper shows only the helper until the owner
+  // pulls another agent in from the Home tab's ▾ (wi_649926f70aaa762a).
+  const pullIn = async (name) => {
+    await page.locator(".tab-strip > .home-tab [data-tab]").click();
+    await page.locator(".tab-strip > .home-tab [data-terminal-menu]").click();
+    const level = (n) => page.locator(`.terminal-menu[data-level="${n}"]`);
+    const named = (n, label) =>
+      level(n)
+        .locator("[data-menu-key]")
+        .filter({
+          has: page.locator(".terminal-menu-label", {
+            hasText: new RegExp(`^${label}$`),
+          }),
+        });
+    await named(0, "No work item").click();
+    await named(1, name).click();
+    await waitFor(
+      async () =>
+        (await named(1, name).getAttribute("aria-checked")) === "true",
+      `${name} pulled in`,
+    );
+    // A newly opened pane may take focus a frame later: retry until closed.
+    await waitFor(async () => {
+      if (!(await level(0).count())) return true;
+      await level(0).locator("[data-menu-key]").first().focus();
+      await page.keyboard.press("Escape");
+      return false;
+    }, "terminal menu closed");
+  };
   const adopter = hub.api.createTask("home-adopt");
   const anchor = hub.api.addAgent(adopter.id, { name: "anchor" });
   ssh.sessions.add("anchor");
@@ -400,6 +429,19 @@ export async function exerciseTasks(page, hub, origin, ssh) {
         "Connected",
       ),
     "helper connected in Home with the same tab",
+  );
+  // The helper's arrival leaves only the helper; anchor comes back through
+  // the menu, on the same session.
+  await pullIn("anchor");
+  await waitFor(
+    async () =>
+      (await page.locator("#tabs .tab.task-tab").count()) === 1 &&
+      (
+        await page
+          .locator(".pane-header:not([data-home]) .pane-label")
+          .allInnerTexts()
+      ).some((text) => text.includes("anchor")),
+    "anchor pulled into its project tab",
   );
   // The helper window: named from the hub role and project, alone at the full
   // terminal width, and in the same place after a reconnect, a roster join and
@@ -448,6 +490,12 @@ export async function exerciseTasks(page, hub, origin, ssh) {
     const joiner = hub.api.addAgent(adopter.id, { name: `joiner-${width}` });
     ssh.sessions.add(joiner.name);
     hub.api.event(adopter.id, "started", joiner.id);
+    // A roster join opens nothing in a helper project...
+    await new Promise((r) => setTimeout(r, 600));
+    assert.equal(await terminals(), panes, at("a joined agent stays closed"));
+    await helperWindow(at("after an unshown roster join"), box);
+    // ...until the owner pulls it in.
+    await pullIn(joiner.name);
     await waitFor(
       async () => (await terminals()) === panes + 1,
       at("joined agent pane"),
@@ -779,6 +827,45 @@ export async function exerciseTaskRestore(page, hub, ssh) {
   const helperId = await page
     .locator(".tab-strip > .home-tab [data-tab]")
     .getAttribute("data-tab");
+  // The helper's arrival leaves only the helper (wi_649926f70aaa762a): pull
+  // the three agents back in from the Home tab's ▾.
+  {
+    await page.locator(".tab-strip > .home-tab [data-tab]").click();
+    await page.locator(".tab-strip > .home-tab [data-terminal-menu]").click();
+    const level = (n) => page.locator(`.terminal-menu[data-level="${n}"]`);
+    const named = (n, label) =>
+      level(n)
+        .locator("[data-menu-key]")
+        .filter({
+          has: page.locator(".terminal-menu-label", {
+            hasText: new RegExp(`^${label}$`),
+          }),
+        });
+    await named(0, "No work item").click();
+    for (const name of ["l1", "l2", "l3"]) {
+      if ((await named(1, name).getAttribute("aria-checked")) !== "true")
+        await named(1, name).click();
+      await waitFor(
+        async () =>
+          (await named(1, name).getAttribute("aria-checked")) === "true",
+        `${name} pulled in`,
+      );
+    }
+    // A newly opened pane may take focus a frame later: retry until closed.
+    await waitFor(async () => {
+      if (!(await level(0).count())) return true;
+      await level(0).locator("[data-menu-key]").first().focus();
+      await page.keyboard.press("Escape");
+      return false;
+    }, "terminal menu closed");
+  }
+  await waitFor(async () => {
+    const tabs = await inventory();
+    return (
+      sessionsOf(tabs, "restore-live")?.join() === "l1,l2,l3" &&
+      tabs.every((t) => t.panes.every((p) => p.status === "Connected"))
+    );
+  }, "restore-live agents pulled in");
   const helperWindow = (step, same) =>
     checkHelperWindow(page, {
       id: helperId,
@@ -1228,7 +1315,675 @@ export async function exerciseTaskRestore(page, hub, ssh) {
   });
   if (await marker.count()) await marker.locator("[data-close]").click();
   for (const name of ["l3", "n2"]) ssh.gone.delete(name);
+  await exerciseHelperOnlyTerminals();
   console.log(
     `Task restore passed: stuck restore finished ${finishedIn} ms after the hub closed a connecting pane, no flash, paused/closed projects dropped, live projects bound, finished sessions checked, bookmarks unbound.`,
   );
+
+  // Helper-only project terminals (wi_649926f70aaa762a). A project with an
+  // owner helper shows only the helper, in Home; the ▾ on the Home tab, on
+  // the project tab and in the tab strip pulls its other agents in by work
+  // item. Removing a pane never closes, retires or cleans up the agent, and
+  // the choice is saved in this origin's encrypted workspace.
+  async function exerciseHelperOnlyTerminals() {
+    const ITEM_A = "wi_00000000000000a1",
+      ITEM_B = "wi_00000000000000b2",
+      TITLE_A = "Synthetic helper-only item";
+    const menu = (level) =>
+      page.locator(`.terminal-menu[data-level="${level}"]`);
+    const labels = (level) =>
+      menu(level)
+        .locator("[data-menu-key] .terminal-menu-label")
+        .allTextContents();
+    const row = (level, label) =>
+      menu(level)
+        .locator("[data-menu-key]")
+        .filter({
+          has: page.locator(".terminal-menu-label", {
+            hasText: new RegExp(`^${label}$`),
+          }),
+        });
+    const checked = async (level, label) =>
+      (await row(level, label).getAttribute("aria-checked")) === "true";
+    // Escape on the first level closes every level.
+    const closeMenu = async () => {
+      // A newly opened pane may take focus a frame later: retry until closed.
+      await waitFor(async () => {
+        if (!(await menu(0).count())) return true;
+        await menu(0).locator("[data-menu-key]").first().focus();
+        await page.keyboard.press("Escape");
+        return false;
+      }, "the menu closed");
+    };
+    const homeMenu = page.locator(
+      ".tab-strip > .home-tab [data-terminal-menu]",
+    );
+    const homeTab = page.locator(".tab-strip > .home-tab [data-tab]");
+    const stripMenu = page.locator("#project-terminals");
+    // The tab id of the pane showing a tmux session, outside Home.
+    const paneId = (session) =>
+      page
+        .locator(".pane-header:not([data-home])")
+        .evaluateAll(
+          (els, name) =>
+            els.find(
+              (el) =>
+                el
+                  .querySelector(".pane-label")
+                  ?.innerText.split(" · ")
+                  .at(-2) === name,
+            )?.dataset.pane || null,
+          session,
+        );
+    const savedTab = async (session) =>
+      (await readVault()).workspace.tabs.find((t) => t.session === session);
+    const hubWrites = (from, taskId) =>
+      hub.api.requests
+        .slice(from)
+        .filter(
+          (r) => !r.startsWith("GET ") && r.includes(`/v1/tasks/${taskId}/`),
+        );
+    const add = (taskId, name, fields = {}) => {
+      const agent = hub.api.addAgent(taskId, {
+        name,
+        session: fields.session || name,
+        role: fields.role || "",
+      });
+      // The roster spreads the stored agent, so later reads carry these.
+      if (fields.item)
+        agent.workItem = {
+          itemTaskId: taskId,
+          itemId: fields.item,
+          itemRevision: 1,
+        };
+      if (fields.lead) agent.itemLead = true;
+      ssh.sessions.add(agent.session);
+      hub.api.event(taskId, "started", agent.id);
+      return agent;
+    };
+
+    // a1: a fresh workspace. Both projects appear while locked, so the
+    // startup discovery binds them on unlock.
+    await lock();
+    const H = hub.api.createTask("helper-only");
+    const helper = add(H.id, "owner-helper-ho", {
+      session: "helper-ho",
+      role: "owner_helper",
+    });
+    const lead = add(H.id, "ho-lead", { item: ITEM_A, lead: true });
+    const builder = add(H.id, "ho-builder", { item: ITEM_A });
+    const handler = add(H.id, "ho-handler");
+    const G = hub.api.createTask("helperless");
+    const g1 = add(G.id, "hl-one");
+    const g2 = add(G.id, "hl-two");
+    const runs = () =>
+      [lead, builder, handler, g1, g2].map((a) => [a.name, a.status, a.runId]);
+    const runsBefore = JSON.stringify(runs());
+    // One item's title is served; the other's read fails, so its id names it.
+    const titleReads = [];
+    await page.route(
+      new RegExp(`/fixture-hub/v1/tasks/${H.id}/work-items/${ITEM_A}(\\?|$)`),
+      (route) => {
+        titleReads.push(ITEM_A);
+        return route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({
+            id: ITEM_A,
+            taskId: H.id,
+            title: TITLE_A,
+            revision: 1,
+          }),
+        });
+      },
+    );
+    ssh.attachLog.length = 0;
+    await unlock();
+    await waitFor(restored, "helper-only restore", 90000);
+    let tabs;
+    await waitFor(async () => {
+      tabs = await inventory();
+      return (
+        tabs
+          .find((t) => t.home)
+          ?.panes.some(
+            (p) => p.session === "helper-ho" && p.status === "Connected",
+          ) &&
+        sessionsOf(tabs, "helperless")?.join() === "hl-one,hl-two" &&
+        tabs.every((t) => t.panes.every((p) => p.status === "Connected"))
+      );
+    }, "the helper in Home and the helperless project's panes");
+    await sleep(1000);
+    tabs = await inventory();
+    assert.ok(
+      !tabs.some((t) => t.project && t.name === "helper-only"),
+      "a1: the helper project has no tab",
+    );
+    assert.deepEqual(
+      tabs.find((t) => t.home).panes.map((p) => p.session),
+      ["helper-ho"],
+      "a1: only the helper shows",
+    );
+    for (const name of ["ho-lead", "ho-builder", "ho-handler"])
+      assert.ok(!ssh.attachLog.includes(name), `a1: ${name} is not attached`);
+    assert.equal(sessionsOf(tabs, "helperless").join(), "hl-one,hl-two");
+    const hoId = await homeTab.getAttribute("data-tab");
+    const hoBox = await checkHelperWindow(page, {
+      id: hoId,
+      project: "helper-only",
+      session: "helper-ho",
+      step: "a1 helper-only, fresh workspace",
+    });
+
+    // a2/a3: the Home tab's ▾ lists the other agents by work item.
+    let from = hub.api.requests.length;
+    await homeTab.click();
+    await homeMenu.click();
+    await waitFor(
+      async () => (await labels(0)).join("|") === `${TITLE_A}|No work item`,
+      "a3: work-item sub-menus named by title, then No work item",
+    );
+    assert.equal(
+      await homeMenu.getAttribute("aria-label"),
+      "Other terminals in helper-only",
+    );
+    await row(0, TITLE_A).click();
+    assert.deepEqual(
+      await labels(1),
+      ["ho-lead", "ho-builder"],
+      "a3: lead first",
+    );
+    assert.equal(await checked(1, "ho-builder"), false);
+    // Choosing an agent opens and focuses its pane in the project tab; the
+    // menu stays open and ticks it.
+    await row(1, "ho-builder").click();
+    await waitFor(async () => {
+      const id = await paneId("ho-builder");
+      return (
+        !!id &&
+        (await page
+          .locator("#tabs .tab.task-tab.active [data-tab]")
+          .getAttribute("data-tab")
+          .catch(() => null)) === id &&
+        (await checked(1, "ho-builder"))
+      );
+    }, "a2: the builder's pane opens focused in the project tab");
+    assert.equal(
+      await page.locator("#tabs .tab.task-tab.active .tab-name").innerText(),
+      "helper-only",
+    );
+    // Choosing it again removes the pane (its tab with it), and nothing
+    // reaches the hub.
+    await row(1, "ho-builder").click();
+    await waitFor(
+      async () =>
+        !(await paneId("ho-builder")) &&
+        !(await page
+          .locator("#tabs .tab.task-tab", { hasText: "helper-only" })
+          .count()) &&
+        !(await checked(1, "ho-builder")),
+      "a2: the menu removes the builder's pane",
+    );
+    assert.deepEqual(
+      hubWrites(from, H.id),
+      [],
+      "a2: no close, retire or cleanup call",
+    );
+    assert.equal(JSON.stringify(runs()), runsBefore, "a2: no agent changed");
+    assert.ok(
+      ssh.sessions.has("ho-builder"),
+      "a2: its tmux session is still listed",
+    );
+    // Choosing it again reattaches the same run.
+    let attachedBefore = ssh.attachLog.filter((n) => n === "ho-builder").length;
+    await row(1, "ho-builder").click();
+    await waitFor(async () => {
+      const saved = await savedTab("ho-builder");
+      return (
+        saved?.task?.runId === builder.runId &&
+        saved.task.agentId === builder.id &&
+        ssh.attachLog.filter((n) => n === "ho-builder").length ===
+          attachedBefore + 1
+      );
+    }, "a2: the same run reattached from the menu");
+    await closeMenu();
+    // × on its pane removes it the same way.
+    await waitFor(
+      async () => !!(await paneId("ho-builder")),
+      "the builder pane shows",
+    );
+    await page
+      .locator(`.pane-header[data-pane="${await paneId("ho-builder")}"]`)
+      .getByRole("button", { name: "Close pane", exact: true })
+      .click();
+    await waitFor(async () => {
+      tabs = await inventory();
+      return !tabs.some((t) => t.project && t.name === "helper-only");
+    }, "a2: × removed the last pane and its tab");
+    assert.deepEqual(hubWrites(from, H.id), [], "a2: × makes no hub call");
+    assert.equal(JSON.stringify(runs()), runsBefore, "a2: × changes no agent");
+    for (const name of ["ho-lead", "ho-builder"])
+      assert.ok(
+        ssh.sessions.has(name),
+        `a2: ${name}'s tmux session is still listed`,
+      );
+    attachedBefore = ssh.attachLog.filter((n) => n === "ho-builder").length;
+    await homeTab.click();
+    await homeMenu.click();
+    await row(0, TITLE_A).click();
+    assert.equal(await checked(1, "ho-builder"), false, "a2: × un-ticks it");
+    await row(1, "ho-builder").click();
+    await waitFor(async () => {
+      const saved = await savedTab("ho-builder");
+      return (
+        saved?.task?.runId === builder.runId &&
+        ssh.attachLog.filter((n) => n === "ho-builder").length ===
+          attachedBefore + 1
+      );
+    }, "a2: the same run reattached after ×");
+    await closeMenu();
+    // a3 keyboard: Enter/ArrowRight in, ArrowLeft/Escape out.
+    await homeTab.click();
+    // A tab-strip redraw can replace the focused ▾ before the key arrives;
+    // press again only while the menu is not open.
+    await waitFor(async () => {
+      if (!(await menu(0).count())) {
+        await homeMenu.focus();
+        await page.keyboard.press("Enter");
+        return false;
+      }
+      return await page.evaluate(
+        () =>
+          document.activeElement ===
+          document.querySelector(
+            '.terminal-menu[data-level="0"] [data-menu-key]',
+          ),
+      );
+    }, "a3: keyboard opening focuses the first row");
+    await page.keyboard.press("ArrowRight");
+    await waitFor(
+      async () => (await menu(1).count()) === 1,
+      "a3: ArrowRight opens",
+    );
+    assert.equal(
+      await page.evaluate(() => document.activeElement?.textContent),
+      await row(1, "ho-lead").textContent(),
+      "a3: focus on the sub-menu's first row",
+    );
+    await page.keyboard.press("ArrowLeft");
+    await waitFor(
+      async () => (await menu(1).count()) === 0,
+      "a3: ArrowLeft returns",
+    );
+    await page.keyboard.press("ArrowDown");
+    await page.keyboard.press("Enter");
+    await waitFor(
+      async () => (await labels(1)).join() === "ho-handler",
+      "a3: Enter opens No work item",
+    );
+    await page.keyboard.press("Escape");
+    await waitFor(
+      async () => (await menu(1).count()) === 0,
+      "a3: Escape returns",
+    );
+    assert.equal(
+      await page.evaluate(() => document.activeElement?.dataset.menuKey),
+      "s:none",
+    );
+    await page.keyboard.press("Enter");
+    await waitFor(
+      async () =>
+        (await page.evaluate(() => document.activeElement?.dataset.menuKey)) ===
+        `a:${handler.id}`,
+      "a3: Enter opens with focus on its first row",
+    );
+    await page.keyboard.press("Enter");
+    await waitFor(
+      async () =>
+        (await checked(1, "ho-handler")) &&
+        (await page.evaluate(() => document.activeElement?.dataset.menuKey)) ===
+          `a:${handler.id}`,
+      "a3: Enter on a row adds the handler and keeps the keyboard in the menu",
+    );
+    await page.keyboard.press("Escape");
+    await page.keyboard.press("Escape");
+    await waitFor(
+      async () => !(await menu(0).count()),
+      "a3: Escape closes the menu",
+    );
+    await waitFor(async () => {
+      tabs = await inventory();
+      return (
+        sessionsOf(tabs, "helper-only")?.join() === "ho-builder,ho-handler"
+      );
+    }, "a3: the handler joined the project tab");
+    // The project tab's own ▾ removes the builder again: one agent shown.
+    const hoTab = page.locator("#tabs .tab.task-tab", {
+      has: page.locator(".tab-name", { hasText: /^helper-only$/ }),
+    });
+    const tabMenu = hoTab.locator("[data-terminal-menu]");
+    await hoTab.locator("button[role=tab]").click();
+    assert.equal(
+      await tabMenu.getAttribute("aria-label"),
+      "Other terminals in helper-only",
+    );
+    await tabMenu.click();
+    await row(0, TITLE_A).click();
+    assert.equal(await checked(1, "ho-builder"), true);
+    await row(1, "ho-builder").click();
+    await waitFor(
+      async () => !(await checked(1, "ho-builder")),
+      "a2: removed from the project tab ▾",
+    );
+    await closeMenu();
+    await waitFor(async () => {
+      tabs = await inventory();
+      return sessionsOf(tabs, "helper-only")?.join() === "ho-handler";
+    }, "a2: only the handler is left in the project tab");
+    assert.deepEqual(hubWrites(from, H.id), [], "a2: still no hub call");
+    assert.equal(JSON.stringify(runs()), runsBefore);
+
+    // a3: an item whose title read fails is named by its id; closed agents
+    // and the helper are never listed.
+    const itemReads = hub.api.requests.length;
+    const extra = add(H.id, "ho-extra", { item: ITEM_B });
+    await homeTab.click();
+    await homeMenu.click();
+    await waitFor(
+      async () => (await labels(0)).includes(ITEM_B),
+      "a3: the new agent's work item",
+    );
+    // Opening the menu reads its title (once per page load, so reopen in
+    // case the first open came before the roster); the fixture hub has none.
+    await closeMenu();
+    await homeTab.click();
+    await homeMenu.click();
+    await waitFor(
+      async () =>
+        hub.api.requests
+          .slice(itemReads)
+          .some((r) =>
+            r.startsWith(`GET /v1/tasks/${H.id}/work-items/${ITEM_B}`),
+          ),
+      "a3: the failing title read",
+    );
+    await sleep(300);
+    assert.equal(
+      (await labels(0)).join("|"),
+      `${TITLE_A}|${ITEM_B}|No work item`,
+      "a3: the item id stands in for a failed title",
+    );
+    hub.api.event(H.id, "closed", extra.id);
+    await waitFor(
+      async () => (await labels(0)).join("|") === `${TITLE_A}|No work item`,
+      "a3: a closed agent leaves the menu",
+    );
+    for (const label of [TITLE_A, "No work item"]) {
+      await row(0, label).click();
+      assert.ok(
+        !(await labels(1)).some((name) => /helper|ho-extra/.test(name)),
+        `a3: ${label} lists no helper and no closed agent`,
+      );
+    }
+    assert.ok(
+      titleReads.length >= 1,
+      "a3: the title came from the work-item read",
+    );
+    await closeMenu();
+
+    // a4: a fresh page load restores exactly the helper and the handler.
+    await waitFor(
+      async () =>
+        JSON.stringify((await readVault()).workspace.shownAgents) ===
+        JSON.stringify([handler.id]),
+      "a4: the saved workspace lists exactly the handler",
+    );
+    ssh.attachLog.length = 0;
+    await hub.navigateWithHubHeld(page, () => page.reload());
+    await page.locator("#lockscreen").waitFor();
+    await unlock();
+    await waitFor(restored, "a4: restore after a reload", 90000);
+    await waitFor(async () => {
+      tabs = await inventory();
+      return (
+        sessionsOf(tabs, "helper-only")?.join() === "ho-handler" &&
+        tabs
+          .find((t) => t.home)
+          ?.panes.map((p) => p.session)
+          .join() === "helper-ho" &&
+        tabs.every((t) => t.panes.every((p) => p.status === "Connected"))
+      );
+    }, "a4: the helper and the handler after a reload");
+    await sleep(1000);
+    for (const name of ["ho-lead", "ho-builder"])
+      assert.ok(!ssh.attachLog.includes(name), `a4: ${name} is not attached`);
+    await checkHelperWindow(page, {
+      id: hoId,
+      project: "helper-only",
+      session: "helper-ho",
+      same: hoBox,
+      step: "a4 after a reload",
+    });
+    // Across the next load, a restarted shown agent reopens on its new run
+    // and a restarted agent that is not shown opens nothing.
+    const oldHandlerRun = handler.runId;
+    hub.api.restartAgent(handler.id);
+    hub.api.restartAgent(builder.id);
+    assert.notEqual(handler.runId, oldHandlerRun);
+    ssh.attachLog.length = 0;
+    await hub.navigateWithHubHeld(page, () => page.reload());
+    await page.locator("#lockscreen").waitFor();
+    await unlock();
+    await waitFor(restored, "a4: restore after the restarts", 90000);
+    await waitFor(
+      async () => (await savedTab("ho-handler"))?.task?.runId === handler.runId,
+      "a4: the restarted handler on its new run",
+    );
+    await sleep(1000);
+    tabs = await inventory();
+    assert.equal(sessionsOf(tabs, "helper-only").join(), "ho-handler");
+    assert.ok(
+      !ssh.attachLog.includes("ho-builder"),
+      "a4: the restarted builder opens nothing",
+    );
+    assert.ok(!ssh.attachLog.includes("ho-lead"));
+
+    // a2/a4 without a helper: removing its last pane removes its tab, and the
+    // strip ▾ and the palette still list it, across a reload.
+    from = hub.api.requests.length;
+    const gRuns = JSON.stringify([g1, g2].map((a) => [a.status, a.runId]));
+    const gTab = page.locator("#tabs .tab.task-tab", {
+      has: page.locator(".tab-name", { hasText: /^helperless$/ }),
+    });
+    await gTab.locator("button[role=tab]").click();
+    await gTab.locator("[data-terminal-menu]").click();
+    await row(0, "No work item").click();
+    assert.deepEqual(await labels(1), ["hl-one", "hl-two"]);
+    assert.ok((await checked(1, "hl-one")) && (await checked(1, "hl-two")));
+    await row(1, "hl-one").click();
+    await waitFor(
+      async () => !(await checked(1, "hl-one")),
+      "helperless: menu removal",
+    );
+    await closeMenu();
+    await gTab.locator("button[role=tab]").click();
+    await waitFor(
+      async () => !(await paneId("hl-one")) && !!(await paneId("hl-two")),
+      "helperless: hl-two left",
+    );
+    await page
+      .locator(`.pane-header[data-pane="${await paneId("hl-two")}"]`)
+      .getByRole("button", { name: "Close pane", exact: true })
+      .click();
+    await waitFor(
+      async () => !(await gTab.count()),
+      "helperless: its tab goes with its last pane",
+    );
+    assert.ok(await stripMenu.isVisible(), "a2: the strip ▾ shows");
+    await stripMenu.click();
+    await waitFor(
+      async () => (await labels(0)).includes("helperless"),
+      "a2: the strip menu lists the helperless project",
+    );
+    await closeMenu();
+    await palette("Project: pick terminals…");
+    await waitFor(
+      async () =>
+        (await labels(0)).includes("helperless") &&
+        (await page.evaluate(
+          () =>
+            document.activeElement ===
+            document.querySelector(
+              '.terminal-menu[data-level="0"] [data-menu-key]',
+            ),
+        )),
+      "a2: the palette command opens the same menu, focused",
+    );
+    await closeMenu();
+    // A fresh load restores none of its panes and keeps it listed.
+    await waitFor(async () => {
+      const { workspace } = await readVault();
+      return (
+        workspace.tasks.includes(G.id) &&
+        !workspace.tabs.some((t) => ["hl-one", "hl-two"].includes(t.session))
+      );
+    }, "a4: the helperless project saved without panes");
+    ssh.attachLog.length = 0;
+    await hub.navigateWithHubHeld(page, () => page.reload());
+    await page.locator("#lockscreen").waitFor();
+    await unlock();
+    await waitFor(restored, "a4: helperless restore", 90000);
+    await waitFor(
+      async () => await stripMenu.isVisible(),
+      "a4: strip ▾ after reload",
+    );
+    await sleep(1000);
+    for (const name of ["hl-one", "hl-two"])
+      assert.ok(!ssh.attachLog.includes(name), `a4: ${name} is not restored`);
+    await stripMenu.click();
+    await row(0, "helperless").click();
+    await row(1, "No work item").click();
+    assert.equal(await checked(2, "hl-two"), false);
+    await row(2, "hl-two").click();
+    await waitFor(async () => {
+      tabs = await inventory();
+      const saved = await savedTab("hl-two");
+      return (
+        sessionsOf(tabs, "helperless")?.join() === "hl-two" &&
+        saved?.task?.runId === g2.runId
+      );
+    }, "a2/a4: re-adding reopens the same run in a project tab");
+    assert.deepEqual(hubWrites(from, G.id), [], "helperless: no hub call");
+    assert.equal(
+      JSON.stringify([g1, g2].map((a) => [a.status, a.runId])),
+      gRuns,
+      "helperless: no agent changed",
+    );
+    await closeMenu();
+
+    // a1: a workspace saved before shownAgents restores only the helper.
+    await homeTab.click();
+    await homeMenu.click();
+    for (const [label, name] of [
+      [TITLE_A, "ho-lead"],
+      [TITLE_A, "ho-builder"],
+    ]) {
+      await row(0, label).click();
+      await row(1, name).click();
+      await waitFor(async () => checked(1, name), `${name} chosen`);
+    }
+    await closeMenu();
+    await waitFor(async () => {
+      const { workspace, sessions } = await readVault();
+      return ["ho-lead", "ho-builder", "ho-handler"].every(
+        (name) =>
+          workspace.tabs.some(
+            (t) => t.session === name && t.task?.taskId === H.id,
+          ) && sessions.find((s) => s.name === name)?.task,
+      );
+    }, "a1: three agent panes saved");
+    await lock();
+    const record = await page.evaluate(
+      () =>
+        new Promise((resolve, reject) => {
+          const r = indexedDB.open("tailserve", 1);
+          r.onsuccess = () => {
+            const q = r.result
+              .transaction("vault")
+              .objectStore("vault")
+              .get("encrypted-v2");
+            q.onsuccess = () => resolve(q.result);
+            q.onerror = reject;
+          };
+          r.onerror = reject;
+        }),
+    );
+    const opened = await openVault(record, passphrase);
+    delete opened.data.workspace.shownAgents;
+    const envelope = await sealVault(opened.data, opened.key, opened.salt, 2);
+    await page.evaluate(
+      (value) =>
+        new Promise((resolve, reject) => {
+          const r = indexedDB.open("tailserve", 1);
+          r.onsuccess = () => {
+            const tx = r.result.transaction("vault", "readwrite");
+            tx.objectStore("vault").put(value, "encrypted-v2");
+            tx.oncomplete = resolve;
+            tx.onerror = reject;
+          };
+          r.onerror = reject;
+        }),
+      envelope,
+    );
+    ssh.attachLog.length = 0;
+    await unlock();
+    await waitFor(restored, "a1: restore of a pre-change workspace", 90000);
+    await waitFor(async () => {
+      tabs = await inventory();
+      return tabs
+        .find((t) => t.home)
+        ?.panes.some(
+          (p) => p.session === "helper-ho" && p.status === "Connected",
+        );
+    }, "a1: the helper restored");
+    await sleep(1000);
+    tabs = await inventory();
+    assert.ok(
+      !tabs.some((t) => t.project && t.name === "helper-only"),
+      "a1: a pre-change workspace shows no project tab",
+    );
+    for (const name of ["ho-lead", "ho-builder", "ho-handler"])
+      assert.ok(
+        !ssh.attachLog.includes(name),
+        `a1: pre-change ${name} is not reconnected`,
+      );
+    const after = await readVault();
+    assert.deepEqual(after.workspace.shownAgents, [], "a1: nothing is shown");
+    for (const name of ["ho-lead", "ho-handler"])
+      assert.equal(
+        after.sessions.find((s) => s.name === name)?.task?.taskId,
+        H.id,
+        `a1: ${name}'s bookmark stays bound (the agent is alive)`,
+      );
+    assert.deepEqual(
+      hubWrites(from, H.id),
+      [],
+      "a1: the restore wrote nothing to the hub",
+    );
+
+    for (const { id } of [H, G]) hub.api.closeTask(id);
+    await waitFor(
+      async () =>
+        (await page.locator("#tabs .tab.task-tab").count()) === 0 &&
+        (await page.locator(".tab-strip > .home-tab [data-tab]").count()) ===
+          0 &&
+        (await stripMenu.isHidden()),
+      "helper-only projects closed",
+    );
+    for (const a of [helper, lead, builder, handler, extra, g1, g2])
+      ssh.sessions.delete(a.session);
+    console.log(
+      `Helper-only terminals passed: a fresh workspace and a pre-change one show only the helper; the Home, tab and strip ▾ add, remove and re-add the same run with no hub call; work-item sub-menus by title or id with the lead first and keyboard navigation; the choice survives a reload; the helperless project stays reachable after its last pane.`,
+    );
+  }
 }

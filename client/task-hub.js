@@ -46,6 +46,8 @@ import {
   taskMemberIds,
   homeAgent,
   homePlacement,
+  helperProject,
+  terminalMenuSections,
 } from "./tasks.js";
 import {
   agentCleanupCommand,
@@ -128,6 +130,11 @@ export function createTaskHub(host) {
     connected = false;
   const feeds = new Map(); // taskId -> {stop, agents, task, unknown, cursor}
   const hidden = new Set();
+  // Agents the owner pulled into a helper project's group (wi_649926f70aaa762a),
+  // saved per origin as shownAgents. Seeded by the login restore before any
+  // reconnect or reconcile; lock reloads the page, so it starts empty.
+  const shown = new Set();
+  const titles = new Map(); // itemId -> work-item title, once per page load
   const bound = new Set(); // task ids mirrored into tabs
   const cache = new Map(); // taskId -> {task, agents} for tooltips/dialogs
   // Startup binding of live projects; see discover().
@@ -405,6 +412,7 @@ export function createTaskHub(host) {
     feeds.get(taskId)?.stop();
     feeds.delete(taskId);
     bound.delete(taskId);
+    for (const a of cache.get(taskId)?.agents || []) shown.delete(a.id);
     cache.delete(taskId);
     unbindGroups(host.paneGroups()?.model.groups || [], taskId);
     for (const tab of host.getTabs()) {
@@ -520,11 +528,13 @@ export function createTaskHub(host) {
   }
   async function doReconcile(feed) {
     if (feed.stopped) return;
+    // A closed agent never comes back: forget the owner's choice for it.
+    for (const a of feed.agents) if (!openAgent(a)) shown.delete(a.id);
     host
       .paneGroups()
       ?.model.setTaskMembers?.(
         feed.taskId,
-        taskMemberIds(feed.task, feed.agents),
+        taskMemberIds(feed.task, feed.agents, shown),
       );
     const syncLayout = () => {
       const groups = host.paneGroups();
@@ -562,6 +572,7 @@ export function createTaskHub(host) {
         tabs: host.getTabs(),
         servers: taskServers(),
         hidden,
+        shown,
       });
     let r = reconcileCurrent();
     if (r.unknown.length) {
@@ -576,13 +587,25 @@ export function createTaskHub(host) {
     feed.unknown = r.unknown.length;
     for (const { tab, agent } of r.adopt) {
       tab.task = taskBinding(feed.taskId, agent);
+      // The owner opened this session: in a helper project it stays shown.
+      if (!homeAgent(agent)) shown.add(agent.id);
       host.bookmark(tab);
     }
+    if (r.adopt.length)
+      host
+        .paneGroups()
+        ?.model.setTaskMembers?.(
+          feed.taskId,
+          taskMemberIds(feed.task, feed.agents, shown),
+        );
     syncLayout();
     for (const tab of r.close) {
       host.clearAgentBookmark?.(feed.taskId, tab.task.agentId, tab.task.runId);
       host.closeTab(tab.id, { fromHub: true });
     }
+    // Not shown in a helper project: only the pane goes. The agent, its run
+    // and its session bookmark stay, and nothing reaches the hub.
+    for (const tab of r.hide) host.closeTab(tab.id, { fromHub: true });
     if (feed.task?.status === "closed")
       unbindGroups(host.paneGroups()?.model.groups || [], feed.taskId);
     const probe = sessionProbe();
@@ -597,6 +620,12 @@ export function createTaskHub(host) {
           quiet: true,
         });
         if (tab) place(feed.taskId, tab);
+        if (
+          tab &&
+          focusNext?.taskId === feed.taskId &&
+          focusNext.agentId === agent.id
+        )
+          focusPane(tab);
       } catch (error) {
         host.notice(`Could not open ${agent.name}: ${error.message}`);
       }
@@ -803,6 +832,128 @@ export function createTaskHub(host) {
     for (const id of hiddenIds) hidden.add(id);
     for (const id of taskIds) if (normalizeTaskId(id)) bound.add(id);
     sync();
+  }
+
+  // The roster an agent belongs to, from the live feeds, else the cache.
+  function rosterOf(agentId) {
+    for (const source of [feeds.values(), cache.values()])
+      for (const entry of source)
+        if (entry.agents?.some((a) => a.id === agentId)) return entry.agents;
+    return [];
+  }
+  // × on a pane. In a helper project an agent other than the helper is only
+  // un-shown; elsewhere (and for the helper) it is hidden as before. Either
+  // way the agent keeps running and nothing reaches the hub.
+  function hideAgent(id) {
+    const agents = rosterOf(id);
+    const agent = agents.find((a) => a.id === id);
+    const wasShown = shown.delete(id);
+    if (!(agent && !homeAgent(agent) && helperProject(agents))) hidden.add(id);
+    if (wasShown) refreshMembers();
+    host.scheduleWorkspaceSave();
+  }
+  // Board, Projects and the ▾ menu open an agent: it is shown from now on.
+  function revealAgent(id) {
+    hidden.delete(id);
+    if (!homeAgent(rosterOf(id).find((a) => a.id === id))) shown.add(id);
+    for (const f of feeds.values()) reconcile(f);
+    host.scheduleWorkspaceSave();
+  }
+  function refreshMembers() {
+    for (const feed of feeds.values())
+      host
+        .paneGroups()
+        ?.model.setTaskMembers?.(
+          feed.taskId,
+          taskMemberIds(feed.task, feed.agents, shown),
+        );
+  }
+  // The ▾ menu's add and remove. Removing closes only the pane, never the
+  // agent: no hub call, and the same run reattaches later. A project without
+  // a helper remembers the removal as hidden, as × does there.
+  async function setShown(taskId, agentId, on) {
+    const tab = host
+      .getTabs()
+      .find(
+        (t) =>
+          !t.disposed &&
+          t.task?.taskId === taskId &&
+          t.task.agentId === agentId,
+      );
+    if (!on) {
+      const agents = rosterOf(agentId);
+      shown.delete(agentId);
+      if (!helperProject(agents)) hidden.add(agentId);
+      refreshMembers();
+      if (tab) host.closeTab(tab.id, { fromHub: true });
+      host.scheduleWorkspaceSave();
+      host.render();
+      return null;
+    }
+    if (!bound.has(taskId)) attach(taskId);
+    // Focus the pane when it opens, here or in a later reconcile.
+    focusNext = { taskId, agentId };
+    revealAgent(agentId);
+    await reconciling;
+    const opened =
+      tab ||
+      host
+        .getTabs()
+        .find(
+          (t) =>
+            !t.disposed &&
+            t.task?.taskId === taskId &&
+            t.task.agentId === agentId,
+        );
+    if (opened) focusPane(opened);
+    return opened || null;
+  }
+  let focusNext = null;
+  function focusPane(tab) {
+    focusNext = null;
+    host.showTerminals?.();
+    host.activate?.(tab.id);
+  }
+  // Bound live projects, for the tab-strip menu: each stays listed whether or
+  // not it has a pane, so a project whose last pane went can be reopened.
+  function pickableProjects() {
+    return [...bound]
+      .map((id) => ({ id, info: feeds.get(id) || cache.get(id) }))
+      .filter(({ info }) => info?.task && liveProject(info.task))
+      .map(({ id, info }) => ({ taskId: id, name: info.task.name || id }));
+  }
+  function menuSections(taskId) {
+    const info = feeds.get(taskId) || cache.get(taskId);
+    return terminalMenuSections(info?.agents || [], { shown, hidden, titles });
+  }
+  // Fetch each work item's title once per page load. A failed read leaves the
+  // item id as its name. Resolves true when a title was added.
+  const titleReads = new Map();
+  async function loadTitles(taskId) {
+    const reader = viewClient || client;
+    if (!reader?.getWorkItem) return false;
+    const sections = menuSections(taskId).filter((s) => s.itemId);
+    const reads = sections.map((section) => {
+      const key = `${section.itemTaskId}/${section.itemId}`;
+      if (!titleReads.has(key))
+        titleReads.set(
+          key,
+          Promise.resolve()
+            .then(() =>
+              reader.getWorkItem(section.itemTaskId || taskId, section.itemId),
+            )
+            .then((item) => {
+              const title = String(item?.title || item?.item?.title || "")
+                .trim()
+                .slice(0, 160);
+              if (title) titles.set(section.itemId, title);
+              return !!title;
+            })
+            .catch(() => false),
+        );
+      return titleReads.get(key);
+    });
+    return (await Promise.all(reads)).some(Boolean);
   }
 
   // Dialogs
@@ -2761,6 +2912,10 @@ export function createTaskHub(host) {
       if (group) {
         host.showTerminals?.();
         host.activate?.(group.active);
+      } else if (helperProject(detail.agents)) {
+        // Only the helper shows: offer the project's other terminals.
+        host.showTerminals?.();
+        host.pickTerminals?.(taskId);
       } else if (detail.agents.some((a) => a.status !== "closed"))
         host.notice(
           "Agent terminals are starting or their servers are unavailable.",
@@ -2906,6 +3061,11 @@ export function createTaskHub(host) {
         label: "Project: open terminals…",
         run: () => attachTask(),
       });
+      if (host.pickTerminals && pickableProjects().length)
+        list.push({
+          label: "Project: pick terminals…",
+          run: () => host.pickTerminals(null, { keyboard: true }),
+        });
       if (taskId) {
         const name = cache.get(taskId)?.task?.name || taskId;
         list.push({
@@ -3591,16 +3751,18 @@ export function createTaskHub(host) {
     closeTask,
     cleanupAgent,
     cleanupTask,
-    hideAgent(id) {
-      hidden.add(id);
-      host.scheduleWorkspaceSave();
-    },
-    revealAgent(id) {
-      hidden.delete(id);
-      for (const f of feeds.values()) reconcile(f);
-      host.scheduleWorkspaceSave();
-    },
+    hideAgent,
+    revealAgent,
     hidden: () => [...hidden],
+    shown: () => [...shown],
+    seedShown(ids = []) {
+      shown.clear();
+      for (const id of ids) shown.add(id);
+    },
+    setShown,
+    menuSections,
+    pickableProjects,
+    loadTitles,
     client: () => client,
     viewClient: () => viewClient,
     dispose() {

@@ -1484,10 +1484,17 @@ dialog:modal {
   overflow: hidden;
   box-sizing: border-box;
 }
+/* Project tabs and Home carry the ▾ terminal menu too: room for its 26 px,
+   so a crowded strip never squeezes their names away. */
+@media (min-width: 721px) {
+  #tabs .tab.task-tab {
+    min-width: 136px;
+  }
+}
 /* The pinned Home tab: a tab outside the scrolling strip, same height. */
 .tab-strip > .home-tab {
   flex: 0 1 200px;
-  min-width: 110px;
+  min-width: 136px;
   max-width: 200px;
   height: 100%;
   overflow: hidden;
@@ -1523,7 +1530,9 @@ dialog:modal {
   width: 100%;
   font-size: 11px;
 }
-.tab-strip > .home-tab button:is([data-close], [data-session-menu]) {
+.tab-strip
+  > .home-tab
+  button:is([data-close], [data-session-menu], [data-terminal-menu]) {
   flex: 0 0 24px;
   padding: 4px;
   justify-content: center;
@@ -1534,7 +1543,7 @@ dialog:modal {
 }
 .tab-strip
   > .home-tab:not(.active):not(:hover):not(:focus-within)
-  > :is([data-close], [data-session-menu]) {
+  > :is([data-close], [data-session-menu], [data-terminal-menu]) {
   display: none;
 }
 #tabs .tab button[data-tab] {
@@ -1572,7 +1581,7 @@ dialog:modal {
   justify-content: center;
   height: 100%;
 }
-#tabs .tab button[data-session-menu] {
+#tabs .tab button:is([data-session-menu], [data-terminal-menu]) {
   flex: 0 0 26px;
   padding: 4px;
   justify-content: center;
@@ -2486,7 +2495,8 @@ aside #discover {
     display: none;
   }
   .tab [data-close],
-  .tab [data-session-menu] {
+  .tab [data-session-menu],
+  .tab [data-terminal-menu] {
     min-width: 36px;
   }
   dialog {
@@ -3495,7 +3505,7 @@ body[data-mode="board"] #notice {
    hover, keyboard focus, or selection (also the touch-screen path). */
 #tabs
   .tab:not(.active):not(:hover):not(:focus-within)
-  > :is([data-close], [data-session-menu]),
+  > :is([data-close], [data-session-menu], [data-terminal-menu]),
 #tabs .tab:not(.active):not(:hover):not(:focus-within) .tab-tmux {
   display: none;
 }
@@ -3509,6 +3519,86 @@ body[data-mode="board"] #notice {
   margin: 0;
   padding: 0;
   border-radius: 0;
+}
+/* The project terminals menu sits beside + at the same height. */
+#workspace .tab-strip > #project-terminals {
+  align-self: stretch;
+  flex: 0 0 auto;
+  height: 100%;
+  min-height: 0;
+  margin: 0;
+  padding: 0 10px;
+  border-radius: 0;
+  font-size: 11px;
+  white-space: nowrap;
+}
+#workspace .tab-strip > #project-terminals[hidden] {
+  display: none;
+}
+/* The ▾ terminal menu and its work-item sub-menus: selection is fill, hover
+   and keyboard focus are outline, rows share one height. */
+.terminal-menu {
+  position: fixed;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  min-width: 220px;
+  max-width: min(360px, calc(100vw - 8px));
+  max-height: min(60vh, 480px);
+  overflow-y: auto;
+  padding: 3px;
+  gap: 2px;
+  background: var(--surface);
+  color: var(--ink);
+  border: 1px solid var(--line);
+  box-shadow: 0 6px 18px rgb(0 0 0 / 0.35);
+}
+#workspace .terminal-menu button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  height: 28px;
+  min-height: 28px;
+  padding: 0 8px;
+  text-align: left;
+  font-size: 12px;
+  border-color: transparent;
+  background: var(--surface);
+}
+#workspace .terminal-menu button:not(:disabled):hover,
+#workspace .terminal-menu button:not(:disabled):focus-visible {
+  background: var(--surface);
+  border-color: var(--accent);
+}
+#workspace .terminal-menu button:focus-visible {
+  outline: none;
+}
+#workspace
+  .terminal-menu
+  button:is([aria-checked="true"], [aria-expanded="true"]) {
+  background: var(--raised);
+}
+.terminal-menu-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.terminal-menu-note,
+.terminal-menu-more,
+.terminal-menu-empty {
+  color: var(--muted);
+  font-size: 11px;
+}
+.terminal-menu-check {
+  flex: 0 0 12px;
+  text-align: center;
+}
+.terminal-menu-empty {
+  margin: 0;
+  padding: 6px 8px;
 }
 #workspace .terminal-tools {
   margin-left: 12px;
@@ -3525,7 +3615,7 @@ body[data-mode="board"] #notice {
 /* Give the hovered tab the detail space without changing the active session. */
 #tabs:has(.tab:not(.active):hover)
   .tab.active
-  > :is([data-close], [data-session-menu]),
+  > :is([data-close], [data-session-menu], [data-terminal-menu]),
 #tabs:has(.tab:not(.active):hover) .tab.active .tab-tmux {
   display: none;
 }

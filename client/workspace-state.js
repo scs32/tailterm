@@ -160,6 +160,16 @@ export function normalizeProjectLayouts(value) {
     .filter(Boolean);
 }
 
+// The newest 400 distinct agent ids, oldest first.
+const shownIds = (ids) =>
+  [
+    ...new Set(
+      (Array.isArray(ids) ? ids : []).filter(
+        (id) => typeof id === "string" && /^agt_[0-9a-f]{16}$/.test(id),
+      ),
+    ),
+  ].slice(-400);
+
 export function workspaceSnapshot(
   tabs,
   groups,
@@ -169,11 +179,13 @@ export function workspaceSnapshot(
   hiddenAgents = [],
   projectLayouts,
   home = null,
+  shownAgents = [],
 ) {
   return {
     hiddenAgents: hiddenAgents
       .filter((id) => /^agt_[0-9a-f]{16}$/.test(id))
       .slice(0, 400),
+    shownAgents: shownIds(shownAgents),
     tasks: [...new Set(tasks.map(normalizeTaskId).filter(Boolean))].slice(
       0,
       30,
@@ -331,6 +343,9 @@ export function normalizeWorkspace(value) {
     hiddenAgents: (Array.isArray(value.hiddenAgents) ? value.hiddenAgents : [])
       .filter((id) => /^agt_[0-9a-f]{16}$/.test(id))
       .slice(0, 400),
+    // Agents the owner pulled into helper projects. A workspace saved before
+    // them has none, so it restores only the helpers.
+    shownAgents: shownIds(value.shownAgents),
     active: ids.has(value.active) ? value.active : tabs[0]?.id,
   };
 }

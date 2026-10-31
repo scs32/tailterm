@@ -20,7 +20,14 @@ import {
   helperReattach,
   helperAttachKey,
   reattachOptions,
+  helperProject,
+  agentShown,
+  terminalMenuSections,
 } from "../client/tasks.js";
+import {
+  workspaceSnapshot,
+  normalizeWorkspace,
+} from "../client/workspace-state.js";
 import { normalizeTaskRef } from "../client/task-ref.js";
 import { tmuxCommand, shellQuote } from "../shared/tmux-command.js";
 import { spawn } from "node:child_process";
@@ -435,6 +442,346 @@ test("taskMemberIds excludes the helper in every state", () => {
     ids,
     "closed agents stay out as before",
   );
+});
+
+// Helper-only project terminals (wi_649926f70aaa762a).
+test("helperProject needs an open owner helper", () => {
+  assert.equal(helperProject([agent(1), agent(2)]), false);
+  assert.equal(helperProject([agent(1), helperFixture]), true);
+  assert.equal(
+    helperProject([agent(1), { ...helperFixture, status: "closed" }]),
+    false,
+    "a closed helper shows nothing in Home",
+  );
+  for (const status of ["done", "exited", "retired", "needs_input"])
+    assert.equal(helperProject([{ ...helperFixture, status }]), true, status);
+  assert.equal(helperProject(), false);
+});
+
+test("agentShown: a helper project shows the helper and the chosen agents", () => {
+  const roster = [helperFixture, agent(1), agent(2)];
+  const shown = new Set([agent(2).id]);
+  assert.equal(agentShown(helperFixture, roster, { shown }), true);
+  assert.equal(agentShown(agent(1), roster, { shown }), false);
+  assert.equal(agentShown(agent(2), roster, { shown }), true);
+  assert.equal(
+    agentShown(agent(2), roster, { shown, hidden: new Set([agent(2).id]) }),
+    false,
+    "hidden still wins",
+  );
+  assert.equal(
+    agentShown(helperFixture, roster, {
+      shown,
+      hidden: new Set([helperFixture.id]),
+    }),
+    false,
+    "a helper the owner closed stays closed",
+  );
+  // Without a helper every agent that is not hidden shows.
+  const plain = [agent(1), agent(2)];
+  assert.equal(agentShown(agent(1), plain, { shown: new Set() }), true);
+  assert.equal(
+    agentShown(agent(1), plain, {
+      shown: new Set(),
+      hidden: new Set([agent(1).id]),
+    }),
+    false,
+  );
+  // No shown set: no helper-only rule (older callers).
+  assert.equal(agentShown(agent(1), roster), true);
+});
+
+test("reconcileTask in a helper project opens only the helper and shown agents", () => {
+  const agents = [helperFixture, agent(1), agent(2), agent(3)];
+  const none = reconcileTask({
+    taskId: TASK,
+    agents,
+    tabs: [],
+    servers,
+    shown: new Set(),
+  });
+  assert.deepEqual(
+    none.open.map((o) => o.agent.id),
+    [helperFixture.id],
+    "helper only by default",
+  );
+  assert.deepEqual(none.hide, []);
+  const one = reconcileTask({
+    taskId: TASK,
+    agents,
+    tabs: [],
+    servers,
+    shown: new Set([agent(2).id]),
+  });
+  assert.deepEqual(
+    one.open.map((o) => o.agent.id),
+    [helperFixture.id, agent(2).id],
+  );
+  // A project without a helper opens all its agents, whatever is shown.
+  const plain = reconcileTask({
+    taskId: TASK,
+    agents: [agent(1), agent(2)],
+    tabs: [],
+    servers,
+    shown: new Set(),
+  });
+  assert.deepEqual(
+    plain.open.map((o) => o.agent.id),
+    [agent(1).id, agent(2).id],
+  );
+  // Unknown hosts of agents that are not shown raise no notice.
+  const mystery = reconcileTask({
+    taskId: TASK,
+    agents: [helperFixture, agent(4, { host: "mystery" })],
+    tabs: [],
+    servers,
+    shown: new Set(),
+  });
+  assert.deepEqual(mystery.unknown, []);
+});
+
+test("reconcileTask hides panes a helper project does not show, never closes them", () => {
+  const bound = (n, runId) => ({
+    id: `t${n}`,
+    server: servers[0],
+    tmux: true,
+    session: `a${n}`,
+    task: normalizeTaskRef({
+      taskId: TASK,
+      agentId: agent(n).id,
+      ...(runId ? { runId } : {}),
+    }),
+  });
+  const agents = [
+    helperFixture,
+    agent(1, { runId: "run_0000000000000001" }),
+    agent(2, { runId: "run_0000000000000002" }),
+    agent(3, { runId: "run_0000000000000033" }),
+  ];
+  const tabs = [
+    bound(1, "run_0000000000000001"),
+    bound(2, "run_0000000000000002"),
+    bound(3, "run_0000000000000003"), // an earlier run
+  ];
+  const r = reconcileTask({
+    taskId: TASK,
+    agents,
+    tabs,
+    servers,
+    shown: new Set([agent(2).id, agent(3).id]),
+  });
+  assert.deepEqual(
+    r.hide.map((t) => t.id),
+    ["t1"],
+    "only the live pane of an agent that is not shown",
+  );
+  assert.deepEqual(
+    r.close.map((t) => t.id),
+    ["t3"],
+    "a replaced run still closes",
+  );
+  assert.deepEqual(
+    r.open.map((o) => o.agent.id),
+    [helperFixture.id, agent(3).id],
+    "the shown agent reopens on its new run",
+  );
+  // A restarted agent that is not shown opens nothing.
+  const quiet = reconcileTask({
+    taskId: TASK,
+    agents,
+    tabs: [bound(3, "run_0000000000000003")],
+    servers,
+    shown: new Set(),
+  });
+  assert.deepEqual(
+    quiet.open.map((o) => o.agent.id),
+    [helperFixture.id],
+  );
+  assert.deepEqual(
+    quiet.close.map((t) => t.id),
+    ["t3"],
+  );
+  assert.deepEqual(quiet.hide, []);
+});
+
+test("reconcileTask adopts the owner's launcher tab of an agent that is not shown", () => {
+  const tabs = [{ id: "mine", server: servers[0], tmux: true, session: "a1" }];
+  const r = reconcileTask({
+    taskId: TASK,
+    agents: [helperFixture, agent(1), agent(2)],
+    tabs,
+    servers,
+    shown: new Set(),
+  });
+  assert.deepEqual(
+    r.adopt.map((x) => [x.tab.id, x.agent.id]),
+    [["mine", agent(1).id]],
+  );
+  assert.deepEqual(
+    r.open.map((o) => o.agent.id),
+    [helperFixture.id],
+  );
+});
+
+test("restoreVerdict skips agents a helper project does not show", () => {
+  const detail = {
+    task: { status: "open", pauseState: "active" },
+    agents: [
+      helperFixture,
+      agent(1, { runId: "run_0000000000000001" }),
+      agent(2, { runId: "run_0000000000000002" }),
+    ],
+  };
+  const ref = (n) =>
+    normalizeTaskRef({
+      taskId: TASK,
+      agentId: agent(n).id,
+      runId: `run_000000000000000${n}`,
+    });
+  const shown = new Set([agent(2).id]);
+  assert.equal(restoreVerdict(ref(1), detail, shown), "not-shown");
+  assert.equal(restoreVerdict(ref(2), detail, shown), "keep");
+  assert.equal(
+    restoreVerdict(
+      normalizeTaskRef({
+        taskId: TASK,
+        agentId: helperFixture.id,
+        runId: helperFixture.runId,
+      }),
+      detail,
+      new Set(),
+    ),
+    "keep",
+    "the helper always restores",
+  );
+  assert.equal(
+    restoreVerdict(ref(1), detail, new Set()),
+    "not-shown",
+    "a workspace saved before shownAgents restores only the helper",
+  );
+  assert.equal(
+    restoreVerdict(
+      { ...ref(1), runId: "run_00000000000000ff" },
+      detail,
+      new Set(),
+    ),
+    "run-changed",
+    "a replaced run still drops its bookmark binding",
+  );
+  assert.equal(restoreVerdict(ref(1), undefined, shown), "unknown");
+  assert.equal(
+    restoreVerdict(
+      ref(1),
+      { ...detail, agents: detail.agents.slice(1) },
+      new Set(),
+    ),
+    "keep",
+    "without a helper every agent restores",
+  );
+  assert.equal(restoreVerdict(ref(1), detail), "keep", "no shown set: no rule");
+});
+
+test("taskMemberIds in a helper project counts only shown agents", () => {
+  const roster = [helperFixture, agent(1), agent(2), agent(3)];
+  assert.deepEqual(
+    taskMemberIds({ status: "open" }, roster, new Set([agent(3).id])),
+    [agent(3).id],
+  );
+  assert.deepEqual(taskMemberIds({ status: "open" }, roster, new Set()), []);
+  assert.deepEqual(
+    taskMemberIds({ status: "open" }, roster.slice(1), new Set()),
+    [agent(1).id, agent(2).id, agent(3).id],
+  );
+});
+
+test("terminalMenuSections groups by work item, lead first, then No work item", () => {
+  const item = (itemId) => ({
+    itemTaskId: "tsk_00000000000000aa",
+    itemId,
+    itemRevision: 1,
+  });
+  const roster = [
+    agent(1, { workItem: item("wi_0000000000000001") }),
+    helperFixture,
+    agent(2), // no work item
+    agent(3, { workItem: item("wi_0000000000000002") }),
+    agent(4, { workItem: item("wi_0000000000000001"), itemLead: true }),
+    agent(5, { status: "closed", workItem: item("wi_0000000000000001") }),
+    agent(6, { status: "needs_input" }),
+  ];
+  const sections = terminalMenuSections(roster, {
+    shown: new Set([agent(1).id]),
+    titles: new Map([["wi_0000000000000001", "Helper-only terminals"]]),
+  });
+  assert.deepEqual(
+    sections.map((s) => [s.itemId, s.title, s.rows.map((r) => r.name)]),
+    [
+      ["wi_0000000000000001", "Helper-only terminals", ["a4", "a1"]],
+      ["wi_0000000000000002", "wi_0000000000000002", ["a3"]],
+      ["", "No work item", ["a2", "a6"]],
+    ],
+    "title or id, lead first, closed agents and the helper left out",
+  );
+  assert.deepEqual(
+    sections[0].rows.map((r) => [r.name, r.lead, r.shown]),
+    [
+      ["a4", true, false],
+      ["a1", false, true],
+    ],
+  );
+  assert.equal(sections[2].rows[1].status, "needs_input");
+  assert.equal(sections[0].itemTaskId, "tsk_00000000000000aa");
+  // Without a helper, rows are shown unless hidden.
+  const plain = terminalMenuSections([agent(1), agent(2)], {
+    shown: new Set(),
+    hidden: new Set([agent(2).id]),
+  });
+  assert.deepEqual(
+    plain[0].rows.map((r) => [r.name, r.shown]),
+    [
+      ["a1", true],
+      ["a2", false],
+    ],
+  );
+  assert.deepEqual(terminalMenuSections([helperFixture]), []);
+});
+
+test("shownAgents round-trips through the workspace snapshot", () => {
+  const ids = [agent(1).id, agent(2).id];
+  const snapshot = workspaceSnapshot(
+    [],
+    [],
+    null,
+    null,
+    [],
+    [],
+    undefined,
+    null,
+    [...ids, "not-an-agent", agent(1).id],
+  );
+  assert.deepEqual(snapshot.shownAgents, ids, "valid ids, once each");
+  assert.deepEqual(
+    normalizeWorkspace(JSON.parse(JSON.stringify(snapshot))).shownAgents,
+    ids,
+  );
+  assert.deepEqual(
+    normalizeWorkspace({ tabs: [], groups: [] }).shownAgents,
+    [],
+    "a workspace saved before shownAgents shows only the helpers",
+  );
+  assert.deepEqual(
+    normalizeWorkspace({ tabs: [], groups: [], shownAgents: "agt_x" })
+      .shownAgents,
+    [],
+  );
+  const many = Array.from({ length: 450 }, (_, i) => agent(i + 1).id);
+  const capped = normalizeWorkspace({
+    tabs: [],
+    groups: [],
+    shownAgents: many,
+  });
+  assert.equal(capped.shownAgents.length, 400);
+  assert.equal(capped.shownAgents.at(-1), many.at(-1), "the newest are kept");
 });
 
 test("helperReattach and reattachOptions force an ignore-size attach", () => {

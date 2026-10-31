@@ -43,11 +43,32 @@ export const liveProject = (task) =>
   task?.status === "open" &&
   [undefined, null, "", "active", "resuming"].includes(task.pauseState);
 
+// The owner's helper session lives in the home area, never in a project group.
+export const homeAgent = (a) => a?.role === "owner_helper";
+
+// A project with an open owner helper shows only the helper until the owner
+// pulls other agents in (wi_649926f70aaa762a).
+export const helperProject = (agents = []) =>
+  agents.some((a) => homeAgent(a) && openAgent(a));
+
+// Whether an agent's terminal belongs open. A hidden agent (closed with ×
+// in a project without a helper, or a helper the owner closed) stays closed.
+// In a helper project every other agent opens only when the owner chose it
+// (shown, keyed by agent id, so a new run of a chosen agent opens again).
+// shown null or undefined applies no helper-only rule.
+export function agentShown(agent, agents, { shown, hidden } = {}) {
+  if (hidden?.has(agent?.id)) return false;
+  if (!shown || homeAgent(agent) || !helperProject(agents)) return true;
+  return shown.has(agent.id);
+}
+
 // What the login restore should do with a saved pane bound to a hub agent.
 // detail is the hub's getTask result: undefined when the hub is unknown or
 // unreachable (restore as before), null when the hub no longer has the task.
-//   keep | unknown | gone | closed | paused | run-changed
-export function restoreVerdict(binding, detail) {
+// shown, when given, is the owner's choice for helper projects.
+//   keep | unknown | gone | closed | paused | run-changed | not-shown
+// not-shown skips the reconnect but keeps the bookmark: the agent is alive.
+export function restoreVerdict(binding, detail, shown) {
   if (detail === undefined) return "unknown";
   if (detail === null) return "gone";
   if (detail.task?.status !== "open") return "closed";
@@ -55,6 +76,7 @@ export function restoreVerdict(binding, detail) {
   const agent = detail.agents?.find((a) => a.id === binding?.agentId);
   if (!agent || !openAgent(agent)) return "closed";
   if (runChanged(binding, agent)) return "run-changed";
+  if (!agentShown(agent, detail.agents, { shown })) return "not-shown";
   return "keep";
 }
 
@@ -67,12 +89,17 @@ export const sessionCheckNeeded = (a) => ["done", "exited"].includes(a?.status);
 //   unknown:  open agents whose host matches no saved server
 //   close:    panes bound to this task whose agent is closed or gone
 //   adopt:    panes matching an agent by server and session but not yet bound
+//   hide:     live panes of agents a helper project does not show (shown);
+//             the agent keeps running, so they close without hiding it
+// A launcher tab the owner opened on an agent's session is adopted even when
+// the agent is not shown: the caller then shows it.
 export function reconcileTask({
   taskId,
   agents,
   tabs,
   servers,
   hidden = new Set(),
+  shown,
 }) {
   const live = tabs.filter((t) => !t.disposed);
   const byAgent = new Map();
@@ -110,6 +137,7 @@ export function reconcileTask({
       bound++;
       continue;
     }
+    if (!agentShown(a, agents, { shown })) continue;
     if (!server) {
       unknown.push(a);
       continue;
@@ -124,11 +152,12 @@ export function reconcileTask({
       (!ids.has(t.task.agentId) ||
         agents.some((a) => a.id === t.task.agentId && runChanged(t.task, a))),
   );
-  return { open, unknown, close, adopt };
+  const hide = [...byAgent.values()].filter((t) => {
+    const a = agents.find((a) => a.id === t.task.agentId);
+    return a && openAgent(a) && !agentShown(a, agents, { shown });
+  });
+  return { open, unknown, close, adopt, hide };
 }
-
-// The owner's helper session lives in the home area, never in a project group.
-export const homeAgent = (a) => a?.role === "owner_helper";
 
 // A normalized binding that keeps the helper role; other roles are dropped.
 export function bindingOf(value) {
@@ -146,11 +175,61 @@ export function taskBinding(taskId, agent) {
   });
 }
 
-// The agents that fill a project's panes: the helper never takes a slot.
-export const taskMemberIds = (task, agents) =>
+// The agents that fill a project's panes: the helper never takes a slot, and
+// in a helper project only the agents the owner chose (shown) do.
+export const taskMemberIds = (task, agents, shown) =>
   task?.status === "closed"
     ? []
-    : agents.filter((a) => openAgent(a) && !homeAgent(a)).map((a) => a.id);
+    : agents
+        .filter(
+          (a) =>
+            openAgent(a) && !homeAgent(a) && agentShown(a, agents, { shown }),
+        )
+        .map((a) => a.id);
+
+// The ▾ terminal menu of a project: its open agents other than the helper, in
+// one section per work item (roster order, the item lead first), then the
+// agents with no work item. titles maps itemId -> title; the id stands in
+// until the title is known. Each row says whether the agent is shown.
+export function terminalMenuSections(
+  agents = [],
+  { shown, hidden, titles } = {},
+) {
+  const sections = new Map();
+  const none = [];
+  for (const a of agents) {
+    if (!openAgent(a) || homeAgent(a)) continue;
+    const row = {
+      agentId: a.id,
+      name: a.name,
+      status: a.status,
+      lead: !!a.itemLead,
+      shown: agentShown(a, agents, { shown, hidden }),
+    };
+    const itemId = a.workItem?.itemId;
+    if (!itemId) {
+      none.push(row);
+      continue;
+    }
+    if (!sections.has(itemId))
+      sections.set(itemId, {
+        itemId,
+        itemTaskId: a.workItem.itemTaskId || a.taskId || "",
+        title: titles?.get(itemId) || itemId,
+        rows: [],
+      });
+    sections.get(itemId).rows.push(row);
+  }
+  const out = [...sections.values()].map((section) => ({
+    ...section,
+    rows: [
+      ...section.rows.filter((r) => r.lead),
+      ...section.rows.filter((r) => !r.lead),
+    ],
+  }));
+  if (none.length) out.push({ itemId: "", title: "No work item", rows: none });
+  return out;
+}
 
 // Whether a pane belongs in the home area: only the owner helper's pane does.
 //   binding: the pane's task binding, if any

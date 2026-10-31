@@ -121,7 +121,7 @@ The deployed frontend uses `npm run build:static` instead.
   | Pane                                                                      | In Home?                                                       |
   | ------------------------------------------------------------------------- | -------------------------------------------------------------- |
   | bound to the `owner_helper` agent                                         | always; it never leaves                                        |
-  | bound to any other agent                                                  | never; it joins its project group                              |
+  | bound to any other agent                                                  | never; it joins its project group (when shown, see below)      |
   | a terminal the owner opens (Start session, plain shell, Resume, bookmark) | never; it opens as an ordinary tab                             |
   | a launcher session the hub later reports as the helper                    | moves into Home when it is adopted                             |
   | restored, bound, roster not yet known                                     | its saved place until the roster arrives, then by its hub role |
@@ -130,6 +130,45 @@ The deployed frontend uses `npm run build:static` instead.
   migrate on the first restore: the shells leave Home together as one ordinary
   group that keeps their arrangement (one shell becomes an ordinary tab) and the
   helper stays. It happens once; afterwards they are ordinary terminals.
+
+  **Helper-only projects** (wi_649926f70aaa762a). A project with an open owner
+  helper shows only the helper, in Home, until the owner pulls other agents
+  in; it has no project tab while none is shown. A project with no helper shows
+  all its agents as before.
+
+  | Agent of a project                                  | Pane opens?                                                   |
+  | --------------------------------------------------- | ------------------------------------------------------------- |
+  | the owner helper                                    | always (in Home), unless the owner closed it                  |
+  | another agent, project has a helper                 | only when the owner chose it (▾ menu, Board or Projects open) |
+  | another agent, project has no helper                | yes, unless the owner closed its pane                         |
+  | a launcher session the owner opened, adopted later  | yes; adoption marks it chosen                                 |
+  | an agent the hub reports later, or a new run of one | only when it is chosen (chosen agents reopen on the new run)  |
+
+  The ▾ on the Home tab and on each project tab (and every continued part)
+  lists the project's other open agents, one sub-menu per work item named by
+  its title (its id until the title loads, or if the read fails) with the item
+  lead first, then "No work item". The helper and closed agents are not
+  listed, and each row shows the agent's status. Choosing an agent opens its
+  pane in the project tab and focuses it; choosing it again, or × on its pane,
+  removes the pane. Removing never closes, retires or cleans up the agent and
+  makes no hub call: the tmux session keeps running and choosing it again
+  reattaches the same run. The menu stays open for several choices and works
+  by keyboard (Enter or ArrowRight opens a sub-menu, ArrowLeft or Escape
+  returns). The tab-strip "▾ Terminals" button, shown while any live project
+  is bound, and the palette command "Project: pick terminals…" open the same
+  menu for every bound project, so a project whose last pane was removed stays
+  reachable. "Project: open terminals…" on a helper project opens that menu
+  instead of every agent.
+
+  The choice is saved per origin as `shownAgents` in the encrypted workspace.
+  The login restore reads it before any reconnect: a saved pane of an agent
+  that is not chosen is skipped (its session bookmark stays bound, since the
+  agent is alive), so nothing opens only to close. A workspace saved before
+  this has no `shownAgents` and restores only the helpers. When the roster is
+  unknown at restore (hub down), saved panes reconnect as before and panes
+  that are not chosen close once the roster arrives. In a helper project the
+  saved project layout tracks only the chosen agents, so a pulled-in pane
+  joins the earliest part with room.
 
   Home is never counted by Panes per group, never splits into "(continued)" and
   never reserves a project slot (the helper is not a project member). Nothing
@@ -159,7 +198,8 @@ bounded `hostname -s` probe. This matters because Mini reports `Stephens-Mini`,
 which differs from some saved Tailscale/DNS names. Do not simplify matching back
 to literal hostname equality.
 
-Terminal layouts and bound project groups are local to each browser origin.
+Terminal layouts, bound project groups and the agents shown in helper
+projects (`shownAgents`) are local to each browser origin.
 After restoring a profile on another origin, use Board → project → Terminals
 or Projects → More → Open terminals to attach the existing agents. A same-origin
 saved project binding is restored even if its previous workspace had zero panes.

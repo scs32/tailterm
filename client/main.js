@@ -75,6 +75,7 @@ import { setupTabStrip } from "./tab-strip.js";
 import { PANE_LIMITS, seriesKey } from "./pane-cap.js";
 import { leaves } from "./pane-layout.js";
 import { setupPaneGroups } from "./pane-groups.js";
+import { createTerminalMenu } from "./terminal-menu.js";
 import { setupTerminalView } from "./terminal-view.js";
 import { sidebarIcon } from "./sidebar-icons.js";
 import logo from "./logo.svg?raw";
@@ -150,6 +151,12 @@ for (const event of ["pointerdown", "keydown"])
     { capture: true },
   );
 let paneGroups;
+// The ▾ terminal menu; created before mount() can run (top-level await).
+const terminalMenu = createTerminalMenu({
+  root: () => document.querySelector("#workspace") || document.body,
+});
+// Re-anchors the open menu after the tab strip redraws its buttons.
+let terminalMenuSource = null; // {scope, taskId, index}
 let taskHub = null,
   modes = null,
   boardView = null,
@@ -251,6 +258,7 @@ async function flushWorkspace() {
       taskHub?.hidden() || [],
       paneGroups.model.projectLayoutSnapshot(),
       paneGroups.model.home,
+      taskHub?.shown() || [],
     ),
     serialized = JSON.stringify(snapshot);
   if (serialized === savedWorkspace) return;
@@ -259,6 +267,10 @@ async function flushWorkspace() {
 }
 async function restoreWorkspace(value) {
   const snapshot = normalizeWorkspace(value);
+  // The owner's choice of agents in helper projects, before any hub read,
+  // reconnect or reconcile; no snapshot (first use) shows only the helpers.
+  const shownSet = new Set(snapshot?.shownAgents || []);
+  taskHub?.seedShown(shownSet);
   restoring = true;
   if ($("#workspace")) $("#workspace").dataset.restoring = "true";
   try {
@@ -326,8 +338,11 @@ async function restoreWorkspace(value) {
         if (!task) continue;
         let role;
         const detail = hub.get(task.taskId);
-        const verdict = restoreVerdict(task, detail);
+        const verdict = restoreVerdict(task, detail, shownSet);
         const agent = detail?.agents?.find((a) => a.id === task.agentId);
+        // Not chosen in a helper project: the agent is alive, so its bookmark
+        // stays; only its pane is not reopened.
+        if (verdict === "not-shown") continue;
         // A known roster decides home by role; otherwise the saved place.
         if (agent) role = homeAgent(agent) ? "owner_helper" : "";
         if (
@@ -521,7 +536,7 @@ function mount() {
   $("#lockscreen")?.remove();
   $("#app").insertAdjacentHTML(
     "beforeend",
-    `<div id="workspace"><aside><div class="brand">${icon}<strong>tailterm</strong></div><div class="sidebar-section"><span>SERVERS</span><button id="all-servers" aria-label="All servers" aria-pressed="true" title="Show sessions from all servers">All</button></div><input id="filter" class="filter" placeholder="⌕  Find a server…" aria-label="Find a server"><nav id="server-list"></nav><button id="discover" class="sidebar-discover">⌕ Discover devices</button><div class="sidebar-bottom"><button id="keys">♧ <span>SSH key vault</span><span id="key-count">0</span></button><button id="lock">↪ <span>Lock workspace</span><kbd>⇧⌘L</kbd></button></div></aside><main><header><div class="header-right"><button id="tailscale-login"><span class="status-dot" id="tail-dot" aria-hidden="true"></span><span id="tail-status">Connect Tailscale ↗</span></button></div></header><section class="terminal-shell"><div class="terminal-tabs"><div class="tab-strip">${staticMode ? '<div id="home-tab" class="tab home-tab" draggable="false"></div>' : ""}<button id="tabs-left" class="tab-scroll" aria-label="Scroll tabs left" title="Scroll tabs left" hidden>‹</button><div id="tabs" role="tablist" aria-label="SSH connections"></div><button id="tabs-right" class="tab-scroll" aria-label="Scroll tabs right" title="Scroll tabs right" hidden>›</button><button id="new-tab" class="icon-button" title="Start or resume a session">+</button></div><div class="terminal-tools"><button id="search-toggle" title="Find in terminal">⌕</button><button id="font-down" title="Smaller text">A−</button><button id="font-up" title="Larger text">A+</button><button id="appearance" title="Appearance\nThemes, fonts, cursor and spacing" aria-label="Appearance">◐</button><button id="fullscreen" title="Fullscreen">⛶</button></div></div><div id="search-bar" hidden><input id="terminal-search" placeholder="Find in scrollback" aria-label="Find in terminal"><button id="find-next">Next ↓</button><button id="search-close">×</button></div><div id="terminal-body"><div id="empty-terminal"><div class="session-launcher"><p id="server-filter-empty" class="fine" hidden></p><span class="eyebrow">YOUR REMOTE WORKSPACE</span><h2>Pick up where you left off.</h2><p class="launcher-intro">Choose a server, then open a fresh workspace or return to a running session.</p><div id="launcher-server" class="server-grid" role="group" aria-label="Session server"></div><div class="launch-section"><div class="launch-section-title"><span class="step-dot">＋</span><div><h3>Start fresh</h3><p>A persistent tmux workspace on <strong id="launch-target"></strong></p></div></div><div class="launch-new"><input id="launcher-name" placeholder="Optional name · leave blank for an automatic ID" aria-label="New tmux session name" maxlength="64"><button id="start-session" class="primary">＋ Start session</button></div></div><div class="resume-heading"><strong>Pick up a session</strong><button id="launcher-refresh" title="Refresh sessions\nQuery this server now; no sessions are changed.">↻ Refresh</button></div><p id="launcher-note"></p><div id="launcher-sessions"></div><div class="launcher-secondary"><button id="launcher-shell">Open plain SSH shell</button><button id="launcher-discover">⌕ Discover devices</button></div></div></div></div><div class="terminal-footer"><span id="terminal-status">○ No active connection</span><div><button id="copy">Copy</button><button id="paste">Paste</button><button id="clear">Clear</button><button id="reconnect">Reconnect</button><span id="dimensions">— × —</span></div></div></section></main></div><dialog id="dialog"></dialog>`,
+    `<div id="workspace"><aside><div class="brand">${icon}<strong>tailterm</strong></div><div class="sidebar-section"><span>SERVERS</span><button id="all-servers" aria-label="All servers" aria-pressed="true" title="Show sessions from all servers">All</button></div><input id="filter" class="filter" placeholder="⌕  Find a server…" aria-label="Find a server"><nav id="server-list"></nav><button id="discover" class="sidebar-discover">⌕ Discover devices</button><div class="sidebar-bottom"><button id="keys">♧ <span>SSH key vault</span><span id="key-count">0</span></button><button id="lock">↪ <span>Lock workspace</span><kbd>⇧⌘L</kbd></button></div></aside><main><header><div class="header-right"><button id="tailscale-login"><span class="status-dot" id="tail-dot" aria-hidden="true"></span><span id="tail-status">Connect Tailscale ↗</span></button></div></header><section class="terminal-shell"><div class="terminal-tabs"><div class="tab-strip">${staticMode ? '<div id="home-tab" class="tab home-tab" draggable="false"></div>' : ""}<button id="tabs-left" class="tab-scroll" aria-label="Scroll tabs left" title="Scroll tabs left" hidden>‹</button><div id="tabs" role="tablist" aria-label="SSH connections"></div><button id="tabs-right" class="tab-scroll" aria-label="Scroll tabs right" title="Scroll tabs right" hidden>›</button><button id="new-tab" class="icon-button" title="Start or resume a session">+</button>${staticMode ? '<button id="project-terminals" aria-label="Project terminals" aria-haspopup="menu" aria-expanded="false" title="Project terminals\nOpen or close the terminals of a project" hidden>▾ Terminals</button>' : ""}</div><div class="terminal-tools"><button id="search-toggle" title="Find in terminal">⌕</button><button id="font-down" title="Smaller text">A−</button><button id="font-up" title="Larger text">A+</button><button id="appearance" title="Appearance\nThemes, fonts, cursor and spacing" aria-label="Appearance">◐</button><button id="fullscreen" title="Fullscreen">⛶</button></div></div><div id="search-bar" hidden><input id="terminal-search" placeholder="Find in scrollback" aria-label="Find in terminal"><button id="find-next">Next ↓</button><button id="search-close">×</button></div><div id="terminal-body"><div id="empty-terminal"><div class="session-launcher"><p id="server-filter-empty" class="fine" hidden></p><span class="eyebrow">YOUR REMOTE WORKSPACE</span><h2>Pick up where you left off.</h2><p class="launcher-intro">Choose a server, then open a fresh workspace or return to a running session.</p><div id="launcher-server" class="server-grid" role="group" aria-label="Session server"></div><div class="launch-section"><div class="launch-section-title"><span class="step-dot">＋</span><div><h3>Start fresh</h3><p>A persistent tmux workspace on <strong id="launch-target"></strong></p></div></div><div class="launch-new"><input id="launcher-name" placeholder="Optional name · leave blank for an automatic ID" aria-label="New tmux session name" maxlength="64"><button id="start-session" class="primary">＋ Start session</button></div></div><div class="resume-heading"><strong>Pick up a session</strong><button id="launcher-refresh" title="Refresh sessions\nQuery this server now; no sessions are changed.">↻ Refresh</button></div><p id="launcher-note"></p><div id="launcher-sessions"></div><div class="launcher-secondary"><button id="launcher-shell">Open plain SSH shell</button><button id="launcher-discover">⌕ Discover devices</button></div></div></div></div><div class="terminal-footer"><span id="terminal-status">○ No active connection</span><div><button id="copy">Copy</button><button id="paste">Paste</button><button id="clear">Clear</button><button id="reconnect">Reconnect</button><span id="dimensions">— × —</span></div></div></section></main></div><dialog id="dialog"></dialog>`,
   );
   if (staticMode) {
     $("#keys").insertAdjacentHTML(
@@ -715,6 +730,7 @@ function mount() {
         boardView?.show(id);
       },
       showTerminals: () => modes?.set("terminals"),
+      pickTerminals: (taskId, options) => pickTerminals(taskId, options),
       clearAgentBookmark,
       tmuxSessions: async (server) => {
         if (
@@ -1217,11 +1233,12 @@ function renderTabs() {
           ? `${continued ? label : groupName}\n${ids.length} panes: ${names.join(", ")}\nFocused: ${tabName(t)} · ${t.status}\nDrag onto another tab to merge groups. × closes the focused pane.`
           : `${tabName(t, true)}\n${t.server.username}@${t.server.host}:${t.server.port}\n${t.status}${t.tmux ? " · tmux launch: " + t.session + (t.tmuxVerified ? "" : " (unverified)") : ""}\nDrop at a tab edge to reorder; drop in its center to group.`) +
         taskLine;
-      return `<div class="tab ${ids.includes(active) ? "active" : ""} ${grouped ? "group-tab" : ""} ${newOutput ? "has-new-output" : ""} ${group?.taskId ? "task-tab" : ""}" data-tab-color="${decoration.color}" data-tab-fill="${decoration.fill}" style='--tab-font:${esc(fonts[decoration.font]?.family || "var(--terminal-font)")}' draggable="false"><button data-tab="${t.id}" role="tab" aria-selected="${ids.includes(active)}" title="${esc(activities.length ? title + "\n" + [...new Set(activities)].join(", ") : title)}"><span class="node-dot ${t.status === "Connected" ? "online" : ""}"></span><span class="tab-copy"><span class="tab-name">${esc(label)}</span></span></button>${staticMode ? `<button data-session-menu="${t.id}" aria-label="Session actions for ${esc(t.session)}" title="Session actions and tab order">...</button>` : ""}<button data-close="${t.id}" aria-label="Close ${esc(t.server.name)} ${grouped ? "focused pane" : "terminal"}">×</button></div>`;
+      return `<div class="tab ${ids.includes(active) ? "active" : ""} ${grouped ? "group-tab" : ""} ${newOutput ? "has-new-output" : ""} ${group?.taskId ? "task-tab" : ""}" data-tab-color="${decoration.color}" data-tab-fill="${decoration.fill}" style='--tab-font:${esc(fonts[decoration.font]?.family || "var(--terminal-font)")}' draggable="false"><button data-tab="${t.id}" role="tab" aria-selected="${ids.includes(active)}" title="${esc(activities.length ? title + "\n" + [...new Set(activities)].join(", ") : title)}"><span class="node-dot ${t.status === "Connected" ? "online" : ""}"></span><span class="tab-copy"><span class="tab-name">${esc(label)}</span></span></button>${staticMode && group?.taskId ? terminalMenuButton(group.taskId, label) : ""}${staticMode ? `<button data-session-menu="${t.id}" aria-label="Session actions for ${esc(t.session)}" title="Session actions and tab order">...</button>` : ""}<button data-close="${t.id}" aria-label="Close ${esc(t.server.name)} ${grouped ? "focused pane" : "terminal"}">×</button></div>`;
     })
     .join("");
   if ($("#home-tab")) renderHomeTab($("#home-tab"));
   $$("[data-tab]").forEach((b) => (b.onclick = () => activate(b.dataset.tab)));
+  renderTerminalMenus();
   $$("[data-session-menu]").forEach(
     (b) =>
       (b.onclick = () => {
@@ -1357,7 +1374,121 @@ function renderHomeTab(el) {
     fonts[decoration.font]?.family || "var(--terminal-font)",
   );
   el.classList.toggle("has-new-output", activities.includes("New output"));
-  el.innerHTML = `<button data-tab="${t.id}" role="tab" aria-selected="${focused}" title="${esc(title)}"><span class="home-mark" role="img" aria-label="Home: ${esc(label)}">⌂</span><span class="node-dot ${t.status === "Connected" ? "online" : ""}"></span><span class="tab-copy"><span class="tab-name" aria-hidden="true">${esc(label)}</span></span></button><button data-session-menu="${t.id}" aria-label="Session actions for ${esc(t.session)}" title="Session actions">...</button><button data-close="${t.id}" aria-label="Close ${esc(t.server.name)} focused pane">×</button>`;
+  el.innerHTML = `<button data-tab="${t.id}" role="tab" aria-selected="${focused}" title="${esc(title)}"><span class="home-mark" role="img" aria-label="Home: ${esc(label)}">⌂</span><span class="node-dot ${t.status === "Connected" ? "online" : ""}"></span><span class="tab-copy"><span class="tab-name" aria-hidden="true">${esc(label)}</span></span></button>${t.task?.taskId ? terminalMenuButton(t.task.taskId, taskHub?.name(t.task.taskId) || label) : ""}<button data-session-menu="${t.id}" aria-label="Session actions for ${esc(t.session)}" title="Session actions">...</button><button data-close="${t.id}" aria-label="Close ${esc(t.server.name)} focused pane">×</button>`;
+}
+// The ▾ terminal menu (wi_649926f70aaa762a): a project with an owner helper
+// shows only the helper; the menu on the Home tab and on each project tab
+// lists the project's other agents by work item, to add or remove their panes.
+// The tab-strip "▾ Terminals" button lists every bound live project, so a
+// project with no pane left stays reachable.
+const terminalStatus = (status) =>
+  ({ needs_input: "needs input" })[status] || status || "";
+function terminalMenuButton(taskId, name) {
+  return `<button data-terminal-menu="${esc(taskId)}" aria-haspopup="menu" aria-expanded="false" aria-label="Other terminals in ${esc(name)}" title="Other terminals in ${esc(name)}">▾</button>`;
+}
+function terminalSectionRows(taskId) {
+  const key = (section) => `s:${section.itemId || "none"}`;
+  return (taskHub?.menuSections(taskId) || []).map((section) => ({
+    key: key(section),
+    label: section.title,
+    note: String(section.rows.length),
+    empty: "No open terminals",
+    children: () =>
+      (
+        taskHub?.menuSections(taskId).find((s) => key(s) === key(section))
+          ?.rows || []
+      ).map((row) => ({
+        key: `a:${row.agentId}`,
+        label: row.name,
+        note: [row.lead ? "lead" : "", terminalStatus(row.status)]
+          .filter(Boolean)
+          .join(" · "),
+        checked: row.shown,
+        select: () => taskHub.setShown(taskId, row.agentId, !row.shown),
+      })),
+  }));
+}
+function terminalProjectRows() {
+  return (taskHub?.pickableProjects() || []).map((project) => ({
+    key: `p:${project.taskId}`,
+    label: project.name,
+    empty: "No other terminals",
+    children: () => terminalSectionRows(project.taskId),
+  }));
+}
+// Open the menu of one project (taskId) from its ▾, or the tab-strip menu
+// of every bound project (taskId null, or no ▾ for it on screen).
+function pickTerminals(taskId, { keyboard = false, button } = {}) {
+  if (!taskHub) return;
+  const anchor =
+    button ||
+    (taskId &&
+      [...$$(`[data-terminal-menu="${CSS.escape(taskId)}"]`)].find(
+        (b) => b.offsetParent,
+      )) ||
+    $("#project-terminals");
+  if (!anchor || anchor.hidden) return;
+  const strip = anchor.id === "project-terminals";
+  const scope = strip ? "strip" : anchor.closest("#home-tab") ? "home" : "tabs";
+  const forTask = strip
+    ? button
+      ? null
+      : taskId
+    : anchor.dataset.terminalMenu;
+  terminalMenuSource = {
+    scope,
+    taskId: anchor.dataset.terminalMenu || "",
+    index: strip
+      ? 0
+      : [
+          ...$$(
+            `#${scope === "home" ? "home-tab" : "tabs"} [data-terminal-menu="${CSS.escape(anchor.dataset.terminalMenu)}"]`,
+          ),
+        ].indexOf(anchor),
+  };
+  const ids = forTask
+    ? [forTask]
+    : (taskHub.pickableProjects() || []).map((p) => p.taskId);
+  terminalMenu.open(anchor, {
+    title: forTask
+      ? `Other terminals in ${taskHub.name(forTask) || "this project"}`
+      : "Project terminals",
+    empty: forTask ? "No other terminals" : "No bound projects",
+    rows: forTask ? () => terminalSectionRows(forTask) : terminalProjectRows,
+    keyboard,
+    closed: () => (terminalMenuSource = null),
+  });
+  for (const id of ids)
+    void taskHub
+      .loadTitles(id)
+      .then((changed) => changed && terminalMenu.refresh());
+}
+function renderTerminalMenus() {
+  const strip = $("#project-terminals");
+  if (strip) strip.hidden = !taskHub?.pickableProjects().length;
+  $$("[data-terminal-menu], #project-terminals").forEach(
+    (b) =>
+      (b.onclick = (event) =>
+        pickTerminals(b.dataset.terminalMenu || null, {
+          button: b,
+          keyboard: event.detail === 0,
+        })),
+  );
+  if (!terminalMenu.isOpen()) return;
+  const anchor = terminalMenu.anchor();
+  if (!anchor?.isConnected || anchor.hidden) {
+    const source = terminalMenuSource;
+    const next =
+      source?.scope === "strip"
+        ? $("#project-terminals")
+        : source &&
+          $$(
+            `#${source.scope === "home" ? "home-tab" : "tabs"} [data-terminal-menu="${CSS.escape(source.taskId)}"]`,
+          )[Math.max(0, source.index)];
+    if (next && !next.hidden) terminalMenu.setAnchor(next);
+    else terminalMenu.close();
+  }
+  terminalMenu.refresh();
 }
 function renderClipboard() {
   const t = currentTab();
