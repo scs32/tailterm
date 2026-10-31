@@ -3,6 +3,9 @@ import { HubError } from "./hub-client.js";
 // The page size of the hub client's subscribe loop. A full page means more
 // retained events are waiting behind it.
 const FEED_PAGE = 100;
+// A full page that no next page follows within this long ends the catch-up:
+// the backlog ended exactly on a page boundary.
+const CATCH_UP_QUIET_MS = 250;
 // Unchanged data is saved again only after this long, to keep its age and
 // eviction order current without a full encrypted save on every refresh.
 const RESAVE_MS = 10 * 60 * 1000;
@@ -330,23 +333,38 @@ export function createCachedHubClient({
   }
   // One hub feed per project for the life of this client. Views attach and
   // detach; a later view resumes from the kept cursor instead of replaying
-  // every retained event, and a catch-up marks reads stale once, at its end.
-  // Views ignore event payloads, so they hear only the last page of it.
+  // every retained event. The initial catch-up marks reads stale once, at its
+  // end: its first short page, or a quiet interval after a full page. After
+  // that every page marks reads stale. Views ignore event payloads, so they
+  // hear only the last page of the catch-up.
   function sharedFeed(task, after = 0) {
     if (feeds.has(task)) return feeds.get(task);
-    const shared = { views: new Set() };
-    let changes = false;
+    const shared = { views: new Set(), quiet: null };
+    let changes = false,
+      caughtUp = false,
+      last = null;
+    const flush = () => {
+      clearTimeout(shared.quiet);
+      shared.quiet = null;
+      caughtUp = true;
+      if (disposed) return;
+      if (changes) markStale();
+      changes = false;
+      const [events, cursor] = last;
+      for (const view of shared.views)
+        Promise.resolve()
+          .then(() => view.onEvents(events, cursor))
+          .catch(view.onError);
+    };
     shared.feed = client.subscribe(
       task,
       (events, cursor) => {
         changes ||= events.some((event) => event.kind !== "heartbeat");
-        if (events.length >= FEED_PAGE) return;
-        if (changes) markStale();
-        changes = false;
-        for (const view of shared.views)
-          Promise.resolve()
-            .then(() => view.onEvents(events, cursor))
-            .catch(view.onError);
+        last = [events, cursor];
+        clearTimeout(shared.quiet);
+        if (!caughtUp && events.length >= FEED_PAGE)
+          shared.quiet = setTimeout(flush, CATCH_UP_QUIET_MS);
+        else flush();
       },
       {
         after,
@@ -736,7 +754,10 @@ export function createCachedHubClient({
       for (const task of auditEpochs.keys())
         auditEpochs.set(task, (auditEpochs.get(task) || 0) + 1);
       for (const stop of stops) stop();
-      for (const shared of feeds.values()) shared.feed.stop();
+      for (const shared of feeds.values()) {
+        shared.feed.stop();
+        clearTimeout(shared.quiet);
+      }
       feeds.clear();
       capabilityMemo = null;
       listeners.clear();

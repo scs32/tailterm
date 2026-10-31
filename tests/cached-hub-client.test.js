@@ -1001,3 +1001,49 @@ test("an unchanged refresh skips the encrypted save until the entry ages", async
     view.dispose();
   }
 });
+
+test("a full live page after the catch-up still marks reads stale and reaches views", async () => {
+  const f = fixture(),
+    feed = feedClient(f.live),
+    view = f.make(feed.client);
+  try {
+    await view.listTasks();
+    await settle();
+    let reloads = 0;
+    view.subscribe("", () => reloads++);
+    await feed.deliver("", 4);
+    await view.listTasks();
+    await settle();
+    assert.equal(reloads, 1);
+    const before = f.requests.length;
+    await feed.deliver("", 100);
+    await view.listTasks();
+    await settle();
+    assert.equal(reloads, 2, "the full live page reaches views");
+    assert.equal(f.requests.length, before + 1, "and marks reads stale");
+  } finally {
+    view.dispose();
+  }
+});
+
+test("a backlog that ends on a full page marks reads stale once the feed goes quiet", async () => {
+  const f = fixture(),
+    feed = feedClient(f.live),
+    view = f.make(feed.client);
+  try {
+    await view.listTasks();
+    await settle();
+    let reloads = 0;
+    view.subscribe("", () => reloads++);
+    const before = f.requests.length;
+    await feed.deliver("", 100);
+    await feed.deliver("", 100);
+    await settle(() => reloads >= 1, 1000);
+    assert.equal(reloads, 1, "the coalesced backlog reaches views once");
+    await view.listTasks();
+    await settle();
+    assert.equal(f.requests.length, before + 1, "and marks reads stale once");
+  } finally {
+    view.dispose();
+  }
+});
