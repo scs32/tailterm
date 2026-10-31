@@ -13,6 +13,14 @@ function pushText(push) {
   return `push ${push.timedOut === true ? "timed out" : "failed"}${push.remoteCheck ? ` · remote ${esc(push.remoteCheck)}` : ""}`;
 }
 
+// The lane policy as it applies now (wi_35e9f7f50b620957): lanes, the day or
+// night window, and why fewer or none are admitted. Absent without a policy.
+function lanesText(lanes) {
+  if (!lanes) return "";
+  const held = lanes.hold ? ` · held: ${lanes.matrixWaiters == null ? "matrix lock not observed" : "matrix waits"}` : "";
+  return `<span class="fine" data-testid="team-delivery-lanes" title="${esc(lanes.hold || "")}">Lanes ${esc(lanes.lanes)} · ${esc(lanes.window)}${lanes.strained ? " · strained" : ""}${held}</span>`;
+}
+
 export function renderTeamDelivery(queue, agents = [], ownerRequests = [], taskId = "") {
   if (!queue || !Array.isArray(queue.entries) || queue.entries.length === 0) return "";
   const byId = new Map(agents.map((agent) => [agent.id, agent]));
@@ -49,10 +57,12 @@ export function renderTeamDelivery(queue, agents = [], ownerRequests = [], taskI
     const notableChecks = verification?.checks?.filter(c => c.status !== "pass" || c.knownFailure || c.nowPassing) || [];
     const verificationText = verification ? `<span class="fine" style="overflow-wrap:anywhere" data-testid="verification-summary">Verification ${esc(verification.state)}${notableChecks.length ? " · " + notableChecks.map(c => `${esc(c.id)}: ${esc(c.status)}${c.knownFailure ? " · known failure" : ""}${c.nowPassing ? " · now passing; remove from known failures" : ""}`).join("; ") : ""}</span>` : "";
     const activity = entry.activities?.map((member) => `${member.name}: ${activityLabel(member.activity)}`).join(" · ") || "";
-    return `<div class="team-delivery-row" data-testid="team-delivery-entry"><strong>${esc(entry.itemId)}</strong><span class="fine">${esc(entry.state)}${shape}${blocked ? ` · ${esc(blocked)}` : ""}</span><span class="fine">Owns ${esc(owns)}</span>${lead || handler ? `<span class="fine">${lead ? `Lead ${esc(lead)}` : ""}${lead && handler ? " · " : ""}${handler ? `Handler ${esc(handler)}` : ""}</span>` : ""}${activity ? `<span class="fine">${esc(activity)}</span>` : ""}<span class="fine">${esc(tokenSnapshot(entry.tokens))}</span><span class="fine" data-testid="review-convergence-summary">${esc(reviewText)}</span>${ownerWaitSummary(ownerRequests, taskId || entry.taskId, entry.itemId)}${followUps}${verificationText}${ready}${releaseText}</div>`;
+    // Queued entries are the up-next list, numbered in admission order.
+    const upNext = entry.upNext ? `<span data-testid="team-up-next">Up next ${esc(entry.upNext)}</span> · ` : "";
+    return `<div class="team-delivery-row" data-testid="team-delivery-entry"><strong>${upNext}${esc(entry.itemId)}</strong><span class="fine">${esc(entry.state)}${shape}${blocked ? ` · ${esc(blocked)}` : ""}</span><span class="fine">Owns ${esc(owns)}</span>${lead || handler ? `<span class="fine">${lead ? `Lead ${esc(lead)}` : ""}${lead && handler ? " · " : ""}${handler ? `Handler ${esc(handler)}` : ""}</span>` : ""}${activity ? `<span class="fine">${esc(activity)}</span>` : ""}<span class="fine">${esc(tokenSnapshot(entry.tokens))}</span><span class="fine" data-testid="review-convergence-summary">${esc(reviewText)}</span>${ownerWaitSummary(ownerRequests, taskId || entry.taskId, entry.itemId)}${followUps}${verificationText}${ready}${releaseText}</div>`;
   }).join("");
   // The hub lists the newest page of finished entries; say when older ones exist.
   const shown = queue.entries.filter((entry) => entry.summary).length;
   const history = queue.history?.nextAfter ? `<span class="fine" data-testid="team-delivery-history">Showing ${esc(shown)} of ${esc(queue.history.total)} finished</span>` : "";
-  return `<article class="task-card task-detail-card team-delivery-panel" data-testid="team-delivery-panel"><header><h3>Delivery</h3><span class="fine">${queue.concurrencyLimit === 0 ? "No fixed limit" : `Limit ${esc(queue.concurrencyLimit ?? 1)}`}</span>${history}</header><div class="team-delivery-rows">${rows}</div></article>`;
+  return `<article class="task-card task-detail-card team-delivery-panel" data-testid="team-delivery-panel"><header><h3>Delivery</h3><span class="fine">${queue.concurrencyLimit === 0 ? "No fixed limit" : `Limit ${esc(queue.concurrencyLimit ?? 1)}`}</span>${lanesText(queue.lanes)}${history}</header><div class="team-delivery-rows">${rows}</div></article>`;
 }

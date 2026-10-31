@@ -118,3 +118,24 @@ test("folded follow-ups are counted apart and named as folded into their item", 
   assert.ok(!escaped.includes("<b>") && !escaped.includes("<i>"));
   assert.match(escaped, /Follow-ups 0 new, 1 folded/);
 });
+
+// wi_35e9f7f50b620957 a3: queued entries read as the up-next list, in the
+// listing's order, and the header names the lanes only with a lane policy.
+test("queued rows are numbered up next and the header shows the lanes", () => {
+  const entries = [
+    { itemId: "wi_running", state: "running" },
+    { itemId: "wi_second", state: "queued", upNext: 1 },
+    { itemId: "wi_third", state: "queued", upNext: 2 },
+  ];
+  const html = renderTeamDelivery({ concurrencyLimit: 4, entries });
+  assert.deepEqual([...html.matchAll(/<strong>(?:<span data-testid="team-up-next">([^<]*)<\/span> · )?([^<]*)<\/strong>/g)].map((m) => [m[1] ?? "", m[2]]), [["", "wi_running"], ["Up next 1", "wi_second"], ["Up next 2", "wi_third"]]);
+  assert.ok(!html.includes("team-delivery-lanes") && !html.includes("Lanes "));
+  const lanes = (fields) => renderTeamDelivery({ concurrencyLimit: 4, entries, lanes: { policy: { day: 4, night: 3 }, window: "night", lanes: 3, active: 1, ...fields } }).match(/data-testid="team-delivery-lanes"[^>]*>([^<]*)</)[1];
+  assert.equal(lanes({}), "Lanes 3 · night");
+  assert.equal(lanes({ window: "day", lanes: 4 }), "Lanes 4 · day");
+  assert.equal(lanes({ lanes: 2, strained: true, memoryPressure: 85 }), "Lanes 2 · night · strained");
+  assert.equal(lanes({ hold: "a matrix run waits for the verification host (1 waiting)", matrixWaiters: 1 }), "Lanes 3 · night · held: matrix waits");
+  assert.equal(lanes({ hold: "the verification host's matrix lock is not observed" }), "Lanes 3 · night · held: matrix lock not observed");
+  const escaped = renderTeamDelivery({ entries, lanes: { window: "<b>", lanes: "<i>", hold: '"><img src=x>' } });
+  assert.ok(!escaped.includes("<b>") && !escaped.includes("<i>") && !escaped.includes("<img"));
+});

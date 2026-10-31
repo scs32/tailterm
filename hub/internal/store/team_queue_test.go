@@ -4142,3 +4142,333 @@ func rotationDueByTokensActivity(t *testing.T, f *rotationFixture) {
 		t.Fatal(err)
 	}
 }
+
+// Lanes and up next (docs/project-queue.md, "Team queue lanes and up next").
+
+// Pinned clocks for the lane tests, in America/Los_Angeles winter time.
+var (
+	laneNight = time.Date(2026, 1, 16, 7, 30, 0, 0, time.UTC) // 23:30 PST
+	laneDay   = time.Date(2026, 1, 15, 20, 0, 0, 0, time.UTC) // 12:00 PST
+)
+
+func lanePolicy(day, night int) api.TeamQueueLanePolicy {
+	return api.TeamQueueLanePolicy{Day: day, Night: night, Zone: "America/Los_Angeles", NightStart: "22:00", NightEnd: "07:00", StrainPressure: api.DefaultLaneStrainPressure, StrainLanes: api.DefaultLaneStrainLanes}
+}
+
+func setLanes(s *Store, taskID string, p *api.TeamQueueLanePolicy) error {
+	_, err := s.TeamQueueAction(context.Background(), taskID, api.TeamQueueRequest{RequestID: api.NewID("tqr"), Operation: "set_lanes", LanePolicy: p, ClearLanePolicy: p == nil})
+	return err
+}
+
+// observeLaneHost pins the clock and saves a fresh host policy and census
+// with the lane signals (nil: not observed).
+func observeLaneHost(t *testing.T, s *Store, taskID string, at time.Time, pressure, waiters *int) {
+	t.Helper()
+	s.now = func() time.Time { return at }
+	ctx := context.Background()
+	var version int64
+	if err := s.db.QueryRow(`SELECT COALESCE(MAX(version),0)+1 FROM team_host_policies WHERE host='mini'`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.TeamQueueAction(ctx, taskID, api.TeamQueueRequest{RequestID: api.NewID("tqr"), Operation: "set_host_policy", Host: "mini", HostPolicyVersion: version, HostPolicyExpires: at.Add(time.Hour).Format(time.RFC3339), HostMaxSessions: 100, HostMaxPolling: 10, LimiterDomain: "https://fixture.invalid", HostMaxRelayBindings: 100, HostMaxRequestsPerMinute: 100000, HostMaxBurst: 10000, HostHeadroomPercent: 20}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.TeamQueueAction(ctx, taskID, api.TeamQueueRequest{RequestID: api.NewID("tqr"), Operation: "observe_host", Host: "mini", HostUsage: &api.TeamHostUsage{Host: "mini", LimiterDomain: "https://fixture.invalid", PolicyVersion: version, ObservedAt: at.Format(time.RFC3339Nano), RelayBindings: 1, Complete: true, SourceDigest: strings.Repeat("a", 64), FreeDiskMiB: freeDiskMiB(1 << 20), MemoryPressure: pressure, MatrixWaiters: waiters}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func intp(n int) *int { return &n }
+
+// finishLaneEntry frees a team's slot as a finished entry does.
+func finishLaneEntry(t *testing.T, s *Store, id string) {
+	t.Helper()
+	if _, err := s.db.Exec(`UPDATE team_queue_entries SET state='finished' WHERE id=?`, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`DELETE FROM team_launch_reservations WHERE entry_id=?`, id); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func laneList(t *testing.T, s *Store, taskID string) (api.TeamQueueList, map[string]api.TeamQueueEntry) {
+	t.Helper()
+	list, err := s.TeamQueuePage(context.Background(), taskID, api.TeamQueueListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]api.TeamQueueEntry{}
+	for _, e := range list.Entries {
+		byID[e.ID] = e
+	}
+	return list, byID
+}
+
+// a1: queued entries are numbered 1..N in position order, others carry no
+// number, and a reorder renumbers them.
+func TestTeamQueueUpNextFollowsPosition(t *testing.T) {
+	s, task, items, orders, _ := uncappedFixture(t, 4, 2)
+	setQueueLimit(t, s, task.ID, 0)
+	var entries []api.TeamQueueEntry
+	for i := range items {
+		entries = append(entries, addScopedEntry(t, s, task, items[i], orders[i], fmt.Sprintf("src/%d", i)))
+	}
+	if _, err := claimEntry(s, task, entries[0]); err != nil {
+		t.Fatal(err)
+	}
+	upNext := func() []int {
+		_, byID := laneList(t, s, task.ID)
+		var out []int
+		for _, e := range entries {
+			out = append(out, byID[e.ID].UpNext)
+		}
+		return out
+	}
+	if got := upNext(); !reflect.DeepEqual(got, []int{0, 1, 2, 3}) {
+		t.Fatalf("up next %v, want [0 1 2 3]", got)
+	}
+	_, byID := laneList(t, s, task.ID)
+	last := byID[entries[3].ID]
+	if _, err := s.TeamQueueAction(context.Background(), task.ID, api.TeamQueueRequest{RequestID: api.NewID("tqr"), Operation: "reorder", EntryID: last.ID, ExpectedRevision: last.Revision, BeforeID: entries[1].ID}); err != nil {
+		t.Fatal(err)
+	}
+	if got := upNext(); !reflect.DeepEqual(got, []int{0, 2, 3, 1}) {
+		t.Fatalf("up next after reorder %v, want [0 2 3 1]", got)
+	}
+	// The one-item listing keeps the entry's place in the whole queue, and
+	// the internal listing agrees.
+	item, err := s.TeamQueuePage(context.Background(), task.ID, api.TeamQueueListOptions{Item: items[2].ID})
+	if err != nil || len(item.Entries) != 1 || item.Entries[0].UpNext != 3 {
+		t.Fatalf("item listing %+v %v", item.Entries, err)
+	}
+	if got := listedEntry(t, s, task.ID, entries[3].ID); got.UpNext != 1 {
+		t.Fatalf("internal listing up next %d", got.UpNext)
+	}
+	// No lane policy, no lanes in the listing.
+	if list, _ := laneList(t, s, task.ID); list.Lanes != nil {
+		t.Fatalf("lanes without a policy: %+v", list.Lanes)
+	}
+}
+
+// a4: a lane policy saves and reads back, clears, refuses what it cannot
+// keep under the limit, and an identical resend changes nothing.
+func TestTeamQueueLanePolicySaveAndRefusals(t *testing.T) {
+	s, task, _, _, _ := uncappedFixture(t, 1, 1)
+	ctx := context.Background()
+	p := lanePolicy(4, 3)
+	if err := setLanes(s, task.ID, &p); !errors.Is(err, api.ErrInvalid) || !strings.Contains(err.Error(), "serial") {
+		t.Fatalf("lanes on a serial queue: %v", err)
+	}
+	setQueueLimit(t, s, task.ID, 4)
+	for name, mutate := range map[string]func(*api.TeamQueueLanePolicy){
+		"over the limit":       func(p *api.TeamQueueLanePolicy) { p.Day = 5 },
+		"no lanes":             func(p *api.TeamQueueLanePolicy) { p.Night = 0 },
+		"unknown zone":         func(p *api.TeamQueueLanePolicy) { p.Zone = "Mars/Base" },
+		"no zone":              func(p *api.TeamQueueLanePolicy) { p.Zone = "" },
+		"local zone":           func(p *api.TeamQueueLanePolicy) { p.Zone = "Local" },
+		"bad clock":            func(p *api.TeamQueueLanePolicy) { p.NightStart = "25:00" },
+		"equal clocks":         func(p *api.TeamQueueLanePolicy) { p.NightEnd = p.NightStart },
+		"strain lanes":         func(p *api.TeamQueueLanePolicy) { p.StrainLanes = 3 },
+		"negative strain":      func(p *api.TeamQueueLanePolicy) { p.StrainLanes = -1 },
+		"no strain threshold":  func(p *api.TeamQueueLanePolicy) { p.StrainPressure = 0 },
+		"strain threshold 100": func(p *api.TeamQueueLanePolicy) { p.StrainPressure = 100 },
+	} {
+		bad := lanePolicy(4, 3)
+		mutate(&bad)
+		if err := setLanes(s, task.ID, &bad); !errors.Is(err, api.ErrInvalid) {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	for _, req := range []api.TeamQueueRequest{
+		{RequestID: api.NewID("tqr"), Operation: "set_lanes"},
+		{RequestID: api.NewID("tqr"), Operation: "set_lanes", LanePolicy: &p, ClearLanePolicy: true},
+	} {
+		if _, err := s.TeamQueueAction(ctx, task.ID, req); !errors.Is(err, api.ErrInvalid) {
+			t.Fatalf("neither or both: %v", err)
+		}
+	}
+	if list, _ := laneList(t, s, task.ID); list.Lanes != nil {
+		t.Fatalf("refusals saved a policy: %+v", list.Lanes)
+	}
+	p.HoldWhileMatrixWaits = true
+	if err := setLanes(s, task.ID, &p); err != nil {
+		t.Fatal(err)
+	}
+	list, _ := laneList(t, s, task.ID)
+	saved := list.Lanes.Policy
+	if saved.UpdatedAt == "" {
+		t.Fatal("saved policy has no time")
+	}
+	want := p
+	want.UpdatedAt = saved.UpdatedAt
+	if saved != want {
+		t.Fatalf("read back %+v, want %+v", saved, want)
+	}
+	// An identical resend under a new request keeps the saved time.
+	s.now = func() time.Time { return time.Now().UTC().Add(time.Minute) }
+	if err := setLanes(s, task.ID, &p); err != nil {
+		t.Fatal(err)
+	}
+	if list, _ := laneList(t, s, task.ID); list.Lanes.Policy.UpdatedAt != saved.UpdatedAt {
+		t.Fatalf("identical resend changed the time %q to %q", saved.UpdatedAt, list.Lanes.Policy.UpdatedAt)
+	}
+	// The limit stays the ceiling: a limit below a lane count, or serial,
+	// is refused and names the clear.
+	for _, limit := range []int{3, 1} {
+		_, err := s.TeamQueueAction(ctx, task.ID, api.TeamQueueRequest{RequestID: api.NewID("tqr"), Operation: "set_limit", Host: "mini", ConcurrencyLimit: limit})
+		if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "tt team queue lanes --task "+task.ID+" --off") {
+			t.Fatalf("limit %d under lanes: %v", limit, err)
+		}
+	}
+	observeFixtureHost(t, s, task.ID, 0, freeDiskMiB(1<<20))
+	setQueueLimit(t, s, task.ID, 0)
+	setQueueLimit(t, s, task.ID, 4)
+	if err := setLanes(s, task.ID, nil); err != nil {
+		t.Fatal(err)
+	}
+	if list, _ := laneList(t, s, task.ID); list.Lanes != nil {
+		t.Fatalf("cleared policy still listed: %+v", list.Lanes)
+	}
+	if err := setLanes(s, task.ID, nil); err != nil {
+		t.Fatalf("clearing no policy: %v", err)
+	}
+	setQueueLimit(t, s, task.ID, 3)
+}
+
+// a5: day 4, night 3 under limit 4. Three teams fill the night lanes; the
+// head waits as for a full limit, and is admitted by day, or at night once
+// a lane frees.
+func TestTeamQueueLanePolicyAdmitsHeadByWindow(t *testing.T) {
+	s, task, items, orders, _ := uncappedFixture(t, 5, 5)
+	s.MaxAgents = 100
+	setQueueLimit(t, s, task.ID, 4)
+	p := lanePolicy(4, 3)
+	if err := setLanes(s, task.ID, &p); err != nil {
+		t.Fatal(err)
+	}
+	var entries []api.TeamQueueEntry
+	for i := range items {
+		entries = append(entries, addScopedEntry(t, s, task, items[i], orders[i], fmt.Sprintf("src/%d", i)))
+	}
+	observeLaneHost(t, s, task.ID, laneNight, intp(10), intp(0))
+	for i := 0; i < 3; i++ {
+		if _, err := claimEntry(s, task, entries[i]); err != nil {
+			t.Fatalf("night claim %d: %v", i, err)
+		}
+	}
+	_, err := claimEntry(s, task, entries[3])
+	if !errors.Is(err, api.ErrConflict) || !strings.HasSuffix(err.Error(), "all team slots are reserved") || !strings.Contains(err.Error(), "lane policy admits 3 teams (night)") {
+		t.Fatalf("night claim of the head: %v", err)
+	}
+	list, byID := laneList(t, s, task.ID)
+	if got := byID[entries[3].ID]; got.BlockReason != "Lanes full: 3 of 3 (night)" || got.UpNext != 1 || got.Stall != nil {
+		t.Fatalf("night head reason %q up next %d stall %+v", got.BlockReason, got.UpNext, got.Stall)
+	}
+	if l := list.Lanes; l == nil || l.Window != api.LaneWindowNight || l.Lanes != 3 || l.Active != 3 || l.Strained || l.Hold != "" || list.ConcurrencyLimit != 4 {
+		t.Fatalf("night lanes %+v limit %d", list.Lanes, list.ConcurrencyLimit)
+	}
+	observeLaneHost(t, s, task.ID, laneDay, intp(10), intp(0))
+	if list, _ := laneList(t, s, task.ID); list.Lanes.Window != api.LaneWindowDay || list.Lanes.Lanes != 4 {
+		t.Fatalf("day lanes %+v", list.Lanes)
+	}
+	if _, err := claimEntry(s, task, entries[3]); err != nil {
+		t.Fatalf("day claim of the head: %v", err)
+	}
+	// Four by day; at night two finish, which frees a night lane.
+	observeLaneHost(t, s, task.ID, laneNight, intp(10), intp(0))
+	if _, err := claimEntry(s, task, entries[4]); err == nil || strings.Contains(err.Error(), "lane policy") || !strings.HasSuffix(err.Error(), "all team slots are reserved") {
+		t.Fatalf("the limit still refuses first: %v", err)
+	}
+	finishLaneEntry(t, s, entries[0].ID)
+	if _, err := claimEntry(s, task, entries[4]); err == nil || !strings.Contains(err.Error(), "lane policy admits 3 teams (night)") {
+		t.Fatalf("three of three night lanes: %v", err)
+	}
+	finishLaneEntry(t, s, entries[1].ID)
+	if _, err := claimEntry(s, task, entries[4]); err != nil {
+		t.Fatalf("freed night lane: %v", err)
+	}
+}
+
+// a6: memory pressure over the threshold lowers the lanes by StrainLanes
+// (never below one), unobserved pressure does not, and a matrix wait holds
+// admission (as does an unobserved lock) while none admits.
+func TestTeamQueueLaneStrainAndMatrixWaitHold(t *testing.T) {
+	s, task, items, orders, _ := uncappedFixture(t, 3, 3)
+	s.MaxAgents = 100
+	setQueueLimit(t, s, task.ID, 4)
+	p := lanePolicy(2, 2)
+	if err := setLanes(s, task.ID, &p); err != nil {
+		t.Fatal(err)
+	}
+	var entries []api.TeamQueueEntry
+	for i := range items {
+		entries = append(entries, addScopedEntry(t, s, task, items[i], orders[i], fmt.Sprintf("src/%d", i)))
+	}
+	observeLaneHost(t, s, task.ID, laneDay, intp(85), intp(0))
+	if _, err := claimEntry(s, task, entries[0]); err != nil {
+		t.Fatal(err)
+	}
+	_, err := claimEntry(s, task, entries[1])
+	if !errors.Is(err, api.ErrConflict) || !strings.HasSuffix(err.Error(), "all team slots are reserved") || !strings.Contains(err.Error(), "admits 1 teams (day, memory pressure 85 over 70)") {
+		t.Fatalf("strained claim: %v", err)
+	}
+	list, byID := laneList(t, s, task.ID)
+	if l := list.Lanes; !l.Strained || l.Lanes != 1 || *l.MemoryPressure != 85 || list.ConcurrencyLimit != 4 {
+		t.Fatalf("strained lanes %+v limit %d", l, list.ConcurrencyLimit)
+	}
+	if got := byID[entries[1].ID].BlockReason; got != "Lanes full: 1 of 1 (day, memory pressure 85 over 70)" {
+		t.Fatalf("strained reason %q", got)
+	}
+	// At the threshold is not over it; unobserved pressure is not strain.
+	observeLaneHost(t, s, task.ID, laneDay, intp(70), intp(0))
+	if list, _ := laneList(t, s, task.ID); list.Lanes.Strained || list.Lanes.Lanes != 2 {
+		t.Fatalf("pressure at the threshold %+v", list.Lanes)
+	}
+	observeLaneHost(t, s, task.ID, laneDay, nil, intp(0))
+	if list, _ := laneList(t, s, task.ID); list.Lanes.Strained || list.Lanes.Lanes != 2 || list.Lanes.MemoryPressure != nil {
+		t.Fatalf("unobserved pressure %+v", list.Lanes)
+	}
+	// The floor is one lane.
+	floor := lanePolicy(2, 2)
+	floor.StrainLanes = 1
+	if got := queueLanes(4, floor, &api.TeamHostUsage{MemoryPressure: intp(99)}, laneDay); got.Lanes != 1 {
+		t.Fatalf("floor %+v", got)
+	}
+	// Matrix waits hold admission only with the policy's hold.
+	observeLaneHost(t, s, task.ID, laneDay, intp(10), intp(1))
+	if list, _ := laneList(t, s, task.ID); list.Lanes.Hold != "" {
+		t.Fatalf("hold without the setting: %+v", list.Lanes)
+	}
+	p.HoldWhileMatrixWaits = true
+	if err := setLanes(s, task.ID, &p); err != nil {
+		t.Fatal(err)
+	}
+	for _, waiters := range []*int{intp(1), nil} {
+		observeLaneHost(t, s, task.ID, laneDay, intp(10), waiters)
+		_, err := claimEntry(s, task, entries[1])
+		if !errors.Is(err, api.ErrConflict) || !strings.HasSuffix(err.Error(), "all team slots are reserved") || !strings.Contains(err.Error(), "lane policy holds admission") {
+			t.Fatalf("claim with waiters %v: %v", waiters, err)
+		}
+		want := "Held: a matrix run waits for the verification host (1 waiting)"
+		if waiters == nil {
+			want = "Held: the verification host's matrix lock is not observed"
+		}
+		if got := listedEntry(t, s, task.ID, entries[1].ID); got.BlockReason != want || got.Stall != nil {
+			t.Fatalf("held reason %q stall %+v, want %q", got.BlockReason, got.Stall, want)
+		}
+	}
+	observeLaneHost(t, s, task.ID, laneDay, intp(10), intp(0))
+	if _, err := claimEntry(s, task, entries[1]); err != nil {
+		t.Fatalf("no waiters: %v", err)
+	}
+	// The census refuses readings outside their range.
+	for _, u := range []api.TeamHostUsage{{MemoryPressure: intp(101)}, {MemoryPressure: intp(-1)}, {MatrixWaiters: intp(-1)}} {
+		u.Host, u.LimiterDomain, u.ObservedAt, u.SourceDigest = "mini", "https://fixture.invalid", laneDay.Format(time.RFC3339Nano), strings.Repeat("a", 64)
+		var version int64
+		_ = s.db.QueryRow(`SELECT MAX(version) FROM team_host_policies WHERE host='mini'`).Scan(&version)
+		u.PolicyVersion = version
+		if _, err := s.TeamQueueAction(context.Background(), task.ID, api.TeamQueueRequest{RequestID: api.NewID("tqr"), Operation: "observe_host", Host: "mini", HostUsage: &u}); !errors.Is(err, api.ErrInvalid) {
+			t.Fatalf("census %+v: %v", u, err)
+		}
+	}
+}

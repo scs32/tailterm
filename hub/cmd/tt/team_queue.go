@@ -30,7 +30,7 @@ func validTeamQueueEntryID(id string) bool {
 	return err == nil
 }
 
-const teamQueueUsage = "usage: tt team queue add|list|policy|limit|provision|scope|wait|rebind|requeue|fail|accept|integrated|replace-lead|remove|reorder|release|abandon"
+const teamQueueUsage = "usage: tt team queue add|list|policy|limit|lanes|provision|scope|wait|rebind|requeue|fail|accept|integrated|replace-lead|remove|reorder|release|abandon"
 
 // teamQueueWaitUsage is the shared-path wait command (docs/project-queue.md,
 // "Team queue shared-path waits"), with the release-job and host-admission
@@ -272,6 +272,15 @@ func cmdTeamQueue(e env, args []string) error {
 	policyBurst := fs.Int("burst", 0, "host relay burst budget")
 	policyHeadroom := fs.Int("headroom-percent", 0, "reserved host limiter headroom percent")
 	auto := fs.String("auto", "", "provision: automatic handler provisioning, on or off")
+	laneDay := fs.Int("day", 0, "lanes: teams admitted by day")
+	laneNight := fs.Int("night", 0, "lanes: teams admitted by night")
+	laneZone := fs.String("zone", "", "lanes: IANA zone of the night hours, such as America/Los_Angeles")
+	laneNightStart := fs.String("night-start", "", "lanes: night starts at this 24-hour HH:MM")
+	laneNightEnd := fs.String("night-end", "", "lanes: night ends at this 24-hour HH:MM")
+	laneStrainPressure := fs.Int("strain-pressure", api.DefaultLaneStrainPressure, "lanes: memory pressure (0-100) over which the host is strained")
+	laneStrainLanes := fs.Int("strain-lanes", api.DefaultLaneStrainLanes, "lanes: lanes taken away while the host is strained, never below one")
+	laneMatrixWaits := fs.String("matrix-waits", "hold", "lanes: hold (admit nothing while a matrix run waits) or ignore")
+	laneOff := fs.Bool("off", false, "lanes: clear the lane policy; the limit alone admits")
 	jsonOut := fs.Bool("json", false, "print JSON")
 	if err := fs.Parse(rest); err != nil {
 		return err
@@ -373,6 +382,8 @@ func cmdTeamQueue(e env, args []string) error {
 			// An older hub does not report the switch.
 			fmt.Printf("handler provisioning=%s\n", list.HandlerProvision)
 		}
+		fmt.Println(queueLanesText(list.Lanes))
+		fmt.Println(queueUpNextText(list.Entries))
 		matrix, matrixNotice := readMatrixWaitlist()
 		if matrixNotice != "" {
 			fmt.Println(matrixNotice)
@@ -389,6 +400,9 @@ func cmdTeamQueue(e env, args []string) error {
 				state += " (owner-integrated)"
 			} else if q.State == "failed" && q.ReleasedAt != "" {
 				state += " (released)"
+			}
+			if q.UpNext > 0 {
+				state += fmt.Sprintf(" up-next=%d", q.UpNext)
 			}
 			fmt.Printf("%d %s %s %s order=#%d template=%s revision=%d repository=%s cwd=%s owns=%s blocked-by=%s reason=%s handler=%s/%s lease=%d%s%s\n", q.Position, state, q.ID, q.ItemID, q.OrderMessageSeq, q.Template, q.Revision, q.Repository, q.Cwd, owns, strings.Join(q.BlockedBy, ","), q.BlockReason, q.HandlerID, q.HandlerRunID, q.HandlerLeaseGeneration, queueArmText(q.HandlerArm), queueAttemptText(q))
 			for _, w := range q.Waits {
@@ -478,6 +492,23 @@ func cmdTeamQueue(e env, args []string) error {
 				}
 			}
 		}
+	case "lanes":
+		req.Operation = "set_lanes"
+		if *laneOff {
+			given := false
+			fs.Visit(func(f *flag.Flag) {
+				given = given || (f.Name != "off" && f.Name != "task" && f.Name != "hub" && f.Name != "json")
+			})
+			if given {
+				return errors.New(queueLanesUsage)
+			}
+			req.ClearLanePolicy = true
+			break
+		}
+		if *laneDay < 1 || *laneNight < 1 || *laneZone == "" || *laneNightStart == "" || *laneNightEnd == "" || (*laneMatrixWaits != "hold" && *laneMatrixWaits != "ignore") {
+			return errors.New(queueLanesUsage)
+		}
+		req.LanePolicy = &api.TeamQueueLanePolicy{Day: *laneDay, Night: *laneNight, Zone: *laneZone, NightStart: *laneNightStart, NightEnd: *laneNightEnd, StrainPressure: *laneStrainPressure, StrainLanes: *laneStrainLanes, HoldWhileMatrixWaits: *laneMatrixWaits == "hold"}
 	case "provision":
 		if *auto != api.HandlerProvisionOn && *auto != api.HandlerProvisionOff {
 			return errors.New("usage: tt team queue provision --auto on|off (automatic handler provisioning; default on)")
@@ -1062,6 +1093,16 @@ func cmdTeamQueue(e env, args []string) error {
 			}
 		} else if sub == "provision" {
 			fmt.Printf("handler provisioning=%s\n", *auto)
+		} else if sub == "lanes" {
+			// The read back is the saved policy as it applies now.
+			list, listErr := c.ListTeamQueuePage(ctx, *task, api.TeamQueueListOptions{View: api.TeamQueueViewActive})
+			if listErr != nil {
+				return fmt.Errorf("lanes saved, but the read back failed: %w", listErr)
+			}
+			if list.Lanes != nil {
+				fmt.Println(queueLanePolicyText(list.Lanes.Policy))
+			}
+			fmt.Println(queueLanesText(list.Lanes))
 		} else if sub == "rebind" {
 			fmt.Printf("rebind %s %s%s (%s)\n", result.ID, result.ItemID, queueAttemptText(result), result.State)
 		} else if sub == "requeue" {
@@ -1104,6 +1145,55 @@ func ownerIntegratedChanges(ctx context.Context, repository, base, commit string
 		return nil, fmt.Errorf("commit %s does not descend from the entry base %s", commit, base)
 	}
 	return queueChangedFiles(ctx, repository, base, commit)
+}
+
+const queueLanesUsage = "usage: tt team queue lanes --day N --night N --zone IANA --night-start HH:MM --night-end HH:MM [--strain-pressure 70] [--strain-lanes 1] [--matrix-waits hold|ignore]\n       tt team queue lanes --off"
+
+// queueLanePolicyText is a saved lane policy on one line.
+func queueLanePolicyText(p api.TeamQueueLanePolicy) string {
+	waits := "ignore"
+	if p.HoldWhileMatrixWaits {
+		waits = "hold"
+	}
+	return fmt.Sprintf("lane policy: day=%d night=%d zone=%s night-hours=%s-%s strain-pressure=%d strain-lanes=%d matrix-waits=%s updated=%s", p.Day, p.Night, p.Zone, p.NightStart, p.NightEnd, p.StrainPressure, p.StrainLanes, waits, p.UpdatedAt)
+}
+
+// queueLanesText is the lanes the policy gives now, or lanes=off without a
+// policy (or from an older hub).
+func queueLanesText(l *api.TeamQueueLanes) string {
+	if l == nil {
+		return "lanes=off"
+	}
+	strained := "no"
+	if l.Strained {
+		strained = "yes"
+	}
+	reading := func(v *int) string {
+		if v == nil {
+			return "unobserved"
+		}
+		return strconv.Itoa(*v)
+	}
+	text := fmt.Sprintf("lanes=%d window=%s active=%d strained=%s memory-pressure=%s matrix-waiters=%s", l.Lanes, l.Window, l.Active, strained, reading(l.MemoryPressure), reading(l.MatrixWaiters))
+	if l.Hold != "" {
+		text += " held: " + l.Hold
+	}
+	return text
+}
+
+// queueUpNextText names the queued entries in the order the queue admits
+// them.
+func queueUpNextText(entries []api.TeamQueueEntry) string {
+	var next []string
+	for _, q := range entries {
+		if q.UpNext > 0 {
+			next = append(next, fmt.Sprintf("%d %s (%s)", q.UpNext, q.ItemID, q.ID))
+		}
+	}
+	if len(next) == 0 {
+		return "up next: none"
+	}
+	return "up next: " + strings.Join(next, ", ")
 }
 
 const queueAddUsage = "usage: tt team queue add --item wi_ID --order SEQ [--template planned|small] [--planned-reason paths|schema|risk:TEXT] [--owns PATH... | --serial] [--cwd DIR | --new-worktree [--base REV] | --no-new-worktree]"

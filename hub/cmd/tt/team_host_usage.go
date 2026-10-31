@@ -5,11 +5,15 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -141,12 +145,84 @@ func hostCensusKnownAt(prior *api.TeamHostUsage, now time.Time) time.Time {
 	return now
 }
 
+// hostMemoryPressure is the host's memory pressure, 0 to 100, higher is
+// worse: 100 - kern.memorystatus_level, as scripts/verify-matrix-host-lock.mjs
+// reads it. It is nil off macOS or when sysctl fails. Tests replace it.
+var hostMemoryPressure = func() *int {
+	if runtime.GOOS != "darwin" {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "sysctl", "-n", "kern.memorystatus_level").Output()
+	if err != nil {
+		return nil
+	}
+	level, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil || level < 0 || level > 100 {
+		return nil
+	}
+	pressure := 100 - level
+	return &pressure
+}
+
+// hostMatrixWaiters counts the live matrix runs waiting in this host's lock
+// (matrix_wait_activity.go). A lock file that does not exist is a confirmed
+// 0: no run has used the host. It is nil when the lock path is unknown or the
+// file is not a confirmed read, so a lane policy that holds while a matrix
+// waits holds then too.
+func hostMatrixWaiters() *int {
+	path := os.Getenv("TAILTERM_MATRIX_HOST_LOCK")
+	if path == "" {
+		path = matrixWaitDefaultPath()
+	}
+	if !filepath.IsAbs(path) {
+		return nil
+	}
+	waiting := 0
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		return &waiting
+	}
+	lock := readMatrixLock()
+	if lock == nil {
+		return nil
+	}
+	for _, w := range lock.Waiters {
+		if matrixWaitPIDAlive(w.PID) {
+			waiting++
+		}
+	}
+	return &waiting
+}
+
+// memoryStrainState is -1 when memory pressure is unobserved, 1 when it is
+// over the default lane strain threshold and 0 otherwise. Like the disk
+// reserve state, only a change forces a census write: the pressure moves on
+// every read, and a census posted each tick would spend the hub's request
+// budget. The census is shared by every project on the host, so a project's
+// own threshold reads a reading at most hostCensusReuse old.
+func memoryStrainState(pressure *int) int {
+	switch {
+	case pressure == nil:
+		return -1
+	case *pressure > api.DefaultLaneStrainPressure:
+		return 1
+	}
+	return 0
+}
+
+func sameCount(a, b *int) bool {
+	return (a == nil) == (b == nil) && (a == nil || *a == *b)
+}
+
 func saveHostRelayCensus(ctx context.Context, c *api.Client, task, host string, policy api.TeamHostPolicy, prior *api.TeamHostUsage, cwds []string, now time.Time) error {
 	usage := hostRelayCensus(relayDir(), host, policy.LimiterDomain, now)
 	usage.PolicyVersion = policy.Version
 	usage.FreeDiskMiB = hostFreeDiskMiB(cwds, statfsFreeMiB)
+	usage.MemoryPressure = hostMemoryPressure()
+	usage.MatrixWaiters = hostMatrixWaiters()
 	reserve := policy.DiskReserveMiB()
-	if prior != nil && prior.PolicyVersion == usage.PolicyVersion && prior.Complete == usage.Complete && prior.SourceDigest == usage.SourceDigest && prior.LimiterDomain == usage.LimiterDomain && diskReserveState(prior.FreeDiskMiB, reserve) == diskReserveState(usage.FreeDiskMiB, reserve) {
+	if prior != nil && prior.PolicyVersion == usage.PolicyVersion && prior.Complete == usage.Complete && prior.SourceDigest == usage.SourceDigest && prior.LimiterDomain == usage.LimiterDomain && diskReserveState(prior.FreeDiskMiB, reserve) == diskReserveState(usage.FreeDiskMiB, reserve) && memoryStrainState(prior.MemoryPressure) == memoryStrainState(usage.MemoryPressure) && sameCount(prior.MatrixWaiters, usage.MatrixWaiters) {
 		observed, err := time.Parse(time.RFC3339Nano, prior.ObservedAt)
 		if err == nil && now.Sub(observed) < hostCensusReuse {
 			return nil
@@ -156,7 +232,14 @@ func saveHostRelayCensus(ctx context.Context, c *api.Client, task, host string, 
 	if usage.FreeDiskMiB != nil {
 		free = *usage.FreeDiskMiB
 	}
-	seed := sha256.Sum256([]byte(fmt.Sprintf("%s:%s:%d:%s:%s:%d", usage.Host, usage.LimiterDomain, usage.PolicyVersion, usage.ObservedAt, usage.SourceDigest, free)))
+	pressure, waiters := -1, -1
+	if usage.MemoryPressure != nil {
+		pressure = *usage.MemoryPressure
+	}
+	if usage.MatrixWaiters != nil {
+		waiters = *usage.MatrixWaiters
+	}
+	seed := sha256.Sum256([]byte(fmt.Sprintf("%s:%s:%d:%s:%s:%d:%d:%d", usage.Host, usage.LimiterDomain, usage.PolicyVersion, usage.ObservedAt, usage.SourceDigest, free, pressure, waiters)))
 	_, err := c.TeamQueueAction(ctx, task, api.TeamQueueRequest{RequestID: "host-usage-" + hex.EncodeToString(seed[:12]), Operation: "observe_host", Host: host, HostUsage: &usage})
 	return err
 }

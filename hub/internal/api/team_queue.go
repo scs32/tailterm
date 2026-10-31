@@ -100,6 +100,10 @@ type TeamQueueEntry struct {
 	// Warning is advice a saved settings change returns, such as a raised
 	// limit that exceeds the available database handlers.
 	Warning string `json:"warning,omitempty"`
+	// UpNext numbers the queued entries 1..N in position order: the order
+	// the queue admits them. It is computed on read and absent on every
+	// other state (docs/project-queue.md, "Team queue lanes and up next").
+	UpNext int `json:"upNext,omitempty"`
 
 	// EstimateDefault is the lane default admission compares with the budget
 	// for an entry whose item has no saved estimate. It is computed on read
@@ -450,6 +454,63 @@ type TeamQueueList struct {
 	// History describes the page of history entries that follows the
 	// active entries; it is absent for view=active and item listings.
 	History *TeamQueueHistoryPage `json:"history,omitempty"`
+	// Lanes is the project's lane policy and the lanes it gives now; it is
+	// absent when the project has no lane policy.
+	Lanes *TeamQueueLanes `json:"lanes,omitempty"`
+}
+
+// TeamQueueLanePolicy is a project's stored lane policy: how many teams the
+// queue admits by day and by night, fewer while the host's memory is
+// strained, and none while a matrix run waits for the verification host
+// (docs/project-queue.md, "Team queue lanes and up next"). The concurrency
+// limit stays the ceiling: lanes only ever admit fewer teams.
+type TeamQueueLanePolicy struct {
+	Day   int `json:"day"`
+	Night int `json:"night"`
+	// Zone is an IANA zone; NightStart and NightEnd are 24-hour HH:MM wall
+	// clock in it. The start minute is night, the end minute day, and a
+	// start after the end crosses midnight.
+	Zone       string `json:"zone"`
+	NightStart string `json:"nightStart"`
+	NightEnd   string `json:"nightEnd"`
+	// The host is strained while its memory pressure (0 to 100, higher is
+	// worse) is over StrainPressure; it then gets StrainLanes fewer lanes,
+	// never fewer than one.
+	StrainPressure int `json:"strainPressure"`
+	StrainLanes    int `json:"strainLanes"`
+	// HoldWhileMatrixWaits admits nothing while a matrix run waits for the
+	// verification host, or while the host's lock is not observed.
+	HoldWhileMatrixWaits bool   `json:"holdWhileMatrixWaits"`
+	UpdatedAt            string `json:"updatedAt,omitempty"`
+}
+
+// Lane policy defaults the CLI fills in; the strain threshold is the matrix
+// host lock's own memory-pressure default.
+const (
+	DefaultLaneStrainPressure = 70
+	DefaultLaneStrainLanes    = 1
+)
+
+// Lane windows.
+const (
+	LaneWindowDay   = "day"
+	LaneWindowNight = "night"
+)
+
+// TeamQueueLanes is the lane policy as it applies now, computed on read from
+// the policy, the clock and the host census of the queue head's host.
+type TeamQueueLanes struct {
+	Policy TeamQueueLanePolicy `json:"policy"`
+	Window string              `json:"window"`
+	// Lanes is how many teams may hold a slot now; Active how many do.
+	Lanes    int  `json:"lanes"`
+	Active   int  `json:"active"`
+	Strained bool `json:"strained,omitempty"`
+	// The census's readings; nil when the host did not observe them.
+	MemoryPressure *int `json:"memoryPressure,omitempty"`
+	MatrixWaiters  *int `json:"matrixWaiters,omitempty"`
+	// Hold says why nothing is admitted now, empty when lanes admit.
+	Hold string `json:"hold,omitempty"`
 }
 
 // TeamQueueHistoryPage is one newest-first page of finished and released
@@ -539,6 +600,12 @@ type TeamHostUsage struct {
 	// FreeDiskMiB is the least free space across the host's queue worktrees;
 	// nil means the runner did not observe it.
 	FreeDiskMiB *int64 `json:"freeDiskMiB,omitempty"`
+	// MemoryPressure is the host's memory pressure, 0 to 100, higher is
+	// worse (100 - kern.memorystatus_level, as the matrix host lock reads
+	// it). MatrixWaiters is how many live matrix runs wait in the host's
+	// lock. Either is nil when the runner did not observe it.
+	MemoryPressure *int `json:"memoryPressure,omitempty"`
+	MatrixWaiters  *int `json:"matrixWaiters,omitempty"`
 }
 
 type TeamQueueRequest struct {
@@ -598,6 +665,10 @@ type TeamQueueRequest struct {
 	SourceMessageSeq int64 `json:"sourceMessageSeq,omitempty"`
 	// HandlerProvision is set_handler_provision's switch value, "on" or "off".
 	HandlerProvision string `json:"handlerProvision,omitempty"`
+	// set_lanes saves LanePolicy, or clears the policy with ClearLanePolicy;
+	// exactly one of the two is given.
+	LanePolicy      *TeamQueueLanePolicy `json:"lanePolicy,omitempty"`
+	ClearLanePolicy bool                 `json:"clearLanePolicy,omitempty"`
 	// The runner's saved handler launch spec for provision_handler: runtime,
 	// model, reasoning and the prompt's template digest, all empty when the
 	// host has no saved spec. HandlerAgentID is the preallocated handler.

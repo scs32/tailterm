@@ -272,6 +272,8 @@ func migrateTeamQueue(db *sql.DB) error {
 	for _, column := range []struct{ name, definition string }{
 		{"policy_version", "INTEGER NOT NULL DEFAULT 0"},
 		{"free_disk_mib", "INTEGER"},
+		{"memory_pressure", "INTEGER"},
+		{"matrix_waiters", "INTEGER"},
 	} {
 		var count int
 		if err := tx.QueryRow(`SELECT count(*) FROM pragma_table_info('team_host_usage') WHERE name=?`, column.name).Scan(&count); err != nil {
@@ -291,6 +293,18 @@ func migrateTeamQueue(db *sql.DB) error {
 	}
 	if provisionColumn == 0 {
 		if _, err := tx.Exec(`ALTER TABLE team_queue_settings ADD COLUMN handler_provision INTEGER NOT NULL DEFAULT 1`); err != nil {
+			return err
+		}
+	}
+	// The lane policy is empty until the owner saves one: the limit alone
+	// then admits, as before (docs/project-queue.md, "Team queue lanes and up
+	// next").
+	var laneColumn int
+	if err := tx.QueryRow(`SELECT count(*) FROM pragma_table_info('team_queue_settings') WHERE name='lane_policy_json'`).Scan(&laneColumn); err != nil {
+		return err
+	}
+	if laneColumn == 0 {
+		if _, err := tx.Exec(`ALTER TABLE team_queue_settings ADD COLUMN lane_policy_json TEXT NOT NULL DEFAULT ''`); err != nil {
 			return err
 		}
 	}
@@ -744,10 +758,22 @@ func (s *Store) explainTeamQueue(ctx context.Context, task string, out *api.Team
 			}
 		}
 	}
+	// The queued entries are the up-next list, in the order the claim
+	// admits them.
+	upNext := 0
+	for i := range out.Entries {
+		if out.Entries[i].State == "queued" {
+			upNext++
+			out.Entries[i].UpNext = upNext
+		}
+	}
 	parallel := queueParallel(out.ConcurrencyLimit)
 	var capacityTx *sql.Tx
 	var active []api.TeamQueueEntry
 	var freeHandler api.Agent
+	// lanes is the lane policy as it applies now, per host census; nil
+	// without a policy.
+	var lanes func(host string) (api.TeamQueueLanes, error)
 	if parallel {
 		capacityTx, err = s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 		if err != nil {
@@ -761,6 +787,46 @@ func (s *Store) explainTeamQueue(ctx context.Context, task string, out *api.Team
 		}
 		if freeHandler, err = freeQueueHandler(ctx, capacityTx, task, active); err != nil {
 			return err
+		}
+		policy, err := loadQueueLanePolicy(ctx, capacityTx, task)
+		if err != nil {
+			return err
+		}
+		if policy != nil {
+			byHost := map[string]api.TeamQueueLanes{}
+			lanes = func(host string) (api.TeamQueueLanes, error) {
+				if l, ok := byHost[host]; ok {
+					return l, nil
+				}
+				var usage *api.TeamHostUsage
+				if host != "" {
+					u, err := readTeamHostUsage(ctx, capacityTx, host)
+					if err != nil {
+						return api.TeamQueueLanes{}, err
+					}
+					usage = u
+				}
+				l := queueLanes(out.ConcurrencyLimit, *policy, usage, s.now())
+				l.Active = activeCount
+				byHost[host] = l
+				return l, nil
+			}
+			// The summary reads the head's host, else an active team's.
+			host := ""
+			for _, entry := range out.Entries {
+				if entry.State == "queued" {
+					host = entry.Host
+					break
+				}
+			}
+			if host == "" && len(active) > 0 {
+				host = active[0].Host
+			}
+			l, err := lanes(host)
+			if err != nil {
+				return err
+			}
+			out.Lanes = &l
 		}
 	}
 	// sharedOnly lists, per queued entry, the active entries that block it
@@ -817,8 +883,18 @@ func (s *Store) explainTeamQueue(ctx context.Context, task string, out *api.Team
 		} else if !parallel {
 			out.Entries[i].BlockReason = capReason
 		} else {
+			laneReason := ""
+			if lanes != nil {
+				l, err := lanes(out.Entries[i].Host)
+				if err != nil {
+					return err
+				}
+				laneReason = queueLaneReason(l, activeCount)
+			}
 			if capacityErr := checkTeamHostAdmission(ctx, capacityTx, out.Entries[i].Host, s.now()); capacityErr != nil {
 				out.Entries[i].BlockReason = capacityErr.Error()
+			} else if laneReason != "" {
+				out.Entries[i].BlockReason = laneReason
 			} else if capReason != "" {
 				out.Entries[i].BlockReason = capReason
 			} else if freeHandler.ID == "" {
@@ -1369,7 +1445,7 @@ func (s *Store) teamQueueAction(ctx context.Context, task string, req api.TeamQu
 		e = api.TeamQueueEntry{TaskID: task, Host: req.Host, State: "host_policy", Revision: req.HostPolicyVersion}
 	case "observe_host":
 		u := req.HostUsage
-		if req.Host == "" || u == nil || u.Host != req.Host || !validLimiterDomain(u.LimiterDomain) || u.PolicyVersion < 1 || u.RelayBindings < 0 || !validContextDigest(u.SourceDigest) || (u.FreeDiskMiB != nil && *u.FreeDiskMiB < 0) {
+		if req.Host == "" || u == nil || u.Host != req.Host || !validLimiterDomain(u.LimiterDomain) || u.PolicyVersion < 1 || u.RelayBindings < 0 || !validContextDigest(u.SourceDigest) || (u.FreeDiskMiB != nil && *u.FreeDiskMiB < 0) || (u.MemoryPressure != nil && (*u.MemoryPressure < 0 || *u.MemoryPressure > 100)) || (u.MatrixWaiters != nil && *u.MatrixWaiters < 0) {
 			return zero, api.ErrInvalid
 		}
 		observed, parseErr := time.Parse(time.RFC3339Nano, u.ObservedAt)
@@ -1389,7 +1465,7 @@ func (s *Store) teamQueueAction(ctx context.Context, task string, req api.TeamQu
 		}
 		if previous != nil && previous.PolicyVersion == u.PolicyVersion {
 			previousAt, parseErr := time.Parse(time.RFC3339Nano, previous.ObservedAt)
-			if parseErr != nil || !observed.After(previousAt) && (observed.Before(previousAt) || previous.SourceDigest != u.SourceDigest || previous.Complete != u.Complete || previous.RelayBindings != u.RelayBindings || !sameFreeDisk(previous.FreeDiskMiB, u.FreeDiskMiB)) {
+			if parseErr != nil || !observed.After(previousAt) && (observed.Before(previousAt) || previous.SourceDigest != u.SourceDigest || previous.Complete != u.Complete || previous.RelayBindings != u.RelayBindings || !sameFreeDisk(previous.FreeDiskMiB, u.FreeDiskMiB) || !sameInt(previous.MemoryPressure, u.MemoryPressure) || !sameInt(previous.MatrixWaiters, u.MatrixWaiters)) {
 				return zero, fmt.Errorf("%w: host usage observation regressed", api.ErrConflict)
 			}
 		}
@@ -1397,13 +1473,20 @@ func (s *Store) teamQueueAction(ctx context.Context, task string, req api.TeamQu
 		if u.FreeDiskMiB != nil {
 			freeDisk = sql.NullInt64{Int64: *u.FreeDiskMiB, Valid: true}
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO team_host_usage(host,limiter_domain,policy_version,observed_at,relay_bindings,complete,source_digest,free_disk_mib) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(host) DO UPDATE SET limiter_domain=excluded.limiter_domain,policy_version=excluded.policy_version,observed_at=excluded.observed_at,relay_bindings=excluded.relay_bindings,complete=excluded.complete,source_digest=excluded.source_digest,free_disk_mib=excluded.free_disk_mib`, u.Host, u.LimiterDomain, u.PolicyVersion, u.ObservedAt, u.RelayBindings, u.Complete, u.SourceDigest, freeDisk); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO team_host_usage(host,limiter_domain,policy_version,observed_at,relay_bindings,complete,source_digest,free_disk_mib,memory_pressure,matrix_waiters) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(host) DO UPDATE SET limiter_domain=excluded.limiter_domain,policy_version=excluded.policy_version,observed_at=excluded.observed_at,relay_bindings=excluded.relay_bindings,complete=excluded.complete,source_digest=excluded.source_digest,free_disk_mib=excluded.free_disk_mib,memory_pressure=excluded.memory_pressure,matrix_waiters=excluded.matrix_waiters`, u.Host, u.LimiterDomain, u.PolicyVersion, u.ObservedAt, u.RelayBindings, u.Complete, u.SourceDigest, freeDisk, intOrNull(u.MemoryPressure), intOrNull(u.MatrixWaiters)); err != nil {
 			return zero, err
 		}
 		e = api.TeamQueueEntry{TaskID: task, Host: req.Host, State: "host_usage"}
 	case "set_limit":
 		if req.ConcurrencyLimit < 0 {
 			return zero, api.ErrInvalid
+		}
+		// A saved lane policy stays under the limit, so a limit that would
+		// drop below a lane count (or to serial) waits for the lanes to go.
+		if lanes, err := loadQueueLanePolicy(ctx, tx, task); err != nil {
+			return zero, err
+		} else if lanes != nil && (!queueParallel(req.ConcurrencyLimit) || (req.ConcurrencyLimit > 0 && max(lanes.Day, lanes.Night) > req.ConcurrencyLimit)) {
+			return zero, fmt.Errorf("%w: limit %d is below the saved lane policy (day %d, night %d); lower the lanes or clear them first: tt team queue lanes --task %s --off", api.ErrConflict, req.ConcurrencyLimit, lanes.Day, lanes.Night, task)
 		}
 		if queueParallel(req.ConcurrencyLimit) {
 			if req.Host == "" {
@@ -1475,6 +1558,49 @@ func (s *Store) teamQueueAction(ctx context.Context, task string, req api.TeamQu
 			return zero, api.ErrInvalid
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO team_queue_settings(task_id,handler_provision) VALUES(?,?) ON CONFLICT(task_id) DO UPDATE SET handler_provision=excluded.handler_provision`, task, req.HandlerProvision == api.HandlerProvisionOn); err != nil {
+			return zero, err
+		}
+		e = api.TeamQueueEntry{TaskID: task, State: "settings"}
+	case "set_lanes":
+		// Exactly one of a policy to save and the clear.
+		if (req.LanePolicy == nil) != req.ClearLanePolicy {
+			return zero, api.ErrInvalid
+		}
+		saved, err := loadQueueLanePolicy(ctx, tx, task)
+		if err != nil {
+			return zero, err
+		}
+		stored := ""
+		if p := req.LanePolicy; p != nil {
+			policy := *p
+			policy.UpdatedAt = ""
+			limit, err := queueConcurrencyLimit(ctx, tx, task)
+			if err != nil {
+				return zero, err
+			}
+			if _, err := validQueueLanePolicy(policy, limit); err != nil {
+				return zero, err
+			}
+			if saved != nil {
+				unchanged := *saved
+				unchanged.UpdatedAt = ""
+				if unchanged == policy {
+					// An identical resend keeps the saved policy and its time.
+					e = api.TeamQueueEntry{TaskID: task, State: "settings"}
+					break
+				}
+			}
+			policy.UpdatedAt = now
+			b, err := json.Marshal(policy)
+			if err != nil {
+				return zero, err
+			}
+			stored = string(b)
+		} else if saved == nil {
+			e = api.TeamQueueEntry{TaskID: task, State: "settings"}
+			break
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO team_queue_settings(task_id,lane_policy_json) VALUES(?,?) ON CONFLICT(task_id) DO UPDATE SET lane_policy_json=excluded.lane_policy_json`, task, stored); err != nil {
 			return zero, err
 		}
 		e = api.TeamQueueEntry{TaskID: task, State: "settings"}
@@ -2006,6 +2132,19 @@ func (s *Store) teamQueueAction(ctx context.Context, task string, req api.TeamQu
 			if queueParallel(limit) {
 				if err := checkTeamHostAdmission(ctx, tx, e.Host, s.now()); err != nil {
 					return zero, err
+				}
+				// The lane policy, under the limit, reads the census the host
+				// admission just found fresh.
+				if policy, err := loadQueueLanePolicy(ctx, tx, task); err != nil {
+					return zero, err
+				} else if policy != nil {
+					usage, err := readTeamHostUsage(ctx, tx, e.Host)
+					if err != nil {
+						return zero, err
+					}
+					if err := queueLaneRefusal(queueLanes(limit, *policy, usage, s.now()), len(activeEntries)); err != nil {
+						return zero, err
+					}
 				}
 			}
 			// Serial or parallel, a team that agent registration would refuse

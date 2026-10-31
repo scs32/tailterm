@@ -21,9 +21,9 @@ try {
 
 const html = `<!doctype html><html><head><link rel="stylesheet" href="/client/style.css"><link rel="stylesheet" href="/client/work-items.css"></head><body><main id="delivery"></main><script type="module">
 import {renderTeamDelivery} from '/client/team-delivery-view.js';
-const queue={concurrencyLimit:2,entries:[
+const queue={concurrencyLimit:2,lanes:{policy:{day:2,night:1},window:'night',lanes:1,active:1,strained:true,memoryPressure:85,matrixWaiters:0},entries:[
  {itemId:'wi_aaaaaaaaaaaaaaaa',state:'finished',ownership:['src/a'],handlerId:'agt_handler_a',acceptance:{branch:'feature/a',commit:'c'.repeat(40)}},
- {itemId:'wi_bbbbbbbbbbbbbbbb',state:'queued',ownership:['src/a/child'],blockedBy:['tqe_aaaaaaaaaaaaaaaa'],blockReason:'ownership overlap'},
+ {itemId:'wi_bbbbbbbbbbbbbbbb',state:'queued',upNext:1,ownership:['src/a/child'],blockedBy:['tqe_aaaaaaaaaaaaaaaa'],blockReason:'ownership overlap'},
  {itemId:'wi_cccccccccccccccc',state:'finished',ownership:['src/c'],handlerId:'agt_handler_c',integration:{repository:'/fixture/git',baseCommit:'a'.repeat(40),worktree:'/fixture/builder-c',branch:'feature/c',commit:'b'.repeat(40),evidence:'item=C;close=receipt'}}
 ]};
 queue.entries.push(...${JSON.stringify(native.queue.entries).replaceAll("<", "\\u003c")});
@@ -66,6 +66,20 @@ try {
       assert.doesNotMatch(await page.locator('[data-testid="team-delivery-panel"] header').innerText(), /Limit 0/);
       await page.evaluate(() => { fixture.queue.concurrencyLimit = 2; fixture.rerender(); });
       assert.match(await page.locator('[data-testid="team-delivery-entry"]').nth(1).innerText(), /Waiting for tqe_aaaaaaaaaaaaaaaa/);
+      // wi_35e9f7f50b620957 a3: the queued row reads as up next, and the
+      // header names the lanes only while the project has a lane policy.
+      assert.match(await page.locator('[data-testid="team-delivery-entry"]').nth(1).innerText(), /^Up next 1 · wi_bbbbbbbbbbbbbbbb/);
+      // The native hub entries carry their own upNext, so every queued
+      // fixture row is numbered.
+      const numbered = await page.evaluate(() => fixture.queue.entries.filter((entry) => entry.upNext).length);
+      assert.ok(numbered >= 1);
+      assert.equal(await page.locator('[data-testid="team-up-next"]').count(), numbered);
+      assert.match(await page.locator('[data-testid="team-delivery-panel"] header').innerText(), /Limit 2[\s\S]*Lanes 1 · night · strained/);
+      await page.evaluate(() => { fixture.queue.lanes.hold = "a matrix run waits for the verification host (1 waiting)"; fixture.queue.lanes.matrixWaiters = 1; fixture.rerender(); });
+      assert.match(await page.locator('[data-testid="team-delivery-lanes"]').innerText(), /held: matrix waits/);
+      const savedLanes = await page.evaluate(() => { const lanes = fixture.queue.lanes; delete fixture.queue.lanes; fixture.rerender(); return lanes; });
+      assert.equal(await page.locator('[data-testid="team-delivery-lanes"]').count(), 0);
+      await page.evaluate((lanes) => { fixture.queue.lanes = lanes; fixture.rerender(); }, savedLanes);
       assert.match(await page.locator('[data-testid="team-delivery-entry"]').nth(0).innerText(), /Lead Lead A · Handler Handler A/);
       assert.doesNotMatch(await page.locator('[data-testid="team-delivery-entry"]').nth(0).innerText(), /waiting for team cleanup/);
       assert.match(await page.locator('[data-testid="team-ready-to-integrate"]').innerText(), /feature\/c @ b{40}/);
@@ -101,6 +115,7 @@ try {
         assert.match(native.summary,/reviews: 2\/2; follow-ups: 1/);
         assert.equal(await page.locator('#delivery script:not([type="module"])').count(),0);
         assert.match(await page.locator('[data-testid="team-delivery-entry"]').nth(3).innerText(),/<script>fixture escape<\/script>/);
+        assert.equal(await page.locator('[data-testid="team-delivery-lanes"]').count(),1);
         assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,`overflow at ${width}`);
       }
       await page.evaluate(()=>{fixture.queue.entries[0].verification={state:"pending",commit:"new"};fixture.rerender();});

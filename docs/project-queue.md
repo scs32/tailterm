@@ -794,7 +794,9 @@ that names `wait clear`. Neither command reads or moves the waiting entry's
 revision.
 
 A wait is a record and a notice trigger only. It does not hold a queued entry
-out of admission and changes no ownership check.
+out of admission and changes no ownership check. A project's lane policy is
+the admission control for host-wide holds such as a waiting matrix run
+([Team queue lanes and up next](#team-queue-lanes-and-up-next)).
 
 ### Handler-gated waits
 
@@ -1177,6 +1179,124 @@ Every other refusal still applies to a decrease. It is refused with `active
 safety reservations exceed requested limit` while more entries than N are
 active, and a parallel limit still needs a frozen repository and base for every
 outstanding entry.
+
+## Team queue lanes and up next
+
+Bug `wi_35e9f7f50b620957`, work order #52227; owner request #51832: the queue
+should hold an ordered up-next list, and nothing about it should live in the
+owner helper's notes.
+
+**What the queue already did.** Queued entries were ordered by position and
+`tt team queue reorder` moved them. The claim admitted only confirmed orders,
+and only the head: the first queued entry not waiting for a rebind, not held
+by the token budget and not in conflict with an active team. The runner
+claimed it as soon as a slot freed. The ceiling was one number, the
+concurrency limit, beside the project agent cap and host capacity
+([Interaction with the concurrency limit](#project-agent-cap)).
+
+**Why confirmed orders stayed out of it.** The owner helper's lane rules are
+four teams by day, three by night, fewer while the host is under memory
+strain, and none while a matrix run waits for the verification host. The hub
+had no clock window, never saw memory pressure or the matrix lock, and a wait
+does not hold admission (see [shared-path waits](#team-queue-shared-path-waits)).
+Queueing an order therefore admitted it under whatever the limit was at that
+moment, so the helper kept orders in its notes and applied the rules in cron
+prompts. Neither the CLI nor TailOS showed the queued entries as a list in
+admission order either.
+
+**Up next.** Every listing numbers the queued entries `upNext` 1..N in
+position order, the order the claim admits them; other states have none. It
+is computed on read, so a reorder renumbers at once, and the `item=` listing
+keeps the entry's place in the whole queue. `tt team queue list` prints
+`up-next=N` after each queued entry's state and one line naming them in order:
+
+```
+lanes=3 window=night active=3 strained=no memory-pressure=41 matrix-waiters=0
+up next: 1 wi_A (tqe_A), 2 wi_B (tqe_B)
+```
+
+The lanes line is `lanes=off` without a policy. TailOS Delivery shows `Up
+next N · wi_ID` on each queued row and, with a policy, `Lanes N · day|night`
+in the header, with `· strained` and `· held: matrix waits` (or `· held:
+matrix lock not observed`) when they apply.
+
+**Lane policy.** A project stores at most one, in
+`team_queue_settings.lane_policy_json` (empty: no policy, and the limit alone
+admits as before):
+
+```
+tt team queue lanes --task TSK --day 4 --night 3 --zone America/Los_Angeles \
+  --night-start 22:00 --night-end 07:00 [--strain-pressure 70] \
+  [--strain-lanes 1] [--matrix-waits hold|ignore]
+tt team queue lanes --task TSK --off
+```
+
+It prints the saved policy and the lanes it gives now. Like `tt team queue
+limit` it is an owner-side change from an unbound session. The night hours
+follow the release quiet window's clock: 24-hour `HH:MM` in an IANA zone, the
+start minute is night and the end minute day, and a start after the end
+crosses midnight. The hub refuses a policy on a serial queue (limit 1), lane
+counts outside 1 to 64 or above a fixed limit, a missing, unknown or `Local`
+zone, a bad or equal pair of hours, a strain threshold outside 1 to 99, and
+strain lanes that are negative or not fewer than the smaller lane count. An
+identical resend saves nothing and keeps the saved `updatedAt`. While a policy
+is saved, `tt team queue limit` refuses a limit below either lane count, or 1,
+and names `tt team queue lanes --task TSK --off`; `none` stays allowed, and the
+lanes are then the only count.
+
+**The rule.** At a claim, after the limit and the host admission gates, the
+hub reads the policy and the launch host's census:
+
+1. The window gives the day or night lane count.
+2. Memory pressure over `strainPressure` takes `strainLanes` away, never
+   below one lane. Pressure the census did not observe is not strain.
+3. A fixed limit stays the ceiling.
+4. With `--matrix-waits hold` (the default), a census with one or more live
+   matrix waiters, or with the lock not observed, holds admission.
+
+When the active teams fill the lanes the claim is refused with `lane policy
+admits N teams (night); all team slots are reserved` (the window reads `day,
+memory pressure 85 over 70` under strain); a hold is refused with `lane policy
+holds admission: a matrix run waits for the verification host (N waiting);
+all team slots are reserved`, or `...: the verification host's matrix lock is
+not observed; ...`. Both end as the limit's own refusal, so the runner waits
+silently and claims the head on the first pass after a lane frees or the wait
+ends. The head rule, ownership, the token budget, the agent cap and the
+handler lease run unchanged after the lanes. The listing gives the queued
+entry the matching reason, `Lanes full: 3 of 3 (night)`, or `Held: a matrix
+run waits for the verification host (1 waiting)`, and its `lanes` object
+carries the policy, `window`, `lanes`, `active`, `strained`, the two readings
+and `hold`. The serial or parallel mode still comes from the limit alone, so
+one strained lane never turns a project serial.
+
+**Census.** The relay's host census (`observe_host`) carries
+`memoryPressure`, 100 minus `kern.memorystatus_level` as the matrix host lock
+reads it (nil off macOS or when `sysctl` fails), and `matrixWaiters`, the
+waiters in this host's lock (`TAILTERM_MATRIX_HOST_LOCK`, else the account's
+shared lock) whose process is alive. A lock file that does not exist is 0; a
+lock path the relay cannot resolve, or a file that is not a confirmed read
+(version 1 or 2 JSON naming this host, as the relay's matrix-wait reports
+read it), is not observed. The hub refuses pressure outside 0 to 100 and a negative count. The
+relay reuses an unchanged census for 20 seconds as before; a change in the
+waiter count, or pressure crossing the default threshold of 70, posts a new
+one at once. A project whose threshold is not 70 reads a pressure at most 20
+seconds old.
+
+**Limits.** Automatic handler provisioning, the stall check and the token
+budget's slot test still read the limit, not the lanes: the runner may add one
+handler that a night lane does not use yet, and a queued entry the lanes hold
+behind a failed entry may show its lane reason instead of a stall. Setting
+the live policy is a separate step after release. The owner helper's own
+procedure text is `wi_6923d3e2a8ee0016`.
+
+**Compatibility and rollback.** Two nullable `team_host_usage` columns and
+one `team_queue_settings` column are added in place; rollback is a binary
+swap, and an older hub ignores them. Without a saved policy every behaviour
+is unchanged apart from the new `upNext` field and list lines. An older relay
+sends no readings: pressure is then not strain, and a policy with
+`--matrix-waits hold` holds admission until the relay is updated, so release
+the hub and the Mini relay together. An older tt or TailOS ignores `upNext`
+and `lanes`.
 
 ## Small-change lane
 
@@ -1876,7 +1996,9 @@ first; the stall notice then carries the text above as the last launch error.
 
 **Interaction with the concurrency limit.** The limit is a ceiling on teams,
 the cap is a ceiling on agents in the project, and host capacity is a third,
-per host. Each is checked on its own and the tightest one holds the queue.
+per host. A saved lane policy is a fourth, never above the limit
+([Team queue lanes and up next](#team-queue-lanes-and-up-next)). Each is
+checked on its own and the tightest one holds the queue.
 Raising the limit never raises the cap: four Planned feature teams need 24
 seats beside the persistent roles and every agent not yet closed. The queue
 keeps its order, so a head entry that does not fit holds the entries behind it,

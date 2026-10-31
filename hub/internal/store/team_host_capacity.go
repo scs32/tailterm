@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -29,15 +30,35 @@ func readTeamHostPolicy(ctx context.Context, q queryRower, host string) (*api.Te
 
 func readTeamHostUsage(ctx context.Context, q queryRower, host string) (*api.TeamHostUsage, error) {
 	var u api.TeamHostUsage
-	var free sql.NullInt64
-	err := q.QueryRowContext(ctx, `SELECT host,limiter_domain,policy_version,observed_at,relay_bindings,complete,source_digest,free_disk_mib FROM team_host_usage WHERE host=?`, host).Scan(&u.Host, &u.LimiterDomain, &u.PolicyVersion, &u.ObservedAt, &u.RelayBindings, &u.Complete, &u.SourceDigest, &free)
+	var free, pressure, waiters sql.NullInt64
+	err := q.QueryRowContext(ctx, `SELECT host,limiter_domain,policy_version,observed_at,relay_bindings,complete,source_digest,free_disk_mib,memory_pressure,matrix_waiters FROM team_host_usage WHERE host=?`, host).Scan(&u.Host, &u.LimiterDomain, &u.PolicyVersion, &u.ObservedAt, &u.RelayBindings, &u.Complete, &u.SourceDigest, &free, &pressure, &waiters)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if free.Valid {
 		u.FreeDiskMiB = &free.Int64
 	}
+	u.MemoryPressure, u.MatrixWaiters = nullInt(pressure), nullInt(waiters)
 	return &u, err
+}
+
+func nullInt(v sql.NullInt64) *int {
+	if !v.Valid {
+		return nil
+	}
+	n := int(v.Int64)
+	return &n
+}
+
+func intOrNull(v *int) sql.NullInt64 {
+	if v == nil {
+		return sql.NullInt64{}
+	}
+	return sql.NullInt64{Int64: int64(*v), Valid: true}
+}
+
+func sameInt(a, b *int) bool {
+	return (a == nil) == (b == nil) && (a == nil || *a == *b)
 }
 
 func sameFreeDisk(a, b *int64) bool {
@@ -342,4 +363,130 @@ func queueItemKind(ctx context.Context, q queryRower, task, item string) (string
 		return "", nil
 	}
 	return kind, err
+}
+
+// maxQueueLanes bounds a lane count; the concurrency limit, when fixed, is
+// the real ceiling.
+const maxQueueLanes = 64
+
+// validQueueLanePolicy checks a lane policy against the project's limit and
+// returns it with its parsed window. The limit stays the ceiling, so a lane
+// count never admits more than the limit already allowed and no host or cap
+// gate needs to run again.
+func validQueueLanePolicy(p api.TeamQueueLanePolicy, limit int) (releaseWindow, error) {
+	invalid := func(why string) (releaseWindow, error) {
+		return releaseWindow{}, fmt.Errorf("%w: lane policy: %s", api.ErrInvalid, why)
+	}
+	if !queueParallel(limit) {
+		return invalid("the queue is serial (limit 1); lanes need a parallel limit: tt team queue limit --limit N")
+	}
+	if p.Day < 1 || p.Night < 1 || p.Day > maxQueueLanes || p.Night > maxQueueLanes {
+		return invalid(fmt.Sprintf("day and night lanes are 1 to %d", maxQueueLanes))
+	}
+	if limit > 0 && (p.Day > limit || p.Night > limit) {
+		return invalid(fmt.Sprintf("day %d and night %d lanes must not exceed the concurrency limit %d", p.Day, p.Night, limit))
+	}
+	if p.Zone == "" {
+		return invalid("zone required, an IANA name such as America/Los_Angeles")
+	}
+	loc, err := interventionLocation(p.Zone)
+	if err != nil {
+		return invalid("unknown zone " + strconv.Quote(p.Zone) + "; use an IANA name such as America/Los_Angeles")
+	}
+	start, ok := releaseWindowClock(p.NightStart)
+	end, ok2 := releaseWindowClock(p.NightEnd)
+	if !ok || !ok2 {
+		return invalid("night start and end are 24-hour HH:MM, 00:00 to 23:59")
+	}
+	if start == end {
+		return invalid("night start and end must differ")
+	}
+	if p.StrainPressure < 1 || p.StrainPressure > 99 {
+		return invalid("strain pressure is a whole number from 1 to 99")
+	}
+	if p.StrainLanes < 0 || p.StrainLanes >= min(p.Day, p.Night) {
+		return invalid(fmt.Sprintf("strain lanes are 0 to %d, fewer than the smaller lane count", min(p.Day, p.Night)-1))
+	}
+	return releaseWindow{loc: loc, start: start, end: end}, nil
+}
+
+// loadQueueLanePolicy reads a project's lane policy, or nil when it has none.
+func loadQueueLanePolicy(ctx context.Context, q queryRower, task string) (*api.TeamQueueLanePolicy, error) {
+	var raw string
+	err := q.QueryRowContext(ctx, `SELECT lane_policy_json FROM team_queue_settings WHERE task_id=?`, task).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && raw == "") {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var p api.TeamQueueLanePolicy
+	if err := json.Unmarshal([]byte(raw), &p); err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
+// queueLanes is the lane policy as it applies at now: the day or night lane
+// count, StrainLanes fewer (never fewer than one) while the census's memory
+// pressure is over the threshold, and a hold while a matrix run waits or the
+// lock is not observed. Unobserved pressure is not strain. A fixed limit
+// stays the ceiling. Active is left for the caller.
+func queueLanes(limit int, p api.TeamQueueLanePolicy, u *api.TeamHostUsage, now time.Time) api.TeamQueueLanes {
+	out := api.TeamQueueLanes{Policy: p, Window: api.LaneWindowDay, Lanes: p.Day}
+	if w, err := validQueueLanePolicy(p, 0); err == nil && releaseWindowInside(w, now) {
+		out.Window, out.Lanes = api.LaneWindowNight, p.Night
+	}
+	if u != nil {
+		out.MemoryPressure, out.MatrixWaiters = u.MemoryPressure, u.MatrixWaiters
+	}
+	if out.MemoryPressure != nil && *out.MemoryPressure > p.StrainPressure {
+		out.Strained = true
+		out.Lanes = max(1, out.Lanes-p.StrainLanes)
+	}
+	if limit > 0 {
+		out.Lanes = min(out.Lanes, limit)
+	}
+	if p.HoldWhileMatrixWaits {
+		switch {
+		case out.MatrixWaiters == nil:
+			out.Hold = "the verification host's matrix lock is not observed"
+		case *out.MatrixWaiters > 0:
+			out.Hold = fmt.Sprintf("a matrix run waits for the verification host (%d waiting)", *out.MatrixWaiters)
+		}
+	}
+	return out
+}
+
+// queueLanesWhy names what set the lane count, as the listing and the
+// claim's refusal say it: the window, and strain when it lowered the count.
+func queueLanesWhy(l api.TeamQueueLanes) string {
+	if l.Strained {
+		return fmt.Sprintf("%s, memory pressure %d over %d", l.Window, *l.MemoryPressure, l.Policy.StrainPressure)
+	}
+	return l.Window
+}
+
+// queueLaneRefusal is the claim's refusal when lanes admit no team now, or
+// nil. Both texts end as the limit's own, so the runner waits silently.
+func queueLaneRefusal(l api.TeamQueueLanes, active int) error {
+	if l.Hold != "" {
+		return fmt.Errorf("%w: lane policy holds admission: %s; all team slots are reserved", api.ErrConflict, l.Hold)
+	}
+	if active >= l.Lanes {
+		return fmt.Errorf("%w: lane policy admits %d teams (%s); all team slots are reserved", api.ErrConflict, l.Lanes, queueLanesWhy(l))
+	}
+	return nil
+}
+
+// queueLaneReason is the listing's reason for a queued entry the lanes hold,
+// or empty.
+func queueLaneReason(l api.TeamQueueLanes, active int) string {
+	if l.Hold != "" {
+		return "Held: " + l.Hold
+	}
+	if active >= l.Lanes {
+		return fmt.Sprintf("Lanes full: %d of %d (%s)", active, l.Lanes, queueLanesWhy(l))
+	}
+	return ""
 }

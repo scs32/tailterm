@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1376,11 +1377,11 @@ func TestTeamQueueListMatrixWait(t *testing.T) {
 	if got := lines(out); len(got) != 1 || got[0] != want {
 		t.Fatalf("waiting lines %q, want only %q:\n%s", got, want, out)
 	}
-	entryAt := strings.Index(out, waitingItem.ID)
+	entryAt := strings.Index(out, waitingItem.ID+" order=")
 	if next := strings.Index(out[entryAt:], "\n"); !strings.Contains(out[entryAt+next:], want) || strings.Index(out, want) < entryAt {
 		t.Fatalf("the line must follow its entry:\n%s", out)
 	}
-	if strings.Index(out, want) < strings.Index(out, idle.ID) && strings.Index(out, idle.ID) > entryAt {
+	if strings.Index(out, want) < strings.Index(out, idle.ID+" order=") && strings.Index(out, idle.ID+" order=") > entryAt {
 		t.Fatalf("the line must be under the waiting entry, not another:\n%s", out)
 	}
 	if got := listJSON(); got != plainJSON {
@@ -1417,7 +1418,7 @@ func TestTeamQueueListMatrixWait(t *testing.T) {
 	if got := lines(out); len(got) != 2 || got[0] != wantV2[0] || got[1] != wantV2[1] {
 		t.Fatalf("version 2 lines %q, want %q:\n%s", got, wantV2, out)
 	}
-	if at := strings.Index(out, wantV2[0]+"\n"+wantV2[1]+"\n"); at < strings.Index(out, waitingItem.ID) || at > strings.Index(out, remote.ID) {
+	if at := strings.Index(out, wantV2[0]+"\n"+wantV2[1]+"\n"); at < strings.Index(out, waitingItem.ID+" order=") || at > strings.Index(out, remote.ID+" order=") {
 		t.Fatalf("the version 2 lines must follow their entry:\n%s", out)
 	}
 	if got := listJSON(); got != plainJSON {
@@ -1467,7 +1468,7 @@ func TestTeamQueueListMatrixWait(t *testing.T) {
 		t.Fatalf("unattributed lines %q, want %q:\n%s", gotUnattributed, wantUnattributed, out)
 	}
 	block := strings.Join(wantUnattributed, "\n") + "\n"
-	if strings.Count(out, block) != 1 || strings.Index(out, block) < strings.Index(out, remote.ID) || !strings.HasPrefix(out[strings.Index(out, block)+len(block):], "history:") {
+	if strings.Count(out, block) != 1 || strings.Index(out, block) < strings.Index(out, remote.ID+" order=") || !strings.HasPrefix(out[strings.Index(out, block)+len(block):], "history:") {
 		t.Fatalf("the unattributed lines must follow every entry, once:\n%s", out)
 	}
 	bareHolders := "holder=unknown/unknown/pid 501,wi_holder/verifier-1/pid 777," + remote.ID + "/unknown/pid 505"
@@ -1475,7 +1476,7 @@ func TestTeamQueueListMatrixWait(t *testing.T) {
 	if got := lines(out); len(got) != 1 || got[0] != itemLine {
 		t.Fatalf("the item's waiter must keep only its entry's line %q, got %q:\n%s", itemLine, got, out)
 	}
-	if at := strings.Index(out, itemLine); at < strings.Index(out, waitingItem.ID) || at > strings.Index(out, remote.ID) {
+	if at := strings.Index(out, itemLine); at < strings.Index(out, waitingItem.ID+" order=") || at > strings.Index(out, remote.ID+" order=") {
 		t.Fatalf("the item's line must follow its entry:\n%s", out)
 	}
 	if got := listJSON(); got != plainJSON {
@@ -3014,5 +3015,297 @@ func TestQueueWaitCLIReleaseAndHost(t *testing.T) {
 	}
 	if got, _ := f.c.GetTeamQueueEntry(ctx, f.task.ID, waiting.ID); len(got.Waits) != 0 {
 		t.Fatalf("cleared waits still open: %+v", got.Waits)
+	}
+}
+
+// liveHostMemoryPressure is the production reader; no other test reads this
+// host's memory pressure, and a test that needs a reading sets one.
+var liveHostMemoryPressure = hostMemoryPressure
+
+func init() {
+	hostMemoryPressure = func() *int { return nil }
+}
+
+func queueIntp(n int) *int { return &n }
+
+// lanesCLIQueue is a parallel project at limit 4 with two entries queued in
+// their own checkouts, the fixture item first.
+func lanesCLIQueue(t *testing.T, f teamFixture) (api.WorkItem, api.WorkItem) {
+	t.Helper()
+	parallelCLIProject(t, f, "4")
+	second, secondOrder := queueFixtureItem(t, f, "lanes-second")
+	for _, add := range []struct {
+		item  string
+		order int64
+		owns  string
+	}{{f.item.ID, f.order, "client"}, {second.ID, secondOrder, "docs"}} {
+		repo, _ := queueGitRepo(t)
+		if _, err := captureCLIOutput(t, func() error {
+			return cmdTeamQueue(f.e, []string{"add", "--item", add.item, "--order", fmt.Sprint(add.order), "--cwd", repo, "--owns", add.owns})
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return f.item, second
+}
+
+// postLaneCensus posts a fresh census for the launch host with the given
+// lane signals, under the saved host policy.
+func postLaneCensus(t *testing.T, f teamFixture, pressure, waiters *int) {
+	t.Helper()
+	ctx := context.Background()
+	list, err := f.c.TeamQueueByHost(ctx, spawn.Host())
+	if err != nil || list.HostPolicy == nil {
+		t.Fatalf("host list %+v %v", list.HostPolicy, err)
+	}
+	free := int64(1 << 20)
+	usage := api.TeamHostUsage{Host: spawn.Host(), LimiterDomain: list.HostPolicy.LimiterDomain, PolicyVersion: list.HostPolicy.Version, ObservedAt: time.Now().UTC().Format(time.RFC3339Nano), RelayBindings: 1, Complete: true, SourceDigest: strings.Repeat("a", 64), FreeDiskMiB: &free, MemoryPressure: pressure, MatrixWaiters: waiters}
+	if _, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: api.NewID("tqr"), Operation: "observe_host", Host: spawn.Host(), HostUsage: &usage}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// a2: the list numbers the queued entries, names them in order on an up
+// next line, and prints the lanes (lanes=off without a policy).
+func TestTeamQueueListPrintsUpNextAndLanes(t *testing.T) {
+	f := newTeamFixture(t, true)
+	first, second := lanesCLIQueue(t, f)
+	out, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"list"}) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	list, err := f.c.ListTeamQueuePage(context.Background(), f.task.ID, api.TeamQueueListOptions{View: api.TeamQueueViewActive})
+	if err != nil || len(list.Entries) != 2 {
+		t.Fatalf("listing %+v %v", list.Entries, err)
+	}
+	a, b := list.Entries[0], list.Entries[1]
+	for _, want := range []string{
+		"lanes=off\n",
+		fmt.Sprintf("up next: 1 %s (%s), 2 %s (%s)\n", first.ID, a.ID, second.ID, b.ID),
+		fmt.Sprintf("%d queued up-next=1 %s %s ", a.Position, a.ID, first.ID),
+		fmt.Sprintf("%d queued up-next=2 %s %s ", b.Position, b.ID, second.ID),
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("list lacks %q:\n%s", want, out)
+		}
+	}
+	if _, err := captureCLIOutput(t, func() error {
+		return cmdTeamQueue(f.e, []string{"reorder", "--entry", b.ID, "--before", a.ID})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	postLaneCensus(t, f, queueIntp(20), queueIntp(0))
+	if _, err := captureCLIOutput(t, func() error {
+		return cmdTeamQueue(f.e, []string{"lanes", "--day", "3", "--night", "3", "--zone", "UTC", "--night-start", "00:00", "--night-end", "23:59", "--matrix-waits", "ignore"})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	out, err = captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"list"}) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"lanes=3 window=",
+		" active=0 strained=no memory-pressure=20 matrix-waiters=0\n",
+		fmt.Sprintf("up next: 1 %s (%s), 2 %s (%s)\n", second.ID, b.ID, first.ID, a.ID),
+		fmt.Sprintf(" queued up-next=1 %s %s ", b.ID, second.ID),
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("list after reorder and lanes lacks %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "lanes=off") {
+		t.Fatalf("policy listed as off:\n%s", out)
+	}
+	if got := queueUpNextText(nil); got != "up next: none" {
+		t.Fatalf("empty up next %q", got)
+	}
+}
+
+// a4 (CLI): tt team queue lanes saves and reads back the policy, passes the
+// hub's refusals through, clears with --off, and checks its own usage.
+func TestTeamQueueLanesCommand(t *testing.T) {
+	f := newTeamFixture(t, true)
+	parallelCLIProject(t, f, "4")
+	set := []string{"lanes", "--day", "4", "--night", "3", "--zone", "America/Los_Angeles", "--night-start", "22:00", "--night-end", "07:00"}
+	out, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, set) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "lane policy: day=4 night=3 zone=America/Los_Angeles night-hours=22:00-07:00 strain-pressure=70 strain-lanes=1 matrix-waits=hold updated=") || !strings.Contains(out, "\nlanes=") {
+		t.Fatalf("lanes output %q", out)
+	}
+	updated := out[strings.Index(out, "updated=") : strings.Index(out, "updated=")+len("updated=")+20]
+	again, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, set) })
+	if err != nil || !strings.Contains(again, updated) {
+		t.Fatalf("identical resend %q %v, want %s", again, err, updated)
+	}
+	list, err := f.c.ListTeamQueuePage(context.Background(), f.task.ID, api.TeamQueueListOptions{View: api.TeamQueueViewActive})
+	if err != nil || list.Lanes == nil || list.Lanes.Policy.Day != 4 || list.Lanes.Policy.Night != 3 || !list.Lanes.Policy.HoldWhileMatrixWaits {
+		t.Fatalf("hub policy %+v %v", list.Lanes, err)
+	}
+	for name, args := range map[string][]string{
+		"no zone":      {"lanes", "--day", "4", "--night", "3", "--night-start", "22:00", "--night-end", "07:00"},
+		"no night":     {"lanes", "--day", "4", "--zone", "UTC", "--night-start", "22:00", "--night-end", "07:00"},
+		"matrix waits": {"lanes", "--day", "4", "--night", "3", "--zone", "UTC", "--night-start", "22:00", "--night-end", "07:00", "--matrix-waits", "maybe"},
+		"off and day":  {"lanes", "--off", "--day", "4"},
+	} {
+		if _, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, args) }); err == nil || !strings.Contains(err.Error(), "usage: tt team queue lanes") {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	over := append([]string{}, set...)
+	over[2] = "5"
+	if _, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, over) }); err == nil || !strings.Contains(err.Error(), "must not exceed the concurrency limit 4") {
+		t.Fatalf("lanes over the limit: %v", err)
+	}
+	if _, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"limit", "--limit", "3"}) }); err == nil || !strings.Contains(err.Error(), "tt team queue lanes --task "+f.task.ID+" --off") {
+		t.Fatalf("limit below the lanes: %v", err)
+	}
+	if out, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"lanes", "--off"}) }); err != nil || strings.TrimSpace(out) != "lanes=off" {
+		t.Fatalf("lanes --off %q %v", out, err)
+	}
+	if out, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"limit", "--limit", "3"}) }); err != nil || !strings.Contains(out, "concurrency limit=3") {
+		t.Fatalf("limit after --off %q %v", out, err)
+	}
+	if out, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"lanes", "--off", "--json"}) }); err != nil || !strings.Contains(out, `"state": "settings"`) {
+		t.Fatalf("lanes --off --json %q %v", out, err)
+	}
+}
+
+// a6 (runner): both lane refusals reach the runner as a 409 it takes for a
+// wait, so the head stays queued with no failure.
+func TestTeamQueueClaimLaneRefusalsAreWaits(t *testing.T) {
+	f := newTeamFixture(t, true)
+	lanesCLIQueue(t, f)
+	ctx := context.Background()
+	if _, err := captureCLIOutput(t, func() error {
+		return cmdTeamQueue(f.e, []string{"lanes", "--day", "1", "--night", "1", "--strain-lanes", "0", "--zone", "UTC", "--night-start", "00:00", "--night-end", "23:59"})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	claim := func() (api.TeamQueueEntry, error) {
+		t.Helper()
+		list, err := f.c.ListTeamQueuePage(ctx, f.task.ID, api.TeamQueueListOptions{View: api.TeamQueueViewActive})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, q := range list.Entries {
+			if q.State == "queued" {
+				return f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: api.NewID("tqr"), Operation: "claim", EntryID: q.ID, ExpectedRevision: q.Revision, Host: spawn.Host(), PauseGeneration: f.task.PauseGeneration})
+			}
+		}
+		t.Fatal("nothing queued")
+		return api.TeamQueueEntry{}, nil
+	}
+	wait := func(err error, want string) {
+		t.Helper()
+		var response *api.HTTPError
+		if !errors.As(err, &response) || response.Status != http.StatusConflict || !strings.Contains(response.Msg, want) || !claimRaceConflict(response.Msg) {
+			t.Fatalf("claim refusal %v, want a runner wait naming %q", err, want)
+		}
+	}
+	postLaneCensus(t, f, queueIntp(10), queueIntp(1))
+	_, err := claim()
+	wait(err, "lane policy holds admission: a matrix run waits for the verification host (1 waiting)")
+	postLaneCensus(t, f, queueIntp(10), nil)
+	_, err = claim()
+	wait(err, "lane policy holds admission: the verification host's matrix lock is not observed")
+	postLaneCensus(t, f, queueIntp(10), queueIntp(0))
+	if _, err := claim(); err != nil {
+		t.Fatalf("claim with no matrix waiter: %v", err)
+	}
+	_, err = claim()
+	wait(err, "lane policy admits 1 teams")
+}
+
+// a7: the census carries memory pressure from its reader and the live
+// matrix waiters from the lock file, and posts again when the waiter count
+// changes or the pressure crosses the strain threshold.
+func TestTeamQueueHostCensusLaneSignals(t *testing.T) {
+	dir := t.TempDir()
+	lock := filepath.Join(dir, "host.json")
+	t.Setenv("TAILTERM_MATRIX_HOST_LOCK", lock)
+	host, err := os.Hostname()
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeLock := func(waiters ...int) {
+		t.Helper()
+		var entries []string
+		for _, pid := range waiters {
+			entries = append(entries, fmt.Sprintf(`{"pid":%d,"kind":"matrix","item":"wi_0000000000000001","agent":"verifier"}`, pid))
+		}
+		body := fmt.Sprintf(`{"version":2,"host":%q,"holders":[{"pid":%d,"kind":"matrix"}],"waiters":[%s]}`, host, os.Getpid(), strings.Join(entries, ","))
+		if err := os.WriteFile(lock, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := hostMatrixWaiters(); got == nil || *got != 0 {
+		t.Fatalf("missing lock %v, want 0", got)
+	}
+	writeLock(os.Getpid(), os.Getpid())
+	if got := hostMatrixWaiters(); got == nil || *got != 2 {
+		t.Fatalf("two waiters read %v", got)
+	}
+	writeLock(os.Getpid(), 0)
+	if got := hostMatrixWaiters(); got == nil || *got != 1 {
+		t.Fatalf("a waiter with no live process counted: %v", got)
+	}
+	if err := os.WriteFile(lock, []byte("not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := hostMatrixWaiters(); got != nil {
+		t.Fatalf("garbage lock read %d, want unobserved", *got)
+	}
+	t.Setenv("TAILTERM_MATRIX_HOST_LOCK", "relative/host.json")
+	if got := hostMatrixWaiters(); got != nil {
+		t.Fatalf("relative lock path read %d", *got)
+	}
+	t.Setenv("TAILTERM_MATRIX_HOST_LOCK", lock)
+	if runtime.GOOS == "darwin" {
+		if got := liveHostMemoryPressure(); got == nil || *got < 0 || *got > 100 {
+			t.Fatalf("live memory pressure %v", got)
+		}
+	}
+
+	f := newTeamFixture(t, true)
+	ctx := context.Background()
+	if _, err := f.c.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: "lane-census-policy", Operation: "set_host_policy", Host: "fixture", HostPolicyVersion: 1, HostPolicyExpires: time.Now().Add(time.Hour).Format(time.RFC3339), HostMaxSessions: 100, HostMaxPolling: 10, LimiterDomain: "https://fixture.invalid", HostMaxRelayBindings: 100, HostMaxRequestsPerMinute: 100000, HostMaxBurst: 10000, HostHeadroomPercent: 20}); err != nil {
+		t.Fatal(err)
+	}
+	previous := hostMemoryPressure
+	t.Cleanup(func() { hostMemoryPressure = previous })
+	census := func(pressure int, waiters ...int) *api.TeamHostUsage {
+		t.Helper()
+		hostMemoryPressure = func() *int { return queueIntp(pressure) }
+		writeLock(waiters...)
+		list, err := f.c.TeamQueueByHost(ctx, "fixture")
+		if err != nil || list.HostPolicy == nil {
+			t.Fatalf("host list %+v %v", list, err)
+		}
+		if err := saveHostRelayCensus(ctx, f.c, f.task.ID, "fixture", *list.HostPolicy, list.HostUsage, nil, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		list, err = f.c.TeamQueueByHost(ctx, "fixture")
+		if err != nil || list.HostUsage == nil || list.HostUsage.MemoryPressure == nil || list.HostUsage.MatrixWaiters == nil {
+			t.Fatalf("host usage %+v %v", list.HostUsage, err)
+		}
+		return list.HostUsage
+	}
+	if got := census(20); *got.MemoryPressure != 20 || *got.MatrixWaiters != 0 {
+		t.Fatalf("first census %d %d", *got.MemoryPressure, *got.MatrixWaiters)
+	}
+	if got := census(30); *got.MemoryPressure != 20 {
+		t.Fatalf("pressure on the same side rewrote the census: %d", *got.MemoryPressure)
+	}
+	if got := census(80); *got.MemoryPressure != 80 {
+		t.Fatalf("crossing the strain threshold kept %d", *got.MemoryPressure)
+	}
+	if got := census(90, os.Getpid(), os.Getpid()); *got.MemoryPressure != 90 || *got.MatrixWaiters != 2 {
+		t.Fatalf("a waiter change kept %d %d", *got.MemoryPressure, *got.MatrixWaiters)
+	}
+	if got := census(95, os.Getpid(), os.Getpid()); *got.MemoryPressure != 90 || *got.MatrixWaiters != 2 {
+		t.Fatalf("an unchanged census was rewritten: %d %d", *got.MemoryPressure, *got.MatrixWaiters)
 	}
 }
