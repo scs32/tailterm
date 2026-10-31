@@ -1918,7 +1918,10 @@ func TestHandoffInjection(t *testing.T) {
 		sort.Strings(commands)
 		want := []string{"tt handoff continuity get --task " + b.helper.Task, "tt handoff restore --task " + b.helper.Task, "tt handoff show", "tt helper env --task " + b.helper.Task, "tt inbox --seq <number>"}
 		// Stage B's other commands are not in the note; the binary has them too.
-		commands = append(commands, "tt handoff status", "tt handoff wake confirm w1", "tt handoff wake due w1")
+		commands = append(commands, "tt handoff status", "tt handoff wake confirm w1", "tt handoff wake due w1",
+			// Wakes on the hub: list, schedule and cancel reach the hub, not the host record.
+			"tt handoff wake list", "tt handoff wake schedule --kind other --schedule * --message 1 --request-id k",
+			"tt handoff wake cancel ohw_0123456789abcdef --revision 1 --request-id k")
 		want = append(want, commands[len(want):]...)
 		if strings.Join(commands, "|") != strings.Join(want, "|") {
 			t.Fatalf("the notes name %q; want %q", commands, want)
@@ -1972,12 +1975,12 @@ func TestHandoffInjection(t *testing.T) {
 			}
 		}
 		// The check can fail: made-up commands are refused.
-		for _, command := range []string{"tt handoff note wake remove", "tt handoff wake", "tt handoff wake cancel w1", "tt helper restore --task " + b.helper.Task, "tt nosuchcommand"} {
+		for _, command := range []string{"tt handoff note wake remove", "tt handoff wake", "tt handoff wake remove w1", "tt helper restore --task " + b.helper.Task, "tt nosuchcommand"} {
 			if ok, out := dispatch(command); ok {
 				t.Errorf("%q was accepted by this binary:\n%s", command, out)
 			}
 		}
-		for _, words := range [][]string{{"wake"}, {"wake", "cancel", "w1"}, {"note", "wake"}, {"note", "wake", "remove"}, {"note", "timer", "add"}, {}} {
+		for _, words := range [][]string{{"wake"}, {"wake", "remove", "w1"}, {"note", "wake"}, {"note", "wake", "remove"}, {"note", "timer", "add"}, {}} {
 			if run, _ := handoffRoute(words); run != nil {
 				t.Errorf("tt handoff %v is routed", words)
 			}
@@ -7003,5 +7006,158 @@ func TestHandoffContinuitySet(t *testing.T) {
 	// The body never enters the host handoff record or its logs.
 	if after := handoffTreeState(handoffDir); after != beforeHandoff {
 		t.Fatalf("set changed the host handoff directory:\nbefore\n%s\nafter\n%s", beforeHandoff, after)
+	}
+}
+
+// Wakes on the hub (bug wi_8d18e0fe8bdf2ad6): schedule, change, cancel and
+// list against a real hub on an isolated store, as the owner from a shell
+// and as the registered helper from its session.
+func TestHandoffHubWakeCommands(t *testing.T) {
+	b := newHandoffBox(t)
+	h := newContinuityHub(t)
+	ctx := context.Background()
+	fixed := time.Date(2026, 11, 2, 14, 50, 0, 0, time.UTC) // 06:50 PST
+	h.st.SetClockForTest(func() time.Time { return fixed })
+	m, err := h.st.PostMessage(ctx, h.task.ID, api.PostMessageRequest{Text: "synthetic wake instructions"}, api.Caller{Node: "workspace", User: "owner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := strconv.FormatInt(m.Seq, 10)
+	handoffDir := filepath.Join(b.root, "handoff")
+	beforeHandoff := handoffTreeState(handoffDir)
+	// The owner, from a shell with no runtime session.
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "")
+	t.Setenv("CODEX_THREAD_ID", "")
+	b.e = env{hub: h.url, token: handoffTestToken}
+	hourlyArgs := []string{"wake", "schedule", "--task", h.task.ID, "--kind", "hourly-update", "--schedule", "14 7-20 * * *", "--message", msg, "--request-id", "wake-hourly"}
+	out := b.must(hourlyArgs...)
+	line := regexp.MustCompile(`^wake (ohw_[0-9a-f]{16}) revision 1 kind=hourly-update schedule='14 7-20 \* \* \*' zone=America/Los_Angeles message=#` + msg + ` state=active next=2026-11-02T15:14:00Z expires=-\n$`)
+	match := line.FindStringSubmatch(out)
+	if match == nil {
+		t.Fatalf("owner schedule:\n%s", out)
+	}
+	hourly := match[1]
+	if again := b.must(hourlyArgs...); again != out {
+		t.Fatalf("replay:\n%s\nwant\n%s", again, out)
+	}
+	// The registered helper, from its session, without --task.
+	reg, err := h.client.RegisterOwnerHelper(ctx, h.task.ID, api.RegisterOwnerHelperRequest{Host: "owner-mac", Session: "owner", Runtime: "claude", RequestID: "ohreg-1"})
+	if err != nil || reg.Agent == nil {
+		t.Fatalf("register %+v %v", reg, err)
+	}
+	b.helper.Hub, b.helper.Task, b.helper.Agent, b.helper.Run = h.url, h.task.ID, reg.Agent.ID, reg.Agent.RunID
+	b.asHelper()
+	out = b.must("wake", "schedule", "--kind", "queue-check", "--schedule", "8,28,48 * * * *", "--message", msg, "--request-id", "wake-queue")
+	if match = regexp.MustCompile(`^wake (ohw_[0-9a-f]{16}) revision 1 kind=queue-check .* next=2026-11-02T15:08:00Z `).FindStringSubmatch(out); match == nil {
+		t.Fatalf("helper schedule:\n%s", out)
+	}
+	queue := match[1]
+	list, err := h.client.ListOwnerHelperWakes(ctx, h.task.ID, 0)
+	if err != nil || len(list.Wakes) != 2 || list.Wakes[0].AgentID != "" || list.Wakes[1].AgentID != reg.Agent.ID || list.Wakes[1].RunID != reg.Agent.RunID {
+		t.Fatalf("writers %+v %v", list, err)
+	}
+	// A change keeps the fields it does not name.
+	out = b.must("wake", "schedule", queue, "--schedule", "0,20,40 * * * *", "--expires", "2026-11-09T00:00:00Z", "--revision", "1", "--request-id", "wake-queue-change")
+	if !strings.HasPrefix(out, "wake "+queue+" revision 2 kind=queue-check schedule='0,20,40 * * * *' zone=America/Los_Angeles message=#"+msg+" state=active next=2026-11-02T15:00:00Z expires=2026-11-09T00:00:00Z") {
+		t.Fatalf("change:\n%s", out)
+	}
+	if out = b.must("wake", "schedule", queue, "--zone", "Europe/London", "--expires", "none", "--revision", "2", "--request-id", "wake-queue-zone"); !strings.Contains(out, "revision 3 kind=queue-check schedule='0,20,40 * * * *' zone=Europe/London") || !strings.HasSuffix(out, "expires=-\n") {
+		t.Fatalf("zone change:\n%s", out)
+	}
+	if _, err := b.run("wake", "schedule", queue, "--kind", "other", "--revision", "2", "--request-id", "wake-queue-stale"); err == nil || !strings.Contains(err.Error(), "409") || !strings.Contains(err.Error(), "revision 3") {
+		t.Fatalf("stale revision: %v", err)
+	}
+	if out = b.must("wake", "cancel", queue, "--revision", "3", "--request-id", "wake-queue-cancel"); !strings.Contains(out, "revision 4 ") || !strings.Contains(out, "state=cancelled next=-") {
+		t.Fatalf("cancel:\n%s", out)
+	}
+	// Refused before any request: another session, another agent, bad input.
+	h.mu.Lock()
+	h.requests = nil
+	h.mu.Unlock()
+	t.Setenv("CLAUDE_CODE_SESSION_ID", handoffOtherID)
+	if _, err := b.run("wake", "cancel", hourly, "--task", h.task.ID, "--revision", "1", "--request-id", "wake-other-session"); err == nil || !strings.Contains(err.Error(), "not the registered owner helper") {
+		t.Fatalf("another session: %v", err)
+	}
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "")
+	b.e.agent = "agt_00000000000000ee"
+	if _, err := b.run("wake", "cancel", hourly, "--task", h.task.ID, "--revision", "1", "--request-id", "wake-other-agent"); err == nil || !strings.Contains(err.Error(), "not") {
+		t.Fatalf("another agent: %v", err)
+	}
+	b.e.agent = ""
+	for _, c := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"wake", "schedule", "--task", h.task.ID, "--kind", "other", "--schedule", "0 7 * * *", "--message", msg}, "usage:"},
+		{[]string{"wake", "schedule", "--task", h.task.ID, "--schedule", "0 7 * * *", "--message", msg, "--request-id", "k"}, "a new wake needs --kind"},
+		{[]string{"wake", "schedule", "--task", h.task.ID, "--kind", "other", "--schedule", "0 7 * * *", "--message", msg, "--revision", "1", "--request-id", "k"}, "takes no --revision"},
+		{[]string{"wake", "schedule", hourly, "--task", h.task.ID, "--kind", "other", "--request-id", "k"}, "current --revision"},
+		{[]string{"wake", "schedule", "w1", "--task", h.task.ID, "--revision", "1", "--request-id", "k"}, "name the wake by its id"},
+		{[]string{"wake", "schedule", "--task", h.task.ID, "--kind", "other", "--schedule", "0 7 * * *", "--message", msg, "--expires", "soon", "--request-id", "k"}, "--expires is not"},
+		{[]string{"wake", "schedule", "--kind", "other", "--schedule", "0 7 * * *", "--message", msg, "--request-id", "k"}, "name the project with --task"},
+		{[]string{"wake", "cancel", "--task", h.task.ID, "--revision", "1", "--request-id", "k"}, "usage:"},
+		{[]string{"wake", "cancel", hourly, "--task", h.task.ID, "--request-id", "k"}, "usage:"},
+		{[]string{"wake", "list"}, "name the project with --task"},
+		{[]string{"wake", "list", "--task", h.task.ID, "--firings", "0"}, "usage:"},
+		{[]string{"wake", "list", "--task", h.task.ID, "--firings", "51"}, "usage:"},
+		{[]string{"wake", "remove"}, "usage:"},
+	} {
+		if _, err := b.run(c.args...); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Fatalf("%v: %v; want %q", c.args, err, c.want)
+		}
+	}
+	if seen := h.seen(); len(seen) != 0 {
+		t.Fatalf("refused commands reached the hub: %q", seen)
+	}
+	// The hub refuses what only it can judge.
+	if _, err := b.run("wake", "schedule", "--task", h.task.ID, "--kind", "nightly", "--schedule", "0 7 * * *", "--message", msg, "--request-id", "wake-bad-kind"); err == nil || !strings.Contains(err.Error(), "400") {
+		t.Fatalf("bad kind: %v", err)
+	}
+	// A slot fires; list shows it.
+	if _, err := h.st.OwnerHelperWakeSweep(ctx, time.Date(2026, 11, 2, 15, 14, 10, 0, time.UTC)); err != nil {
+		t.Fatal(err)
+	}
+	h.mu.Lock()
+	h.requests = nil
+	h.mu.Unlock()
+	out = b.must("wake", "list", "--task", h.task.ID)
+	lines := strings.Split(strings.TrimSuffix(out, "\n"), "\n")
+	if len(lines) != 3 || !strings.HasPrefix(lines[0], "wake "+hourly+" revision 1 kind=hourly-update ") || !strings.Contains(lines[0], "next=2026-11-02T16:14:00Z") ||
+		!regexp.MustCompile(`^  due=2026-11-02T15:14:00Z outcome=posted notice=#\d+ posted=2026-11-02T15:14:10Z read=- late=0min report=-$`).MatchString(lines[1]) ||
+		!strings.HasPrefix(lines[2], "wake "+queue+" revision 4 ") {
+		t.Fatalf("list:\n%s", out)
+	}
+	var got api.OwnerHelperWakeList
+	if err := json.Unmarshal([]byte(b.must("wake", "list", "--task", h.task.ID, "--json", "--firings", "2")), &got); err != nil {
+		t.Fatal(err)
+	}
+	want, err := h.client.ListOwnerHelperWakes(ctx, h.task.ID, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotJSON, _ := json.Marshal(got)
+	wantJSON, _ := json.Marshal(want)
+	if string(gotJSON) != string(wantJSON) || len(got.Wakes) != 2 || len(got.Wakes[0].Firings) != 1 {
+		t.Fatalf("list --json:\n%s\nwant\n%s", gotJSON, wantJSON)
+	}
+	b.e.task = h.task.ID
+	if out := b.must("wake", "list"); !strings.HasPrefix(out, "wake "+hourly) {
+		t.Fatalf("list from the environment's project:\n%s", out)
+	}
+	for _, r := range h.seen() {
+		if !strings.HasPrefix(r, "GET /v1/tasks/"+h.task.ID+"/owner-helper/wakes") {
+			t.Fatalf("list sent %s; want only wake GET requests", r)
+		}
+	}
+	other, err := h.client.CreateTask(ctx, api.CreateTaskRequest{Name: "Empty"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out := b.must("wake", "list", "--task", other.ID); out != "no wakes are scheduled on the hub for this project\n" {
+		t.Fatalf("empty list: %q", out)
+	}
+	// None of this touched the host handoff record.
+	if after := handoffTreeState(handoffDir); after != beforeHandoff {
+		t.Fatalf("hub wake commands changed the host handoff directory:\nbefore\n%s\nafter\n%s", beforeHandoff, after)
 	}
 }

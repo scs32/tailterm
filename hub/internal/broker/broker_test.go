@@ -1543,3 +1543,198 @@ func TestStallListsTheSilentObligationOnly(t *testing.T) {
 		t.Errorf("silent holder: owner %v stall %v, want one owner escalation and a stall", owner[1], stall[1])
 	}
 }
+
+// The owner helper's wakes on the hub (bug wi_8d18e0fe8bdf2ad6): Tick
+// delivers each due slot once, to the current owner helper, across ticks and
+// a restart. Fake clocks and an isolated store only.
+
+type wakeTickFixture struct {
+	*fixture
+	now    time.Time
+	helper api.Agent
+	msg    int64
+}
+
+func newWakeTickFixture(t *testing.T) *wakeTickFixture {
+	t.Helper()
+	f := &wakeTickFixture{fixture: newFixture(t), now: time.Date(2026, 11, 2, 14, 50, 0, 0, time.UTC)} // 06:50 PST
+	f.clock()
+	out, err := f.st.RegisterOwnerHelper(f.ctx, f.task.ID, api.RegisterOwnerHelperRequest{Host: "owner-host", Session: "owner", Runtime: "claude", Cwd: "/work/tailterm", RequestID: "wake-helper"}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.helper = *out.Agent
+	m, err := f.st.PostMessage(f.ctx, f.task.ID, api.PostMessageRequest{Text: "synthetic wake instructions"}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.msg = m.Seq
+	return f
+}
+
+func (f *wakeTickFixture) clock() { f.st.SetClockForTest(func() time.Time { return f.now }) }
+
+func (f *wakeTickFixture) restartWakes(t *testing.T) {
+	f.restart(t)
+	f.clock()
+}
+
+func (f *wakeTickFixture) schedule(t *testing.T, key, kind, schedule string) api.OwnerHelperWake {
+	t.Helper()
+	w, _, err := f.st.SetOwnerHelperWake(f.ctx, f.task.ID, api.SetOwnerHelperWakeRequest{Kind: kind, Schedule: schedule, MessageSeq: f.msg, RequestID: key}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return w
+}
+
+// tick runs one broker pass at at and returns its owner-wake steps.
+func (f *wakeTickFixture) tick(t *testing.T, at time.Time) []Step {
+	t.Helper()
+	f.now = at
+	steps, err := (&Broker{Store: f.st}).Tick(f.ctx, at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []Step
+	for _, s := range steps {
+		if strings.HasPrefix(s.Action, "owner-wake") {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func (f *wakeTickFixture) read(t *testing.T, at time.Time) {
+	t.Helper()
+	msgs, err := f.st.ListMessages(f.ctx, f.task.ID, 0, "", 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.st.MarkRead(f.ctx, f.task.ID, api.MarkReadRequest{AgentID: f.helper.ID, UpTo: msgs[len(msgs)-1].Seq}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.st.MarkObligationsDelivered(f.ctx, f.task.ID, f.helper.ID, f.helper.RunID, at); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (f *wakeTickFixture) message(t *testing.T, seq int64) api.Message {
+	t.Helper()
+	msgs, err := f.st.ListMessages(f.ctx, f.task.ID, seq-1, "", 1)
+	if err != nil || len(msgs) != 1 || msgs[0].Seq != seq {
+		t.Fatalf("message %d: %+v %v", seq, msgs, err)
+	}
+	return msgs[0]
+}
+
+func pacific(day, hour, minute int) time.Time {
+	return time.Date(2026, 11, day, hour+8, minute, 0, 0, time.UTC)
+}
+
+// a2: the hourly update, morning and evening summaries and the team watch.
+func TestBrokerTickDeliversOwnerHelperWakes(t *testing.T) {
+	for _, c := range []struct {
+		kind, schedule, subject string
+		first, second           time.Time
+	}{
+		{"hourly-update", "14 7-20 * * *", "Owner-helper wake: hourly update due 07:14 PST", pacific(2, 7, 14), pacific(2, 8, 14)},
+		{"morning-summary", "0 7 * * *", "Owner-helper wake: morning summary due 07:00 PST", pacific(2, 7, 0), pacific(3, 7, 0)},
+		{"evening-summary", "0 21 * * *", "Owner-helper wake: evening summary due 21:00 PST", pacific(2, 21, 0), pacific(3, 21, 0)},
+		{"queue-check", "8,28,48 * * * *", "Owner-helper wake: queue check (team watch) due 07:08 PST", pacific(2, 7, 8), pacific(2, 7, 28)},
+	} {
+		t.Run(c.kind, func(t *testing.T) {
+			f := newWakeTickFixture(t)
+			w := f.schedule(t, "wake-"+c.kind, c.kind, c.schedule)
+			if steps := f.tick(t, c.first.Add(-time.Second)); len(steps) != 0 {
+				t.Fatalf("before the slot %+v", steps)
+			}
+			steps := f.tick(t, c.first.Add(15*time.Second))
+			if len(steps) != 1 || steps[0].Action != "owner-wake" || steps[0].WakeID != w.ID || steps[0].TaskID != f.task.ID {
+				t.Fatalf("at the slot %+v", steps)
+			}
+			m := f.message(t, steps[0].MessageSeq)
+			wantText := fmt.Sprintf("Wake %s (%s) was due at %s. Do what Board message #%d says. This wake comes from the hub: delete any session cron for it.", w.ID, c.kind, c.first.Format(time.RFC3339), f.msg)
+			wantRefs := map[string]string{"ownerWake": c.kind, "wake": w.ID, "due": c.first.Format(time.RFC3339), "message": fmt.Sprint(f.msg)}
+			if m.To != f.helper.ID || m.Envelope == nil || m.Envelope.Kind != api.EnvelopeKindNotice || m.Envelope.Subject != c.subject || m.Envelope.Body.Text != wantText || !reflect.DeepEqual(m.Envelope.Refs, wantRefs) {
+				t.Fatalf("notice %+v %+v", m, m.Envelope)
+			}
+			obls, err := f.st.ListObligations(f.ctx, f.task.ID, store.ObligationFilter{AgentID: f.helper.ID}, f.now)
+			if err != nil || len(obls) != 1 || obls[0].MessageSeq != m.Seq || obls[0].Needs != api.ObligationNeedsDelivery {
+				t.Fatalf("obligations %+v %v", obls, err)
+			}
+			if steps := f.tick(t, c.first.Add(30*time.Second)); len(steps) != 0 {
+				t.Fatalf("a second tick %+v", steps)
+			}
+			f.restartWakes(t)
+			if steps := f.tick(t, c.first.Add(45*time.Second)); len(steps) != 0 {
+				t.Fatalf("a tick after a restart %+v", steps)
+			}
+			f.read(t, c.first.Add(time.Minute))
+			steps = f.tick(t, c.second.Add(15*time.Second))
+			if len(steps) != 1 || steps[0].Action != "owner-wake" || steps[0].MessageSeq <= m.Seq {
+				t.Fatalf("the next slot %+v", steps)
+			}
+		})
+	}
+}
+
+// a2, a4: a cancelled wake posts nothing; a restart after missed slots posts
+// the latest slot and one missed report, once.
+func TestBrokerTickOwnerHelperWakeCancelAndCatchUp(t *testing.T) {
+	f := newWakeTickFixture(t)
+	cancelled := f.schedule(t, "wake-cancelled", "morning-summary", "0 7 * * *")
+	if _, _, err := f.st.SetOwnerHelperWake(f.ctx, f.task.ID, api.SetOwnerHelperWakeRequest{WakeID: cancelled.ID, ExpectedRevision: 1, State: api.OwnerHelperWakeCancelled, RequestID: "wake-cancel"}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	hourly := f.schedule(t, "wake-hourly", "hourly-update", "14 7-20 * * *")
+	if steps := f.tick(t, pacific(2, 7, 0)); len(steps) != 0 {
+		t.Fatalf("a cancelled wake %+v", steps)
+	}
+	// The hub is down from 07:00 to 09:15: three slots pass with no tick.
+	f.restartWakes(t)
+	steps := f.tick(t, pacific(2, 9, 15))
+	if len(steps) != 2 || steps[0].Action != "owner-wake" || steps[1].Action != "owner-wake-missed" || steps[0].WakeID != hourly.ID || steps[1].WakeID != hourly.ID {
+		t.Fatalf("catch-up %+v", steps)
+	}
+	report := f.message(t, steps[1].MessageSeq)
+	if report.To != "" || report.Envelope.Refs["recipientKind"] != "owner" || report.Envelope.Refs["escalation"] != "owner" || !strings.Contains(report.Envelope.Body.Text, "missed 2 earlier slot(s)") {
+		t.Fatalf("missed report %+v", report.Envelope)
+	}
+	f.restartWakes(t)
+	if steps := f.tick(t, pacific(2, 9, 16)); len(steps) != 0 {
+		t.Fatalf("again after a restart %+v", steps)
+	}
+	list, err := f.st.ListOwnerHelperWakes(f.ctx, f.task.ID, 0)
+	if err != nil || len(list.Wakes) != 2 || len(list.Wakes[0].Firings) != 0 || len(list.Wakes[1].Firings) != 3 {
+		t.Fatalf("list %+v %v", list, err)
+	}
+}
+
+// R1: concurrent ticks post a slot once.
+func TestBrokerTickOwnerHelperWakeConcurrentTicks(t *testing.T) {
+	f := newWakeTickFixture(t)
+	f.schedule(t, "wake-queue", "queue-check", "8,28,48 * * * *")
+	at := pacific(2, 7, 8).Add(10 * time.Second)
+	f.now = at
+	results := make(chan []Step, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			steps, err := (&Broker{Store: f.st}).Tick(f.ctx, at)
+			if err != nil {
+				t.Error(err)
+			}
+			var mine []Step
+			for _, s := range steps {
+				if s.Action == "owner-wake" {
+					mine = append(mine, s)
+				}
+			}
+			results <- mine
+		}()
+	}
+	total := len(<-results) + len(<-results)
+	if total != 1 {
+		t.Fatalf("%d owner-wake steps from two concurrent ticks", total)
+	}
+}

@@ -113,3 +113,60 @@ func (s *Server) saveOwnerHelperContinuity(w http.ResponseWriter, r *http.Reques
 	}
 	writeJSON(w, http.StatusCreated, out)
 }
+
+// Owner helper wake routes (docs/session-handoff.md, "Wakes on the hub").
+// Any identified caller lists; a write is the owner or the current helper's
+// exact run, which the store checks. The Discord bridge credential reaches
+// neither (they are not bridge routes).
+
+func (s *Server) listOwnerHelperWakes(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.caller(w, r); !ok {
+		return
+	}
+	id, ok := taskID(w, r)
+	if !ok {
+		return
+	}
+	firings := 0
+	if v := r.URL.Query().Get("firings"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > api.MaxOwnerHelperWakeFirings {
+			writeError(w, http.StatusBadRequest, "invalid firings: give 1 to "+strconv.Itoa(api.MaxOwnerHelperWakeFirings))
+			return
+		}
+		firings = n
+	}
+	out, err := s.store.ListOwnerHelperWakes(r.Context(), id, firings)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// setOwnerHelperWake answers 201 when it created a wake (also on the
+// create's replay) and 200 for a change or cancel.
+func (s *Server) setOwnerHelperWake(w http.ResponseWriter, r *http.Request) {
+	caller, ok := s.writer(w, r)
+	if !ok {
+		return
+	}
+	id, ok := taskID(w, r)
+	if !ok {
+		return
+	}
+	var req api.SetOwnerHelperWakeRequest
+	if !decodeLimited(w, r, &req, api.MaxOwnerHelperWakeRequest) {
+		return
+	}
+	out, created, err := s.store.SetOwnerHelperWake(r.Context(), id, req, caller)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	code := http.StatusOK
+	if created {
+		code = http.StatusCreated
+	}
+	writeJSON(w, code, out)
+}

@@ -44,6 +44,11 @@ import (
 // registered helper and says what is and is not restored; `tt handoff status`;
 // and `tt handoff wake confirm` and `tt handoff wake due`. The hook still
 // never registers anything, and tt never creates or lists a cron.
+//
+// Wakes on the hub (bug wi_8d18e0fe8bdf2ad6) add `tt handoff wake schedule`,
+// `cancel` and `list`: the hub stores the wake and its broker delivers each
+// due slot to the owner helper, so the wake no longer needs a session cron.
+// These commands talk to the hub only and never touch the host record.
 
 func init() { hookHandlers["handoff"] = handoffHook }
 
@@ -93,6 +98,10 @@ const handoffUsage = "usage: tt handoff show [--task T] [--json]\n" +
 	"       tt handoff status [--task T]\n" +
 	"       tt handoff wake confirm ID [--asserted] [--task T]\n" +
 	"       tt handoff wake due ID [--task T]\n" +
+	"       tt handoff wake schedule --kind K --schedule 'M H D M W' --message N [--zone Z] [--expires TIME|DURATION|none] --request-id KEY [--task T]\n" +
+	"       tt handoff wake schedule ID [--kind K] [--schedule S] [--message N] [--zone Z] [--expires ...] --revision N --request-id KEY [--task T]\n" +
+	"       tt handoff wake cancel ID --revision N --request-id KEY [--task T]\n" +
+	"       tt handoff wake list [--task T] [--firings N] [--json]\n" +
 	"       tt handoff continuity get [--task T] [--revision N] [--json]\n" +
 	"       tt handoff continuity revisions [--task T] [--json]\n" +
 	"       tt handoff continuity set [--task T] --revision N --body-file PATH|- --request-id KEY\n" +
@@ -2053,13 +2062,22 @@ func handoffRoute(args []string) (func(e env, args []string) error, int) {
 	case "status":
 		return handoffStatusCommand, 1
 	case "wake":
-		if len(args) < 2 || args[1] != "confirm" && args[1] != "due" {
+		if len(args) < 2 {
 			return nil, 0
 		}
-		if args[1] == "confirm" {
+		switch args[1] {
+		case "confirm":
 			return handoffWakeConfirmCommand, 2
+		case "due":
+			return handoffWakeDueCommand, 2
+		case "schedule":
+			return handoffHubWakeScheduleCommand, 2
+		case "cancel":
+			return handoffHubWakeCancelCommand, 2
+		case "list":
+			return handoffHubWakeListCommand, 2
 		}
-		return handoffWakeDueCommand, 2
+		return nil, 0
 	case "continuity":
 		if len(args) < 2 {
 			return nil, 0
@@ -3887,4 +3905,245 @@ func handoffContinuitySetCommand(e env, args []string) error {
 	}
 	fmt.Printf("continuity revision %d saved, digest %s, %d bytes\n", out.Revision, out.Digest, out.Bytes)
 	return nil
+}
+
+// ---- tt handoff wake schedule, cancel and list (wakes on the hub) ----
+
+// The owner helper's wakes on the hub (docs/session-handoff.md, "Wakes on the
+// hub"). list needs only the hub configuration and a project id. schedule
+// and cancel write as the registered helper's agent and run from this host's
+// helper file when run in that session, and as the owner from a shell with no
+// runtime session and no agent identity; any other session or agent is
+// refused before a request is sent.
+
+var handoffHubWakeIDPattern = regexp.MustCompile(`^ohw_[0-9a-f]{16}$`)
+
+// handoffHubWakeWriter returns the project, agent and run a wake write is made
+// as: empty agent and run for the owner.
+func handoffHubWakeWriter(e *env, task string) (string, string, string, error) {
+	_, _, single := sessionHelperThread()
+	inSession := single || os.Getenv("CODEX_THREAD_ID") != "" && os.Getenv("CLAUDE_CODE_SESSION_ID") != ""
+	if !inSession && e.agent == "" {
+		if err := handoffContinuityTask(task); err != nil {
+			return "", "", "", err
+		}
+		return task, "", "", nil
+	}
+	helper, err := handoffWriter(*e, task)
+	if err != nil {
+		return "", "", "", err
+	}
+	if e.hub == "" {
+		e.hub = helper.Hub
+	}
+	if e.hub != helper.Hub {
+		return "", "", "", errors.New("the owner helper on this host is registered with another hub")
+	}
+	if helper.Agent == "" || helper.Run == "" {
+		return "", "", "", errors.New("the owner helper file on this host names no agent and run; run tt helper register")
+	}
+	return helper.Task, helper.Agent, helper.Run, nil
+}
+
+// handoffHubWakeArgs splits a leading wake ID from the flags.
+func handoffHubWakeArgs(args []string) (string, []string, error) {
+	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
+		return "", args, nil
+	}
+	if !handoffHubWakeIDPattern.MatchString(args[0]) {
+		return "", nil, errors.New("name the wake by its id, such as ohw_0123456789abcdef")
+	}
+	return args[0], args[1:], nil
+}
+
+func handoffHubWakeScheduleCommand(e env, args []string) error {
+	id, args, err := handoffHubWakeArgs(args)
+	if err != nil {
+		return err
+	}
+	fs := handoffFlags("handoff wake schedule")
+	task := fs.String("task", e.task, "project id")
+	kind := fs.String("kind", "", "what the wake is for: "+strings.Join(api.OwnerHelperWakeKinds, ", "))
+	schedule := fs.String("schedule", "", "five-field cron schedule, read in the zone")
+	message := fs.Int64("message", 0, "the Board message that says what to do")
+	zone := fs.String("zone", "", "IANA time zone; "+api.DefaultOwnerHelperWakeZone+" for a new wake")
+	expires := fs.String("expires", "", "an RFC 3339 time, a duration such as 72h, or none")
+	rev := fs.Int64("revision", 0, "the wake's current revision, to change it")
+	requestID := fs.String("request-id", "", "stable retry identity")
+	if err := fs.Parse(args); err != nil || fs.NArg() > 0 || *requestID == "" || *message < 0 || *rev < 0 {
+		return errors.New(handoffUsage)
+	}
+	given := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { given[f.Name] = true })
+	if id == "" && (given["revision"] || *kind == "" || *schedule == "" || *message == 0) {
+		return errors.New("a new wake needs --kind, --schedule and --message, and takes no --revision\n" + handoffUsage)
+	}
+	if id != "" && *rev == 0 {
+		return errors.New("a change names the wake's current --revision (see tt handoff wake list)")
+	}
+	var expiry *time.Time
+	if given["expires"] {
+		stamp, err := handoffParseExpiry(*expires)
+		if err != nil {
+			return fmt.Errorf("--expires %s", err.Error())
+		}
+		if stamp != handoffNone {
+			t, _ := time.Parse(handoffTimeLayout, stamp)
+			expiry = &t
+		}
+	}
+	project, agent, run, err := handoffHubWakeWriter(&e, *task)
+	if err != nil {
+		return err
+	}
+	c, err := e.client(10 * time.Second)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := ctxTimeout(30 * time.Second)
+	defer cancel()
+	req := api.SetOwnerHelperWakeRequest{WakeID: id, Kind: *kind, Schedule: *schedule, TimeZone: *zone, MessageSeq: *message, ExpiresAt: expiry, ExpectedRevision: *rev, RequestID: *requestID, AgentID: agent, RunID: run}
+	if id != "" {
+		// A change sends the whole wake: unnamed fields keep their saved values.
+		current, err := handoffHubWakeFind(ctx, c, project, id)
+		if err != nil {
+			return err
+		}
+		if !given["kind"] {
+			req.Kind = current.Kind
+		}
+		if !given["schedule"] {
+			req.Schedule = current.Schedule
+		}
+		if !given["zone"] {
+			req.TimeZone = current.TimeZone
+		}
+		if !given["message"] {
+			req.MessageSeq = current.MessageSeq
+		}
+		if !given["expires"] {
+			req.ExpiresAt = current.ExpiresAt
+		}
+	}
+	out, err := c.SetOwnerHelperWake(ctx, project, req)
+	if err != nil {
+		return err
+	}
+	fmt.Println(handoffHubWakeLine(out))
+	return nil
+}
+
+func handoffHubWakeFind(ctx context.Context, c *api.Client, task, id string) (api.OwnerHelperWake, error) {
+	list, err := c.ListOwnerHelperWakes(ctx, task, 1)
+	if err != nil {
+		return api.OwnerHelperWake{}, err
+	}
+	for _, w := range list.Wakes {
+		if w.ID == id {
+			return w, nil
+		}
+	}
+	return api.OwnerHelperWake{}, fmt.Errorf("this project has no wake %s", id)
+}
+
+func handoffHubWakeCancelCommand(e env, args []string) error {
+	id, args, err := handoffHubWakeArgs(args)
+	if err != nil {
+		return err
+	}
+	fs := handoffFlags("handoff wake cancel")
+	task := fs.String("task", e.task, "project id")
+	rev := fs.Int64("revision", 0, "the wake's current revision")
+	requestID := fs.String("request-id", "", "stable retry identity")
+	if err := fs.Parse(args); err != nil || fs.NArg() > 0 || id == "" || *rev < 1 || *requestID == "" {
+		return errors.New(handoffUsage)
+	}
+	project, agent, run, err := handoffHubWakeWriter(&e, *task)
+	if err != nil {
+		return err
+	}
+	c, err := e.client(10 * time.Second)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := ctxTimeout(30 * time.Second)
+	defer cancel()
+	out, err := c.SetOwnerHelperWake(ctx, project, api.SetOwnerHelperWakeRequest{WakeID: id, State: api.OwnerHelperWakeCancelled, ExpectedRevision: *rev, RequestID: *requestID, AgentID: agent, RunID: run})
+	if err != nil {
+		return err
+	}
+	fmt.Println(handoffHubWakeLine(out))
+	return nil
+}
+
+func handoffHubWakeListCommand(e env, args []string) error {
+	fs := handoffFlags("handoff wake list")
+	task := fs.String("task", e.task, "project id")
+	firings := fs.Int("firings", api.DefaultOwnerHelperWakeFirings, "firings to show per wake, newest first")
+	asJSON := fs.Bool("json", false, "print JSON")
+	if err := fs.Parse(args); err != nil || fs.NArg() > 0 || *firings < 1 || *firings > api.MaxOwnerHelperWakeFirings {
+		return errors.New(handoffUsage)
+	}
+	if err := handoffContinuityTask(*task); err != nil {
+		return err
+	}
+	c, err := e.client(10 * time.Second)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := ctxTimeout(30 * time.Second)
+	defer cancel()
+	list, err := c.ListOwnerHelperWakes(ctx, *task, *firings)
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		printJSON(list)
+		return nil
+	}
+	if len(list.Wakes) == 0 {
+		fmt.Println("no wakes are scheduled on the hub for this project")
+		return nil
+	}
+	for _, w := range list.Wakes {
+		fmt.Println(handoffHubWakeLine(w))
+		for _, f := range w.Firings {
+			fmt.Println(handoffHubWakeFiringLine(f))
+		}
+	}
+	return nil
+}
+
+func handoffHubWakeStamp(t *time.Time) string {
+	if t == nil {
+		return "-"
+	}
+	return t.UTC().Format(handoffTimeLayout)
+}
+
+// handoffHubWakeLine is one line per wake: what it is, its state and when it
+// is next due.
+func handoffHubWakeLine(w api.OwnerHelperWake) string {
+	return fmt.Sprintf("wake %s revision %d kind=%s schedule='%s' zone=%s message=#%d state=%s next=%s expires=%s",
+		w.ID, w.Revision, w.Kind, w.Schedule, w.TimeZone, w.MessageSeq, w.State, handoffHubWakeStamp(w.NextDueAt), handoffHubWakeStamp(w.ExpiresAt))
+}
+
+// handoffHubWakeFiringLine is one slot: due, outcome, posted, read, lateness
+// in whole minutes and report (with its message, or folded into an earlier
+// report).
+func handoffHubWakeFiringLine(f api.OwnerHelperWakeFiring) string {
+	report := "-"
+	switch {
+	case f.Report != "" && f.ReportSeq > 0:
+		report = fmt.Sprintf("%s(#%d)", f.Report, f.ReportSeq)
+	case f.Report != "":
+		report = f.Report + "(folded)"
+	}
+	notice := "-"
+	if f.NoticeSeq > 0 {
+		notice = fmt.Sprintf("#%d", f.NoticeSeq)
+	}
+	due := f.DueAt
+	return fmt.Sprintf("  due=%s outcome=%s notice=%s posted=%s read=%s late=%dmin report=%s",
+		handoffHubWakeStamp(&due), f.Outcome, notice, handoffHubWakeStamp(f.PostedAt), handoffHubWakeStamp(f.DeliveredAt), f.LateMinutes, report)
 }

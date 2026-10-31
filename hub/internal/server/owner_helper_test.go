@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -614,4 +615,150 @@ func rawContinuity(t *testing.T, h tokenHub, token, method, path string, body []
 		_ = json.NewDecoder(res.Body).Decode(out)
 	}
 	return res.StatusCode
+}
+
+// The owner helper's wakes on the hub (bug wi_8d18e0fe8bdf2ad6): the list and
+// write routes, their writer rule and the bridge refusal.
+func TestOwnerHelperWakeHTTP(t *testing.T) {
+	h := newTokenHub(t)
+	task, builder, obligation := h.project()
+	other, _, _ := h.project()
+	base := "/v1/tasks/" + task.ID + "/owner-helper/wakes"
+	msg := obligation.MessageSeq
+	var helper api.OwnerActionResult
+	if code, _ := h.do(ownerToken, "POST", "/v1/tasks/"+task.ID+"/owner-helper", api.RegisterOwnerHelperRequest{Host: "owner-mac", Session: "owner", Runtime: "claude", RequestID: "ohreg-1"}, &helper); code != http.StatusCreated || helper.Agent == nil {
+		t.Fatalf("register %d %+v", code, helper)
+	}
+	set := func(token string, req api.SetOwnerHelperWakeRequest, who *api.Agent) (int, api.OwnerHelperWake) {
+		t.Helper()
+		if who != nil {
+			req.AgentID, req.RunID = who.ID, who.RunID
+		}
+		var out api.OwnerHelperWake
+		code, _ := h.do(token, "POST", base, req, &out)
+		return code, out
+	}
+	hourly := api.SetOwnerHelperWakeRequest{Kind: "hourly-update", Schedule: "14 7-20 * * *", MessageSeq: msg, RequestID: "wake-hourly"}
+	code, owned := set(ownerToken, hourly, nil)
+	if code != http.StatusCreated || owned.Revision != 1 || owned.AgentID != "" || owned.TimeZone != api.DefaultOwnerHelperWakeZone || owned.NextDueAt == nil {
+		t.Fatalf("owner create %d %+v", code, owned)
+	}
+	if code, again := set(ownerToken, hourly, nil); code != http.StatusCreated || again.ID != owned.ID {
+		t.Fatalf("replay %d %+v", code, again)
+	}
+	reused := hourly
+	reused.Schedule = "15 7-20 * * *"
+	if code, _ := set(ownerToken, reused, nil); code != http.StatusConflict {
+		t.Fatalf("reused request id %d", code)
+	}
+	queue := api.SetOwnerHelperWakeRequest{Kind: "queue-check", Schedule: "8,28,48 * * * *", MessageSeq: msg, RequestID: "wake-queue"}
+	code, watch := set(ownerToken, queue, helper.Agent)
+	if code != http.StatusCreated || watch.AgentID != helper.Agent.ID || watch.RunID != helper.Agent.RunID {
+		t.Fatalf("helper create %d %+v", code, watch)
+	}
+	change := api.SetOwnerHelperWakeRequest{WakeID: watch.ID, ExpectedRevision: 1, Kind: "queue-check", Schedule: "0,20,40 * * * *", MessageSeq: msg, RequestID: "wake-queue-change"}
+	if code, changed := set(ownerToken, change, helper.Agent); code != http.StatusOK || changed.Revision != 2 || changed.Schedule != "0,20,40 * * * *" {
+		t.Fatalf("helper change %d %+v", code, changed)
+	}
+	stale := change
+	stale.RequestID = "wake-queue-stale"
+	if code, _ := set(ownerToken, stale, helper.Agent); code != http.StatusConflict {
+		t.Fatalf("stale revision %d", code)
+	}
+	if code, _ := set(ownerToken, api.SetOwnerHelperWakeRequest{Kind: "other", Schedule: "0 7 * * *", MessageSeq: msg, RequestID: "wake-builder"}, &builder); code != http.StatusConflict {
+		t.Fatalf("another agent's write %d", code)
+	}
+	for name, req := range map[string]api.SetOwnerHelperWakeRequest{
+		"bad schedule": {Kind: "other", Schedule: "0 25 * * *", MessageSeq: msg, RequestID: "wake-bad-schedule"},
+		"bad zone":     {Kind: "other", Schedule: "0 7 * * *", TimeZone: "Local", MessageSeq: msg, RequestID: "wake-bad-zone"},
+		"bad kind":     {Kind: "nightly", Schedule: "0 7 * * *", MessageSeq: msg, RequestID: "wake-bad-kind"},
+		"bad message":  {Kind: "other", Schedule: "0 7 * * *", MessageSeq: 999999, RequestID: "wake-bad-message"},
+	} {
+		if code, _ := set(ownerToken, req, nil); code != http.StatusBadRequest {
+			t.Fatalf("%s: %d", name, code)
+		}
+	}
+	huge, _ := json.Marshal(api.SetOwnerHelperWakeRequest{Kind: "other", Schedule: strings.Repeat("1", api.MaxOwnerHelperWakeRequest), MessageSeq: msg, RequestID: "wake-huge"})
+	if code := rawContinuity(t, h, ownerToken, "POST", base, huge, nil, nil); code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("a request over the POST bound %d", code)
+	}
+	// A replaced run is refused; the new run writes.
+	var again api.OwnerActionResult
+	if code, _ := h.do(ownerToken, "POST", "/v1/tasks/"+task.ID+"/owner-helper", api.RegisterOwnerHelperRequest{Host: "owner-mac", Session: "owner", Runtime: "claude", RequestID: "ohreg-2"}, &again); code != http.StatusCreated && code != http.StatusOK {
+		t.Fatalf("re-register %d", code)
+	}
+	cancel := api.SetOwnerHelperWakeRequest{WakeID: watch.ID, ExpectedRevision: 2, State: api.OwnerHelperWakeCancelled, RequestID: "wake-queue-cancel"}
+	if code, _ := set(ownerToken, cancel, helper.Agent); code != http.StatusConflict {
+		t.Fatalf("a replaced run's cancel %d", code)
+	}
+	if code, cancelled := set(ownerToken, cancel, again.Agent); code != http.StatusOK || cancelled.State != api.OwnerHelperWakeCancelled || cancelled.NextDueAt != nil {
+		t.Fatalf("cancel %d %+v", code, cancelled)
+	}
+	// The 21st active wake is refused.
+	for i := 2; i <= api.MaxOwnerHelperWakes; i++ {
+		if code, _ := set(ownerToken, api.SetOwnerHelperWakeRequest{Kind: "other", Schedule: "0 7 * * *", MessageSeq: msg, RequestID: "wake-cap-" + strconv.Itoa(i)}, nil); code != http.StatusCreated {
+			t.Fatalf("wake %d: %d", i, code)
+		}
+	}
+	if code, _ := set(ownerToken, api.SetOwnerHelperWakeRequest{Kind: "other", Schedule: "0 7 * * *", MessageSeq: msg, RequestID: "wake-cap-21"}, nil); code != http.StatusConflict {
+		t.Fatalf("21st active wake %d", code)
+	}
+	// One firing, so the list has one to show.
+	if _, err := h.st.OwnerHelperWakeSweep(context.Background(), owned.NextDueAt.Add(10*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	// Any identified caller lists; the GET body is the store's list as JSON.
+	want, err := h.st.ListOwnerHelperWakes(context.Background(), task.ID, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantJSON, _ := json.Marshal(want)
+	for name, headers := range map[string]map[string]string{"owner": nil, "agent": {"X-Tailterm-Agent": builder.ID, "X-Tailterm-Run": builder.RunID}} {
+		var got json.RawMessage
+		code := rawContinuity(t, h, ownerToken, "GET", base+"?firings=2", nil, func(r *http.Request) {
+			for k, v := range headers {
+				r.Header.Set(k, v)
+			}
+		}, &got)
+		var compact bytes.Buffer
+		json.Compact(&compact, got)
+		if code != http.StatusOK || compact.String() != string(wantJSON) {
+			t.Fatalf("%s list %d\n%s\nwant\n%s", name, code, compact.String(), wantJSON)
+		}
+	}
+	if len(want.Wakes) != api.MaxOwnerHelperWakes+1 || len(want.Wakes[0].Firings) != 1 || want.Wakes[0].Firings[0].Outcome != api.OwnerHelperWakePosted || want.Wakes[0].Firings[0].RecipientID != again.Agent.ID {
+		t.Fatalf("list %+v", want.Wakes[0])
+	}
+	for name, c := range map[string]struct {
+		token, method, path string
+		want                int
+	}{
+		"no credential list": {"", "GET", base, http.StatusForbidden},
+		"no credential set":  {"", "POST", base, http.StatusForbidden},
+		"bridge list":        {bridgeToken, "GET", base, http.StatusForbidden},
+		"bridge set":         {bridgeToken, "POST", base, http.StatusForbidden},
+		"zero firings":       {ownerToken, "GET", base + "?firings=0", http.StatusBadRequest},
+		"too many firings":   {ownerToken, "GET", base + "?firings=51", http.StatusBadRequest},
+		"word firings":       {ownerToken, "GET", base + "?firings=all", http.StatusBadRequest},
+		"malformed project":  {ownerToken, "GET", "/v1/tasks/nope/owner-helper/wakes", http.StatusNotFound},
+	} {
+		var body any
+		if c.method == "POST" {
+			body = api.SetOwnerHelperWakeRequest{Kind: "other", Schedule: "0 7 * * *", MessageSeq: msg, RequestID: "wake-" + strings.ReplaceAll(name, " ", "-")}
+		}
+		if code, _ := h.do(c.token, c.method, c.path, body, nil); code != c.want {
+			t.Fatalf("%s: %d, want %d", name, code, c.want)
+		}
+	}
+	var otherList api.OwnerHelperWakeList
+	if code, _ := h.do(ownerToken, "GET", "/v1/tasks/"+other.ID+"/owner-helper/wakes", nil, &otherList); code != http.StatusOK || len(otherList.Wakes) != 0 {
+		t.Fatalf("another project's list %d %+v", code, otherList)
+	}
+	// A closed project is refused.
+	if _, err := h.st.CloseTask(context.Background(), task.ID, api.Caller{Node: "workspace", User: "owner"}); err != nil {
+		t.Fatal(err)
+	}
+	if code, _ := set(ownerToken, api.SetOwnerHelperWakeRequest{Kind: "other", Schedule: "0 7 * * *", MessageSeq: msg, RequestID: "wake-closed"}, nil); code != http.StatusConflict {
+		t.Fatalf("closed project %d", code)
+	}
 }

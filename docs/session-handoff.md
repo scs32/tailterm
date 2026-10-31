@@ -2,7 +2,9 @@
 
 Feature `wi_3dae763822d9c061`, stage A (build order #28607, design accepted in #28589). The design, with its reasons, is `.build/plans/wi_3dae763822d9c061-session-handoff-design.md`.
 
-The owner helper session holds things the hub does not: the wakes it scheduled, the standing instructions it is working under, what it meant to do next. A Claude Code restart, `/clear` or compaction loses them. This feature keeps a small structured record of them on the host, and tells a fresh session that the record exists.
+The owner helper session holds things the hub does not: the standing instructions it is working under, what it meant to do next, and any wakes it still keeps as session crons. A Claude Code restart, `/clear` or compaction loses them. This feature keeps a small structured record of them on the host, and tells a fresh session that the record exists.
+
+A wake does not have to be a session cron. The hub can hold the helper's recurring wakes (the hourly update, the morning and evening summaries, the team watch) and deliver each one as a directed notice, so a restart loses none of them and a missed or late one is reported; see "Wakes on the hub" below. The host wake notes and the cron checks described here remain for wakes a session still keeps as crons.
 
 Stage A does three things:
 
@@ -18,7 +20,7 @@ Stage B (feature `wi_e403542387af7deb`, owner order #31581) adds what a session 
 - `tt handoff status` prints that report again, with each wake's state now.
 - `tt handoff wake confirm` and `tt handoff wake due` record, for each wake, whether this session created its cron and when it last fired.
 
-The hook still registers nothing: the session runs `tt handoff restore` when the note prompts it. `tt` never creates, lists or deletes a cron; the session does, with its own tools, and `tt` reports a wake as restored only on evidence it did not get from the session.
+The hook still registers nothing: the session runs `tt handoff restore` when the note prompts it. `tt` never creates, lists or deletes a session cron; the session does, with its own tools, and `tt` reports a cron wake as restored only on evidence it did not get from the session. A wake on the hub needs no cron at all.
 
 It ships switched off. Until a host turns it on, the hook reads one small file and exits.
 
@@ -158,6 +160,10 @@ tt handoff restore --task T
 tt handoff status [--task T]
 tt handoff wake confirm ID [--asserted] [--task T]
 tt handoff wake due ID [--task T]
+tt handoff wake schedule --kind K --schedule 'M H D M W' --message N [--zone Z] [--expires TIME|DURATION|none] --request-id KEY [--task T]
+tt handoff wake schedule ID [the same flags] --revision N --request-id KEY [--task T]
+tt handoff wake cancel ID --revision N --request-id KEY [--task T]
+tt handoff wake list [--task T] [--firings N] [--json]
 tt handoff continuity get [--task T] [--revision N] [--json]
 tt handoff continuity revisions [--task T] [--json]
 tt handoff continuity set [--task T] --revision N --body-file PATH|- --request-id KEY
@@ -169,11 +175,11 @@ tt handoff continuity set [--task T] --revision N --body-file PATH|- --request-i
 - **`show`** is local and works with the setting off. It prints the identity with its date, the capture stamps, the snapshot with its as-of time, the current entries of each list, then expired, revoked and cancelled instructions and wakes under "Expired: not authority" (done wakes are listed there too), then the other closed entries, and for each list when it last changed and how many entries it dropped. With `--json` it prints the record with expiry applied.
 - **`write`** reads the hub for the snapshot and rewrites the record. It reads the helper agent, its delegation windows, the obligations it owes, one Board message per obligation for who sent it, the open owner decisions and the team queue. It reads no work-item record, makes only `GET` requests and marks nothing delivered. `--out PATH` also writes the same text `show` prints, with the destination's next commands, for a person or another runtime to read.
 
-- **`restore`**, **`status`** and the two **`wake`** commands are described under "Restoring a session" and "Wakes" below. `restore`, `wake confirm` and `wake due` need the setting on; `status` is local and works with it off. `status` and `wake confirm` judge receipts only when run inside the session they speak for; see "The latest start is read, not only captured". Changing a wake's schedule with `note wake set` clears its receipt.
+- **`restore`**, **`status`** and the two cron **`wake`** commands (`confirm` and `due`) are described under "Restoring a session" and "Wakes" below. `restore`, `wake confirm` and `wake due` need the setting on; `status` is local and works with it off. `status` and `wake confirm` judge receipts only when run inside the session they speak for; see "The latest start is read, not only captured". Changing a wake's schedule with `note wake set` clears its receipt.
 
-The three **`continuity`** commands are described under "The continuity record on the hub" below.
+The three **`continuity`** commands are described under "The continuity record on the hub" below, and **`wake schedule`**, **`wake cancel`** and **`wake list`**, which keep wakes on the hub and need no setting, under "Wakes on the hub".
 
-`note`, `write` and the `wake` commands act for the helper registered from this runtime session, or with `--task` for that project's helper on this host. A Claude or Codex session other than the registered one is refused, and so is an agent that is not the helper. `show` also works from a new session in the helper's tmux session, and when the host has only one record.
+`note`, `write` and the cron `wake` commands act for the helper registered from this runtime session, or with `--task` for that project's helper on this host. A Claude or Codex session other than the registered one is refused, and so is an agent that is not the helper. `show` also works from a new session in the helper's tmux session, and when the host has only one record.
 
 ## The continuity record on the hub
 
@@ -204,6 +210,50 @@ Routes, for any identified caller; the Discord bridge credential reaches none of
 The hook never reads this record and the body never enters `record.json`, `captures.jsonl`, `restore.json` or the note; the note's footer only names the `get` command.
 
 The repo file `.build/owner-session-handoff.md` is retired as a source: tt and these docs no longer name it, and the hub record replaces it. The file is gitignored, so this change cannot delete it; after release the owner helper moves its current state into the hub record, archives the file and deletes it, as a separate follow-up item.
+
+## Wakes on the hub
+
+Bug `wi_8d18e0fe8bdf2ad6` (work order #52946, owner principle #51832). The owner helper's recurring wakes live on the hub: each is a schedule, a zone and the Board message that says what to do. The hub's broker delivers each due slot as a directed notice to the project's current owner helper and records when the slot was due, posted and read, so a restart, `/clear`, compaction or a session that never re-created its crons loses no wake, and a missed or late wake is reported to the owner instead of passing unseen.
+
+```sh
+tt handoff wake schedule --kind K --schedule 'M H D M W' --message N [--zone Z] [--expires TIME|DURATION|none] --request-id KEY [--task T]
+tt handoff wake schedule ID [--kind K] [--schedule S] [--message N] [--zone Z] [--expires ...] --revision N --request-id KEY [--task T]
+tt handoff wake cancel ID --revision N --request-id KEY [--task T]
+tt handoff wake list [--task T] [--firings N] [--json]
+```
+
+- **`schedule`** without an id creates a wake; it needs `--kind`, `--schedule` and `--message`. The kinds are `hourly-update`, `morning-summary`, `evening-summary`, `queue-check` (the team watch), `obligation-check`, `authority-expiry` and `other`. The schedule is five cron fields of numbers, ranges, lists and steps (Sunday is 0 or 7; with both day fields restricted either one fires), read in `--zone`, an IANA zone name, `America/Los_Angeles` when left out. `--expires` takes an RFC 3339 time, a duration from now, or `none`. With a wake id it changes that wake: name its current `--revision` from `list`, and the fields it leaves out keep their saved values. It prints the wake on one line, with its revision, state and next due time.
+- **`cancel`** cancels a wake at its current revision. A cancelled or expired wake cannot be changed again; schedule a new one.
+- **`list`** prints each wake, then its last `--firings` slots (5 by default, at most 50), newest first: due time, outcome, notice message, posted, read, lateness in whole minutes and report. `--json` prints the hub's list.
+- `--request-id` is the retry identity of a write: the same key with the same input returns the wake as saved now, and the same key with other input is refused. Every write adds one project event, "Owner helper wake saved", with no words.
+
+`list` needs only the hub configuration and a project id. `schedule` and `cancel` act for the helper registered from this runtime session on this host, under the same rule as `continuity set`, and save with the helper file's agent and run; from a plain shell with no runtime session and no agent identity they write as the owner and need `--task`. Another Claude or Codex session, or an agent that is not the helper, is refused before any request. None of them needs the handoff setting or touches the host record.
+
+The hub decides who may write: the owner (no agent and no run), or the exact current run of the project's owner helper while it is not exited, retired or closed; a replaced run is told to register again. A stale `--revision` is refused (409) with the current one. A project holds at most 20 active wakes. A closed project refuses writes; a paused one does not. A schedule that does not fire within a year, a Board message that is not in the project, an expiry in the past or before the next slot, and the zone `Local` are refused.
+
+**Delivery.** Every 30 seconds the broker reads the active wakes that are due. Each slot is one firing row keyed by its wake and due time, so a slot fires at most once, across ticks, concurrent ticks and hub restarts. When the owner helper is running, done or needs input, the slot is posted as a directed notice with a fixed subject, "Owner-helper wake: <kind> due <HH:MM zone>", and the fixed text "Wake <id> (<kind>) was due at <time>. Do what Board message #<N> says. This wake comes from the hub: delete any session cron for it.", with refs `ownerWake`, `wake`, `due` and `message`. The notice creates a delivery-only obligation, so the broker wakes the helper again at 1, 3 and 7 minutes like any directed message. The slot's read time is when that obligation was delivered: when the helper's read cursor passed the notice.
+
+**Reports.** Each problem is one undirected owner notice with refs `ownerWake`, `wake`, `due`, `recipientKind=owner` and `escalation`: `owner` by day, which the bridge sends as an owner ping, and `lead` between 22:00 and 07:00 Pacific, which it posts as a plain channel line. A slot gets at most one report, across ticks and restarts.
+
+- **Missed.** When the hub did not run for one or more slots, the next tick records every earlier slot `missed`, delivers only the latest, and posts one report naming how many were missed, from when to when, and what happened to the latest. At most 48 missed rows are stored per catch-up; with more, the report says "at least" and the count.
+- **Helper absent.** With no owner helper, or a retired, exited or closed one, the slot is `helper-absent` and reported with the helper's state.
+- **Late.** A slot posted, or read, more than 5 minutes after it was due is reported with its lateness.
+- **Undelivered.** A posted slot still unread 15 minutes after it was due is reported. If it is read later, the read time is recorded with no second report.
+- **Paused.** In a paused project every slot is recorded `skipped-paused`, with no notice and no report; delivery resumes at the first slot after the pause.
+- **Once per episode.** A slot folds into the report of the wake's previous slot, recorded in `list` as folded with no notice, only while that trouble is still going on: a helper-absent slot after a helper-absent slot, and a late or undelivered slot after a slot with the same report that is still unread. So a dead helper session is reported once rather than every slot, while a wake read late on two days, or an unread slot after one that was read in the end, is reported each time. A slot without that report ends the episode. A missed report is never folded.
+
+**Daylight saving.** A wall-clock minute that occurs twice (the fall back, such as 01:30 on 2026-11-01 in Pacific time) fires once, at its first occurrence; a minute the spring forward skips (02:30 on 2027-03-14) does not fire that day.
+
+Routes, for any identified caller; the Discord bridge credential reaches neither:
+
+| Route | Does |
+| --- | --- |
+| `GET /v1/tasks/{id}/owner-helper/wakes[?firings=N]` | Every wake with its last N firings (default 5, at most 50) |
+| `POST /v1/tasks/{id}/owner-helper/wakes` | Creates (201), changes or cancels (200) one wake |
+
+### Moving a wake to the hub
+
+For each recurring wake the helper keeps as a session cron: schedule it on the hub with the same schedule and Board message (`tt handoff wake schedule`), check it with `tt handoff wake list`, then close its host note (`tt handoff note wake close ID`) and delete its session cron. Until the cron is deleted the helper is woken twice; the hub notice's text says to delete it, and nothing enforces that.
 
 ## The note at session start
 
@@ -299,7 +349,9 @@ Restore never opens or renews a delegation window, acknowledges or answers an ob
 
 ## Wakes
 
-A wake is a cron the session created with its own tool. `tt` cannot create one or list them, so it does not take the session's word as proof. For the session asking, an active wake is in one of three states:
+This section is about host wake notes: wakes the session keeps as crons of its own. A wake can instead live on the hub, which delivers it with no cron (see "Wakes on the hub"); prefer that for every recurring wake, and keep a host note only for a wake the hub cannot hold.
+
+A host wake is a cron the session created with its own tool. `tt` cannot create one or list them, so it does not take the session's word as proof. For the session asking, an active wake is in one of three states:
 
 - **Restored.** A tool-ledger row (`docs/claude-wake.md`) shows this session calling `CronCreate` with outcome `ok`, later than this session's latest start, with an arguments digest equal to the digest of the exact arguments restore printed for that wake. One row backs one wake only; the receipt stores its tool-use id. It is printed as "this session created its cron at T". That is what the row proves: creation, at that time, not that the cron still exists.
 - **Session-asserted.** The session ran `tt handoff wake confirm ID --asserted`. It is printed as "session-asserted, not verified" and counts as not restored for restore's exit code. The command itself exits 0.
@@ -507,6 +559,9 @@ All within the 7-second budget. After each run no hook process was left. For H2 
 
 ## Known limits
 
+- **A hub wake's read time is the helper's read cursor, not when it acted.** A helper busy in a long turn reads its notice late, and that is reported late; a helper that read the notice and did nothing is not reported. A posted slot's read is looked for for 7 days after it was due.
+- **A hub wake fires within a broker tick of its due time**, about 30 seconds, not on the second.
+- **Moving a cron wake to the hub is by hand.** Nothing checks that the session cron was deleted, so a wake kept both ways fires twice.
 - **Restore does not create wakes.** It registers the session and says which wakes to create again. The session creates each cron and confirms it.
 - **A receipt proves creation, not that the cron still exists.** A cron deleted later is not seen. Claude Code's recurring session crons also expire after 7 days, by the tool's own description, so a wake confirmed once stops firing after that with nothing recording it.
 - **A receipt needs the session's start to have been captured.** If the session's only start hook ran out of time, `confirm` says no start was captured and the wake can only be asserted. A compaction's stamp does not count as that start. The record keeps the session's last start that is not a compaction (`began`), so a compaction, however long the session, does not cost it. One case is left: a record written before `began` existed whose session had already compacted. Its real start is only in the capture log (1 MiB a file, one rotated file kept), and once that row has rotated out every wake shows as not restored with "no start was captured" and can only be asserted, until the session's next start of another source.

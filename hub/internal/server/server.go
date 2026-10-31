@@ -159,6 +159,8 @@ func New(st *store.Store, identity Identity) *Server {
 	m.HandleFunc("GET /v1/tasks/{id}/owner-helper/continuity", s.getOwnerHelperContinuity)
 	m.HandleFunc("GET /v1/tasks/{id}/owner-helper/continuity/revisions", s.listOwnerHelperContinuityRevisions)
 	m.HandleFunc("POST /v1/tasks/{id}/owner-helper/continuity", s.saveOwnerHelperContinuity)
+	m.HandleFunc("GET /v1/tasks/{id}/owner-helper/wakes", s.listOwnerHelperWakes)
+	m.HandleFunc("POST /v1/tasks/{id}/owner-helper/wakes", s.setOwnerHelperWake)
 	m.HandleFunc("POST /v1/tasks/{id}/interventions", s.createIntervention)
 	m.HandleFunc("GET /v1/tasks/{id}/interventions", s.listInterventions)
 	m.HandleFunc("POST /v1/tasks/{id}/messages/read", s.markRead)

@@ -5,7 +5,8 @@
 // deadline missed during downtime fires once rather than once per missed tick.
 // A Tick also runs the team queue's shared-path wait sweep
 // (docs/project-queue.md, "Team queue shared-path waits") and the stall
-// watch sweep (docs/stall-watch.md).
+// watch sweep (docs/stall-watch.md), and the owner helper's wake sweep
+// (docs/session-handoff.md, "Wakes on the hub").
 package broker
 
 import (
@@ -31,7 +32,8 @@ type Step struct {
 	ObligationID string
 	MessageSeq   int64
 	WindowID     string // delegation-expired only
-	Action       string // wake, nudge, escalate-lead, escalate-owner, recipient-gone, project-stalled, delegation-expired, deployer-silent, wait-met, wait-overdue, wait-orphaned, helper-quiet, helper-quiet-ping, team-quiet, team-quiet-ping
+	WakeID       string // owner-wake actions only
+	Action       string // wake, nudge, escalate-lead, escalate-owner, recipient-gone, project-stalled, delegation-expired, deployer-silent, wait-met, wait-overdue, wait-orphaned, helper-quiet, helper-quiet-ping, team-quiet, team-quiet-ping, owner-wake, owner-wake-missed, owner-wake-absent, owner-wake-late, owner-wake-undelivered
 }
 
 func wakesDue(o store.BrokerObligation, now time.Time) int {
@@ -89,6 +91,17 @@ func (b *Broker) Tick(ctx context.Context, now time.Time) ([]Step, error) {
 	quiet, err := b.Store.StallWatchSweep(ctx, now)
 	for _, q := range quiet {
 		steps = append(steps, Step{TaskID: q.TaskID, MessageSeq: q.MessageSeq, Action: q.Action})
+	}
+	if err != nil && firstErr == nil {
+		firstErr = err
+	}
+	// The owner helper's wakes: each due slot is one directed notice to the
+	// project's current owner helper, and a missed, late, unread or
+	// helper-absent slot one owner report. Paused projects record their slots
+	// as skipped and post nothing.
+	wakes, err := b.Store.OwnerHelperWakeSweep(ctx, now)
+	for _, w := range wakes {
+		steps = append(steps, Step{TaskID: w.TaskID, MessageSeq: w.MessageSeq, WakeID: w.WakeID, Action: w.Action})
 	}
 	if err != nil && firstErr == nil {
 		firstErr = err
@@ -215,6 +228,8 @@ func (b *Broker) Start(ctx context.Context) <-chan struct{} {
 				for _, s := range steps {
 					if s.Action == "delegation-expired" {
 						b.Log("broker: %s %s", s.Action, s.WindowID)
+					} else if strings.HasPrefix(s.Action, "owner-wake") {
+						b.Log("broker: %s %s %s message %d", s.Action, s.TaskID, s.WakeID, s.MessageSeq)
 					} else if s.Action == "deployer-silent" || strings.HasPrefix(s.Action, "wait-") || strings.HasPrefix(s.Action, "helper-quiet") || strings.HasPrefix(s.Action, "team-quiet") {
 						b.Log("broker: %s %s message %d", s.Action, s.TaskID, s.MessageSeq)
 					} else if s.Action != "wake" {

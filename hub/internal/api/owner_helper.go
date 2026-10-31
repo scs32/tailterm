@@ -164,3 +164,154 @@ func (c *Client) SaveOwnerHelperContinuity(ctx context.Context, task string, req
 	var out OwnerHelperContinuity
 	return out, c.do(ctx, "POST", "/v1/tasks/"+url.PathEscape(task)+"/owner-helper/continuity", req, &out)
 }
+
+// The owner helper's wakes on the hub (docs/session-handoff.md, "Wakes on the
+// hub"): recurring wakes the hub stores and its broker delivers as a directed
+// NOTICE to the project's current owner helper, recording when each slot was
+// due, posted and read, and reporting a missed, late or unread slot to the
+// owner. They replace the helper's session-only crons.
+
+// OwnerHelperWakeKinds is what a hub wake is for. queue-check is the team
+// watch. evening-summary exists only on the hub list; host wake notes keep
+// their own list.
+var OwnerHelperWakeKinds = []string{"hourly-update", "morning-summary", "evening-summary", "queue-check", "obligation-check", "authority-expiry", "other"}
+
+// ValidOwnerHelperWakeKind reports whether kind is in OwnerHelperWakeKinds.
+func ValidOwnerHelperWakeKind(kind string) bool {
+	for _, k := range OwnerHelperWakeKinds {
+		if k == kind {
+			return true
+		}
+	}
+	return false
+}
+
+// Wake states.
+const (
+	OwnerHelperWakeActive    = "active"
+	OwnerHelperWakeCancelled = "cancelled"
+	OwnerHelperWakeExpired   = "expired"
+)
+
+// Firing outcomes: what the hub did with one due slot.
+const (
+	OwnerHelperWakePosted        = "posted"         // a NOTICE went to the helper
+	OwnerHelperWakeMissed        = "missed"         // an earlier slot of a catch-up; not delivered
+	OwnerHelperWakeHelperAbsent  = "helper-absent"  // no running, done or needs-input helper
+	OwnerHelperWakeSkippedPaused = "skipped-paused" // the project was paused
+)
+
+// Firing reports: what the owner was told about a slot. A report with no
+// report message was folded into an earlier report of the same wake.
+const (
+	OwnerHelperWakeReportLate        = "late"
+	OwnerHelperWakeReportMissed      = "missed"
+	OwnerHelperWakeReportUndelivered = "undelivered"
+	OwnerHelperWakeReportAbsent      = "helper-absent"
+)
+
+const (
+	// MaxOwnerHelperWakes bounds the active wakes of one project.
+	MaxOwnerHelperWakes = 20
+	// OwnerHelperWakeLateAfter is how long after its due time a slot may be
+	// posted, or read, before it is reported late.
+	OwnerHelperWakeLateAfter = 5 * time.Minute
+	// OwnerHelperWakeUnreadAfter is how long after its due time a posted
+	// slot may stay unread, past the broker's 1, 3 and 7 minute re-wakes,
+	// before it is reported undelivered.
+	OwnerHelperWakeUnreadAfter = 15 * time.Minute
+	// OwnerHelperWakeMissedRows bounds the rows one catch-up writes; more
+	// slots are counted in the report, not stored.
+	OwnerHelperWakeMissedRows = 48
+	// OwnerHelperWakeReadWindow is how long after its due time the hub
+	// keeps looking for a posted slot's read.
+	OwnerHelperWakeReadWindow = 7 * 24 * time.Hour
+	// DefaultOwnerHelperWakeZone is the zone a wake's schedule is read in
+	// unless the request names one.
+	DefaultOwnerHelperWakeZone = "America/Los_Angeles"
+	// DefaultOwnerHelperWakeFirings and MaxOwnerHelperWakeFirings bound the
+	// firings a list returns per wake.
+	DefaultOwnerHelperWakeFirings = 5
+	MaxOwnerHelperWakeFirings     = 50
+	// MaxOwnerHelperWakeRequest bounds the POST body.
+	MaxOwnerHelperWakeRequest = 8 * 1024
+)
+
+// OwnerHelperWake is one stored wake. NextDueAt is unset unless it is active.
+type OwnerHelperWake struct {
+	ID         string                  `json:"id"`
+	TaskID     string                  `json:"taskId"`
+	Kind       string                  `json:"kind"`
+	Schedule   string                  `json:"schedule"`
+	TimeZone   string                  `json:"timeZone"`
+	MessageSeq int64                   `json:"messageSeq"`
+	State      string                  `json:"state"`
+	ExpiresAt  *time.Time              `json:"expiresAt,omitempty"`
+	NextDueAt  *time.Time              `json:"nextDueAt,omitempty"`
+	Revision   int64                   `json:"revision"`
+	RequestID  string                  `json:"requestId"`
+	AgentID    string                  `json:"agentId,omitempty"`
+	RunID      string                  `json:"runId,omitempty"`
+	CreatedBy  Caller                  `json:"createdBy"`
+	CreatedAt  time.Time               `json:"createdAt"`
+	UpdatedAt  time.Time               `json:"updatedAt"`
+	Firings    []OwnerHelperWakeFiring `json:"firings,omitempty"`
+}
+
+// OwnerHelperWakeFiring is one due slot of a wake. LateMinutes is how many
+// whole minutes after DueAt the slot was read, or posted when it is unread.
+type OwnerHelperWakeFiring struct {
+	WakeID         string     `json:"wakeId"`
+	DueAt          time.Time  `json:"dueAt"`
+	Outcome        string     `json:"outcome"`
+	PostedAt       *time.Time `json:"postedAt,omitempty"`
+	NoticeSeq      int64      `json:"noticeSeq,omitempty"`
+	RecipientID    string     `json:"recipientId,omitempty"`
+	RecipientRunID string     `json:"recipientRunId,omitempty"`
+	DeliveredAt    *time.Time `json:"deliveredAt,omitempty"`
+	LateMinutes    int64      `json:"lateMinutes"`
+	Report         string     `json:"report,omitempty"`
+	ReportSeq      int64      `json:"reportSeq,omitempty"`
+}
+
+// SetOwnerHelperWakeRequest creates a wake (WakeID empty) or replaces an
+// existing one's fields at ExpectedRevision. State cancelled cancels it and
+// takes no other field. Only the owner (no agent and no run) or the current
+// owner helper's exact run may write. A replayed RequestID with the same input
+// returns the saved row. ExpiresAt nil means the wake does not expire.
+type SetOwnerHelperWakeRequest struct {
+	WakeID           string     `json:"wakeId,omitempty"`
+	Kind             string     `json:"kind,omitempty"`
+	Schedule         string     `json:"schedule,omitempty"`
+	TimeZone         string     `json:"timeZone,omitempty"`
+	MessageSeq       int64      `json:"messageSeq,omitempty"`
+	ExpiresAt        *time.Time `json:"expiresAt,omitempty"`
+	State            string     `json:"state,omitempty"`
+	ExpectedRevision int64      `json:"expectedRevision,omitempty"`
+	RequestID        string     `json:"requestId"`
+	AgentID          string     `json:"agentId,omitempty"`
+	RunID            string     `json:"runId,omitempty"`
+}
+
+// OwnerHelperWakeList is the GET route's body.
+type OwnerHelperWakeList struct {
+	TaskID string            `json:"taskId"`
+	Wakes  []OwnerHelperWake `json:"wakes"`
+}
+
+// ListOwnerHelperWakes returns every wake of the project with its last
+// firings (newest first); firings 0 means the default.
+func (c *Client) ListOwnerHelperWakes(ctx context.Context, task string, firings int) (OwnerHelperWakeList, error) {
+	var out OwnerHelperWakeList
+	path := "/v1/tasks/" + url.PathEscape(task) + "/owner-helper/wakes"
+	if firings > 0 {
+		path += "?firings=" + strconv.Itoa(firings)
+	}
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
+// SetOwnerHelperWake creates, changes or cancels one wake.
+func (c *Client) SetOwnerHelperWake(ctx context.Context, task string, req SetOwnerHelperWakeRequest) (OwnerHelperWake, error) {
+	var out OwnerHelperWake
+	return out, c.do(ctx, "POST", "/v1/tasks/"+url.PathEscape(task)+"/owner-helper/wakes", req, &out)
+}
