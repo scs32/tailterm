@@ -481,3 +481,137 @@ func TestOwnerHelperRegistrationByRunHTTP(t *testing.T) {
 		t.Fatalf("the reads wrote something:\nbefore %+v %v\nafter  %+v %v", beforeReceipts, beforeEvents, afterReceipts, afterEvents)
 	}
 }
+
+// a2 (wi_32b39bab910066b2, order #52620): the owner helper continuity routes.
+// Saves answer 201 and reads 200 with the body; another identified caller
+// reads it; an unidentified caller gets the hub's 403 and the Discord bridge
+// credential is refused; a stale revision is 409 and an oversize body is
+// refused.
+func TestOwnerHelperContinuityHTTP(t *testing.T) {
+	h := newTokenHub(t)
+	task, builder, _ := h.project()
+	other, _, _ := h.project()
+	base := "/v1/tasks/" + task.ID + "/owner-helper/continuity"
+	var helper api.OwnerActionResult
+	if code, _ := h.do(ownerToken, "POST", "/v1/tasks/"+task.ID+"/owner-helper", api.RegisterOwnerHelperRequest{Host: "owner-mac", Session: "owner", Runtime: "claude", RequestID: "ohreg-1"}, &helper); code != http.StatusCreated || helper.Agent == nil {
+		t.Fatalf("register %d %+v", code, helper)
+	}
+	if code, _ := h.do(ownerToken, "GET", base, nil, nil); code != http.StatusNotFound {
+		t.Fatalf("read before any save %d", code)
+	}
+	save := func(token, key string, expected int64, body string, who *api.Agent) (int, api.OwnerHelperContinuity) {
+		t.Helper()
+		req := api.SaveOwnerHelperContinuityRequest{ExpectedRevision: expected, Body: body, RequestID: key}
+		if who != nil {
+			req.AgentID, req.RunID = who.ID, who.RunID
+		}
+		var out api.OwnerHelperContinuity
+		code, _ := h.do(token, "POST", base, req, &out)
+		return code, out
+	}
+	code, r1 := save(ownerToken, "cont-1", 0, "## State\nsynthetic one\n", helper.Agent)
+	if code != http.StatusCreated || r1.Revision != 1 || r1.AgentID != helper.Agent.ID || r1.RunID != helper.Agent.RunID || r1.Bytes != len("## State\nsynthetic one\n") {
+		t.Fatalf("save 1 %d %+v", code, r1)
+	}
+	if code, replay := save(ownerToken, "cont-1", 0, "## State\nsynthetic one\n", helper.Agent); code != http.StatusCreated || replay.Revision != 1 || replay.Digest != r1.Digest {
+		t.Fatalf("replay %d %+v", code, replay)
+	}
+	code, r2 := save(ownerToken, "cont-2", 1, "## State\nsynthetic two\n", nil)
+	if code != http.StatusCreated || r2.Revision != 2 || r2.AgentID != "" {
+		t.Fatalf("owner save %d %+v", code, r2)
+	}
+	if code, _ := save(ownerToken, "cont-stale", 1, "stale", nil); code != http.StatusConflict {
+		t.Fatalf("stale revision %d", code)
+	}
+	if code, _ := save(ownerToken, "cont-builder", 2, "not the helper", &builder); code != http.StatusConflict {
+		t.Fatalf("another agent's save %d", code)
+	}
+	if code, _ := save(ownerToken, "cont-big", 2, strings.Repeat("x", api.MaxOwnerHelperContinuityLen+1), nil); code != http.StatusBadRequest {
+		t.Fatalf("a body over the record limit %d", code)
+	}
+	huge, _ := json.Marshal(api.SaveOwnerHelperContinuityRequest{ExpectedRevision: 2, Body: strings.Repeat("y", api.MaxOwnerHelperContinuityRequest), RequestID: "cont-huge"})
+	if code := rawContinuity(t, h, ownerToken, "POST", base, huge, nil, nil); code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("a request over the POST bound %d", code)
+	}
+	// Reads: the latest and revision N carry the body; the list has none.
+	read := func(token, path string, headers map[string]string) (int, api.OwnerHelperContinuity) {
+		t.Helper()
+		var out api.OwnerHelperContinuity
+		return rawContinuity(t, h, token, "GET", path, nil, func(r *http.Request) {
+			for k, v := range headers {
+				r.Header.Set(k, v)
+			}
+		}, &out), out
+	}
+	if code, got := read(ownerToken, base, nil); code != http.StatusOK || got.Revision != 2 || got.Body != "## State\nsynthetic two\n" {
+		t.Fatalf("latest %d %+v", code, got)
+	}
+	if code, got := read(ownerToken, base+"?revision=1", nil); code != http.StatusOK || got.Revision != 1 || got.Body != "## State\nsynthetic one\n" {
+		t.Fatalf("revision 1 %d %+v", code, got)
+	}
+	// Another identified caller, an agent session, reads both.
+	asBuilder := map[string]string{"X-Tailterm-Agent": builder.ID, "X-Tailterm-Run": builder.RunID}
+	if code, got := read(ownerToken, base, asBuilder); code != http.StatusOK || got.Revision != 2 || got.Body != "## State\nsynthetic two\n" {
+		t.Fatalf("an agent's latest read %d %+v", code, got)
+	}
+	if code, got := read(ownerToken, base+"?revision=1", asBuilder); code != http.StatusOK || got.Body != "## State\nsynthetic one\n" {
+		t.Fatalf("an agent's revision read %d %+v", code, got)
+	}
+	var list struct {
+		Revisions []api.OwnerHelperContinuity `json:"revisions"`
+	}
+	if code, _ := h.do(ownerToken, "GET", base+"/revisions", nil, &list); code != http.StatusOK || len(list.Revisions) != 2 || list.Revisions[0].Body != "" || list.Revisions[1].Revision != 2 {
+		t.Fatalf("revisions %d %+v", code, list)
+	}
+	for name, c := range map[string]struct {
+		token, method, path string
+		want                int
+	}{
+		"no credential read": {"", "GET", base, http.StatusForbidden},
+		"no credential list": {"", "GET", base + "/revisions", http.StatusForbidden},
+		"no credential save": {"", "POST", base, http.StatusForbidden},
+		"bridge read":        {bridgeToken, "GET", base, http.StatusForbidden},
+		"bridge list":        {bridgeToken, "GET", base + "/revisions", http.StatusForbidden},
+		"bridge save":        {bridgeToken, "POST", base, http.StatusForbidden},
+		"bad revision":       {ownerToken, "GET", base + "?revision=0", http.StatusBadRequest},
+		"missing revision":   {ownerToken, "GET", base + "?revision=9", http.StatusNotFound},
+		"other project":      {ownerToken, "GET", "/v1/tasks/" + other.ID + "/owner-helper/continuity", http.StatusNotFound},
+		"malformed project":  {ownerToken, "GET", "/v1/tasks/nope/owner-helper/continuity", http.StatusNotFound},
+	} {
+		var body any
+		if c.method == "POST" {
+			body = api.SaveOwnerHelperContinuityRequest{ExpectedRevision: 2, Body: "refused", RequestID: "cont-" + strings.ReplaceAll(name, " ", "-")}
+		}
+		var out api.OwnerHelperContinuity
+		if code, _ := h.do(c.token, c.method, c.path, body, &out); code != c.want || out.Body != "" {
+			t.Fatalf("%s: %d %+v, want %d and no record", name, code, out, c.want)
+		}
+	}
+	if code, got := read(ownerToken, base, nil); code != http.StatusOK || got.Revision != 2 {
+		t.Fatalf("a refusal saved something: %d %+v", code, got)
+	}
+}
+
+// rawContinuity sends one request with an optional raw body and header edit.
+func rawContinuity(t *testing.T, h tokenHub, token, method, path string, body []byte, edit func(*http.Request), out any) int {
+	t.Helper()
+	req, err := http.NewRequest(method, h.url+path, bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	if edit != nil {
+		edit(req)
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if out != nil {
+		_ = json.NewDecoder(res.Body).Decode(out)
+	}
+	return res.StatusCode
+}

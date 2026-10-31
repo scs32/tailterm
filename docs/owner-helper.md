@@ -170,6 +170,11 @@ record is not proof of registration; step 2 is, and restore verifies it against
 the hub. In a Codex destination restore reports every wake as "not restored: this
 runtime has no session timer" and leaves them active in the record.
 
+In the destination, read the continuity log from the hub with
+`tt handoff continuity get --task tsk_...`. It needs no setting or helper file, so
+it works on any host; see "The continuity record on the hub" in
+[session-handoff.md](session-handoff.md#the-continuity-record-on-the-hub).
+
 Codex uses its registered executable and `CODEX_HOME` for native queue delivery.
 Both inbox and broker wakes name `tt helper inbox --task T`. Outside tmux either
 runtime still registers without automatic wake and shows offline. Existing

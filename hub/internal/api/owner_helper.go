@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"time"
 )
 
@@ -100,4 +101,66 @@ func ValidOwnerHelperRun(run string) bool { return ownerHelperRunRE.MatchString(
 func (c *Client) GetOwnerHelperRegistration(ctx context.Context, task, run string) (OwnerHelperRegistration, error) {
 	var out OwnerHelperRegistration
 	return out, c.do(ctx, "GET", "/v1/tasks/"+url.PathEscape(task)+"/owner-helper/registrations/"+url.PathEscape(run), nil, &out)
+}
+
+// The owner helper's continuity record (docs/session-handoff.md, "The
+// continuity record on the hub") is an append-only list of revisions holding
+// the helper's free-text continuity log. Any identified caller reads it from
+// any host; the owner or the current helper's exact run saves it.
+const (
+	// MaxOwnerHelperContinuityLen bounds a continuity body in bytes.
+	MaxOwnerHelperContinuityLen = 64 * 1024
+	// MaxOwnerHelperContinuityRequest bounds the POST body: a maximal body
+	// of characters JSON escapes as \uXXXX, plus the other fields.
+	MaxOwnerHelperContinuityRequest = 6*MaxOwnerHelperContinuityLen + 4*1024
+)
+
+// OwnerHelperContinuity is one saved revision. Revision lists leave Body empty.
+type OwnerHelperContinuity struct {
+	TaskID    string    `json:"taskId"`
+	Revision  int64     `json:"revision"`
+	Body      string    `json:"body,omitempty"`
+	Digest    string    `json:"digest"`
+	Bytes     int       `json:"bytes"`
+	AgentID   string    `json:"agentId,omitempty"`
+	RunID     string    `json:"runId,omitempty"`
+	RequestID string    `json:"requestId"`
+	CreatedBy Caller    `json:"createdBy"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
+// SaveOwnerHelperContinuityRequest appends revision ExpectedRevision+1. Only
+// the owner (no agent and no run) or the current owner helper's exact run may
+// save. A replayed RequestID with the same input returns the saved row.
+type SaveOwnerHelperContinuityRequest struct {
+	ExpectedRevision int64  `json:"expectedRevision"`
+	Body             string `json:"body"`
+	RequestID        string `json:"requestId"`
+	AgentID          string `json:"agentId,omitempty"`
+	RunID            string `json:"runId,omitempty"`
+}
+
+// OwnerHelperContinuity reads the latest revision, or revision rev when rev > 0.
+func (c *Client) OwnerHelperContinuity(ctx context.Context, task string, rev int64) (OwnerHelperContinuity, error) {
+	var out OwnerHelperContinuity
+	path := "/v1/tasks/" + url.PathEscape(task) + "/owner-helper/continuity"
+	if rev > 0 {
+		path += "?revision=" + strconv.FormatInt(rev, 10)
+	}
+	return out, c.do(ctx, "GET", path, nil, &out)
+}
+
+// OwnerHelperContinuityRevisions lists every revision without bodies.
+func (c *Client) OwnerHelperContinuityRevisions(ctx context.Context, task string) ([]OwnerHelperContinuity, error) {
+	var out struct {
+		Revisions []OwnerHelperContinuity `json:"revisions"`
+	}
+	err := c.do(ctx, "GET", "/v1/tasks/"+url.PathEscape(task)+"/owner-helper/continuity/revisions", nil, &out)
+	return out.Revisions, err
+}
+
+// SaveOwnerHelperContinuity saves the next revision.
+func (c *Client) SaveOwnerHelperContinuity(ctx context.Context, task string, req SaveOwnerHelperContinuityRequest) (OwnerHelperContinuity, error) {
+	var out OwnerHelperContinuity
+	return out, c.do(ctx, "POST", "/v1/tasks/"+url.PathEscape(task)+"/owner-helper/continuity", req, &out)
 }

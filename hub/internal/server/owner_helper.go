@@ -2,6 +2,7 @@ package server
 
 import (
 	"net/http"
+	"strconv"
 
 	"github.com/scs32/tailterm/hub/internal/api"
 )
@@ -43,4 +44,72 @@ func (s *Server) getOwnerHelperRegistration(w http.ResponseWriter, r *http.Reque
 		}
 	}
 	writeError(w, http.StatusNotFound, "no owner-helper registration started run "+run+" in this project")
+}
+
+// Owner helper continuity routes (docs/session-handoff.md, "The continuity
+// record on the hub"). Reads need an identity; saves are writes. The Discord
+// bridge credential reaches none of them (they are not bridge routes).
+
+func (s *Server) getOwnerHelperContinuity(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.caller(w, r); !ok {
+		return
+	}
+	id, ok := taskID(w, r)
+	if !ok {
+		return
+	}
+	var rev int64
+	if v := r.URL.Query().Get("revision"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n < 1 {
+			writeError(w, http.StatusBadRequest, "invalid revision")
+			return
+		}
+		rev = n
+	}
+	out, err := s.store.OwnerHelperContinuity(r.Context(), id, rev)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) listOwnerHelperContinuityRevisions(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.caller(w, r); !ok {
+		return
+	}
+	id, ok := taskID(w, r)
+	if !ok {
+		return
+	}
+	out, err := s.store.OwnerHelperContinuityRevisions(r.Context(), id)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"revisions": out})
+}
+
+// saveOwnerHelperContinuity reads a body large enough for a maximal record
+// whose characters JSON escapes; the store enforces the record's own limit.
+func (s *Server) saveOwnerHelperContinuity(w http.ResponseWriter, r *http.Request) {
+	caller, ok := s.writer(w, r)
+	if !ok {
+		return
+	}
+	id, ok := taskID(w, r)
+	if !ok {
+		return
+	}
+	var req api.SaveOwnerHelperContinuityRequest
+	if !decodeLimited(w, r, &req, api.MaxOwnerHelperContinuityRequest) {
+		return
+	}
+	out, err := s.store.SaveOwnerHelperContinuity(r.Context(), id, req, caller)
+	if err != nil {
+		fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, out)
 }

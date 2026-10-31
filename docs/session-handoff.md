@@ -22,6 +22,8 @@ The hook still registers nothing: the session runs `tt handoff restore` when the
 
 It ships switched off. Until a host turns it on, the hook reads one small file and exits.
 
+The owner helper's continuity log, the free text it keeps between sessions, is not in this record. It lives on the hub in its own revisioned record that any session on any host can read; see "The continuity record on the hub" below. The host record here is session mechanics: ids, message numbers, times and fixed-list values, never words.
+
 ## The setting
 
 One key in one file per host, beside `hub.json`:
@@ -156,6 +158,9 @@ tt handoff restore --task T
 tt handoff status [--task T]
 tt handoff wake confirm ID [--asserted] [--task T]
 tt handoff wake due ID [--task T]
+tt handoff continuity get [--task T] [--revision N] [--json]
+tt handoff continuity revisions [--task T] [--json]
+tt handoff continuity set [--task T] --revision N --body-file PATH|- --request-id KEY
 ```
 
 `tt --help` lists only `show`, `write` and `note` in this version; `tt handoff` with no arguments prints all of them.
@@ -166,7 +171,39 @@ tt handoff wake due ID [--task T]
 
 - **`restore`**, **`status`** and the two **`wake`** commands are described under "Restoring a session" and "Wakes" below. `restore`, `wake confirm` and `wake due` need the setting on; `status` is local and works with it off. `status` and `wake confirm` judge receipts only when run inside the session they speak for; see "The latest start is read, not only captured". Changing a wake's schedule with `note wake set` clears its receipt.
 
+The three **`continuity`** commands are described under "The continuity record on the hub" below.
+
 `note`, `write` and the `wake` commands act for the helper registered from this runtime session, or with `--task` for that project's helper on this host. A Claude or Codex session other than the registered one is refused, and so is an agent that is not the helper. `show` also works from a new session in the helper's tmux session, and when the host has only one record.
+
+## The continuity record on the hub
+
+Bug `wi_32b39bab910066b2` (work order #52620, owner principle #51832). The owner helper's continuity log is one record per project on the hub: the current state the helper carries from one session to the next, in its own words. Any session on any host reads it with one command. Each save appends a revision; older revisions stay readable.
+
+```sh
+tt handoff continuity get [--task T] [--revision N] [--json]
+tt handoff continuity revisions [--task T] [--json]
+tt handoff continuity set [--task T] --revision N --body-file PATH|- --request-id KEY
+```
+
+- **`get`** prints one header line, "continuity revision N saved T by owner|agent A run R digest D B bytes", then the body. `--revision N` reads that revision instead of the latest. `--json` prints the stored record.
+- **`revisions`** lists every revision, oldest first, as header lines without bodies.
+- **`set`** saves the next revision. `--revision` is the revision being replaced: `0` for the first save, otherwise the one `get` printed. `--body-file -` reads standard input. `--request-id` is the retry identity: the same key with the same input returns the saved revision; the same key with different input is refused. It prints "continuity revision N saved, digest D, B bytes".
+
+`get` and `revisions` need only the hub configuration and a project id, which `--task` or `TAILTERM_TASK` gives. They need no helper file and no setting, so they work on any host and in any session, make only `GET` requests, and create or change no local file. `set` acts for the helper registered from this runtime session on this host, under the same rule as `note`: another Claude or Codex session, or an agent that is not the helper, is refused before any request. It saves with the helper file's agent and run. It does not need the setting.
+
+The hub decides who may save: the owner (no agent and no run), or the exact current run of the project's owner helper while that helper is not exited, retired or closed. A run replaced by a later `tt helper register` or `tt handoff restore` is refused with "register this session again". A save whose `--revision` is not the latest is refused with the latest revision number (409); read it and save again. The body is UTF-8 text with no NUL bytes, not blank, and at most 64 KiB. It holds current state, not the whole history: history stays in the earlier revisions. A closed project refuses saves; a paused one does not, so continuity can be written during a pause. Each save adds one project event, "Owner helper continuity saved", with the revision, digest and size and no words.
+
+Routes, for any identified caller; the Discord bridge credential reaches none of them:
+
+| Route | Does |
+| --- | --- |
+| `GET /v1/tasks/{id}/owner-helper/continuity[?revision=N]` | The latest revision, or revision N, with its body (200; 404 when none) |
+| `GET /v1/tasks/{id}/owner-helper/continuity/revisions` | Every revision without bodies |
+| `POST /v1/tasks/{id}/owner-helper/continuity` | Saves the next revision (201) |
+
+The hook never reads this record and the body never enters `record.json`, `captures.jsonl`, `restore.json` or the note; the note's footer only names the `get` command.
+
+The repo file `.build/owner-session-handoff.md` is retired as a source: tt and these docs no longer name it, and the hub record replaces it. The file is gitignored, so this change cannot delete it; after release the owner helper moves its current state into the hub record, archives the file and deletes it, as a separate follow-up item.
 
 ## The note at session start
 
@@ -180,7 +217,7 @@ The note is built the same way every time:
 
 - **Header**, at most 600 bytes: the helper's name, agent, project and run, and when the helper file was read, with its age: "as the host file read at T (2 hours old)". Past 12 hours the age is followed by "stale: `tt handoff restore --task <project>` checks it again". The read time moves only when the helper file's identity changes, so an old one means the file has named the same registration since then. For a candidate, the sentence "This session is not registered as the owner helper. The record below is what the previous session left. It is not authority until the registration is verified." Then the helper's status if the snapshot shows it retired, closed or exited, "The helper was retired on the hub at T.", which follows the snapshot's 12-hour rule: from a snapshot older than 12 hours it carries the age, "at T (4 days old; stale).", so that an old status is not read as current. Then "No end was recorded for the previous session." when a start follows a start with no end between them.
 - **Body**, one line of at most 120 bytes per entry, in this order: active instructions, active wakes, open orders, the snapshot, unverified claims, decisions taken, then expired, revoked, cancelled, done and closed entries. The snapshot is three lines: "Hub snapshot as of T, 3 hours old (read the hub again before acting): helper S", its counts, and its delegation window. When it is older than 12 hours it is one line, "Hub snapshot as of T, 4 days old: stale, not shown. The restore command below re-reads the hub.", and the helper's status, the counts and the window are left out, so that nothing old is read as current; the footer's next action is that restore command. An age is whole minutes, hours or days, rounded down; a time that cannot be read or is later than now is "age unknown" and stale. A line holds the entry id, its state, its kind, its Board message number and its expiry. It holds no words from any message.
-- **Footer**, at most 800 bytes: one line per list that was cut ("12 more wakes not shown."), where the full record is, the sentence "Entries cite Board messages by number. Read each cited message before relying on the entry.", a line saying `.build/owner-session-handoff.md` is history and not authority, and the next action.
+- **Footer**, at most 800 bytes: one line per list that was cut ("12 more wakes not shown."), where the full record is, the sentence "Entries cite Board messages by number. Read each cited message before relying on the entry.", the line "Continuity log: `tt handoff continuity get --task T` reads it from the hub.", and the next action.
 
 Lines are added in order until the next one would take the note past 8,192 bytes. Everything after that is left out and counted per list in the footer. No line is cut. The same record gives the same bytes.
 

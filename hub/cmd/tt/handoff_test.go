@@ -30,7 +30,9 @@ import (
 	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
+	"github.com/scs32/tailterm/hub/internal/server"
 	"github.com/scs32/tailterm/hub/internal/spawn"
+	"github.com/scs32/tailterm/hub/internal/store"
 )
 
 // Session handoff, stage A (feature wi_3dae763822d9c061). Criteria a1 to a15
@@ -1914,7 +1916,7 @@ func TestHandoffInjection(t *testing.T) {
 			}
 		}
 		sort.Strings(commands)
-		want := []string{"tt handoff restore --task " + b.helper.Task, "tt handoff show", "tt helper env --task " + b.helper.Task, "tt inbox --seq <number>"}
+		want := []string{"tt handoff continuity get --task " + b.helper.Task, "tt handoff restore --task " + b.helper.Task, "tt handoff show", "tt helper env --task " + b.helper.Task, "tt inbox --seq <number>"}
 		// Stage B's other commands are not in the note; the binary has them too.
 		commands = append(commands, "tt handoff status", "tt handoff wake confirm w1", "tt handoff wake due w1")
 		want = append(want, commands[len(want):]...)
@@ -6772,4 +6774,234 @@ func TestHandoffLiveCronCheck(t *testing.T) {
 		t.Errorf("a hook process is left running:\n%s", left)
 	}
 	r.isolated(map[string]int{"SessionStart": 1, "SessionEnd": 1})
+}
+
+// continuityHub is a real hub on an isolated store that logs every request.
+type continuityHub struct {
+	url      string
+	st       *store.Store
+	client   *api.Client
+	task     api.Task
+	mu       sync.Mutex
+	requests []string
+}
+
+func (h *continuityHub) seen() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]string{}, h.requests...)
+}
+
+func newContinuityHub(t *testing.T) *continuityHub {
+	t.Helper()
+	st, err := store.Open(filepath.Join(t.TempDir(), "continuity-hub.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	identity, err := server.TokenIdentities(map[string]api.Caller{handoffTestToken: {Node: "workspace", User: "owner"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &continuityHub{st: st}
+	srv := server.New(st, identity)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h.mu.Lock()
+		h.requests = append(h.requests, r.Method+" "+r.URL.Path)
+		h.mu.Unlock()
+		srv.ServeHTTP(w, r)
+	}))
+	t.Cleanup(ts.Close)
+	h.url = ts.URL
+	if h.client, err = api.NewClient(ts.URL, 10*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	h.client.Token = handoffTestToken
+	if h.task, err = h.client.CreateTask(context.Background(), api.CreateTaskRequest{Name: "Continuity fixture", Orchestrator: "lead"}); err != nil {
+		t.Fatal(err)
+	}
+	h.mu.Lock()
+	h.requests = nil
+	h.mu.Unlock()
+	return h
+}
+
+// a3: get and revisions read the hub-held continuity record from a host with
+// no helper file and the handoff setting off. They send only GET requests
+// and create or change no local file, and the body stays out of every file.
+func TestHandoffContinuityGet(t *testing.T) {
+	b := newHandoffBox(t)
+	h := newContinuityHub(t)
+	ctx := context.Background()
+	const one, two = "## Continuity\nsynthetic continuity line one\n", "## Continuity\nsynthetic continuity line two"
+	handoffForbid("synthetic continuity line")
+	for i, body := range []string{one, two} {
+		if _, err := h.client.SaveOwnerHelperContinuity(ctx, h.task.ID, api.SaveOwnerHelperContinuityRequest{ExpectedRevision: int64(i), Body: body, RequestID: fmt.Sprintf("cont-%d", i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.mu.Lock()
+	h.requests = nil
+	h.mu.Unlock()
+	// Another host: no helper file, setting off, no runtime session.
+	t.Setenv("CLAUDE_CODE_SESSION_ID", "")
+	b.e = env{hub: h.url, token: handoffTestToken}
+	if handoffOn() {
+		t.Fatal("the handoff setting is on in a fresh box")
+	}
+	before := handoffTreeState(b.root)
+	out := b.must("continuity", "get", "--task", h.task.ID)
+	header, body, _ := strings.Cut(out, "\n")
+	if !regexp.MustCompile(`^continuity revision 2 saved \S+ by owner digest [0-9a-f]{64} \d+ bytes$`).MatchString(header) || body != two+"\n" {
+		t.Fatalf("get latest:\n%s", out)
+	}
+	if out = b.must("continuity", "get", "--task", h.task.ID, "--revision", "1"); !strings.HasPrefix(out, "continuity revision 1 ") || !strings.HasSuffix(out, "\n"+one) {
+		t.Fatalf("get revision 1:\n%s", out)
+	}
+	var got api.OwnerHelperContinuity
+	if out = b.must("continuity", "get", "--task", h.task.ID, "--json"); json.Unmarshal([]byte(out), &got) != nil || got.Revision != 2 || got.Body != two {
+		t.Fatalf("get --json:\n%s", out)
+	}
+	out = b.must("continuity", "revisions", "--task", h.task.ID)
+	if lines := strings.Split(strings.TrimSpace(out), "\n"); len(lines) != 2 || !strings.HasPrefix(lines[0], "continuity revision 1 ") || !strings.HasPrefix(lines[1], "continuity revision 2 ") || strings.Contains(out, "synthetic") {
+		t.Fatalf("revisions:\n%s", out)
+	}
+	var list []api.OwnerHelperContinuity
+	if out = b.must("continuity", "revisions", "--task", h.task.ID, "--json"); json.Unmarshal([]byte(out), &list) != nil || len(list) != 2 || list[0].Body != "" {
+		t.Fatalf("revisions --json:\n%s", out)
+	}
+	// The project comes from the environment when --task is left out.
+	b.e.task = h.task.ID
+	if out = b.must("continuity", "get"); !strings.HasPrefix(out, "continuity revision 2 ") {
+		t.Fatalf("get from the environment's project:\n%s", out)
+	}
+	b.e.task = ""
+	for _, c := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"continuity", "get"}, "name the project with --task"},
+		{[]string{"continuity", "get", "--task", "nope"}, "--task is not a project id"},
+		{[]string{"continuity", "get", "--task", h.task.ID, "--revision", "9"}, "has no revision 9"},
+		{[]string{"continuity", "get", "--task", h.task.ID, "extra"}, "usage:"},
+		{[]string{"continuity", "revisions"}, "name the project with --task"},
+		{[]string{"continuity"}, "usage:"},
+		{[]string{"continuity", "delete"}, "usage:"},
+	} {
+		if _, err := b.run(c.args...); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Fatalf("%v: %v; want %q", c.args, err, c.want)
+		}
+	}
+	if after := handoffTreeState(b.root); after != before {
+		t.Fatalf("a read changed local files:\nbefore\n%s\nafter\n%s", before, after)
+	}
+	for _, r := range h.seen() {
+		if !strings.HasPrefix(r, "GET /v1/tasks/"+h.task.ID+"/owner-helper/continuity") {
+			t.Fatalf("a read sent %s; want only continuity GET requests (all: %q)", r, h.seen())
+		}
+	}
+	if len(h.seen()) == 0 {
+		t.Fatal("no request reached the hub")
+	}
+	// With no record saved, get says so.
+	other, err := h.client.CreateTask(ctx, api.CreateTaskRequest{Name: "Empty"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.run("continuity", "get", "--task", other.ID); err == nil || !strings.Contains(err.Error(), "no continuity record has been saved") {
+		t.Fatalf("empty project: %v", err)
+	}
+	if out := b.must("continuity", "revisions", "--task", other.ID); out != "no continuity record has been saved for this project\n" {
+		t.Fatalf("empty revisions: %q", out)
+	}
+}
+
+// a3: set saves as the registered helper's agent and run from this host's
+// helper file; another session or agent is refused before any request; a
+// stale revision prints the hub's conflict and fails.
+func TestHandoffContinuitySet(t *testing.T) {
+	b := newHandoffBox(t)
+	h := newContinuityHub(t)
+	ctx := context.Background()
+	reg, err := h.client.RegisterOwnerHelper(ctx, h.task.ID, api.RegisterOwnerHelperRequest{Host: "owner-mac", Session: "owner", Runtime: "claude", RequestID: "ohreg-1"})
+	if err != nil || reg.Agent == nil {
+		t.Fatalf("register %+v %v", reg, err)
+	}
+	b.helper.Hub, b.helper.Task, b.helper.Agent, b.helper.Run = h.url, h.task.ID, reg.Agent.ID, reg.Agent.RunID
+	b.e = env{hub: h.url, token: handoffTestToken}
+	b.asHelper() // the setting stays off: set does not need it
+	handoffForbid("synthetic continuity body")
+	bodyFile := filepath.Join(b.root, "continuity.md")
+	write := func(body string) {
+		t.Helper()
+		if err := os.WriteFile(bodyFile, []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	handoffDir := filepath.Join(b.root, "handoff")
+	beforeHandoff := handoffTreeState(handoffDir)
+	write("## Continuity\nsynthetic continuity body one\n")
+	out := b.must("continuity", "set", "--task", h.task.ID, "--revision", "0", "--body-file", bodyFile, "--request-id", "cont-1")
+	if !regexp.MustCompile(`^continuity revision 1 saved, digest [0-9a-f]{64}, \d+ bytes\n$`).MatchString(out) {
+		t.Fatalf("set:\n%s", out)
+	}
+	saved, err := h.client.OwnerHelperContinuity(ctx, h.task.ID, 0)
+	if err != nil || saved.Revision != 1 || saved.AgentID != reg.Agent.ID || saved.RunID != reg.Agent.RunID || saved.Body != "## Continuity\nsynthetic continuity body one\n" {
+		t.Fatalf("saved %+v %v", saved, err)
+	}
+	// The registered session finds its project without --task.
+	write("## Continuity\nsynthetic continuity body two\n")
+	b.must("continuity", "set", "--revision", "1", "--body-file", bodyFile, "--request-id", "cont-2")
+	// A stale revision: the hub's conflict, and a failure.
+	write("## Continuity\nsynthetic continuity body stale\n")
+	if _, err := b.run("continuity", "set", "--task", h.task.ID, "--revision", "1", "--body-file", bodyFile, "--request-id", "cont-stale"); err == nil ||
+		!strings.Contains(err.Error(), "409") || !strings.Contains(err.Error(), "at revision 2") {
+		t.Fatalf("stale revision: %v", err)
+	}
+	// Refused before any request: another runtime session, another agent,
+	// and a malformed command.
+	h.mu.Lock()
+	h.requests = nil
+	h.mu.Unlock()
+	t.Setenv("CLAUDE_CODE_SESSION_ID", handoffOtherID)
+	if _, err := b.run("continuity", "set", "--task", h.task.ID, "--revision", "2", "--body-file", bodyFile, "--request-id", "cont-other-session"); err == nil || !strings.Contains(err.Error(), "not the registered owner helper") {
+		t.Fatalf("another session: %v", err)
+	}
+	t.Setenv("CLAUDE_CODE_SESSION_ID", b.helper.Thread)
+	b.e.agent = "agt_00000000000000ee"
+	if _, err := b.run("continuity", "set", "--task", h.task.ID, "--revision", "2", "--body-file", bodyFile, "--request-id", "cont-other-agent"); err == nil || !strings.Contains(err.Error(), "not the registered owner helper") {
+		t.Fatalf("another agent: %v", err)
+	}
+	b.e.agent = ""
+	for _, args := range [][]string{
+		{"continuity", "set", "--task", h.task.ID, "--body-file", bodyFile, "--request-id", "cont-x"},
+		{"continuity", "set", "--task", h.task.ID, "--revision", "2", "--request-id", "cont-x"},
+		{"continuity", "set", "--task", h.task.ID, "--revision", "2", "--body-file", bodyFile},
+	} {
+		if _, err := b.run(args...); err == nil || !strings.Contains(err.Error(), "usage:") {
+			t.Fatalf("%v: %v; want usage", args, err)
+		}
+	}
+	write(strings.Repeat("z", api.MaxOwnerHelperContinuityLen+1))
+	if _, err := b.run("continuity", "set", "--task", h.task.ID, "--revision", "2", "--body-file", bodyFile, "--request-id", "cont-big"); err == nil || !strings.Contains(err.Error(), "condense") {
+		t.Fatalf("oversize body: %v", err)
+	}
+	if seen := h.seen(); len(seen) != 0 {
+		t.Fatalf("refused commands reached the hub: %q", seen)
+	}
+	// A replaced run is refused by the hub, with a pointer to re-register.
+	if _, err := h.client.RegisterOwnerHelper(ctx, h.task.ID, api.RegisterOwnerHelperRequest{Host: "owner-mac", Session: "owner", Runtime: "claude", RequestID: "ohreg-2"}); err != nil {
+		t.Fatal(err)
+	}
+	write("## Continuity\nsynthetic continuity body after\n")
+	if _, err := b.run("continuity", "set", "--task", h.task.ID, "--revision", "2", "--body-file", bodyFile, "--request-id", "cont-replaced"); err == nil || !strings.Contains(err.Error(), "register this session again") {
+		t.Fatalf("replaced run: %v", err)
+	}
+	if list, err := h.client.OwnerHelperContinuityRevisions(ctx, h.task.ID); err != nil || len(list) != 2 {
+		t.Fatalf("revisions %+v %v", list, err)
+	}
+	// The body never enters the host handoff record or its logs.
+	if after := handoffTreeState(handoffDir); after != beforeHandoff {
+		t.Fatalf("set changed the host handoff directory:\nbefore\n%s\nafter\n%s", beforeHandoff, after)
+	}
 }

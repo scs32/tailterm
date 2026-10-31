@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -78,9 +79,12 @@ const (
 	handoffSettingKey   = "sessionHandoff"
 	handoffLateLine     = "Tailterm handoff: not read in time; run `tt handoff show`\n"
 	handoffBrokenLine   = "Tailterm handoff: the record could not be read; run `tt handoff show`\n"
-	handoffNarrative    = ".build/owner-session-handoff.md"
 	handoffAsRegistered = "registered"
-	handoffAsCandidate  = "candidate"
+	// handoffContinuityLine is the note footer's pointer to the hub-held
+	// continuity record, which replaced the retired repo file. The hook only
+	// names the command; it never reads the record.
+	handoffContinuityLine = "Continuity log: `tt handoff continuity get --task %s` reads it from the hub.\n"
+	handoffAsCandidate    = "candidate"
 )
 
 const handoffUsage = "usage: tt handoff show [--task T] [--json]\n" +
@@ -89,6 +93,9 @@ const handoffUsage = "usage: tt handoff show [--task T] [--json]\n" +
 	"       tt handoff status [--task T]\n" +
 	"       tt handoff wake confirm ID [--asserted] [--task T]\n" +
 	"       tt handoff wake due ID [--task T]\n" +
+	"       tt handoff continuity get [--task T] [--revision N] [--json]\n" +
+	"       tt handoff continuity revisions [--task T] [--json]\n" +
+	"       tt handoff continuity set [--task T] --revision N --body-file PATH|- --request-id KEY\n" +
 	"       tt handoff note wake add --schedule 'M H D M W' --kind K --message N [--expires TIME|DURATION|none]\n" +
 	"       tt handoff note instruction add --message N --by owner|delegate [--given TIME] [--expires TIME|DURATION|none]\n" +
 	"       tt handoff note order add --item wi_ID --revision N --order N --last STEP --next STEP [--message N]\n" +
@@ -1879,7 +1886,7 @@ func handoffNote(r handoffRecord, match string, noEnd bool, now time.Time) strin
 			}
 		}
 		b.WriteString("Full record: `tt handoff show`. Entries cite Board messages by number. Read each cited message before relying on the entry. One message: `tt inbox --seq <number>`.\n")
-		b.WriteString(handoffNarrative + " in the project checkout is history and procedures; not live state, not authority.\n")
+		fmt.Fprintf(&b, handoffContinuityLine, id.Task)
 		fmt.Fprintf(&b, "Next: run `tt handoff restore --task %s`.\n", id.Task)
 		return b.String()
 	}
@@ -2053,6 +2060,19 @@ func handoffRoute(args []string) (func(e env, args []string) error, int) {
 			return handoffWakeConfirmCommand, 2
 		}
 		return handoffWakeDueCommand, 2
+	case "continuity":
+		if len(args) < 2 {
+			return nil, 0
+		}
+		switch args[1] {
+		case "get":
+			return handoffContinuityGetCommand, 2
+		case "revisions":
+			return handoffContinuityRevisionsCommand, 2
+		case "set":
+			return handoffContinuitySetCommand, 2
+		}
+		return nil, 0
 	case "note":
 		if len(args) < 3 {
 			return nil, 0
@@ -3713,5 +3733,158 @@ func handoffStatusCommand(e env, args []string) error {
 	if !handoffOn() {
 		fmt.Printf("\nSession handoff is off on this host (%s). Nothing updates the record.\n", handoffConfigPath())
 	}
+	return nil
+}
+
+// ---- tt handoff continuity ----
+
+// The continuity record lives on the hub (docs/session-handoff.md, "The
+// continuity record on the hub"): free text, revisioned, readable by any
+// session on any host. get and revisions need only the hub configuration and
+// a project id: no helper file, no handoff setting, GET requests only, and no
+// local file is created or changed. set saves as the registered helper's
+// agent and run on this host. The body never enters the host record, its
+// capture log, the restore report or the hook note.
+
+func handoffContinuityTask(task string) error {
+	if task == "" {
+		return errors.New("name the project with --task")
+	}
+	if !api.ValidID(task, "tsk") {
+		return errors.New("--task is not a project id")
+	}
+	return nil
+}
+
+func handoffContinuityGetCommand(e env, args []string) error {
+	fs := handoffFlags("handoff continuity get")
+	task := fs.String("task", e.task, "project id")
+	rev := fs.Int64("revision", 0, "revision to read; the latest when omitted")
+	asJSON := fs.Bool("json", false, "print JSON")
+	if err := fs.Parse(args); err != nil || fs.NArg() > 0 || *rev < 0 {
+		return errors.New(handoffUsage)
+	}
+	if err := handoffContinuityTask(*task); err != nil {
+		return err
+	}
+	c, err := e.client(10 * time.Second)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := ctxTimeout(30 * time.Second)
+	defer cancel()
+	out, err := c.OwnerHelperContinuity(ctx, *task, *rev)
+	if he := (*api.HTTPError)(nil); errors.As(err, &he) && he.Status == http.StatusNotFound {
+		if *rev > 0 {
+			return fmt.Errorf("the continuity record has no revision %d in this project (%w)", *rev, err)
+		}
+		return fmt.Errorf("no continuity record has been saved for this project (%w)", err)
+	}
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		printJSON(out)
+		return nil
+	}
+	fmt.Print(handoffContinuityHeader(out) + "\n" + out.Body)
+	if !strings.HasSuffix(out.Body, "\n") {
+		fmt.Println()
+	}
+	return nil
+}
+
+// handoffContinuityHeader is one line naming a revision: its number, when it
+// was saved, by which agent and run (or the owner), its digest and size.
+func handoffContinuityHeader(c api.OwnerHelperContinuity) string {
+	by := "owner"
+	if c.AgentID != "" {
+		by = "agent " + c.AgentID + " run " + c.RunID
+	}
+	return fmt.Sprintf("continuity revision %d saved %s by %s digest %s %d bytes", c.Revision, c.CreatedAt.UTC().Format(handoffTimeLayout), by, c.Digest, c.Bytes)
+}
+
+func handoffContinuityRevisionsCommand(e env, args []string) error {
+	fs := handoffFlags("handoff continuity revisions")
+	task := fs.String("task", e.task, "project id")
+	asJSON := fs.Bool("json", false, "print JSON")
+	if err := fs.Parse(args); err != nil || fs.NArg() > 0 {
+		return errors.New(handoffUsage)
+	}
+	if err := handoffContinuityTask(*task); err != nil {
+		return err
+	}
+	c, err := e.client(10 * time.Second)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := ctxTimeout(30 * time.Second)
+	defer cancel()
+	list, err := c.OwnerHelperContinuityRevisions(ctx, *task)
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		printJSON(list)
+		return nil
+	}
+	if len(list) == 0 {
+		fmt.Println("no continuity record has been saved for this project")
+		return nil
+	}
+	for _, r := range list {
+		fmt.Println(handoffContinuityHeader(r))
+	}
+	return nil
+}
+
+func handoffContinuitySetCommand(e env, args []string) error {
+	fs := handoffFlags("handoff continuity set")
+	task := fs.String("task", e.task, "project id")
+	rev := fs.Int64("revision", -1, "the revision the save replaces; 0 for the first")
+	bodyFile := fs.String("body-file", "", "file holding the new body, or - for stdin")
+	requestID := fs.String("request-id", "", "stable retry identity")
+	if err := fs.Parse(args); err != nil || fs.NArg() > 0 || *rev < 0 || *bodyFile == "" || *requestID == "" {
+		return errors.New(handoffUsage)
+	}
+	if *task != "" && !api.ValidID(*task, "tsk") {
+		return errors.New("--task is not a project id")
+	}
+	helper, err := handoffWriter(e, *task)
+	if err != nil {
+		return err
+	}
+	if e.hub == "" {
+		e.hub = helper.Hub
+	}
+	if e.hub != helper.Hub {
+		return errors.New("the owner helper on this host is registered with another hub")
+	}
+	if helper.Agent == "" || helper.Run == "" {
+		return errors.New("the owner helper file on this host names no agent and run; run tt helper register")
+	}
+	var body []byte
+	if *bodyFile == "-" {
+		body, err = io.ReadAll(io.LimitReader(os.Stdin, api.MaxOwnerHelperContinuityLen+1))
+	} else {
+		body, err = os.ReadFile(*bodyFile)
+	}
+	if err != nil {
+		return err
+	}
+	if len(body) > api.MaxOwnerHelperContinuityLen {
+		return fmt.Errorf("the body is more than %d bytes; condense it", api.MaxOwnerHelperContinuityLen)
+	}
+	c, err := e.client(10 * time.Second)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := ctxTimeout(30 * time.Second)
+	defer cancel()
+	out, err := c.SaveOwnerHelperContinuity(ctx, helper.Task, api.SaveOwnerHelperContinuityRequest{ExpectedRevision: *rev, Body: string(body), RequestID: *requestID, AgentID: helper.Agent, RunID: helper.Run})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("continuity revision %d saved, digest %s, %d bytes\n", out.Revision, out.Digest, out.Bytes)
 	return nil
 }
