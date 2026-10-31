@@ -965,3 +965,39 @@ test("capabilities are not served from memory offline", async () => {
     view.dispose();
   }
 });
+
+test("an unchanged refresh skips the encrypted save until the entry ages", async () => {
+  const f = fixture();
+  let clock = 1000,
+    disk = null,
+    saves = 0;
+  const view = f.make(f.live, {
+    now: () => clock,
+    cache: createHubReadCache({
+      load: async () => disk,
+      save: async (value) => {
+        saves++;
+        disk = structuredClone(value);
+      },
+      now: () => clock,
+    }),
+  });
+  try {
+    await view.listTasks();
+    await settle(() => saves === 1);
+    await view.refreshConnection();
+    await settle();
+    assert.equal(saves, 1, "unchanged data is not saved again");
+    f.response({ tasks: [{ id: "one", name: "Changed project" }] });
+    await view.refreshConnection();
+    await settle(() => saves === 2);
+    assert.equal(saves, 2, "changed data is saved");
+    clock += 10 * 60 * 1000;
+    await view.listTasks();
+    await settle(() => saves === 3);
+    assert.equal(saves, 3, "an aged entry is saved again");
+    assert.equal(disk.entries[0].savedAt, clock);
+  } finally {
+    view.dispose();
+  }
+});

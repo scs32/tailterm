@@ -3,6 +3,9 @@ import { HubError } from "./hub-client.js";
 // The page size of the hub client's subscribe loop. A full page means more
 // retained events are waiting behind it.
 const FEED_PAGE = 100;
+// Unchanged data is saved again only after this long, to keep its age and
+// eviction order current without a full encrypted save on every refresh.
+const RESAVE_MS = 10 * 60 * 1000;
 
 // Cache only presentation reads. The underlying client remains authoritative
 // for terminal reconciliation, launches, cleanup and every mutation.
@@ -183,21 +186,24 @@ export function createCachedHubClient({
           notify(true);
           return data;
         }
+        const changed =
+          JSON.stringify(old?.value.data) !== JSON.stringify(data);
         // The caller gets the data without waiting for the encrypted save.
         // The cache takes the entry into memory before put returns, and
         // refuses it once the vault locks or this client is disposed.
-        cache.put(key, path, { data }).then(
-          (retained) => {
-            if (disposed || !retained || saved) return;
-            saved = true;
-            notify();
-          },
-          () => {
-            if (disposed) return;
-            cacheFailed = true;
-            notify();
-          },
-        );
+        if (changed || !old || !(now() - old.savedAt < RESAVE_MS))
+          cache.put(key, path, { data }).then(
+            (retained) => {
+              if (disposed || !retained || saved) return;
+              saved = true;
+              notify();
+            },
+            () => {
+              if (disposed) return;
+              cacheFailed = true;
+              notify();
+            },
+          );
         const recoveredOptional = optionalFailures.delete(path);
         staleOptionalPaths.delete(path);
         failed = false;
@@ -207,11 +213,7 @@ export function createCachedHubClient({
         // An event during the request may not be in this response.
         if (staleGeneration === staleAtStart) stale.delete(path);
         else again = true;
-        if (
-          recoveredOptional ||
-          JSON.stringify(old?.value.data) !== JSON.stringify(data)
-        )
-          notify(true);
+        if (recoveredOptional || changed) notify(true);
         return data;
       } catch (error) {
         if (disposed) throw error;
