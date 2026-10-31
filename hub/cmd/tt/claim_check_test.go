@@ -151,6 +151,37 @@ func TestClaimCheckCommand(t *testing.T) {
 	if f := state(cited("ok"), claimEvidenceRow(cmd, nil, "", at(1))); f.state != claimUnproven || f.detail != "exit not recorded" {
 		t.Errorf("no exit: %+v", f)
 	}
+	// Outcome wording (review finding f1): zero counts of failures or errors
+	// are passes, "not ok" is a failure, and an outcome read neither way is
+	// never matched by a failed run.
+	for _, c := range []struct {
+		outcome string
+		exit    int
+		want    claimState
+	}{
+		{"no errors", 0, claimMatched},
+		{"no errors", 1, claimContradicted},
+		{"62 passed, 0 failed", 1, claimContradicted},
+		{"62 passed, 0 failed", 0, claimMatched},
+		{"pass, no errors", 0, claimMatched},
+		{"4 pass 0 fail", 0, claimMatched},
+		{"3 failed", 0, claimContradicted},
+		{"3 failed", 1, claimMatched},
+		{"not ok 3 - TestX", 0, claimContradicted},
+		{"1 passed, 3 failed", 1, claimUnproven},
+		{"62/62", 1, claimUnproven},
+		{"62/62", 0, claimMatched},
+	} {
+		f := state(cited(c.outcome), claimEvidenceRow(cmd, claimExit(c.exit), "", at(1)))
+		if f.state != c.want {
+			t.Errorf("%q with exit %d: got %s %q, want %s", c.outcome, c.exit, claimStateNames[f.state], f.detail, claimStateNames[c.want])
+		}
+	}
+	for text, want := range map[string]int{"no errors": 1, "0 failures": 1, "NO FAILED": 1, "not ok": -1, "ok": 1, "FAIL": -1, "62/62": 0, "": 0} {
+		if got := claimOutcome(text); got != want {
+			t.Errorf("claimOutcome(%q) = %d, want %d", text, got, want)
+		}
+	}
 	withCommit := cited("ok")
 	withCommit.Refs = map[string]string{"commit": "0a1b2c3"}
 	if f := claimFindingFor(t, claimRunFor(t, withCommit, claimEvidenceRow(cmd, claimExit(0), claimCommitA, at(1))), cmd); f.state != claimContradicted ||

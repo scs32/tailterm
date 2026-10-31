@@ -112,13 +112,20 @@ Otherwise the latest candidate, by time, decides:
   `exit 0`, with none of `fail`, `error`, `panic`, `exit 1`-`9`) and the run
   exited non-zero: `contradicted`;
 - the claimed outcome is a failure (a failure word and no pass word) and the
-  run exited 0: `contradicted`. An outcome with both, such as
-  `4 pass 0 fail`, is judged neither way;
+  run exited 0: `contradicted`;
 - the message cites exactly one commit and the run recorded a different one:
   `contradicted`;
 - the run has no exit code recorded (a background start, an unparsed failure):
   `unproven`;
+- the outcome reads neither way and the run exited non-zero: `unproven`;
 - otherwise `matched`.
+
+Before the outcome is read, TAP's `not ok` counts as a failure word, and a zero
+count of failures or errors (`0 failed`, `0 fail`, `0 failures`, `0 errors`,
+`no errors`, `no failures`, `no failed`, any case) counts as a pass word. So
+`62 passed, 0 failed` and `no errors` are passes. An outcome that still names
+both, such as `1 passed, 3 failed`, or neither, such as `62/62`, is judged
+neither way.
 
 ### Receipt
 

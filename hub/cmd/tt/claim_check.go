@@ -330,11 +330,20 @@ func claimLatest(rows []claimRow, match func(claimRow) bool) (claimRow, bool) {
 var (
 	claimPassWords = regexp.MustCompile(`(?i)\b(ok|pass|passed|green|clean)\b|\bexit 0\b`)
 	claimFailWords = regexp.MustCompile(`(?i)fail|error|panic|\bexit [1-9]`)
+	// TAP's "not ok" is a failure, never the "ok" inside it.
+	claimNotOK = regexp.MustCompile(`(?i)\bnot ok\b`)
+	// A zero count of failures or errors says the run passed.
+	claimZeroFailures = regexp.MustCompile(`(?i)\b(0|no)\s+(failed|fail|failures|failure|errors|error)\b`)
 )
 
 // claimOutcome reads a claimed outcome as a pass (1), a failure (-1) or
-// neither (0). Text naming both, such as "4 pass 0 fail", is neither.
+// neither (0). "not ok" is read as a failure first; then a zero count of
+// failures or errors ("0 failed", "no errors") is read as a pass, so
+// "62 passed, 0 failed" and "no errors" are passes. Text that still names
+// both, such as "1 passed, 3 failed", is neither.
 func claimOutcome(text string) int {
+	text = claimNotOK.ReplaceAllString(text, " fail ")
+	text = claimZeroFailures.ReplaceAllString(text, " pass ")
 	pass, fail := claimPassWords.MatchString(text), claimFailWords.MatchString(text)
 	switch {
 	case pass && !fail:
@@ -385,8 +394,8 @@ func claimCheckCommand(c citedClaim, rows []claimRow, single string) claimFindin
 	if !ok {
 		return claimFinding{claim: c, state: claimUnmatched, detail: "no identical single command in your ledger"}
 	}
-	exit := latest.ev.ExitCode
-	switch outcome := claimOutcome(c.outcome); {
+	exit, outcome := latest.ev.ExitCode, claimOutcome(c.outcome)
+	switch {
 	case exit != nil && outcome > 0 && *exit != 0:
 		return claimFinding{claim: c, state: claimContradicted, detail: fmt.Sprintf("your latest run exited %d at %s", *exit, claimAt(latest.at))}
 	case exit != nil && outcome < 0 && *exit == 0:
@@ -397,6 +406,10 @@ func claimCheckCommand(c citedClaim, rows []claimRow, single string) claimFindin
 	}
 	if exit == nil {
 		return claimFinding{claim: c, state: claimUnproven, detail: "exit not recorded"}
+	}
+	// An outcome read neither way is never credited by a failed run.
+	if outcome == 0 && *exit != 0 {
+		return claimFinding{claim: c, state: claimUnproven, detail: fmt.Sprintf("the outcome reads as neither a pass nor a failure and your latest run exited %d at %s", *exit, claimAt(latest.at))}
 	}
 	return claimFinding{claim: c, state: claimMatched, detail: fmt.Sprintf("exit %d at %s", *exit, claimAt(latest.at))}
 }
