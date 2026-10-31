@@ -191,6 +191,10 @@ Previously visited hub views use an encrypted local read cache and refresh in
 the background, including small incremental Board message reads. The cache is
 bounded to 100 entries/8 MiB/seven days and isolated by hub credential. Saved data
 remains readable while the hub is offline; hub mutations are never queued.
+When the hub answers, a read after a confirmed write returns post-write data,
+never the result of a refresh that began before the write. A failed decisions
+read degrades only the decisions panel; the rest of the cached client stays
+online.
 Terminal lifecycle operations continue using live authoritative reads.
 
 Send to project saves a directed board message to the selected open project's

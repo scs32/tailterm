@@ -3,8 +3,8 @@ import { HubError } from "./hub-client.js";
 // The page size of the hub client's subscribe loop. A full page means more
 // retained events are waiting behind it.
 const FEED_PAGE = 100;
-// A full page that no next page follows within this long ends the catch-up:
-// the backlog ended exactly on a page boundary.
+// A full page that no next page follows within this long asks the hub whether
+// the catch-up is over: its backlog may have ended exactly on a page boundary.
 const CATCH_UP_QUIET_MS = 250;
 // Unchanged data is saved again only after this long, to keep its age and
 // eviction order current without a full encrypted save on every refresh.
@@ -28,6 +28,7 @@ export function createCachedHubClient({
     revision = 0;
   const listeners = new Set(),
     pending = new Map(),
+    pendingRevisions = new Map(),
     checked = new Map();
   const auditJobs = new Map(),
     auditEpochs = new Map(),
@@ -36,10 +37,13 @@ export function createCachedHubClient({
   const optionalFailures = new Map(),
     staleOptionalPaths = new Set();
   let optionalAuthenticationError = null;
-  const optionalOwnerRead = (path) => {
+  // Reads whose failure degrades only their own panel, never the whole client:
+  // the owner reads, and decisions, whose views handle a failed read.
+  const optionalRead = (path) => {
     const url = new URL(path, client.base);
     return (
       url.pathname.endsWith("/delegation-windows") ||
+      url.pathname.endsWith("/decisions") ||
       ((url.pathname.includes("/usage") ||
         url.pathname.endsWith("/obligations")) &&
         (url.pathname.includes("/usage") ||
@@ -128,7 +132,15 @@ export function createCachedHubClient({
   }
   function refresh(path) {
     if (disposed) return Promise.reject(new Error("Workspace is locked."));
-    if (pending.has(path)) return pending.get(path);
+    // A refresh that began before a confirmed write may return pre-write data,
+    // so a later read waits for it and then asks the hub again.
+    if (pending.has(path))
+      return pendingRevisions.get(path) === revision
+        ? pending.get(path)
+        : pending
+            .get(path)
+            .catch(() => {})
+            .then(() => refresh(path));
     if (!online()) {
       failed = true;
       notify();
@@ -229,7 +241,7 @@ export function createCachedHubClient({
         if (disposed) throw error;
         if (error.status === 401 || error.status === 403) {
           authenticationError = error;
-          if (optionalOwnerRead(path)) optionalAuthenticationError = error;
+          if (optionalRead(path)) optionalAuthenticationError = error;
           await cache.clear(await scope).catch(() => {});
           saved = false;
           staleOptionalPaths.clear();
@@ -241,11 +253,11 @@ export function createCachedHubClient({
             .catch(() => {});
           dirty.delete(path);
           staleOptionalPaths.delete(path);
-        } else if (!optionalOwnerRead(path)) failed = true;
+        } else if (!optionalRead(path)) failed = true;
         else if (old && !old.value.error) staleOptionalPaths.add(path);
         // An unsupported/transient optional read must not flip ordinary cached
         // views offline or trigger an endless read -> failure -> reload loop.
-        if (optionalOwnerRead(path) && ![401, 403].includes(error.status)) {
+        if (optionalRead(path) && ![401, 403].includes(error.status)) {
           const newlyUnavailable = !optionalFailures.has(path);
           optionalFailures.set(path, error);
           notify(newlyUnavailable);
@@ -253,12 +265,14 @@ export function createCachedHubClient({
         throw error;
       } finally {
         pending.delete(path);
+        pendingRevisions.delete(path);
         notify();
         if (again && !disposed && now() - touched.get(path) < refreshMs * 2)
           void refresh(path).catch(() => {});
       }
     })();
     pending.set(path, work);
+    pendingRevisions.set(path, requestedRevision);
     notify();
     return work;
   }
@@ -345,9 +359,10 @@ export function createCachedHubClient({
   // One hub feed per project for the life of this client. Views attach and
   // detach; a later view resumes from the kept cursor instead of replaying
   // every retained event. The initial catch-up marks reads stale once, at its
-  // end: its first short page, or a quiet interval after a full page. After
-  // that every page marks reads stale. Views ignore event payloads, so they
-  // hear only the last page of the catch-up.
+  // end: its first short page, or a quiet full page that the hub confirms no
+  // event follows. A slow next page alone never ends it. After that every page
+  // marks reads stale. Views ignore event payloads, so they hear only the last
+  // page of the catch-up.
   function sharedFeed(task, after = 0) {
     if (feeds.has(task)) return feeds.get(task);
     const shared = { views: new Set(), quiet: null };
@@ -367,6 +382,22 @@ export function createCachedHubClient({
           .then(() => view.onEvents(events, cursor))
           .catch(view.onError);
     };
+    // One read without waiting: no event after the cursor means caught up.
+    // A failed probe ends the catch-up rather than hold reads fresh forever.
+    const probe = () => {
+      shared.quiet = null;
+      const cursor = last[1];
+      const current = () => !disposed && !caughtUp && last[1] === cursor;
+      if (!client.events) return flush();
+      client.events(task, { after: cursor, limit: 1 }).then(
+        (list) => {
+          if (current() && !list?.events?.length) flush();
+        },
+        () => {
+          if (current()) flush();
+        },
+      );
+    };
     shared.feed = client.subscribe(
       task,
       (events, cursor) => {
@@ -374,7 +405,7 @@ export function createCachedHubClient({
         last = [events, cursor];
         clearTimeout(shared.quiet);
         if (!caughtUp && events.length >= FEED_PAGE)
-          shared.quiet = setTimeout(flush, CATCH_UP_QUIET_MS);
+          shared.quiet = setTimeout(probe, CATCH_UP_QUIET_MS);
         else flush();
       },
       {

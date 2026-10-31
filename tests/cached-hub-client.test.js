@@ -1117,7 +1117,165 @@ test("a backlog that ends on a full page marks reads stale once the feed goes qu
     assert.equal(reloads, 1, "the coalesced backlog reaches views once");
     await view.listTasks();
     await settle();
-    assert.equal(f.requests.length, before + 1, "and marks reads stale once");
+    // One no-wait probe confirmed the catch-up ended, then one refresh.
+    assert.equal(f.requests.length, before + 2, "and marks reads stale once");
+  } finally {
+    view.dispose();
+  }
+});
+
+for (const failure of ["server error", "timeout"]) {
+  test(`a decisions read ${failure} degrades only that read and keeps the client online`, async () => {
+    const f = fixture(),
+      requests = [];
+    const live = createHubClient({
+      baseURL: "http://fixture",
+      token: "first",
+      fetchImpl: async (url) => {
+        const path = new URL(url).pathname;
+        requests.push(path);
+        if (path.endsWith("/decisions")) {
+          if (failure === "timeout") throw Error("Synthetic timeout");
+          return {
+            status: 500,
+            text: async () => JSON.stringify({ error: "Synthetic failure" }),
+          };
+        }
+        const body = path.endsWith("/agents")
+          ? { agents: [{ id: "agent" }] }
+          : path === "/v1/tasks"
+            ? { tasks: [{ id: "one", name: "Live project" }] }
+            : { id: "one", name: "Live project" };
+        return { status: 200, text: async () => JSON.stringify(body) };
+      },
+    });
+    const view = f.make(feedClient(live).client);
+    try {
+      assert.equal((await view.listAgents("one"))[0].id, "agent");
+      await settle();
+      // A view reloads on every notification and reads decisions again.
+      let reloads = 0;
+      view.subscribe("one", () => {
+        reloads++;
+        view.listDecisions("one").catch(() => {});
+      });
+      await assert.rejects(
+        view.listDecisions("one"),
+        failure === "timeout" ? /Synthetic timeout/ : { status: 500 },
+      );
+      await tick(100);
+      assert.doesNotMatch(view.cacheStatus().label, /offline/);
+      assert.ok(reloads <= 1, `views reloaded ${reloads} times`);
+      assert.equal(
+        requests.filter((path) => path.endsWith("/decisions")).length,
+        1,
+        "a failed decisions read is not retried in a loop",
+      );
+      const before = requests.length;
+      assert.equal((await view.listTasks())[0].name, "Live project");
+      assert.equal((await view.getTask("one")).name, "Live project");
+      assert.equal(requests.length, before + 2, "both reads reach the hub");
+      assert.doesNotMatch(view.cacheStatus().label, /offline/);
+    } finally {
+      view.dispose();
+    }
+  });
+}
+
+test("a read after a confirmed write never returns data from a refresh that began before it", async () => {
+  const f = fixture(),
+    gates = [];
+  let name = "before write",
+    deliver,
+    mutate;
+  const client = {
+    base: "http://fixture",
+    token: "first",
+    async request() {
+      const value = name;
+      await new Promise((resolve) => gates.push(resolve));
+      return { tasks: [{ id: "one", name: value }] };
+    },
+    subscribe(task, onEvents) {
+      deliver = onEvents;
+      return { stop() {}, cursor: () => 0 };
+    },
+    onMutation(listener) {
+      mutate = listener;
+      return () => {};
+    },
+  };
+  const view = f.make(client);
+  const open = () => {
+    while (gates.length) gates.shift()();
+  };
+  try {
+    const first = view.listTasks();
+    await settle(() => gates.length);
+    open();
+    assert.equal((await first)[0].name, "before write");
+    view.subscribe("", () => {});
+    await deliver([{ seq: 1, kind: "message" }], 1);
+    // The stale entry is served and refreshed in the background.
+    const served = view.listTasks();
+    await settle(() => gates.length);
+    assert.equal(gates.length, 1, "a refresh is in flight before the write");
+    name = "after write";
+    mutate();
+    let result;
+    view.listTasks().then((tasks) => (result = tasks));
+    await settle(() => {
+      open();
+      return result;
+    });
+    assert.equal(result?.[0].name, "after write");
+    await served;
+  } finally {
+    view.dispose();
+  }
+});
+
+test("a slow catch-up of full pages marks reads stale once, at its first short page", async () => {
+  const f = fixture(),
+    feed = feedClient(f.live),
+    probes = [];
+  let waiting = true;
+  const view = f.make({
+    ...feed.client,
+    // The hub still holds events behind each full page until the short one.
+    async events(task, options) {
+      probes.push(options);
+      return waiting
+        ? { events: [{ seq: options.after + 1, kind: "message" }] }
+        : { events: [] };
+    },
+  });
+  try {
+    await view.listTasks();
+    await settle();
+    let reloads = 0;
+    view.subscribe("", () => reloads++);
+    const before = f.requests.length;
+    for (let page = 0; page < 10; page++) {
+      await feed.deliver("", 100);
+      await view.listTasks();
+      await tick(300);
+    }
+    await feed.deliver("", 4);
+    waiting = false;
+    await view.listTasks();
+    await settle();
+    assert.equal(reloads, 1, "the slow catch-up reloads views once");
+    assert.equal(
+      f.requests.length,
+      before + 1,
+      "and marks reads stale only at its end",
+    );
+    assert.ok(probes.length >= 1, "a quiet full page asks the hub");
+    for (const probe of probes) {
+      assert.equal(probe.limit, 1);
+      assert.equal(probe.wait, undefined, "the probe does not wait");
+    }
   } finally {
     view.dispose();
   }
