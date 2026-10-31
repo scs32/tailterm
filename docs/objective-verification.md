@@ -642,8 +642,10 @@ save checks it: when the item's standing disposition has `correctionOf`, `tt
 work-items update --status done --commit B` runs `git merge-base --is-ancestor
 A B` in the queue entry's repository and, when A is not an ancestor, exits
 non-zero naming A and B, saving nothing: the item stays open and no release job
-exists. A done save from another client, such as the owner's UI, is not
-checked.
+exists. Two paths are not checked: a done save from another client, such as
+the owner's UI, and a done save without queue acceptance (by the handler, for
+example) followed by the handler's `tt team queue accept`, which records
+acceptance on B with no ancestry check.
 
 If a hand release already shipped B, the acceptance supersedes B's release job
 at once (docs/project-deployment.md, "Superseding jobs released by hand").

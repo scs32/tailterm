@@ -452,7 +452,7 @@ func cmdWorkItemUpdate(e env, args []string) error {
 			if err = verifyAcceptedGit(ctx, entry.Repository, base, realWorktree, *branch, *commit); err != nil {
 				return fmt.Errorf("accepted Git tuple failed worktree verification: %v", err)
 			}
-			if err = verifyCorrectionDescent(ctx, c, project, entry.ItemID, entry.Repository, *commit); err != nil {
+			if err = verifyCorrectionDescent(ctx, c, project, *entry, *commit); err != nil {
 				return err
 			}
 		} else {
@@ -501,20 +501,23 @@ func cmdWorkItemUpdate(e env, args []string) error {
 // verifyCorrectionDescent proves, for an acceptance the owner re-bound to a
 // verified correction (owner-accept with correctionOf), that the cleared
 // accepted candidate is an ancestor of the commit being saved done. The hub
-// runs no git and trusts this check, as it does for hand releases.
-func verifyCorrectionDescent(ctx context.Context, c *api.Client, project, itemID, repository, commit string) error {
-	reviews, err := c.ListReviewConvergence(ctx, project)
-	if err != nil {
-		return fmt.Errorf("read the review state for the correction check: %w", err)
+// runs no git and trusts this check, as it does for hand releases. It reads
+// the item's review state from its queue entry, which listings and entry
+// reads carry, and reads the one entry again only when that is missing.
+func verifyCorrectionDescent(ctx context.Context, c *api.Client, project string, entry api.TeamQueueEntry, commit string) error {
+	if entry.Reviews == nil {
+		fresh, err := c.GetTeamQueueEntry(ctx, project, entry.ID)
+		if err != nil {
+			return fmt.Errorf("read the review state for the correction check: %w", err)
+		}
+		entry.Reviews = fresh.Reviews
 	}
-	for _, r := range reviews {
-		if r.ItemID != itemID || r.Disposition == nil || r.Disposition.CorrectionOf == "" {
-			continue
-		}
-		accepted := r.Disposition.CorrectionOf
-		if err = exec.CommandContext(ctx, "git", "--git-dir="+repository, "merge-base", "--is-ancestor", accepted, commit).Run(); err != nil {
-			return fmt.Errorf("the acceptance was re-bound as a correction of %s, but commit %s does not descend from it; nothing was saved", accepted, commit)
-		}
+	if entry.Reviews == nil || entry.Reviews.Disposition == nil || entry.Reviews.Disposition.CorrectionOf == "" {
+		return nil
+	}
+	accepted := entry.Reviews.Disposition.CorrectionOf
+	if err := exec.CommandContext(ctx, "git", "--git-dir="+entry.Repository, "merge-base", "--is-ancestor", accepted, commit).Run(); err != nil {
+		return fmt.Errorf("the acceptance was re-bound as a correction of %s, but commit %s does not descend from it; nothing was saved", accepted, commit)
 	}
 	return nil
 }
