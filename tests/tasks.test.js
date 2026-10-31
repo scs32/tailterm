@@ -23,6 +23,7 @@ import {
   helperProject,
   agentShown,
   terminalMenuSections,
+  openAgent,
 } from "../client/tasks.js";
 import {
   workspaceSnapshot,
@@ -445,13 +446,13 @@ test("taskMemberIds excludes the helper in every state", () => {
 });
 
 // Helper-only project terminals (wi_649926f70aaa762a).
-test("helperProject needs an open owner helper", () => {
+test("helperProject needs an owner helper in any state", () => {
   assert.equal(helperProject([agent(1), agent(2)]), false);
   assert.equal(helperProject([agent(1), helperFixture]), true);
   assert.equal(
     helperProject([agent(1), { ...helperFixture, status: "closed" }]),
-    false,
-    "a closed helper shows nothing in Home",
+    true,
+    "a closed helper is being replaced: still a helper project",
   );
   for (const status of ["done", "exited", "retired", "needs_input"])
     assert.equal(helperProject([{ ...helperFixture, status }]), true, status);
@@ -602,6 +603,83 @@ test("reconcileTask hides panes a helper project does not show, never closes the
     ["t3"],
   );
   assert.deepEqual(quiet.hide, []);
+});
+
+// Review f1 (wi_bbace63389bf0ba4): the hub replaces a closed helper with a
+// fresh agent. Between the two the project stays helper-only, so no agent
+// that is not shown opens only to close when the new helper arrives.
+test("a helper project stays helper-only while its owner helper is replaced", () => {
+  const oldHelper = { ...helperFixture, status: "closed" };
+  const newHelper = agent(91, {
+    name: "owner-helper-fx",
+    runId: "run_0000000000000091",
+    session: "helper-fx-2",
+    role: "owner_helper",
+  });
+  const others = [agent(1), agent(2), agent(3)];
+  const shown = new Set([agent(2).id]);
+  const pane = (id, a, extra = {}) => ({
+    id,
+    server: servers[0],
+    tmux: true,
+    session: a.session,
+    task: normalizeTaskRef({ taskId: TASK, agentId: a.id, ...extra }),
+  });
+  const tabs = [
+    pane("home", helperFixture, { runId: helperFixture.runId }),
+    pane("t2", agent(2)),
+  ];
+  const states = [
+    ["helper open", [helperFixture, ...others]],
+    ["old helper closed, new one not yet open", [oldHelper, ...others]],
+    ["new helper open", [oldHelper, newHelper, ...others]],
+  ];
+  for (const [label, agents] of states) {
+    const r = reconcileTask({ taskId: TASK, agents, tabs, servers, shown });
+    const helper = agents.find((a) => homeAgent(a) && openAgent(a));
+    assert.deepEqual(
+      r.open.map((o) => o.agent.id),
+      helper && helper !== helperFixture ? [helper.id] : [],
+      `${label}: only a new helper opens`,
+    );
+    assert.deepEqual(r.hide, [], `${label}: the chosen agent's pane stays`);
+    assert.deepEqual(
+      r.close.map((t) => t.id),
+      helper === helperFixture ? [] : ["home"],
+      `${label}: only the closed helper's pane closes`,
+    );
+    for (const a of others)
+      assert.equal(
+        agentShown(a, agents, { shown }),
+        a.id === agent(2).id,
+        `${label}: ${a.name}`,
+      );
+    assert.deepEqual(
+      taskMemberIds({ status: "open" }, agents, shown),
+      [agent(2).id],
+      `${label}: the layout tracks only the chosen agent`,
+    );
+    assert.equal(
+      restoreVerdict(
+        { taskId: TASK, agentId: agent(1).id },
+        { task: { status: "open" }, agents },
+        shown,
+      ),
+      "not-shown",
+      `${label}: restore skips an agent that is not chosen`,
+    );
+  }
+  // A project that never had a helper still opens everything.
+  assert.deepEqual(
+    reconcileTask({
+      taskId: TASK,
+      agents: others,
+      tabs: [],
+      servers,
+      shown,
+    }).open.map((o) => o.agent.id),
+    others.map((a) => a.id),
+  );
 });
 
 test("reconcileTask adopts the owner's launcher tab of an agent that is not shown", () => {

@@ -632,6 +632,10 @@ export function createTaskHub(host) {
     }
     syncLayout();
     host.scheduleWorkspaceSave();
+    // Name the menu's work items before the owner opens it.
+    void loadTitles(feed.taskId).then(
+      (added) => added && host.titlesChanged?.(),
+    );
   }
   // A done or exited agent may have left its tmux session. Probe once per
   // agent run and status, so each event batch does not list sessions again.
@@ -926,33 +930,66 @@ export function createTaskHub(host) {
     const info = feeds.get(taskId) || cache.get(taskId);
     return terminalMenuSections(info?.agents || [], { shown, hidden, titles });
   }
-  // Fetch each work item's title once per page load. A failed read leaves the
-  // item id as its name. Resolves true when a title was added.
+  // Work-item titles for the ▾ menu (review f2, wi_dc11da6de42efd7c). Each
+  // item's title is read once per page load, as soon as a roster names the
+  // item (doReconcile), not when the menu opens. A failed read leaves the id
+  // as its name and is retried straight from the hub after 1 s, 3 s, 9 s,
+  // 27 s and then every minute, eight tries in all, so the title replaces the
+  // id without a reload. host.titlesChanged redraws an open menu.
+  const TITLE_RETRY_MS = [1000, 3000, 9000, 27000, 60000];
+  const TITLE_TRIES = 8;
   const titleReads = new Map();
+  function readTitle(key, taskId, itemId) {
+    let entry = titleReads.get(key);
+    if (!entry) titleReads.set(key, (entry = { tries: 0 }));
+    if (entry.promise) return entry.promise;
+    if (entry.done || entry.timer || entry.tries >= TITLE_TRIES)
+      return Promise.resolve(false);
+    // The first read may come from the saved copy; a retry asks the hub.
+    const reader = entry.tries ? client : viewClient || client;
+    entry.tries++;
+    entry.promise = Promise.resolve()
+      .then(() => {
+        if (!reader?.getWorkItem) throw new Error("No hub.");
+        return reader.getWorkItem(taskId, itemId);
+      })
+      .then((item) => {
+        entry.done = true;
+        const title = String(item?.title || item?.item?.title || "")
+          .trim()
+          .slice(0, 160);
+        if (title) titles.set(itemId, title);
+        return !!title;
+      })
+      .catch(() => {
+        if (entry.tries < TITLE_TRIES)
+          entry.timer = setTimeout(
+            () => {
+              entry.timer = null;
+              void readTitle(key, taskId, itemId).then(
+                (added) => added && host.titlesChanged?.(),
+              );
+            },
+            TITLE_RETRY_MS[Math.min(entry.tries, TITLE_RETRY_MS.length) - 1],
+          );
+        return false;
+      })
+      .finally(() => {
+        entry.promise = null;
+      });
+    return entry.promise;
+  }
+  // Resolves true when a title was added.
   async function loadTitles(taskId) {
-    const reader = viewClient || client;
-    if (!reader?.getWorkItem) return false;
-    const sections = menuSections(taskId).filter((s) => s.itemId);
-    const reads = sections.map((section) => {
-      const key = `${section.itemTaskId}/${section.itemId}`;
-      if (!titleReads.has(key))
-        titleReads.set(
-          key,
-          Promise.resolve()
-            .then(() =>
-              reader.getWorkItem(section.itemTaskId || taskId, section.itemId),
-            )
-            .then((item) => {
-              const title = String(item?.title || item?.item?.title || "")
-                .trim()
-                .slice(0, 160);
-              if (title) titles.set(section.itemId, title);
-              return !!title;
-            })
-            .catch(() => false),
-        );
-      return titleReads.get(key);
-    });
+    const reads = menuSections(taskId)
+      .filter((s) => s.itemId)
+      .map((section) =>
+        readTitle(
+          `${section.itemTaskId || taskId}/${section.itemId}`,
+          section.itemTaskId || taskId,
+          section.itemId,
+        ),
+      );
     return (await Promise.all(reads)).some(Boolean);
   }
 

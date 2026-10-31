@@ -1328,7 +1328,8 @@ export async function exerciseTaskRestore(page, hub, ssh) {
   async function exerciseHelperOnlyTerminals() {
     const ITEM_A = "wi_00000000000000a1",
       ITEM_B = "wi_00000000000000b2",
-      TITLE_A = "Synthetic helper-only item";
+      TITLE_A = "Synthetic helper-only item",
+      TITLE_B = "Synthetic retried item";
     const menu = (level) =>
       page.locator(`.terminal-menu[data-level="${level}"]`);
     const labels = (level) =>
@@ -1419,8 +1420,35 @@ export async function exerciseTaskRestore(page, hub, ssh) {
     const runs = () =>
       [lead, builder, handler, g1, g2].map((a) => [a.name, a.status, a.runId]);
     const runsBefore = JSON.stringify(runs());
-    // One item's title is served; the other's read fails, so its id names it.
+    // One item's title is served; the other's read fails (404) until serveB,
+    // so its id names it until a retry reads the title.
     const titleReads = [];
+    const itemBReads = [];
+    let serveB = false;
+    await page.route(
+      new RegExp(`/fixture-hub/v1/tasks/${H.id}/work-items/${ITEM_B}(\\?|$)`),
+      (route) => {
+        itemBReads.push(serveB);
+        return route.fulfill(
+          serveB
+            ? {
+                status: 200,
+                contentType: "application/json",
+                body: JSON.stringify({
+                  id: ITEM_B,
+                  taskId: H.id,
+                  title: TITLE_B,
+                  revision: 1,
+                }),
+              }
+            : {
+                status: 404,
+                contentType: "application/json",
+                body: JSON.stringify({ error: "not found" }),
+              },
+        );
+      },
+    );
     await page.route(
       new RegExp(`/fixture-hub/v1/tasks/${H.id}/work-items/${ITEM_A}(\\?|$)`),
       (route) => {
@@ -1475,6 +1503,11 @@ export async function exerciseTaskRestore(page, hub, ssh) {
       step: "a1 helper-only, fresh workspace",
     });
 
+    // f2: the roster's work-item title is read before any menu opens.
+    await waitFor(
+      async () => titleReads.length >= 1,
+      "f2: the title is read before the menu opens",
+    );
     // a2/a3: the Home tab's ▾ lists the other agents by work item.
     let from = hub.api.requests.length;
     await homeTab.click();
@@ -1683,35 +1716,32 @@ export async function exerciseTaskRestore(page, hub, ssh) {
     assert.deepEqual(hubWrites(from, H.id), [], "a2: still no hub call");
     assert.equal(JSON.stringify(runs()), runsBefore);
 
-    // a3: an item whose title read fails is named by its id; closed agents
-    // and the helper are never listed.
-    const itemReads = hub.api.requests.length;
+    // a3/f2: an item whose title read fails is named by its id until a
+    // background retry reads it, without a reload or reopening the menu.
+    // Closed agents and the helper are never listed.
     const extra = add(H.id, "ho-extra", { item: ITEM_B });
-    await homeTab.click();
-    await homeMenu.click();
     await waitFor(
-      async () => (await labels(0)).includes(ITEM_B),
-      "a3: the new agent's work item",
+      async () => itemBReads.length >= 1,
+      "f2: the new item's title is read without opening the menu",
     );
-    // Opening the menu reads its title (once per page load, so reopen in
-    // case the first open came before the roster); the fixture hub has none.
-    await closeMenu();
     await homeTab.click();
     await homeMenu.click();
     await waitFor(
       async () =>
-        hub.api.requests
-          .slice(itemReads)
-          .some((r) =>
-            r.startsWith(`GET /v1/tasks/${H.id}/work-items/${ITEM_B}`),
-          ),
-      "a3: the failing title read",
-    );
-    await sleep(300);
-    assert.equal(
-      (await labels(0)).join("|"),
-      `${TITLE_A}|${ITEM_B}|No work item`,
+        (await labels(0)).join("|") === `${TITLE_A}|${ITEM_B}|No work item`,
       "a3: the item id stands in for a failed title",
+    );
+    serveB = true;
+    await waitFor(
+      async () =>
+        (await labels(0)).join("|") === `${TITLE_A}|${TITLE_B}|No work item`,
+      "f2: a retried read names the item in the open menu",
+      60000,
+    );
+    assert.ok(
+      itemBReads.filter((served) => !served).length >= 1 &&
+        itemBReads.at(-1) === true,
+      `f2: failed reads, then one served: ${JSON.stringify(itemBReads)}`,
     );
     hub.api.event(H.id, "closed", extra.id);
     await waitFor(

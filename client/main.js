@@ -731,6 +731,8 @@ function mount() {
       },
       showTerminals: () => modes?.set("terminals"),
       pickTerminals: (taskId, options) => pickTerminals(taskId, options),
+      // A work-item title arrived: an open ▾ menu names the item now.
+      titlesChanged: () => terminalMenu.refresh(),
       clearAgentBookmark,
       tmuxSessions: async (server) => {
         if (

@@ -46,10 +46,12 @@ export const liveProject = (task) =>
 // The owner's helper session lives in the home area, never in a project group.
 export const homeAgent = (a) => a?.role === "owner_helper";
 
-// A project with an open owner helper shows only the helper until the owner
-// pulls other agents in (wi_649926f70aaa762a).
-export const helperProject = (agents = []) =>
-  agents.some((a) => homeAgent(a) && openAgent(a));
+// A project with an owner helper shows only the helper until the owner pulls
+// other agents in (wi_649926f70aaa762a). A closed helper still counts: the hub
+// replaces a closed helper with a fresh agent, so between the old helper's
+// close and the new one's start the project must not open every agent and
+// then close them again. A project that never had a helper opens them all.
+export const helperProject = (agents = []) => agents.some(homeAgent);
 
 // Whether an agent's terminal belongs open. A hidden agent (closed with ×
 // in a project without a helper, or a helper the owner closed) stays closed.

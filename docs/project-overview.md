@@ -131,10 +131,12 @@ The deployed frontend uses `npm run build:static` instead.
   group that keeps their arrangement (one shell becomes an ordinary tab) and the
   helper stays. It happens once; afterwards they are ordinary terminals.
 
-  **Helper-only projects** (wi_649926f70aaa762a). A project with an open owner
+  **Helper-only projects** (wi_649926f70aaa762a). A project with an owner
   helper shows only the helper, in Home, until the owner pulls other agents
-  in; it has no project tab while none is shown. A project with no helper shows
-  all its agents as before.
+  in; it has no project tab while none is shown. A closed helper still makes
+  it a helper project: the hub replaces a closed helper with a fresh agent, so
+  nothing opens and closes again between the two. A project that never had a
+  helper shows all its agents as before.
 
   | Agent of a project                                  | Pane opens?                                                   |
   | --------------------------------------------------- | ------------------------------------------------------------- |
@@ -146,8 +148,12 @@ The deployed frontend uses `npm run build:static` instead.
 
   The ▾ on the Home tab and on each project tab (and every continued part)
   lists the project's other open agents, one sub-menu per work item named by
-  its title (its id until the title loads, or if the read fails) with the item
-  lead first, then "No work item". The helper and closed agents are not
+  its title with the item lead first, then "No work item". Titles are read
+  when the roster first names an item, not when the menu opens; until a title
+  loads, or while its read fails, the item id stands in, and a failed read is
+  retried in the background (1 s, 3 s, 9 s, 27 s, then every minute, eight
+  tries per page load) so the title replaces the id in an open menu without a
+  reload. The helper and closed agents are not
   listed, and each row shows the agent's status. Choosing an agent opens its
   pane in the project tab and focuses it; choosing it again, or × on its pane,
   removes the pane. Removing never closes, retires or cleans up the agent and
