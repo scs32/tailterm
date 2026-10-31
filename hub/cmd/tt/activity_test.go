@@ -3478,3 +3478,254 @@ func TestActivityBackgroundTaskTick(t *testing.T) {
 		}
 	})
 }
+
+// turnBetweenChecks is a fake-hub relay binding for a turn that ends and a
+// new one that starts between two activity checks (bug wi_b31b73ad4fdaf7ef).
+// begin is the transcript at the first check; ended and restarted are the
+// records appended after it: the turn's end at T+5s, then the next turn's
+// start and a tool call at T+6s and T+7s.
+type turnBetweenChecks struct {
+	t      *testing.T
+	b      runtimeBinding
+	hub    *receiptHub
+	path   string
+	start  time.Time
+	probe  activityProbe
+	client *api.Client
+}
+
+const (
+	codexTurnBegin = `{"type":"task_started","timestamp":"2026-10-30T20:00:00Z"}` + "\n" +
+		`{"type":"response_item","timestamp":"2026-10-30T20:00:00Z","payload":{"type":"function_call","name":"exec_command","call_id":"c1","arguments":"{}"}}` + "\n"
+	codexTurnEnded = `{"type":"response_item","timestamp":"2026-10-30T20:00:02Z","payload":{"type":"function_call_output","call_id":"c1"}}` + "\n" +
+		`{"type":"event_msg","timestamp":"2026-10-30T20:00:04Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":12,"output_tokens":7,"total_tokens":19}}}}` + "\n" +
+		`{"type":"task_complete","timestamp":"2026-10-30T20:00:05Z"}` + "\n"
+	codexTurnRestarted = `{"type":"task_started","timestamp":"2026-10-30T20:00:06Z"}` + "\n" +
+		`{"type":"response_item","timestamp":"2026-10-30T20:00:07Z","payload":{"type":"function_call","name":"exec_command","call_id":"c2","arguments":"{}"}}` + "\n"
+
+	claudeTurnBegin = `{"type":"user","timestamp":"2026-10-30T20:00:00.000Z","message":{"role":"user","content":"Synthetic fixture prompt."}}` + "\n" +
+		`{"type":"assistant","timestamp":"2026-10-30T20:00:00.500Z","message":{"id":"msg_fixture_turn_1","role":"assistant","content":[{"type":"tool_use","id":"toolu_fixture_turn_1","name":"Bash","input":{"command":"synthetic"}}],"stop_reason":"tool_use","usage":{"input_tokens":2,"output_tokens":1}}}` + "\n"
+	claudeTurnEnded = `{"type":"user","timestamp":"2026-10-30T20:00:02.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_fixture_turn_1"}]}}` + "\n" +
+		`{"type":"assistant","timestamp":"2026-10-30T20:00:05.000Z","message":{"id":"msg_fixture_turn_2","role":"assistant","content":[{"type":"text","text":"Synthetic reply."}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":6}}}` + "\n"
+	claudeTurnRestarted = `{"type":"user","timestamp":"2026-10-30T20:00:06.000Z","message":{"role":"user","content":"Synthetic second prompt."}}` + "\n" +
+		`{"type":"assistant","timestamp":"2026-10-30T20:00:07.000Z","message":{"id":"msg_fixture_turn_3","role":"assistant","content":[{"type":"tool_use","id":"toolu_fixture_turn_3","name":"Bash","input":{"command":"synthetic"}}],"stop_reason":"tool_use","usage":{"input_tokens":2,"output_tokens":1}}}` + "\n"
+)
+
+func newTurnBetweenChecks(t *testing.T, runtime string, agent api.Agent) *turnBetweenChecks {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("TAILTERM_RELAY_STATE", filepath.Join(home, "relay"))
+	thread := "12345678-1234-1234-1234-123456789abc"
+	var path, begin string
+	if runtime == "claude" {
+		path, begin = filepath.Join(home, ".claude", "projects", "-synthetic", thread+".jsonl"), claudeTurnBegin
+	} else {
+		path, begin = filepath.Join(home, ".codex", "sessions", "2026", "10", "30", "rollout-test-"+thread+".jsonl"), codexTurnBegin
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(begin), 0600); err != nil {
+		t.Fatal(err)
+	}
+	agent.ID, agent.RunID, agent.Status, agent.Online, agent.Runtime = "agt_0123456789abcdef", "run_0123456789abcdef", api.AgentRunning, true, runtime
+	h := &receiptHub{agent: agent}
+	server := h.serve(t)
+	t.Cleanup(server.Close)
+	client, _ := api.NewClient(server.URL, 5*time.Second)
+	b := runtimeBinding{Hub: server.URL, Task: "tsk_0123456789abcdef", Agent: agent.ID, Run: agent.RunID, Thread: thread, Runtime: runtime, Codex: filepath.Join(home, "codex")}
+	probe := func(runtimeBinding, api.Agent) (bool, bool, error) { return true, true, nil }
+	return &turnBetweenChecks{t: t, b: b, hub: h, path: path, start: time.Date(2026, 10, 30, 20, 0, 0, 0, time.UTC), probe: probe, client: client}
+}
+
+func (f *turnBetweenChecks) append(records string) {
+	f.t.Helper()
+	file, err := os.OpenFile(f.path, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	defer file.Close()
+	if _, err := file.WriteString(records); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+func (f *turnBetweenChecks) tick(after time.Duration) error {
+	return relayActivityTick(context.Background(), f.b, f.client, f.start.Add(after), f.probe)
+}
+
+func (f *turnBetweenChecks) states() []string {
+	var out []string
+	for _, r := range f.hub.committed {
+		out = append(out, r.Activity.State)
+	}
+	return out
+}
+
+func (f *turnBetweenChecks) records(runtime string) (ended, restarted string) {
+	if runtime == "claude" {
+		return claudeTurnEnded, claudeTurnRestarted
+	}
+	return codexTurnEnded, codexTurnRestarted
+}
+
+// s1/s2 (bug wi_b31b73ad4fdaf7ef): a turn that ends and restarts between two
+// checks is committed as its own idle report, observed at its end, before the
+// working report of the next turn. A handler successor is therefore ready.
+func TestActivityTickReportsTurnEndedBetweenChecks(t *testing.T) {
+	for _, runtime := range []string{"codex", "claude"} {
+		t.Run(runtime, func(t *testing.T) {
+			f := newTurnBetweenChecks(t, runtime, api.Agent{})
+			if err := f.tick(0); err != nil {
+				t.Fatal(err)
+			}
+			ended, restarted := f.records(runtime)
+			f.append(ended + restarted)
+			if err := f.tick(16 * time.Second); err != nil {
+				t.Fatal(err)
+			}
+			if got := f.states(); !slices.Equal(got, []string{"working", "idle", "working"}) || f.hub.conflicts != 0 {
+				t.Fatalf("committed %v conflicts=%d", got, f.hub.conflicts)
+			}
+			hidden := f.hub.committed[1]
+			if want := f.start.Add(5 * time.Second); !hidden.Activity.ObservedAt.Equal(want) || hidden.Activity.Reason != "" || hidden.RunID != f.b.Run {
+				t.Fatalf("hidden report %+v, want observedAt %s", hidden, want)
+			}
+			if hidden.Activity.Tokens.Output == 0 || !api.HandlerSuccessorReady(hidden.Activity) {
+				t.Fatalf("hidden report is not a ready successor's turn: %+v", hidden.Activity)
+			}
+			if current := f.hub.committed[2].Activity; !current.ObservedAt.Equal(f.start.Add(16*time.Second)) || current.Tokens.Output < hidden.Activity.Tokens.Output {
+				t.Fatalf("current report %+v", current)
+			}
+			ids := map[string]bool{}
+			for _, r := range f.hub.committed {
+				if ids[r.RequestID] {
+					t.Fatalf("request ID reused: %v", f.hub.posted)
+				}
+				ids[r.RequestID] = true
+			}
+			if _, kept := savedActivityState(t, f.b)["turnEnd"]; kept {
+				t.Fatal("reported turn end still saved")
+			}
+			// The next steady check adds nothing.
+			if err := f.tick(32 * time.Second); err != nil || len(f.hub.committed) != 3 {
+				t.Fatalf("steady check: %v %v", f.states(), err)
+			}
+		})
+	}
+}
+
+// A turn that is still ended at the check is the ordinary idle report, once,
+// however many turns ended inside the check.
+func TestActivityTickTurnEndedAtCheckReportsOnce(t *testing.T) {
+	f := newTurnBetweenChecks(t, "codex", api.Agent{})
+	if err := f.tick(0); err != nil {
+		t.Fatal(err)
+	}
+	f.append(codexTurnEnded)
+	if err := f.tick(16 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.states(); !slices.Equal(got, []string{"working", "idle"}) || !f.hub.committed[1].Activity.ObservedAt.Equal(f.start.Add(16*time.Second)) {
+		t.Fatalf("committed %v %+v", got, f.hub.committed)
+	}
+	// Another turn starts and ends before the next check: still idle there.
+	f.append(`{"type":"task_started","timestamp":"2026-10-30T20:00:20Z"}` + "\n" + `{"type":"task_complete","timestamp":"2026-10-30T20:00:25Z"}` + "\n")
+	if err := f.tick(32 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.states(); !slices.Equal(got, []string{"working", "idle"}) || len(f.hub.posted) != 2 {
+		t.Fatalf("second check: committed %v posted %v", got, f.hub.posted)
+	}
+}
+
+// a4: a lost reply on the hidden turn's report leaves it pending: the next
+// check replays its own request ID, with no 409, then posts the current state.
+func TestActivityTickTurnEndedBetweenChecksReplaysLostReply(t *testing.T) {
+	f := newTurnBetweenChecks(t, "codex", api.Agent{})
+	if err := f.tick(0); err != nil {
+		t.Fatal(err)
+	}
+	f.append(codexTurnEnded + codexTurnRestarted)
+	f.hub.dropReply = true
+	if err := f.tick(16 * time.Second); err == nil {
+		t.Fatal("expected lost reply")
+	}
+	if got := f.states(); !slices.Equal(got, []string{"working", "idle"}) {
+		t.Fatalf("after the lost reply: %v", got)
+	}
+	hiddenID := f.hub.committed[1].RequestID
+	if err := f.tick(17 * time.Second); err != nil || len(f.hub.posted) != 2 {
+		t.Fatalf("retry ignored spacing: posted %v err %v", f.hub.posted, err)
+	}
+	if err := f.tick(32 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.states(); !slices.Equal(got, []string{"working", "idle", "working"}) || f.hub.conflicts != 0 {
+		t.Fatalf("after the replay: %v conflicts=%d", got, f.hub.conflicts)
+	}
+	if len(f.hub.posted) != 4 || f.hub.posted[2] != hiddenID || f.hub.posted[3] == hiddenID {
+		t.Fatalf("posted %v, hidden %s", f.hub.posted, hiddenID)
+	}
+}
+
+// a5: the hidden turn's report carries the check's matrix wait and wake, so
+// no hub hook sees a wait end or a wake change that did not happen.
+func TestActivityTickTurnEndedBetweenChecksKeepsMatrixWait(t *testing.T) {
+	f := newTurnBetweenChecks(t, "claude", api.Agent{Name: "lead-a", WorkItem: &api.AgentWorkItemBinding{ItemID: matrixTestItem}})
+	write := matrixLockFixture(t, 22)
+	write(matrixLockJSON("test-mini", matrixEntry("22", matrixTestItem, "lead-a", "2026-10-30T19:50:00.000Z")))
+	wake := &api.WakeOutcome{Status: "delivered", MessageSeqs: []int64{41}, At: f.start.Add(-time.Minute)}
+	if err := writePrivateJSON(filepath.Join(relayDir(), bindingKey(f.b)+".progress.json"), relayProgress{Run: f.b.Run, Thread: f.b.Thread, Wake: wake}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.tick(0); err != nil {
+		t.Fatal(err)
+	}
+	f.append(claudeTurnEnded + claudeTurnRestarted)
+	if err := f.tick(16 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.states(); !slices.Equal(got, []string{"working", "idle", "working"}) {
+		t.Fatalf("committed %v", got)
+	}
+	first, hidden, current := f.hub.committed[0].Activity, f.hub.committed[1].Activity, f.hub.committed[2].Activity
+	if w := hidden.MatrixWait; w == nil || w.Role != api.MatrixWaitRunning || !api.SameMatrixWait(w, current.MatrixWait) || !api.SameMatrixWait(w, first.MatrixWait) {
+		t.Fatalf("matrix waits: first %+v hidden %+v current %+v", first.MatrixWait, hidden.MatrixWait, current.MatrixWait)
+	}
+	if hidden.Wake == nil || wakeKey(hidden.Wake) != wakeKey(current.Wake) || wakeKey(hidden.Wake) != wakeKey(wake) {
+		t.Fatalf("wakes: hidden %+v current %+v", hidden.Wake, current.Wake)
+	}
+}
+
+// A turn end read in a catch-up pass, which publishes nothing, is kept in the
+// saved cursor and reported by the next complete pass.
+func TestActivityTickTurnEndedBetweenChecksSurvivesCatchUp(t *testing.T) {
+	f := newTurnBetweenChecks(t, "codex", api.Agent{})
+	if err := f.tick(0); err != nil {
+		t.Fatal(err)
+	}
+	partial := `{"type":"response_item","timestamp":"2026-10-30T20:00:08Z","payload":{"type":"function_call_output",`
+	f.append(codexTurnEnded + codexTurnRestarted + partial)
+	if err := f.tick(16 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.states(); !slices.Equal(got, []string{"working"}) {
+		t.Fatalf("catch-up pass published %v", got)
+	}
+	if end, ok := savedActivityState(t, f.b)["turnEnd"].(map[string]any); !ok || end["at"] != "2026-10-30T20:00:05Z" {
+		t.Fatalf("saved turn end %+v", savedActivityState(t, f.b)["turnEnd"])
+	}
+	f.append(`"call_id":"c2"}}` + "\n" + `{"type":"response_item","timestamp":"2026-10-30T20:00:09Z","payload":{"type":"function_call","name":"exec_command","call_id":"c3","arguments":"{}"}}` + "\n")
+	if err := f.tick(32 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.states(); !slices.Equal(got, []string{"working", "idle", "working"}) {
+		t.Fatalf("committed %v", got)
+	}
+	// Observed at the end, clamped to the catch-up pass's check.
+	if hidden := f.hub.committed[1].Activity; !hidden.ObservedAt.Equal(f.start.Add(16*time.Second)) || hidden.Tokens.Output != 7 {
+		t.Fatalf("hidden report %+v", hidden)
+	}
+}

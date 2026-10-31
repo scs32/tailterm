@@ -296,12 +296,16 @@ NOTICE when it commits, and the relay wakes the successor then.
 
 Why posts count, and why the bound did not change: on 2026-10-30 three
 rotations went stuck although each successor had posted within minutes that
-it was waiting for the handoff. The relay samples a run's state, not its turn
-ends, at most every 15 seconds, and each successor was idle for well under a
-second between turns, so no sample saw a completed turn. Activity-report lag
+it was waiting for the handoff. The relay then sampled a run's state, not its
+turn ends, at most every 15 seconds, and each successor was idle for well under
+a second between turns, so no sample saw a completed turn. Activity-report lag
 was not the cause, and no longer window would fix a sampler that never sees
-the idle state. The bound stays 10 minutes from `spawnedAt`. A successor that
-never posts and is never sampled idle still ends stuck.
+the idle state. The relay now also reports a turn that ended between two of
+its checks, observed at its end, before the next turn's state (bug
+`wi_b31b73ad4fdaf7ef`, [agent-activity.md](agent-activity.md)), so a
+successor that completes a turn with a model reply is ready even when it
+starts the next turn at once. The bound stays 10 minutes from `spawnedAt`. A
+successor that never posts and never completes such a turn still ends stuck.
 
 A prepared rotation can therefore last about 13 minutes: the two minute online
 wait, the 10 minute readiness bound and three counted resumes a minute apart.
@@ -1086,9 +1090,12 @@ directory are inert without the new CLI.
   from a message the run posted. A Codex successor binds to the relay only
   through its own `tt` commands, so one whose first turns never run one and
   never post is never ready; it ends in the stuck notice and the old handler
-  keeps its obligations. The relay samples state, not turn ends, so a
-  successor that ignores its briefing, never posts and is never sampled idle
-  ends stuck the same way.
+  keeps its obligations. After its first report for a run, the relay reports
+  a turn that ended between two of its checks (only the latest one per
+  check), so a successor whose turn ends and restarts inside a check is still
+  ready; one that ignores its briefing,
+  never posts and never completes a turn with a model reply ends stuck the
+  same way.
 - A runner whose due list was empty asks again only after 5 minutes, so a
   `provider_blocked` replacement in a project with nothing else listed can come
   up to 5 minutes after the 20 minute bound.

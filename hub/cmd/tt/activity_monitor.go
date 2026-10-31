@@ -319,6 +319,18 @@ func queueMemberActivity(a *api.AgentActivity) string {
 type relayActivityState struct {
 	activityCursor
 	RequestNonce string `json:"requestNonce,omitempty"`
+	// TurnEnd is the latest turn end read since the last observed check
+	// (bug wi_b31b73ad4fdaf7ef). When the next turn is already open at the
+	// check, it is reported as its own completed turn first.
+	TurnEnd *activityTurnEnd `json:"turnEnd,omitempty"`
+}
+
+// activityTurnEnd is a turn end as the transcript recorded it: its record
+// time, its turn-end reason and the token totals at that record.
+type activityTurnEnd struct {
+	At     time.Time       `json:"at"`
+	Reason string          `json:"reason,omitempty"`
+	Tokens api.TokenTotals `json:"tokens"`
 }
 
 func activityRequestNonce() (string, error) {
@@ -344,9 +356,9 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 	if data, err := os.ReadFile(path); err == nil {
 		fresh = json.Unmarshal(data, &saved) != nil
 	}
-	c, nonce := saved.activityCursor, saved.RequestNonce
+	c, nonce, turnEnd := saved.activityCursor, saved.RequestNonce, saved.TurnEnd
 	if c.Run != b.Run || c.Thread != b.Thread {
-		c, fresh = activityCursor{Run: b.Run, Thread: b.Thread}, true
+		c, fresh, turnEnd = activityCursor{Run: b.Run, Thread: b.Thread}, true, nil
 	}
 	// A cursor an older relay saved has no nonce; it gets one, and a pending
 	// report keeps the request ID it was saved with.
@@ -370,7 +382,7 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 				return err
 			}
 		}
-		return writePrivateJSON(path, relayActivityState{activityCursor: c, RequestNonce: nonce})
+		return writePrivateJSON(path, relayActivityState{activityCursor: c, RequestNonce: nonce, TurnEnd: turnEnd})
 	}
 	// Metering failures never suppress activity transitions or alerts.
 	if u != nil && u.hasPendingWork() {
@@ -423,6 +435,7 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 	if !c.LastCheck.IsZero() && now.Sub(c.LastCheck) < 15*time.Second {
 		return nil
 	}
+	previousCheck := c.LastCheck
 	c.LastCheck = now
 	a, err := client.GetAgent(ctx, b.Task, b.Agent)
 	if err != nil {
@@ -485,7 +498,14 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 					u.Coverage = "partial: usage outbox capacity exceeded"
 				}
 			}
+			wasComplete := cursor.TurnComplete
 			activityParseErr := parse(line, cursor)
+			// The latest end wins; it is kept across catch-up passes. A cursor
+			// that has not reported yet records none: its first report is the
+			// state at its check.
+			if !wasComplete && cursor.TurnComplete && cursor.Transition > 0 {
+				turnEnd = &activityTurnEnd{At: cursor.LastEventAt, Reason: cursor.TurnEndReason, Tokens: cursor.Tokens}
+			}
 			if usageParseErr != nil {
 				u.Coverage = "partial: malformed usage record"
 			}
@@ -506,6 +526,9 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 	}
 	tmuxAlive, processAlive, probeErr := probe(b, a)
 	var state api.AgentActivity
+	// hidden is a turn that ended since the last check while the next one is
+	// open at this check (bug wi_b31b73ad4fdaf7ef).
+	var hidden *api.AgentActivity
 	observed := false
 	if transcript != "" && !c.Ready {
 		if transcriptReadErr == nil && probeErr == nil && tmuxAlive && processAlive {
@@ -542,7 +565,7 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 			c.Worktree = signature
 		}
 		open := 0
-		if c.TurnComplete {
+		if c.TurnComplete || turnEnd != nil {
 			obligations, listErr := client.ListObligations(ctx, b.Task, b.Agent, "", true, false)
 			if listErr != nil {
 				_ = save()
@@ -554,6 +577,25 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 			c.Verified = &verifiedActivitySnapshot{Path: c.Path, FileID: c.FileID, Offset: c.Offset, LastEventAt: c.LastEventAt, Tokens: c.Tokens}
 		}
 		state = activityState(&c, a, open, tmuxAlive, processAlive, probeErr, now, activityDefaults())
+		if end := turnEnd; end != nil && c.SeenTurn && !c.TurnComplete {
+			// The completed turn as this check would have seen it, observed at
+			// its end inside the check interval. Only an idle or finished_silent
+			// turn is reported; any other state is the current report's.
+			at := end.At
+			if at.Before(previousCheck) {
+				at = previousCheck
+			}
+			if at.After(now) {
+				at = now
+			}
+			h := c
+			h.TurnComplete, h.TurnEndReason, h.Pending, h.LastEventAt, h.Tokens = true, end.Reason, nil, end.At, end.Tokens
+			if s := activityState(&h, a, open, tmuxAlive, processAlive, probeErr, at, activityDefaults()); s.State == "idle" || s.State == "finished_silent" {
+				hidden = &s
+			}
+		}
+		// A turn still ended at the check is the current state itself.
+		turnEnd = nil
 		failed := c.ProviderBlock != nil && (!hadBlock || c.ProviderBlock.Class != blockBefore.Class || !c.ProviderBlock.Since.Equal(blockBefore.Since) || c.ProviderBlock.Count > blockBefore.Count)
 		wokenDoneProviderBlock(&c, a, &state, open, failed, tmuxAlive, processAlive, probeErr, activityDefaults())
 		observed = true
@@ -590,6 +632,23 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 	// A verification run in this host's matrix lock is the agent's open work
 	// even when its transcript is quiet (docs/agent-activity.md).
 	state.MatrixWait = matrixWaitFor(a, now)
+	if hidden != nil {
+		// The hidden turn shares the check's wake and matrix wait, so no hub
+		// hook sees a wait end or a wake change that did not happen.
+		hidden.Wake, hidden.MatrixWait = state.Wake, state.MatrixWait
+		if err := reportActivityTransition(ctx, b, client, nonce, &c, *hidden, now, save); err != nil {
+			// The hidden report is pending and replays first; the current
+			// state follows at the next check.
+			return err
+		}
+	}
+	return reportActivityTransition(ctx, b, client, nonce, &c, state, now, save)
+}
+
+// reportActivityTransition reports state unless it repeats the last report or
+// the last rejected one, and records the outcome in c. The pending report is
+// saved before HTTP; an error leaves it pending to replay on a later check.
+func reportActivityTransition(ctx context.Context, b runtimeBinding, client *api.Client, nonce string, c *activityCursor, state api.AgentActivity, now time.Time, save func() error) error {
 	key := activityReportKey(state)
 	sameLast := state.State == c.LastState && sameActivityKey(c.LastWakeKey, state)
 	if sameLast || (state.State == c.RejectedState && sameActivityKey(c.RejectedWakeKey, state)) {
@@ -609,8 +668,8 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 	if err := save(); err != nil {
 		return err
 	}
-	_, err = client.ReportActivity(ctx, b.Task, b.Agent, *c.PendingReport)
-	if retry, downgraded := stuckFallback(b, nonce, &c, err); downgraded {
+	_, err := client.ReportActivity(ctx, b.Task, b.Agent, *c.PendingReport)
+	if retry, downgraded := stuckFallback(b, nonce, c, err); downgraded {
 		if err := save(); err != nil {
 			return err
 		}
@@ -618,7 +677,7 @@ func relayActivityTick(ctx context.Context, b runtimeBinding, client *api.Client
 		_, err = client.ReportActivity(ctx, b.Task, b.Agent, *retry)
 		state = retry.Activity
 	}
-	if providerFallback(&c, err) {
+	if providerFallback(c, err) {
 		// The next tick observes again and reports the legacy form.
 		return save()
 	}
