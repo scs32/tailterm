@@ -812,19 +812,24 @@ func (s *Store) explainTeamQueue(ctx context.Context, task string, out *api.Team
 				return l, nil
 			}
 			// The summary reads the head's host, else an active team's.
-			host := ""
+			host, waiting := "", false
 			for _, entry := range out.Entries {
 				if entry.State == "queued" {
-					host = entry.Host
+					host, waiting = entry.Host, true
 					break
 				}
 			}
-			if host == "" && len(active) > 0 {
+			if !waiting && len(active) > 0 {
 				host = active[0].Host
 			}
 			l, err := lanes(host)
 			if err != nil {
 				return err
+			}
+			// With nothing queued or running no entry waits, so nothing is
+			// held; with no host there is no lock reading to report either.
+			if !waiting && len(active) == 0 {
+				l.Hold = ""
 			}
 			out.Lanes = &l
 		}

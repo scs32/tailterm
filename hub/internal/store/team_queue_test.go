@@ -4461,6 +4461,17 @@ func TestTeamQueueLaneStrainAndMatrixWaitHold(t *testing.T) {
 	if _, err := claimEntry(s, task, entries[1]); err != nil {
 		t.Fatalf("no waiters: %v", err)
 	}
+	// With nothing queued or running the summary reports no hold, even
+	// when the lock is unobserved or a matrix run waits.
+	for _, e := range entries {
+		finishLaneEntry(t, s, e.ID)
+	}
+	for _, waiters := range []*int{nil, intp(1)} {
+		observeLaneHost(t, s, task.ID, laneDay, intp(10), waiters)
+		if list, _ := laneList(t, s, task.ID); list.Lanes == nil || list.Lanes.Hold != "" || list.Lanes.Lanes != 2 {
+			t.Fatalf("idle queue with waiters %v: %+v", waiters, list.Lanes)
+		}
+	}
 	// The census refuses readings outside their range.
 	for _, u := range []api.TeamHostUsage{{MemoryPressure: intp(101)}, {MemoryPressure: intp(-1)}, {MatrixWaiters: intp(-1)}} {
 		u.Host, u.LimiterDomain, u.ObservedAt, u.SourceDigest = "mini", "https://fixture.invalid", laneDay.Format(time.RFC3339Nano), strings.Repeat("a", 64)
