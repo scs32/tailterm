@@ -860,3 +860,28 @@ func TestSendRequestIDIgnoresDerivedEvidence(t *testing.T) {
 		t.Fatalf("request id %q, want %q; envelope %+v", posted.RequestID, golden, posted.Envelope)
 	}
 }
+
+// Review finding f1: the flag line claims a post, so a refused post prints no
+// flag line and no posting claim.
+func TestSendRefusedFlaggedPostClaimsNoPost(t *testing.T) {
+	t.Setenv("TAILTERM_TOOL_LEDGER_DIR", t.TempDir())
+	posts := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/messages") {
+			posts++
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"error":"request ID was already used with different message data"}`))
+	}))
+	defer srv.Close()
+	out, stderr, err := claimSend(t, env{hub: srv.URL, task: "tsk_0000000000000001", agent: "agt_0000000000000001"},
+		"--kind", "result", "--subject", "Tests pass for the refused post fixture", "--outcome", "done",
+		"--status", "a1=pass", "--evidence", "e1 (command): go test ./x -> exit 1; 2 failed")
+	if err == nil || posts != 1 {
+		t.Fatalf("refused post: err %v, %d post attempts", err, posts)
+	}
+	if strings.Contains(out+stderr, "posted") || strings.Contains(stderr, "flag:") {
+		t.Fatalf("a refused post claimed a post: stdout %q stderr %q", out, stderr)
+	}
+}

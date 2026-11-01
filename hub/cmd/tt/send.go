@@ -157,9 +157,6 @@ func cmdSend(e env, args []string) error {
 	if report, ok := claimCheck(e.agent, env); ok {
 		writeClaimReport(os.Stderr, report, false)
 	}
-	for _, f := range env.Flags {
-		fmt.Fprintf(os.Stderr, "flag: %s; posted and marked on the Board\n", f.Reason)
-	}
 
 	if *task == "" {
 		return errors.New("no task")
@@ -209,6 +206,10 @@ func cmdSend(e env, args []string) error {
 		return err
 	}
 	recordUsageContext(e, *task, "post", m.Seq)
+	// Only after the hub stored the post: a refused post makes no posting claim.
+	for _, f := range env.Flags {
+		fmt.Fprintf(os.Stderr, "flag: %s; posted and marked on the Board\n", f.Reason)
+	}
 	fmt.Printf("posted #%d\n", m.Seq)
 	return nil
 }
