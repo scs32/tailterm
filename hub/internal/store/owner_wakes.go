@@ -13,6 +13,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
@@ -801,9 +802,70 @@ ORDER BY f.due_at,f.wake_id`, api.OwnerHelperWakePosted, ownerWakeTS(now.Add(-ap
 	return out, rows.Err()
 }
 
+// ownerWakeBusyBound is how long after due a slot whose recipient run was
+// mid-turn may stay unread, or be read, before it is reported as any other
+// slot: a turn that long is treated as stuck (bug wi_072b2bfbf02fb549).
+const ownerWakeBusyBound = 30 * time.Minute
+
+// ownerWakeTurnBusy is the part of the relay's wake-skip reason for a turn
+// still running (claudeTurnBusyReason in cmd/tt).
+const ownerWakeTurnBusy = "turn in progress"
+
+// ownerWakeHelperBusy reports whether a posted slot's late read, or its
+// unread state at end, is explained by the recipient run being mid-turn. It
+// reads that exact run's stored activity reports and compares their parsed
+// observedAt times. The run was busy when the latest report at or before due
+// was working, or a report after due and at or before end records the relay
+// skipping a wake because a turn was in progress; and no report after due and
+// more than OwnerHelperWakeLateAfter before end is idle, since a helper that
+// finished its turn and sat idle with the slot unread missed it. Any other
+// state at due, or no history, is not busy.
+func ownerWakeHelperBusy(ctx context.Context, tx *sql.Tx, firing api.OwnerHelperWakeFiring, end time.Time) (bool, error) {
+	if firing.RecipientID == "" || firing.RecipientRunID == "" {
+		return false, nil
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT payload FROM agent_activity_receipts WHERE agent_id=? AND run_id=? ORDER BY rowid`, firing.RecipientID, firing.RecipientRunID)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	due := firing.DueAt
+	var atDue *api.AgentActivity
+	skipped, idleGap := false, false
+	for rows.Next() {
+		var payload string
+		if err := rows.Scan(&payload); err != nil {
+			return false, err
+		}
+		var a api.AgentActivity
+		if json.Unmarshal([]byte(payload), &a) != nil || a.ObservedAt.IsZero() {
+			continue
+		}
+		at := a.ObservedAt
+		switch {
+		case !at.After(due):
+			if atDue == nil || !at.Before(atDue.ObservedAt) {
+				atDue = &a
+			}
+		case at.After(end):
+		case a.State == "idle" && end.Sub(at) > api.OwnerHelperWakeLateAfter:
+			idleGap = true
+		case a.Wake != nil && a.Wake.Status == "skipped" && strings.Contains(a.Wake.Reason, ownerWakeTurnBusy):
+			skipped = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	return !idleGap && (skipped || atDue != nil && atDue.State == "working"), nil
+}
+
 // ownerWakeSettle records a posted slot's read time, reporting it late when
 // it was read more than OwnerHelperWakeLateAfter after due, or reports it
 // undelivered once it has stayed unread OwnerHelperWakeUnreadAfter. A slot
+// whose recipient run was mid-turn (ownerWakeHelperBusy) is excused up to
+// ownerWakeBusyBound after due: its read and lateness are recorded with no
+// report, and an unread one is reported undelivered only at the bound. A slot
 // already reported gets no second report.
 func (s *Store) ownerWakeSettle(ctx context.Context, f ownerWakeUnreadFiring, now time.Time) ([]OwnerHelperWakeStep, error) {
 	s.writeMu.Lock()
@@ -839,10 +901,24 @@ func (s *Store) ownerWakeSettle(ctx context.Context, f ownerWakeUnreadFiring, no
 			return nil, err
 		}
 		if at := parseTS(read); firing.Report == "" && at.Sub(firing.DueAt) > api.OwnerHelperWakeLateAfter {
-			report, action = api.OwnerHelperWakeReportLate, ownerWakeActionLate
-			text = fmt.Sprintf("Wake %s (%s), due %s, was posted as message #%d but the owner helper read it %s late.", w.ID, w.Kind, ownerWakeWhen(firing.DueAt), firing.NoticeSeq, stallDuration(at.Sub(firing.DueAt)))
+			busy := false
+			if at.Sub(firing.DueAt) <= ownerWakeBusyBound {
+				if busy, err = ownerWakeHelperBusy(ctx, tx, firing, at); err != nil {
+					return nil, err
+				}
+			}
+			if !busy {
+				report, action = api.OwnerHelperWakeReportLate, ownerWakeActionLate
+				text = fmt.Sprintf("Wake %s (%s), due %s, was posted as message #%d but the owner helper read it %s late.", w.ID, w.Kind, ownerWakeWhen(firing.DueAt), firing.NoticeSeq, stallDuration(at.Sub(firing.DueAt)))
+			}
 		}
 	case firing.Report == "" && now.Sub(firing.DueAt) >= api.OwnerHelperWakeUnreadAfter:
+		if now.Sub(firing.DueAt) < ownerWakeBusyBound {
+			busy, err := ownerWakeHelperBusy(ctx, tx, firing, now)
+			if err != nil || busy {
+				return nil, err // mid-turn: no write until the read or the bound
+			}
+		}
 		report, action = api.OwnerHelperWakeReportUndelivered, ownerWakeActionUndelivered
 		text = fmt.Sprintf("Wake %s (%s), due %s, was posted to the owner helper as message #%d and is still unread after %s, past its re-wakes. Check the helper's session; the hub records the read when it happens.",
 			w.ID, w.Kind, ownerWakeWhen(firing.DueAt), firing.NoticeSeq, stallDuration(now.Sub(firing.DueAt)))

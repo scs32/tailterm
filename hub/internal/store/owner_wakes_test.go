@@ -1079,3 +1079,171 @@ func TestOwnerHelperWakeClockStepBack(t *testing.T) {
 		t.Fatalf("firings %+v", list)
 	}
 }
+
+// Bug wi_072b2bfbf02fb549 (order #53433): a slot read late, or unread,
+// because the helper's run was mid-turn is recorded with its lateness and not
+// reported, up to ownerWakeBusyBound. Isolated stores and a fake clock only.
+
+// activity stores one activity report of the helper's current run.
+func (f *wakeFixture) activity(key, state string, at time.Time, wake *api.WakeOutcome) {
+	f.t.Helper()
+	a := api.AgentActivity{State: state, ObservedAt: at, Wake: wake}
+	if _, err := f.s.ReportActivity(context.Background(), f.task.ID, f.helper.ID, api.ActivityReport{RequestID: key, RunID: f.helper.RunID, Activity: a}); err != nil {
+		f.t.Fatalf("activity %s: %v", key, err)
+	}
+}
+
+// wakeReports lists the owner reports of wake id: undirected broker notices.
+func (f *wakeFixture) wakeReports(id string) []wakeNotice {
+	f.t.Helper()
+	var out []wakeNotice
+	for _, n := range f.notices(0) {
+		if n.to == "" && n.env.Refs["ownerWake"] != "" && n.env.Refs["wake"] == id {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// busyWake creates the hourly wake, stores the helper's activity at 07:10
+// with state, and posts the 07:14 slot.
+func busyWake(t *testing.T, state string) (*wakeFixture, api.OwnerHelperWake) {
+	t.Helper()
+	f := wakeStore(t, true)
+	w := f.create("wake", "hourly-update", "14 7-20 * * *")
+	f.activity("act-at-due", state, pst(2, 7, 10, 0), nil)
+	if steps := f.sweep(pst(2, 7, 14, 10)); len(steps) != 1 || steps[0].Action != ownerWakeActionPosted {
+		t.Fatalf("post %+v", steps)
+	}
+	return f, w
+}
+
+// lateRead reads the slot at read, sweeps 30 s later and checks the firing
+// records the read with lateMinutes and the expected report.
+func (f *wakeFixture) lateRead(w api.OwnerHelperWake, read time.Time, lateMinutes int64, reported bool) {
+	f.t.Helper()
+	f.read(read)
+	steps := f.sweep(read.Add(30 * time.Second))
+	x := f.firings(w.ID)[0]
+	if x.DeliveredAt == nil || !x.DeliveredAt.Equal(read) || x.LateMinutes != lateMinutes {
+		f.t.Fatalf("read not recorded %+v", x)
+	}
+	if !reported {
+		if len(steps) != 0 || x.Report != "" || x.ReportSeq != 0 || len(f.wakeReports(w.ID)) != 0 {
+			f.t.Fatalf("busy read reported: steps %+v firing %+v", steps, x)
+		}
+		return
+	}
+	if len(steps) != 1 || steps[0].Action != ownerWakeActionLate || x.Report != api.OwnerHelperWakeReportLate || x.ReportSeq != steps[0].MessageSeq {
+		f.t.Fatalf("late read not reported: steps %+v firing %+v", steps, x)
+	}
+	if n := f.wakeReports(w.ID); len(n) != 1 || n[0].env.Refs["escalation"] != "owner" || !strings.Contains(n[0].env.Body.Text, "read it "+strconv.FormatInt(lateMinutes, 10)+" min late") {
+		f.t.Fatalf("report %+v", n)
+	}
+}
+
+// t1: working at due, read 8 min late: recorded, no report.
+func TestOwnerHelperWakeBusyReadLate(t *testing.T) {
+	f, w := busyWake(t, "working")
+	f.lateRead(w, pst(2, 7, 22, 0), 8, false)
+	f.reopen()
+	if steps := f.sweep(pst(2, 7, 50, 0)); len(steps) != 0 {
+		t.Fatalf("reported after a restart %+v", steps)
+	}
+	// The excused read ends the episode like an on-time read: the next slot,
+	// read late while idle, is reported.
+	f.activity("act-idle", "idle", pst(2, 8, 0, 0), nil)
+	f.sweep(pst(2, 8, 14, 10))
+	f.read(pst(2, 8, 22, 0))
+	if steps := f.sweep(pst(2, 8, 22, 30)); len(steps) != 1 || steps[0].Action != ownerWakeActionLate {
+		t.Fatalf("next idle late read %+v", steps)
+	}
+}
+
+// t2: idle at due, read 8 min late: reported late as before.
+func TestOwnerHelperWakeBusyIdleReadLate(t *testing.T) {
+	f, w := busyWake(t, "idle")
+	f.lateRead(w, pst(2, 7, 22, 0), 8, true)
+}
+
+// t3: working at due and unread: no report at 16 min, undelivered at the
+// 30 min bound.
+func TestOwnerHelperWakeBusyUnread(t *testing.T) {
+	f, w := busyWake(t, "working")
+	for _, at := range []time.Time{pst(2, 7, 30, 0), pst(2, 7, 43, 59)} {
+		if steps := f.sweep(at); len(steps) != 0 {
+			t.Fatalf("busy unread reported at %s: %+v", at, steps)
+		}
+	}
+	if x := f.firings(w.ID)[0]; x.Report != "" || x.DeliveredAt != nil || len(f.wakeReports(w.ID)) != 0 {
+		t.Fatalf("firing before the bound %+v", x)
+	}
+	steps := f.sweep(pst(2, 7, 45, 0))
+	if len(steps) != 1 || steps[0].Action != ownerWakeActionUndelivered {
+		t.Fatalf("unread at 31 min %+v", steps)
+	}
+	x := f.firings(w.ID)[0]
+	if x.Report != api.OwnerHelperWakeReportUndelivered || x.ReportSeq != steps[0].MessageSeq {
+		t.Fatalf("firing %+v", x)
+	}
+	if n := f.wakeReports(w.ID); len(n) != 1 || !strings.Contains(n[0].env.Body.Text, "is still unread after 31 min") {
+		t.Fatalf("report %+v", n)
+	}
+	f.read(pst(2, 7, 50, 0))
+	if steps := f.sweep(pst(2, 7, 50, 30)); len(steps) != 0 {
+		t.Fatalf("second report %+v", steps)
+	}
+}
+
+// t4: working at due, read past the bound: reported late.
+func TestOwnerHelperWakeBusyReadPastBound(t *testing.T) {
+	f, w := busyWake(t, "working")
+	// No sweep runs between the post and the read, so the slot is never
+	// reported undelivered first.
+	f.lateRead(w, pst(2, 7, 49, 0), 35, true)
+}
+
+// t5: working at due, then idle more than 5 min before the read: reported.
+// An idle report less than 5 min before the read keeps the excuse.
+func TestOwnerHelperWakeBusyIdleGap(t *testing.T) {
+	t.Run("idle gap", func(t *testing.T) {
+		f, w := busyWake(t, "working")
+		f.activity("act-idle", "idle", pst(2, 7, 16, 0), nil)
+		f.lateRead(w, pst(2, 7, 23, 0), 9, true)
+	})
+	t.Run("turn just ended", func(t *testing.T) {
+		f, w := busyWake(t, "working")
+		f.activity("act-idle", "idle", pst(2, 7, 20, 0), nil)
+		f.lateRead(w, pst(2, 7, 23, 0), 9, false)
+	})
+}
+
+// t6: idle at due, then the relay skips the wake because a turn is in
+// progress: the read 8 min late is excused.
+func TestOwnerHelperWakeBusyRelaySkip(t *testing.T) {
+	f, w := busyWake(t, "idle")
+	notice := f.firings(w.ID)[0].NoticeSeq
+	f.activity("act-skip", "working", pst(2, 7, 15, 0), &api.WakeOutcome{Status: "skipped", Reason: "Claude transcript busy, incomplete, or unknown: turn in progress", MessageSeqs: []int64{notice}, At: pst(2, 7, 15, 0)})
+	f.lateRead(w, pst(2, 7, 22, 0), 8, false)
+}
+
+// t7: a stuck or hung run at due is not busy: reported late.
+func TestOwnerHelperWakeBusyStuck(t *testing.T) {
+	for _, state := range []string{"stuck", "hung_tool"} {
+		t.Run(state, func(t *testing.T) {
+			f, w := busyWake(t, state)
+			f.lateRead(w, pst(2, 7, 22, 0), 8, true)
+		})
+	}
+}
+
+// t8: activity of another run of the same agent is ignored.
+func TestOwnerHelperWakeBusyOtherRun(t *testing.T) {
+	f, w := busyWake(t, "idle")
+	other, _ := json.Marshal(api.AgentActivity{State: "working", ObservedAt: pst(2, 7, 12, 0)})
+	if _, err := f.s.db.Exec(`INSERT INTO agent_activity_receipts(task_id,request_id,agent_id,run_id,payload,request_payload) VALUES(?,?,?,?,?,?)`,
+		f.task.ID, "act-other-run", f.helper.ID, "run_other", string(other), "{}"); err != nil {
+		t.Fatal(err)
+	}
+	f.lateRead(w, pst(2, 7, 22, 0), 8, true)
+}
