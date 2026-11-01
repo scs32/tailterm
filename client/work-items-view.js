@@ -38,6 +38,8 @@ const priorities = {
   high: "High",
   urgent: "Urgent",
 };
+// The hub's page limit (api.MaxLimit).
+const PAGE_LIMIT = 200;
 const options = (values, selected) =>
   Object.entries(values)
     .map(
@@ -70,20 +72,34 @@ export function createWorkItemsView({
     query = "",
     loading = false,
     again = false,
+    // While a first load or a filter change is still fetching later pages,
+    // the rows of the pages already read are on screen (bug wi_782e0ea7627f9fca).
+    morePages = false,
+    // The filter whose complete list is on screen; a refresh of it keeps that
+    // list until the replacement is complete.
+    completeKey = "",
+    // The filter of the last full render, and the reload whose first page has
+    // been shown.
+    renderedKey = "",
+    shownGeneration = 0,
+    listScheduled = false,
+    // The filter of the load in flight.
+    loadingKey = "",
     narrativeGeneration = 0,
     searchGeneration = 0,
-    searchLoading = false;
+    searchLoading = false,
+    searchMore = false;
   const searchHistory = new Map();
   const presentation = createViewRefreshPresentation({
     render: () => {
-      if (visible && !loading) render();
+      if (visible && (!loading || morePages)) render();
     },
   });
   const project = (id) => tasks.find((t) => t.id === id);
   const itemScroll = createWorkItemsScroll({
     getContainer: () => root?.querySelector?.(".work-items-main"),
     render: () => render(),
-    canRender: () => visible && !loading,
+    canRender: () => visible && (!loading || morePages),
   });
   function mount(container) {
     root = container;
@@ -95,6 +111,9 @@ export function createWorkItemsView({
     generation++;
     searchGeneration++;
     loading = false;
+    morePages = false;
+    completeKey = "";
+    renderedKey = "";
     subscription?.stop();
     subscription = null;
     itemScroll.interrupt();
@@ -119,7 +138,9 @@ export function createWorkItemsView({
   }
   async function reload() {
     if (!visible || !root) return;
-    if (loading) {
+    // A refresh during a load runs after it; a filter change starts its own
+    // load at once, and the old one stops at its next page.
+    if (loading && loadingKey === JSON.stringify([scope, state])) {
       again = true;
       return;
     }
@@ -134,27 +155,50 @@ export function createWorkItemsView({
     again = false;
     const token = ++generation;
     const filter = { taskId: scope, status: state };
+    loadingKey = JSON.stringify([scope, state]);
     try {
       const nextTasks = await client().listTasks(),
         next = [];
       if (!visible || token !== generation) return;
-      let after = 0;
-      do {
+      const key = JSON.stringify([filter.taskId, filter.status]);
+      // Without a complete list for this filter on screen (a first load, a
+      // tab revisit or a filter change) each page is shown as it arrives.
+      const progressive = completeKey !== key;
+      let after = 0,
+        fullPage = 0;
+      for (;;) {
         const page = await client().listWorkItems({
           kind,
           ...filter,
           after,
-          limit: 200,
+          limit: PAGE_LIMIT,
         });
+        if (!visible || token !== generation) return;
+        if (filter.taskId !== scope || filter.status !== state) {
+          again = true;
+          return;
+        }
         next.push(...page.items);
-        if (!page.items.length || !page.next || page.next <= after) break;
+        // The hub names a next cursor on every non-empty page, so the list
+        // ends at an empty page, or at a page shorter than an earlier one of
+        // this read: a hub that pages below PAGE_LIMIT still reads every page.
+        if (
+          !page.items.length ||
+          !page.next ||
+          page.next <= after ||
+          (fullPage && page.items.length < Math.min(PAGE_LIMIT, fullPage))
+        )
+          break;
+        fullPage = Math.max(fullPage, page.items.length);
         after = page.next;
-      } while (visible && token === generation);
-      if (!visible || token !== generation) return;
-      if (filter.taskId !== scope || filter.status !== state) {
-        again = true;
+        if (progressive) showPage(token, nextTasks, next, true);
+      }
+      completeKey = key;
+      if (shownGeneration === token) {
+        showPage(token, nextTasks, next, false);
         return;
       }
+      morePages = false;
       tasks = nextTasks;
       items = next;
       searchGeneration++;
@@ -166,6 +210,9 @@ export function createWorkItemsView({
       if (query.trim()) void enrichSearchHistory();
     } catch (error) {
       if (!visible || token !== generation) return;
+      morePages = false;
+      completeKey = "";
+      renderedKey = "";
       itemScroll.interrupt();
       presentation.interrupt();
       root.innerHTML = `<div class="mode-empty"><span class="eyebrow">${plural.toUpperCase()}</span><h2>Hub unavailable.</h2><p class="launcher-intro" role="alert">${esc(error.message)}</p><button data-items-retry>Retry</button></div>`;
@@ -177,6 +224,44 @@ export function createWorkItemsView({
         else itemScroll.flush();
       }
     }
+  }
+  // Shows the pages read so far. The first page of a reload starts a new
+  // search cache and renders the whole view; later pages, and the last,
+  // repaint only the list, at most once a frame.
+  function showPage(token, nextTasks, next, pending) {
+    tasks = nextTasks;
+    items = next.slice();
+    morePages = pending;
+    if (shownGeneration !== token) {
+      shownGeneration = token;
+      searchGeneration++;
+      searchHistory.clear();
+      render();
+    } else scheduleList();
+    if (query.trim()) {
+      searchMore = true;
+      void enrichSearchHistory();
+    }
+  }
+  function scheduleList() {
+    if (listScheduled) return;
+    listScheduled = true;
+    const run = () => {
+      listScheduled = false;
+      if (visible) updateList();
+    };
+    if (typeof requestAnimationFrame === "function")
+      requestAnimationFrame(() => setTimeout(run, 0));
+    else setTimeout(run, 0);
+  }
+  function updateList() {
+    const filterKey = JSON.stringify([scope, state]);
+    if (renderedKey !== filterKey) return render();
+    // A held scroll keeps this DOM; its flush renders the whole view.
+    const frame = itemScroll.beforeRender(filterKey);
+    if (!frame) return;
+    updateSearchResults();
+    itemScroll.afterRender(frame);
   }
   function render() {
     if (!visible) return;
@@ -233,6 +318,7 @@ export function createWorkItemsView({
     };
     root.querySelector("[data-items-new]").onclick = () => edit();
     root.querySelector("[data-items-new-rail]").onclick = () => edit();
+    renderedKey = filterKey;
     updateSearchResults();
     itemScroll.afterRender(itemScrollFrame);
   }
@@ -305,18 +391,23 @@ export function createWorkItemsView({
     const unavailable = items.filter(
       (item) => searchHistory.get(item.id)?.error,
     ).length;
-    root.querySelector("[data-items-search-status]").textContent = query.trim()
-      ? ` · ${pending ? "Searching current records and history…" : `${filtered.length} match${filtered.length === 1 ? "" : "es"}${unavailable ? ` · history unavailable for ${unavailable}` : ""}`}`
+    const loadingMore = morePages
+      ? ` · Loading more ${plural.toLowerCase()}…`
       : "";
+    root.querySelector("[data-items-search-status]").textContent =
+      (query.trim()
+        ? ` · ${pending ? "Searching current records and history…" : `${filtered.length} match${filtered.length === 1 ? "" : "es"}${morePages ? " so far" : ""}${unavailable ? ` · history unavailable for ${unavailable}` : ""}`}`
+        : "") + loadingMore;
     list.innerHTML = filtered.length
       ? filtered.map(rowMarkup).join("")
-      : `<p class="work-items-empty fine">${pending ? `Searching ${plural.toLowerCase()} history…` : `No ${plural.toLowerCase()} match this search and the selected filters.`}</p>`;
+      : `<p class="work-items-empty fine">${pending ? `Searching ${plural.toLowerCase()} history…` : morePages ? `Loading more ${plural.toLowerCase()}…` : `No ${plural.toLowerCase()} match this search and the selected filters.`}</p>`;
     bindRows();
     if (resetScroll) root.querySelector(".work-items-main").scrollTop = 0;
   }
   async function enrichSearchHistory() {
     if (searchLoading) return;
     searchLoading = true;
+    searchMore = false;
     const token = searchGeneration;
     const pending = items.filter((item) => {
       const cached = searchHistory.get(item.id);
@@ -352,9 +443,10 @@ export function createWorkItemsView({
       if (token === searchGeneration) updateSearchResults();
     } finally {
       searchLoading = false;
+      // A new search cache, or a page that arrived during this pass.
       if (
         query.trim() &&
-        token !== searchGeneration &&
+        (token !== searchGeneration || searchMore) &&
         items.some((item) => !searchHistory.has(item.id))
       )
         void enrichSearchHistory();

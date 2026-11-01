@@ -21,6 +21,18 @@ and excluded from profile sync and portable exports. It retains up to 100 reads
 or 8 MiB for at most seven days, evicting older entries. An unvisited view or a
 new browser origin may need a connection before it has anything to show.
 
+Bugs and Features read the hub 200 items a page. On a first visit, a tab
+revisit or a filter change, the first page's rows show as soon as that page
+arrives, and later pages are added below them as they arrive. Meanwhile the status
+line says more items are still loading. A search covers the pages read so far
+and reports its matches "so far" rather than "no match". The status and project
+filters always ask the hub, so they cover every item. A filter change starts its
+own read at once, and rows of the earlier filter never return. A background refresh
+keeps the complete list on screen until its replacement is complete. The read
+ends at an empty page, or at a page shorter than an earlier one, so a hub that
+pages below 200 still lists every item (bug `wi_782e0ea7627f9fca`; measurements
+in [measurements/work-items-fetch-2026-11-01.md](measurements/work-items-fetch-2026-11-01.md)).
+
 Board refreshes normally fetch only messages newer than the saved conversation.
 Terminal reconciliation, launches and cleanup still require authoritative hub
 reads. Changes and dispatches require a confirmed hub response: failures retain
