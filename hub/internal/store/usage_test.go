@@ -3817,3 +3817,160 @@ func BenchmarkUsageReportLiveSize(parent *testing.B) {
 		})
 	}
 }
+
+// usageWindowFixture is one project with a metered agent whose orders are
+// linked to two items. All data is synthetic; times are on 2026-01-01.
+type usageWindowFixture struct {
+	t        *testing.T
+	path     string
+	s        *Store
+	task     api.Task
+	agent    api.Agent
+	items    []api.WorkItem
+	messages []api.Message
+	serial   int
+}
+
+func newUsageWindowFixture(t *testing.T) *usageWindowFixture {
+	t.Helper()
+	s, task, a, items, messages := usageFixture(t)
+	var seq int
+	var name, path string
+	if err := s.db.QueryRow(`PRAGMA database_list`).Scan(&seq, &name, &path); err != nil {
+		t.Fatal(err)
+	}
+	return &usageWindowFixture{t: t, path: path, s: s, task: task, agent: a, items: items, messages: messages}
+}
+
+// reopen closes and opens the store, as a hub restart does: the open's
+// backfill clears the turns listed for a totals check.
+func (f *usageWindowFixture) reopen() {
+	f.t.Helper()
+	if err := f.s.Close(); err != nil {
+		f.t.Fatal(err)
+	}
+	s, err := Open(f.path)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	f.t.Cleanup(func() { s.Close() })
+	f.s = s
+}
+
+// turns reports one request per instant, acknowledging item i's order, and
+// returns their request ids.
+func (f *usageWindowFixture) turns(i int, at ...time.Time) []string {
+	f.t.Helper()
+	list, ids := []api.UsageTurn{}, []string{}
+	for _, x := range at {
+		f.serial++
+		turn := syntheticUsageTurn(fmt.Sprintf("window-%d", f.serial))
+		turn.At = x
+		turn.Handled = []api.UsageEvidence{{TaskID: f.task.ID, Seq: f.messages[i].Seq, Operation: "ack", At: x}}
+		list, ids = append(list, turn), append(ids, turn.ID)
+	}
+	f.serial++
+	if _, err := f.s.ReportUsage(context.Background(), f.task.ID, f.agent.ID, usageBatch(f.agent, fmt.Sprintf("window-batch-%d", f.serial), list...)); err != nil {
+		f.t.Fatal(err)
+	}
+	return ids
+}
+
+// spans reports chunks handling item i's order.
+func (f *usageWindowFixture) spans(i int, spans ...api.UsageSpan) {
+	f.t.Helper()
+	for k := range spans {
+		spans[k].Handled = []api.UsageEvidence{{TaskID: f.task.ID, Seq: f.messages[i].Seq, Operation: "ack", At: spans[k].Start}}
+	}
+	f.serial++
+	if _, err := f.s.ReportUsage(context.Background(), f.task.ID, f.agent.ID, spanBatch(f.agent, fmt.Sprintf("window-spans-%d", f.serial), spans...)); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+func (f *usageWindowFixture) report(from, to time.Time) api.UsageReport {
+	f.t.Helper()
+	report, err := f.s.Usage(context.Background(), f.task.ID, api.UsageQuery{From: from, To: to})
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	return report
+}
+
+func (f *usageWindowFixture) item(report api.UsageReport, i int) api.UsageItemReport {
+	f.t.Helper()
+	for _, row := range report.Items {
+		if row.ItemID == f.items[i].ID {
+			return row
+		}
+	}
+	f.t.Fatalf("item %d missing from the report", i)
+	return api.UsageItemReport{}
+}
+
+// A windowed read counts exactly the requests in [From,To), including one
+// whose totals row is stale but listed for a check, and leaves lifetime
+// budgets as the unwindowed read gives them.
+func TestUsageWindowedTurnsHalfOpenAndStaleTotals(t *testing.T) {
+	f := newUsageWindowFixture(t)
+	from, to := timeAt("10:00:00"), timeAt("11:00:00")
+	ns := time.Nanosecond
+	f.turns(0, from.Add(-ns), from, to.Add(-ns), to, timeAt("09:00:00"), timeAt("12:00:00"))
+	staleID := f.turns(1, timeAt("10:30:00"))[0]
+	f.reopen()
+	report := f.report(from, to)
+	if report.Summary.Requests != 3 || f.item(report, 0).Summary.Requests != 2 || f.item(report, 1).Summary.Requests != 1 {
+		t.Fatalf("half-open window: %d requests, item 0 %d, item 1 %d", report.Summary.Requests, f.item(report, 0).Summary.Requests, f.item(report, 1).Summary.Requests)
+	}
+	// Stale totals: the in-window request of item 1 gets a totals row at
+	// another revision and instant, which lists it for a check.
+	if _, err := f.s.db.Exec(`UPDATE usage_turn_totals SET turn_revision=0,at_ns=? WHERE task_id=? AND request_id=?`, timeAt("08:00:00").UnixNano(), f.task.ID, staleID); err != nil {
+		t.Fatal(err)
+	}
+	var listed int
+	if err := f.s.db.QueryRow(`SELECT count(*) FROM usage_turn_total_checks`).Scan(&listed); err != nil || listed != 1 {
+		t.Fatalf("stale totals row listed %d times: %v", listed, err)
+	}
+	stale := f.report(from, to)
+	if stale.Summary.Requests != 3 || f.item(stale, 1).Summary.Requests != 1 {
+		t.Fatalf("stale totals dropped a request: %d, item 1 %d", stale.Summary.Requests, f.item(stale, 1).Summary.Requests)
+	}
+	all := f.report(time.Time{}, time.Time{})
+	if all.Summary.Requests != 7 {
+		t.Fatalf("unwindowed read: %d requests", all.Summary.Requests)
+	}
+	for i := range f.items {
+		if !reflect.DeepEqual(f.item(stale, i).Budget, f.item(all, i).Budget) || f.item(all, i).Budget.ActualTokens == "0" {
+			t.Fatalf("item %d budget is not lifetime: %+v vs %+v", i, f.item(stale, i).Budget, f.item(all, i).Budget)
+		}
+	}
+}
+
+// Spans straddling From and To are clipped; a chunk outside the window still
+// counts its poll when the poll's request instant is inside it; a chunk with
+// neither adds nothing.
+func TestUsageWindowedSpansStraddleAndPollInstant(t *testing.T) {
+	f := newUsageWindowFixture(t)
+	from, to := timeAt("10:00:00"), timeAt("11:00:00")
+	straddleFrom := testSpan("t1", "09:59:30", "10:00:30")
+	straddleTo := testSpan("t2", "10:59:40", "11:00:20")
+	poll := testSpan("t3", "09:50:00", "09:50:40")
+	poll.Segments[0].At, poll.Segments[0].Poll = timeAt("10:30:00"), true
+	outside := testSpan("t4", "12:00:00", "12:01:00")
+	f.spans(0, straddleFrom, straddleTo, poll, outside)
+	f.reopen()
+	got := f.item(f.report(from, to), 0).Time
+	if got == nil {
+		t.Fatal("no time in the window")
+	}
+	if got.ModelMs != "50000" || got.WallMs != "3600000" || got.WaitingMs != "3550000" || got.Polls != 1 || got.PollMs != "0" {
+		t.Fatalf("windowed time: model %s wall %s waiting %s polls %d pollMs %s", got.ModelMs, got.WallMs, got.WaitingMs, got.Polls, got.PollMs)
+	}
+	if !got.From.Equal(from) || !got.To.Equal(to) {
+		t.Fatalf("windowed time bounds: %s - %s", got.From, got.To)
+	}
+	all := f.item(f.report(time.Time{}, time.Time{}), 0).Time
+	if all == nil || all.Polls != 1 || all.PollMs != "40000" {
+		t.Fatalf("unwindowed time: %+v", all)
+	}
+}
