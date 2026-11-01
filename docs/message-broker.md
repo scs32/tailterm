@@ -113,13 +113,48 @@ hub wraps them as `kind: human` with the text as the body.
 - **`body`**: named fields per kind (below). Named keys, not arrays, so Jev
   questions can target `body.acceptance.a2` directly.
 - **`evidence`**: named entries, each
-  `{type: command|commit|file|record|url, value, outcome}`.
+  `{type: command|commit|file|record|url, value, outcome, exit}`. A `command`
+  entry may carry its exit code as the start of its outcome:
+  `e1 (command): CMD -> exit N [; outcome]`, for example
+  `e1 (command): go test ./cmd/tt -> exit 0; 62 passed`. The hub derives `exit`
+  (0 to 255) from that text and replaces any `exit` a sender supplies; the
+  outcome text stays the source of truth and is rendered unchanged. Evidence
+  without an exit stays valid.
 - **`attachments`**: artifact IDs for anything longer than about 2 KB. The board
   never carries file content. This replaces multi-part chunk posts.
 - **Size**: body at most 4 KB. The hub rejects anything larger and points the
   sender to attachments.
 - **`to`**: an agent name, `role:<role>` or `lead`. The broker resolves roles to
   the current agent/run when it creates the obligation and records the resolution.
+
+### Failed-command flag (report only)
+
+Owner decision #52911 (feature `wi_06f39b93792cba61`): the hub flags, and never
+refuses, a RESULT whose cited command failed.
+
+- **Rule**: a `result` whose outcome is `done`, or whose statuses are all `pass`,
+  while a `command` evidence entry has an exit other than 0, is accepted and
+  stored with one flag per such entry, in key order.
+- **Field**: `flags` in the stored envelope, each
+  `{kind: "failed_command", field: "evidence.e1", reason}`, where the reason names
+  the entry, such as `e1 exited 1, but this result reports done`. The hub derives
+  `flags` on every post and replaces any value a sender supplies, so a flag can be
+  neither forged nor cleared.
+- **Board**: a flagged message shows each reason in red under its text, and lists
+  every command entry's exit (`e1 exit 0 · e2 exit 1`).
+- **No exit**: a command entry with no exit code is shown as `exit unknown`,
+  never as passed or failed, and is never flagged.
+- **Nothing is refused**: blocking is not authorized. `tt send` prints one
+  `flag:` line on stderr per flag and still posts.
+- **Claim checker**: when a command entry starts with `exit N`, that exit is its
+  claimed outcome and the words after it are not read for pass or failure (see
+  [claude-mods-claim-checker.md](claude-mods-claim-checker.md), "Command").
+- **Limits and retries**: the derived `exit` and `flags` are not counted in the
+  8 KB envelope limit and are left out of a post's retry identity (the hub's
+  request hash and `tt send`'s default request id), so a retry across a hub or tt
+  upgrade replays instead of conflicting.
+- **Not covered**: a success claim written in prose with no command evidence.
+  The handler prompt rule still applies to that.
 
 ### Receipt refs
 

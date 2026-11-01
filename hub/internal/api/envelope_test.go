@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"strings"
@@ -512,5 +513,198 @@ func TestEnvelopeReviewFindingTitleEchoesCappedID(t *testing.T) {
 				t.Fatalf("problems %q, want %q", got, want)
 			}
 		})
+	}
+}
+
+func exitPtr(n int) *int { return &n }
+
+func exitString(p *int) string {
+	if p == nil {
+		return "nil"
+	}
+	return fmt.Sprint(*p)
+}
+
+// Criterion a1: command evidence may carry an exit code read from a leading
+// "exit N" in its outcome; anything else has none, and old entries stay valid.
+func TestEvidenceExitParsedFromOutcome(t *testing.T) {
+	for _, c := range []struct {
+		entry string
+		exit  *int
+	}{
+		{"e1 (command): go test ./x -> exit 0", exitPtr(0)},
+		{"e1 (command): go test ./x -> exit 1", exitPtr(1)},
+		{"e1: go test ./x -> exit 0; 62 passed", exitPtr(0)},
+		{"e1: go test ./x -> EXIT 2; 1 failed", exitPtr(2)},
+		{"e1: go test ./x -> exit 255", exitPtr(255)},
+		{"e1: go test ./x -> ok", nil},
+		{"e1: go test ./x -> ok (exit 0)", nil},
+		{"e1: go test ./x -> exit unknown", nil},
+		{"e1: go test ./x -> exiting early", nil},
+		{"e1: go test ./x -> exit -1", nil},
+		{"e1: go test ./x -> exit 300", nil},
+		{"e1: go test ./x -> exit 1000", nil},
+		{"e1 (record): saved row -> exit 1", nil},
+		{"e1 (commit): abc1234", nil},
+	} {
+		_, ev, ok := ParseEvidenceEntry(c.entry)
+		if !ok || exitString(ev.Exit) != exitString(c.exit) || exitString(EvidenceExit(ev)) != exitString(c.exit) {
+			t.Errorf("%q: exit %s, want %s (ok %v)", c.entry, exitString(ev.Exit), exitString(c.exit), ok)
+		}
+	}
+	// The outcome text is kept whole and round-trips through the rendered text.
+	e := validEnvelopes()[EnvelopeKindResult]
+	_, ev, _ := ParseEvidenceEntry("e1 (command): go test ./x -> exit 1; 2 failed")
+	e.Evidence = map[string]Evidence{"e1": ev, "e2": {Type: "command", Value: "go vet ./...", Outcome: "ok"}}
+	if ev.Outcome != "exit 1; 2 failed" || ValidateEnvelope(e) != nil {
+		t.Fatalf("entry %+v problems %v", ev, ValidateEnvelope(e))
+	}
+	parsed, matched := ParseTextConvention(RenderText(e))
+	if !matched || parsed.Evidence["e1"].Outcome != "exit 1; 2 failed" || exitString(parsed.Evidence["e1"].Exit) != "1" || parsed.Evidence["e2"].Exit != nil {
+		t.Fatalf("round trip %+v", parsed.Evidence)
+	}
+}
+
+// Criteria a2 and a3: the failed-command flag rule, and no flag without an exit.
+func TestEvidenceFlagsForFailedCommand(t *testing.T) {
+	cmd := func(outcome string) Evidence {
+		return Evidence{Type: "command", Value: "go test ./x", Outcome: outcome}
+	}
+	for _, c := range []struct {
+		name     string
+		kind     string
+		outcome  string
+		status   map[string]string
+		evidence map[string]Evidence
+		want     []EnvelopeFlag
+	}{
+		{"done with exit 1", "result", "done", map[string]string{"a1": "fail"}, map[string]Evidence{"e1": cmd("exit 1; 2 failed")},
+			[]EnvelopeFlag{{Kind: "failed_command", Field: "evidence.e1", Reason: "e1 exited 1, but this result reports done"}}},
+		{"partial but every status pass", "result", "partial", map[string]string{"a1": "pass", "a2": "pass"}, map[string]Evidence{"e1": cmd("exit 2")},
+			[]EnvelopeFlag{{Kind: "failed_command", Field: "evidence.e1", Reason: "e1 exited 2, but this result reports every status pass"}}},
+		{"exit 0", "result", "done", map[string]string{"a1": "pass"}, map[string]Evidence{"e1": cmd("exit 0; ok")}, nil},
+		{"missing exit", "result", "done", map[string]string{"a1": "pass"}, map[string]Evidence{"e1": cmd("failed")}, nil},
+		{"honest failure", "result", "partial", map[string]string{"a1": "fail"}, map[string]Evidence{"e1": cmd("exit 1")}, nil},
+		{"record type", "result", "done", map[string]string{"a1": "pass"}, map[string]Evidence{"e1": {Type: "record", Value: "row", Outcome: "exit 1"}}, nil},
+		{"finding kind", "finding", "", nil, map[string]Evidence{"e1": cmd("exit 1")}, nil},
+		{"two failed entries in key order", "result", "done", map[string]string{"a1": "pass"},
+			map[string]Evidence{"e10": cmd("exit 3"), "e2": cmd("exit 1"), "e1": cmd("exit 0")},
+			[]EnvelopeFlag{{Kind: "failed_command", Field: "evidence.e2", Reason: "e2 exited 1, but this result reports done"},
+				{Kind: "failed_command", Field: "evidence.e10", Reason: "e10 exited 3, but this result reports done"}}},
+	} {
+		e := Envelope{Kind: c.kind, Subject: "Fixture for the failed command flag", Body: EnvelopeBody{Outcome: c.outcome, Status: c.status, Severity: "low", Summary: "s"}, Evidence: c.evidence}
+		DeriveEvidence(&e)
+		if !reflect.DeepEqual(e.Flags, c.want) {
+			t.Errorf("%s: flags %+v, want %+v", c.name, e.Flags, c.want)
+		}
+		for k, ev := range e.Evidence {
+			if exitString(ev.Exit) != exitString(EvidenceExit(ev)) {
+				t.Errorf("%s: %s exit %s", c.name, k, exitString(ev.Exit))
+			}
+		}
+	}
+}
+
+// Criterion a2: the hub accepts a flagged result (nothing is refused), stores
+// the derived exit and flag, keeps old clients' text, and replaces forged values.
+func TestNormalizeEnvelopePostFlagsWithoutRefusing(t *testing.T) {
+	failed := func() *Envelope {
+		return &Envelope{Kind: "result", Subject: "Tests pass for the flag fixture", Body: EnvelopeBody{Outcome: "done", Status: map[string]string{"a1": "pass"}},
+			Evidence: map[string]Evidence{"e1": {Type: "command", Value: "go test ./x", Outcome: "exit 1; 2 failed"}, "e2": {Type: "command", Value: "go vet ./...", Outcome: "ok"}}}
+	}
+	// An old tt sends no exit field and the text it rendered itself.
+	req := PostMessageRequest{Envelope: failed()}
+	req.Text = RenderText(*req.Envelope)
+	oldText := req.Text
+	if err := NormalizeEnvelopePost(&req); err != nil {
+		t.Fatalf("flagged result refused: %v", err)
+	}
+	if req.Text != oldText || exitString(req.Envelope.Evidence["e1"].Exit) != "1" || req.Envelope.Evidence["e2"].Exit != nil ||
+		len(req.Envelope.Flags) != 1 || req.Envelope.Flags[0].Field != "evidence.e1" || !strings.Contains(req.Envelope.Flags[0].Reason, "e1") {
+		t.Fatalf("normalized %+v text %q", req.Envelope, req.Text)
+	}
+	// Forged values: a clean result's flags are cleared, a wrong exit is rederived.
+	clean := failed()
+	clean.Evidence = map[string]Evidence{"e1": {Type: "command", Value: "go test ./x", Outcome: "exit 0", Exit: exitPtr(1)}}
+	clean.Flags = []EnvelopeFlag{{Kind: "failed_command", Field: "evidence.e1", Reason: "forged"}}
+	req = PostMessageRequest{Envelope: clean}
+	if err := NormalizeEnvelopePost(&req); err != nil || req.Envelope.Flags != nil || exitString(req.Envelope.Evidence["e1"].Exit) != "0" {
+		t.Fatalf("forged clean: %v %+v", err, req.Envelope)
+	}
+	hidden := failed()
+	hidden.Evidence["e1"] = Evidence{Type: "command", Value: "go test ./x", Outcome: "exit 1", Exit: exitPtr(0)}
+	req = PostMessageRequest{Envelope: hidden}
+	if err := NormalizeEnvelopePost(&req); err != nil || len(req.Envelope.Flags) != 1 || exitString(req.Envelope.Evidence["e1"].Exit) != "1" {
+		t.Fatalf("hidden failure: %v %+v", err, req.Envelope)
+	}
+}
+
+// The 8 KB envelope limit measures what the sender wrote; derived exit and
+// flags never push a message over it, on either normalize pass.
+func TestEnvelopeSizeLimitExcludesDerivedFields(t *testing.T) {
+	build := func(pad int) Envelope {
+		e := Envelope{Kind: "result", Subject: "Tests pass for the size limit fixture", Body: EnvelopeBody{Outcome: "done", Status: map[string]string{"a1": "pass"}},
+			Evidence: map[string]Evidence{"e1": {Type: "command", Value: "go test ./x", Outcome: "exit 1"}}}
+		for i := 0; pad > 0; i++ {
+			n := pad
+			if n > 1500 {
+				n = 1500
+			}
+			e.Attachments = append(e.Attachments, strings.Repeat("a", n))
+			pad -= n
+		}
+		return e
+	}
+	size := func(e Envelope) int { b, _ := json.Marshal(WithoutDerived(e)); return len(b) }
+	pad := 0
+	for size(build(pad)) < MaxEnvelopeBytes {
+		pad++
+	}
+	// Each extra attachment adds separator bytes; step down to the exact limit.
+	for size(build(pad)) > MaxEnvelopeBytes {
+		pad--
+	}
+	e := build(pad)
+	if size(e) != MaxEnvelopeBytes {
+		t.Fatalf("fixture is %d bytes, want exactly %d", size(e), MaxEnvelopeBytes)
+	}
+	if len(RenderText(e)) > MaxTextLen {
+		t.Fatalf("fixture renders to %d bytes", len(RenderText(e)))
+	}
+	if p := ValidateEnvelope(e); p != nil {
+		t.Fatalf("at the limit: %v", p)
+	}
+	env := e
+	req := PostMessageRequest{Envelope: &env}
+	if err := NormalizeEnvelopePost(&req); err != nil {
+		t.Fatalf("first normalize: %v", err)
+	}
+	if whole, _ := json.Marshal(*req.Envelope); len(whole) <= MaxEnvelopeBytes {
+		t.Fatalf("derived envelope is %d bytes; the fixture should exceed the limit only with derived fields", len(whole))
+	}
+	if err := NormalizeEnvelopePost(&req); err != nil || len(req.Envelope.Flags) != 1 {
+		t.Fatalf("second normalize: %v %+v", err, req.Envelope.Flags)
+	}
+	if p := ValidateEnvelope(*req.Envelope); p != nil {
+		t.Fatalf("derived envelope: %v", p)
+	}
+	over := build(pad + 1)
+	if size(over) != MaxEnvelopeBytes+1 {
+		t.Fatalf("over fixture is %d bytes", size(over))
+	}
+	if p := ValidateEnvelope(over); len(p) != 1 || p[0].String() != fmt.Sprintf("envelope: must be at most %d bytes", MaxEnvelopeBytes) {
+		t.Fatalf("one byte over: %v", p)
+	}
+}
+
+func TestEnvelopeWithoutDerivedLeavesInputUnchanged(t *testing.T) {
+	e := Envelope{Kind: "result", Evidence: map[string]Evidence{"e1": {Type: "command", Value: "x", Outcome: "exit 1", Exit: exitPtr(1)}},
+		Flags: []EnvelopeFlag{{Kind: "failed_command", Field: "evidence.e1", Reason: "r"}}}
+	plain := WithoutDerived(e)
+	if plain.Flags != nil || plain.Evidence["e1"].Exit != nil || plain.Evidence["e1"].Outcome != "exit 1" {
+		t.Fatalf("plain %+v", plain)
+	}
+	if len(e.Flags) != 1 || exitString(e.Evidence["e1"].Exit) != "1" {
+		t.Fatalf("input changed %+v", e)
 	}
 }

@@ -25,7 +25,21 @@ type Envelope struct {
 	Attachments    []string            `json:"attachments,omitempty"`
 	ExpectedAnswer string              `json:"expectedAnswer,omitempty"`
 	Due            string              `json:"due,omitempty"`
+	// Flags is derived by the hub (DeriveEvidence); a sender's value is
+	// replaced. It reports, and never refuses (docs/message-broker.md).
+	Flags []EnvelopeFlag `json:"flags,omitempty"`
 }
+
+// EnvelopeFlag is one derived report-only mark on a stored message.
+type EnvelopeFlag struct {
+	Kind   string `json:"kind"`
+	Field  string `json:"field"`
+	Reason string `json:"reason"`
+}
+
+// EnvelopeFlagFailedCommand marks a RESULT that reports done or every status
+// pass while a cited command evidence entry exited nonzero.
+const EnvelopeFlagFailedCommand = "failed_command"
 
 // EnvelopeBody holds the named fields of every kind. Maps use short named keys
 // (a1, e2) so each entry can be addressed directly, never by position.
@@ -54,6 +68,88 @@ type Evidence struct {
 	Type    string `json:"type"`
 	Value   string `json:"value"`
 	Outcome string `json:"outcome,omitempty"`
+	// Exit is derived from a command entry's outcome when it starts with
+	// "exit N" (EvidenceExit). The outcome text stays the source of truth.
+	Exit *int `json:"exit,omitempty"`
+}
+
+var evidenceExitPrefix = regexp.MustCompile(`(?i)^exit\s+(\d{1,3})\b`)
+
+// EvidenceExit is the only reader of an evidence exit code: a command entry
+// whose outcome starts with "exit N", N from 0 to 255. Anything else, including
+// every other type, has no exit (nil), which is shown as "exit unknown".
+func EvidenceExit(ev Evidence) *int {
+	if ev.Type != "command" {
+		return nil
+	}
+	m := evidenceExitPrefix.FindStringSubmatch(strings.TrimSpace(ev.Outcome))
+	if m == nil {
+		return nil
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil || n > 255 {
+		return nil
+	}
+	return &n
+}
+
+// DeriveEvidence recomputes every evidence entry's Exit and the envelope's
+// Flags from what the sender wrote; values a sender supplied for either are
+// replaced, so a flag can be neither forged nor cleared. A RESULT is flagged,
+// never refused, when it reports done or every status pass while a cited
+// command entry exited nonzero. An entry with no exit is never flagged.
+func DeriveEvidence(e *Envelope) {
+	if e == nil {
+		return
+	}
+	e.Flags = nil
+	if len(e.Evidence) > 0 {
+		derived := make(map[string]Evidence, len(e.Evidence))
+		for k, ev := range e.Evidence {
+			ev.Exit = EvidenceExit(ev)
+			derived[k] = ev
+		}
+		e.Evidence = derived
+	}
+	if e.Kind != EnvelopeKindResult {
+		return
+	}
+	claim := ""
+	if e.Body.Outcome == "done" {
+		claim = "reports done"
+	} else if len(e.Body.Status) > 0 {
+		claim = "reports every status pass"
+		for _, v := range e.Body.Status {
+			if v != "pass" {
+				claim = ""
+			}
+		}
+	}
+	if claim == "" {
+		return
+	}
+	for _, k := range sortedKeys(e.Evidence) {
+		if exit := e.Evidence[k].Exit; exit != nil && *exit != 0 {
+			e.Flags = append(e.Flags, EnvelopeFlag{Kind: EnvelopeFlagFailedCommand, Field: "evidence." + k,
+				Reason: fmt.Sprintf("%s exited %d, but this result %s", k, *exit, claim)})
+		}
+	}
+}
+
+// WithoutDerived returns a copy of e without the fields DeriveEvidence fills,
+// so size limits and retry identities measure only what the sender wrote. The
+// input is not changed.
+func WithoutDerived(e Envelope) Envelope {
+	e.Flags = nil
+	if len(e.Evidence) > 0 {
+		plain := make(map[string]Evidence, len(e.Evidence))
+		for k, ev := range e.Evidence {
+			ev.Exit = nil
+			plain[k] = ev
+		}
+		e.Evidence = plain
+	}
+	return e
 }
 
 // Problem is one reason an envelope is invalid, addressed by field path.
@@ -114,6 +210,7 @@ func normalizeEnvelopePost(req *PostMessageRequest, validate func(Envelope) []Pr
 		}
 		req.ReplyTo = seq
 	}
+	DeriveEvidence(req.Envelope)
 	rendered := RenderText(*req.Envelope)
 	if req.Text != "" && req.Text != rendered {
 		return &EnvelopeError{Problems: []Problem{{Field: "text", Reason: "must be empty or equal the envelope's rendered text"}}}
@@ -410,7 +507,9 @@ func ValidateEnvelope(e Envelope) []Problem {
 	if body, err := json.Marshal(e.Body); err == nil && len(body) > MaxEnvelopeBodyBytes {
 		add("body", "must be at most %d bytes; put longer material in a file and cite it in refs", MaxEnvelopeBodyBytes)
 	}
-	if whole, err := json.Marshal(e); err == nil && len(whole) > MaxEnvelopeBytes {
+	// Derived fields (exit, flags) are not counted: the limit is on what the
+	// sender wrote, so deriving them never pushes a valid message over it.
+	if whole, err := json.Marshal(WithoutDerived(e)); err == nil && len(whole) > MaxEnvelopeBytes {
 		add("envelope", "must be at most %d bytes", MaxEnvelopeBytes)
 	} else if len(RenderText(e)) > MaxTextLen {
 		add("envelope", "renders to more than %d bytes", MaxTextLen)
@@ -659,6 +758,7 @@ func ParseEvidenceEntry(part string) (string, Evidence, bool) {
 	if item.Type == "" {
 		item.Type = inferEvidenceType(item.Value)
 	}
+	item.Exit = EvidenceExit(item)
 	return m[1], item, true
 }
 

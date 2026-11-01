@@ -65,6 +65,7 @@ type citedClaim struct {
 	source  string   // where the message cites it, e.g. "ref commit" or "e1"
 	text    string   // the commit, the command or the receipt path
 	outcome string   // a command's claimed outcome
+	exit    *int     // a command's claimed exit (api.EvidenceExit), if any
 	words   []string // a command's single simple command
 }
 
@@ -153,7 +154,7 @@ func claimExtract(m api.Envelope, r *claimReport) []citedClaim {
 			r.skip(claimReasonCommand)
 			continue
 		}
-		claims = append(claims, citedClaim{kind: claimCommand, source: k, text: ev.Value, outcome: ev.Outcome, words: words})
+		claims = append(claims, citedClaim{kind: claimCommand, source: k, text: ev.Value, outcome: ev.Outcome, exit: api.EvidenceExit(ev), words: words})
 	}
 	receipt := func(v, source string) {
 		v = strings.TrimSpace(v)
@@ -394,7 +395,22 @@ func claimCheckCommand(c citedClaim, rows []claimRow, single string) claimFindin
 	if !ok {
 		return claimFinding{claim: c, state: claimUnmatched, detail: "no identical single command in your ledger"}
 	}
-	exit, outcome := latest.ev.ExitCode, claimOutcome(c.outcome)
+	exit := latest.ev.ExitCode
+	// A cited "exit N" is the claimed outcome; the prose after it is not read.
+	// The single-commit guard still comes first: a run at another commit is
+	// never credited, whatever it exited.
+	if c.exit != nil {
+		switch {
+		case single != "" && latest.ev.Commit != "" && !strings.HasPrefix(strings.ToLower(latest.ev.Commit), single):
+			return claimFinding{claim: c, state: claimContradicted, detail: fmt.Sprintf("ran at %s, not %s", claimShort(latest.ev.Commit), single)}
+		case exit == nil:
+			return claimFinding{claim: c, state: claimUnproven, detail: "exit not recorded"}
+		case *exit != *c.exit:
+			return claimFinding{claim: c, state: claimContradicted, detail: fmt.Sprintf("you cited exit %d but your latest run exited %d at %s", *c.exit, *exit, claimAt(latest.at))}
+		}
+		return claimFinding{claim: c, state: claimMatched, detail: fmt.Sprintf("exit %d at %s", *exit, claimAt(latest.at))}
+	}
+	outcome := claimOutcome(c.outcome)
 	switch {
 	case exit != nil && outcome > 0 && *exit != 0:
 		return claimFinding{claim: c, state: claimContradicted, detail: fmt.Sprintf("your latest run exited %d at %s", *exit, claimAt(latest.at))}

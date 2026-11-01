@@ -4397,6 +4397,19 @@ html:fullscreen {
   padding: 3px 8px;
   font-size: 11px;
 }
+/* Report-only evidence marks: a failed cited command is red; exits are muted. */
+.board-evidence-flag {
+  margin: 6px 0 0;
+  border-left: 2px solid light-dark(#a13f4e, #edada1);
+  padding: 3px 8px;
+  color: light-dark(#a13f4e, #edada1);
+  font-size: 11px;
+}
+.board-evidence {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 10px;
+}
 .reply-context {
   margin: 8px 0;
   border-left: 2px solid var(--accent);

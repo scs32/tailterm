@@ -420,3 +420,39 @@ func TestClaimCheckReportFormat(t *testing.T) {
 		t.Fatalf("a send with nothing checkable is silent, got %q", out.String())
 	}
 }
+
+// A cited "exit N" is the claimed outcome and is compared exactly with the
+// ledger's exit; the prose after it is not read. Entries without an exit keep
+// the word rules. A run at another commit than the single cited one is never
+// credited, even when its exit matches (lead decision L1).
+func TestClaimCheckExitPrecedence(t *testing.T) {
+	at := time.Now().Add(-time.Hour)
+	cmd := "go test ./cmd/tt"
+	exitRow := func(n int) toolLedgerRow { return claimEvidenceRow(cmd, claimExit(n), "", at) }
+	for _, c := range []struct {
+		outcome string
+		row     toolLedgerRow
+		want    claimState
+		detail  string
+	}{
+		{"exit 1; 2 passed", exitRow(0), claimContradicted, "you cited exit 1 but your latest run exited 0"},
+		{"exit 0; 3 failed", exitRow(1), claimContradicted, "you cited exit 0 but your latest run exited 1"},
+		{"exit 1", exitRow(1), claimMatched, "exit 1 at "},
+		{"exit 0; ok", exitRow(0), claimMatched, "exit 0 at "},
+		{"exit 2", exitRow(1), claimContradicted, "you cited exit 2 but your latest run exited 1"},
+		{"exit 1", claimEvidenceRow(cmd, nil, "", at), claimUnproven, "exit not recorded"},
+		{"ok, 0 failed", exitRow(0), claimMatched, "exit 0 at "},
+		{"fail", exitRow(0), claimContradicted, "your latest run exited 0"},
+	} {
+		m := claimResult(map[string]api.Evidence{"e1": {Type: "command", Value: cmd, Outcome: c.outcome}}, nil)
+		f := claimFindingFor(t, claimRunFor(t, m, c.row), cmd)
+		if f.state != c.want || !strings.Contains(f.detail, c.detail) {
+			t.Errorf("%q: got %s %q, want %s containing %q", c.outcome, claimStateNames[f.state], f.detail, claimStateNames[c.want], c.detail)
+		}
+	}
+	wrong := claimResult(map[string]api.Evidence{"e1": {Type: "command", Value: cmd, Outcome: "exit 0"}}, map[string]string{"commit": "0a1b2c3"})
+	f := claimFindingFor(t, claimRunFor(t, wrong, claimEvidenceRow(cmd, claimExit(0), claimCommitA, at)), cmd)
+	if f.state != claimContradicted || !strings.Contains(f.detail, "ran at abcdef012345, not 0a1b2c3") {
+		t.Errorf("explicit exit at another commit: %s %q", claimStateNames[f.state], f.detail)
+	}
+}

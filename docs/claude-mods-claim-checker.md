@@ -106,7 +106,24 @@ design.
 A row is a candidate only when it passes isolation and its word list is
 identical, word for word, to the cited command's. `go test ./...` never matches
 `go test ./... -run TestOne`, nor the reverse. No candidate: `unmatched`.
-Otherwise the latest candidate, by time, decides:
+Otherwise the latest candidate, by time, decides.
+
+When the cited outcome starts with an exit code (`exit N`, the evidence `exit`
+field in docs/message-broker.md), that exit is the claimed outcome and the text
+after it is not read for pass or failure words:
+
+- the message cites exactly one commit and the run recorded a different one:
+  `contradicted`, checked first, so a run at another commit is never credited;
+- the run has no exit code recorded: `unproven`;
+- the run exited a different code than the one cited: `contradicted` ("you
+  cited exit 1 but your latest run exited 0"), so `exit 1; 2 passed` against a
+  passing run and `exit 0; 3 failed` against a failing one are both
+  contradicted;
+- otherwise `matched`. A truthful `exit 1` is matched: the checker verifies the
+  citation, and the hub's failed-command flag is what marks a passed result
+  that cites it.
+
+Otherwise, for an outcome with no leading exit code:
 
 - the claimed outcome is a pass (`ok`, `pass`, `passed`, `green`, `clean` or
   `exit 0`, with none of `fail`, `error`, `panic`, `exit 1`-`9`) and the run

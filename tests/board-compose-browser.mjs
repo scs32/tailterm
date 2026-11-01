@@ -1205,6 +1205,81 @@ try {
         );
       }
       await api("DELETE", `/v1/tasks/${railProject.id}`);
+      // Report-only failed-command flag (wi_06f39b93792cba61): the hub stores
+      // the flag on a done RESULT citing a nonzero exit, and the Board marks it
+      // in red; command evidence with no exit reads "exit unknown".
+      const typedResult = (subject, outcome) =>
+        api(
+          "POST",
+          `/v1/tasks/${fixture.task.id}/messages`,
+          {
+            agentId: fixture.agent.id,
+            envelope: {
+              kind: "result",
+              subject,
+              body: { outcome: "done", status: { a1: "pass" } },
+              evidence: {
+                e1: { type: "command", value: "go test ./x", outcome },
+                e2: { type: "command", value: "go vet ./...", outcome: "ok" },
+              },
+            },
+          },
+          201,
+        );
+      const flagged = await typedResult(
+        "Tests pass for the flagged fixture",
+        "exit 1; 2 failed",
+      );
+      const clean = await typedResult(
+        "Tests pass for the clean fixture",
+        "exit 0; 3 passed",
+      );
+      const storedFlag = (await messages(fixture)).find(
+        (message) => message.seq === flagged.seq,
+      );
+      assert.equal(
+        storedFlag?.envelope?.flags?.length,
+        1,
+        `${name}: stored flags`,
+      );
+      assert.equal(storedFlag.envelope.flags[0].field, "evidence.e1");
+      assert.equal(storedFlag.envelope.evidence.e1.exit, 1);
+      assert.equal(storedFlag.envelope.evidence.e2.exit, undefined);
+      await page.evaluate(() => window.qa.board.reload());
+      const flaggedRow = `[data-message="${flagged.seq}"]`;
+      const cleanRow = `[data-message="${clean.seq}"]`;
+      await page.locator(`${flaggedRow} .board-evidence-flag`).waitFor();
+      await page.locator(`${cleanRow} .board-evidence`).waitFor();
+      const marks = await page.evaluate(
+        ({ flaggedRow, cleanRow }) => {
+          const flag = document.querySelector(
+            `${flaggedRow} .board-evidence-flag`,
+          );
+          const color = getComputedStyle(flag).color.match(/\d+(\.\d+)?/g);
+          return {
+            flagText: flag.textContent,
+            color: color.slice(0, 3).map(Number),
+            flaggedExits: document.querySelector(
+              `${flaggedRow} .board-evidence`,
+            )?.textContent,
+            cleanFlags: document.querySelectorAll(
+              `${cleanRow} .board-evidence-flag`,
+            ).length,
+            cleanExits: document.querySelector(`${cleanRow} .board-evidence`)
+              ?.textContent,
+          };
+        },
+        { flaggedRow, cleanRow },
+      );
+      assert.match(marks.flagText, /e1 exited 1, but this result reports done/);
+      const [red, green, blue] = marks.color;
+      assert.ok(
+        red > 120 && red > green + 40 && red > blue + 30,
+        `${name}: the flag is not red: rgb(${marks.color})`,
+      );
+      assert.equal(marks.flaggedExits, "e1 exit 1 · e2 exit unknown");
+      assert.equal(marks.cleanFlags, 0, `${name}: a clean result was flagged`);
+      assert.equal(marks.cleanExits, "e1 exit 0 · e2 exit unknown");
       // A project on another hub can hold a message with the same seq; a
       // focused Reply must not pull focus onto that project's Reply.
       const other = await project(`${name}-hub2`, hub2);
@@ -1285,7 +1360,7 @@ try {
     }
   }
   console.log(
-    `Board audit/composer passed in ${results.join(", ")}: explicit Intake/work/related/resolve/correct, open+closed verified v2 exports, real Enter, Shift+Enter, synthetic composition/repeat guards, recipient/cancel retention, and committed failure retry exactly once.`,
+    `Board audit/composer passed in ${results.join(", ")}: explicit Intake/work/related/resolve/correct, the failed-command flag and "exit unknown", open+closed verified v2 exports, real Enter, Shift+Enter, synthetic composition/repeat guards, recipient/cancel retention, and committed failure retry exactly once.`,
   );
 } finally {
   if (web) await new Promise((resolve) => web.close(resolve));

@@ -730,3 +730,133 @@ func TestSendClaimsOnly(t *testing.T) {
 		t.Fatalf("timeout: %q %v", out, err)
 	}
 }
+
+// Criteria a1-a3 from the CLI side: exit 0, nonzero and missing exits are all
+// posted; only the nonzero one is flagged, on stderr and in the stored envelope.
+func TestSendCarriesExitCodeAndFlagsFailedCommand(t *testing.T) {
+	for _, c := range []struct {
+		name, outcome, exit string
+		flagged             bool
+	}{
+		{"exit0", "exit 0; 12 passed", "0", false},
+		{"nonzero", "exit 1; 2 failed", "1", true},
+		{"missing", "ok", "", false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("TAILTERM_TOOL_LEDGER_DIR", t.TempDir())
+			e, cl, task, _ := cliWorkItemFixture(t)
+			out, stderr, err := claimSend(t, e, "--kind", "result", "--subject", "Tests pass for the exit code fixture", "--outcome", "done",
+				"--status", "a1=pass", "--evidence", "e1 (command): go test ./x -> "+c.outcome)
+			if err != nil || !strings.HasPrefix(out, "posted #") {
+				t.Fatalf("send: %q %q %v", out, stderr, err)
+			}
+			wantStderr := ""
+			if c.flagged {
+				wantStderr = "flag: e1 exited 1, but this result reports done; posted and marked on the Board\n"
+			}
+			if stderr != wantStderr {
+				t.Fatalf("stderr %q, want %q", stderr, wantStderr)
+			}
+			msgs, err := cl.ListMessages(context.Background(), task.ID, 0, "", 10)
+			if err != nil || len(msgs) != 1 || msgs[0].Envelope == nil {
+				t.Fatalf("messages %v %+v", err, msgs)
+			}
+			ev := msgs[0].Envelope.Evidence["e1"]
+			got := ""
+			if ev.Exit != nil {
+				got = fmt.Sprint(*ev.Exit)
+			}
+			if got != c.exit || ev.Outcome != c.outcome || (len(msgs[0].Envelope.Flags) == 1) != c.flagged || len(msgs[0].Envelope.Flags) > 1 {
+				t.Fatalf("stored evidence %+v exit %q flags %+v", ev, got, msgs[0].Envelope.Flags)
+			}
+			if c.flagged && (msgs[0].Envelope.Flags[0].Field != "evidence.e1" || msgs[0].Envelope.Flags[0].Kind != api.EnvelopeFlagFailedCommand) {
+				t.Fatalf("flag %+v", msgs[0].Envelope.Flags[0])
+			}
+			if msgs[0].Text != api.RenderText(*msgs[0].Envelope) {
+				t.Fatalf("text %q", msgs[0].Text)
+			}
+		})
+	}
+}
+
+// A message at the 8 KB limit that the flag applies to is still posted, and
+// the hub's two normalize passes both accept the request tt sent.
+func TestSendNearLimitFailedCommandPosts(t *testing.T) {
+	t.Setenv("TAILTERM_TOOL_LEDGER_DIR", t.TempDir())
+	const subject, entry = "Tests pass for the near limit fixture", "e1 (command): go test ./x -> exit 1"
+	_, ev, _ := api.ParseEvidenceEntry(entry)
+	build := func(pad int) []string {
+		var out []string
+		for ; pad > 0; pad -= 1500 {
+			out = append(out, strings.Repeat("a", min(pad, 1500)))
+		}
+		return out
+	}
+	size := func(pad int) int {
+		e := api.Envelope{Kind: "result", Subject: subject, Body: api.EnvelopeBody{Outcome: "done", Status: map[string]string{"a1": "pass"}},
+			Evidence: map[string]api.Evidence{"e1": ev}, Attachments: build(pad)}
+		b, _ := json.Marshal(api.WithoutDerived(e))
+		return len(b)
+	}
+	pad := 0
+	for size(pad) < api.MaxEnvelopeBytes {
+		pad++
+	}
+	for size(pad) > api.MaxEnvelopeBytes {
+		pad--
+	}
+	if size(pad) != api.MaxEnvelopeBytes {
+		t.Fatalf("fixture is %d bytes", size(pad))
+	}
+	var normalized []error
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/messages") {
+			var req api.PostMessageRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Error(err)
+			}
+			mu.Lock()
+			normalized = append(normalized, api.NormalizeEnvelopePost(&req), api.NormalizeEnvelopePost(&req))
+			mu.Unlock()
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"seq":7,"taskId":"tsk_0000000000000001"}`))
+	}))
+	defer srv.Close()
+	args := []string{"--kind", "result", "--subject", subject, "--outcome", "done", "--status", "a1=pass", "--evidence", entry}
+	for _, a := range build(pad) {
+		args = append(args, "--attachment", a)
+	}
+	out, stderr, err := claimSend(t, env{hub: srv.URL, task: "tsk_0000000000000001", agent: "agt_0000000000000001"}, args...)
+	if err != nil || out != "posted #7\n" || !strings.Contains(stderr, "flag: e1 exited 1") {
+		t.Fatalf("send: %q %q %v", out, stderr, err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(normalized) != 2 || normalized[0] != nil || normalized[1] != nil {
+		t.Fatalf("hub normalize passes: %v", normalized)
+	}
+}
+
+// The default request id leaves the derived exit out, so a tt from before
+// exit codes and this one post the same message under the same id.
+func TestSendRequestIDIgnoresDerivedEvidence(t *testing.T) {
+	t.Setenv("TAILTERM_TOOL_LEDGER_DIR", t.TempDir())
+	hub := newClaimHub(t, false)
+	e := env{hub: hub.url, task: "tsk_0000000000000001", agent: "agt_0000000000000001", runID: "run_0000000000000003"}
+	if _, _, err := claimSend(t, e, "--kind", "result", "--subject", "Tests ran for the request id fixture", "--outcome", "done",
+		"--status", "a1=pass", "--evidence", "e1 (command): go test ./x -> exit 1; 2 failed"); err != nil {
+		t.Fatal(err)
+	}
+	var posted api.PostMessageRequest
+	if err := json.Unmarshal(hub.posts()[0], &posted); err != nil {
+		t.Fatal(err)
+	}
+	// Golden: the id tt at tasks-hub f03f6a56 (before exit codes) derived for
+	// this exact send (same run, recipient, reply and flags).
+	const golden = "send-501ed04c2be451a9d784f073"
+	if posted.RequestID != golden || posted.Envelope == nil || posted.Envelope.Evidence["e1"].Exit == nil || len(posted.Envelope.Flags) != 1 {
+		t.Fatalf("request id %q, want %q; envelope %+v", posted.RequestID, golden, posted.Envelope)
+	}
+}

@@ -1274,6 +1274,18 @@ func (s *Store) writeAgentStatus(ctx context.Context, id, status string, by api.
 
 const selfAddressedMessage = "a directed message to yourself wakes nobody; the hub sends you a notice when your matrix run ends, and to wait for anything else run tt inbox --unread --wait 9m in your turn or ask a teammate to message you"
 
+// messageHashForm is the request a post's retry identity hashes: the
+// envelope without the fields the hub derives (evidence exit, flags). Hashing
+// only what the sender wrote keeps a retry sent to an older hub, or from an
+// older tt, replaying instead of conflicting. The stored message keeps them.
+func messageHashForm(req api.PostMessageRequest) api.PostMessageRequest {
+	if req.Envelope != nil {
+		plain := api.WithoutDerived(*req.Envelope)
+		req.Envelope = &plain
+	}
+	return req
+}
+
 func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMessageRequest, by api.Caller) (api.Message, error) {
 	if err := api.NormalizeEnvelopePost(&req); err != nil {
 		return api.Message{}, err
@@ -1289,7 +1301,7 @@ func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMess
 	}
 	payload := ""
 	if req.RequestID != "" {
-		payload = requestHash(req)
+		payload = requestHash(messageHashForm(req))
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1393,7 +1405,7 @@ func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMess
 			req.WorkOrderMessage = &binding.WorkOrderMessage
 			if req.RequestID == "" {
 				req.RequestID = newObligationID("ownerrequest")
-				payload = requestHash(req)
+				payload = requestHash(messageHashForm(req))
 			}
 		}
 	}
@@ -1412,7 +1424,7 @@ func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMess
 			req.WorkItems, req.WorkOrderMessage = source.WorkItems, source.WorkOrderMessage
 			if req.RequestID == "" {
 				req.RequestID = newObligationID("ownerreply")
-				payload = requestHash(req)
+				payload = requestHash(messageHashForm(req))
 			}
 			if req.To == "" && source.From.AgentID != "" {
 				var status string

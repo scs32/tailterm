@@ -144,6 +144,26 @@ function auditContextMarkup(record) {
   const order = original.workOrderMessage;
   return `<div class="message-audit" data-audit-kind="${esc(classification)}"><span>Original: ${esc(auditProjectionText(original))}</span>${order ? `<span>Order ${esc(order.taskId)}#${order.seq}</span>` : ""}${current ? `<span>Current: ${esc(auditProjectionText(current))}</span>` : "<span>Current: no classified projection</span>"}</div>`;
 }
+// Command evidence exits and the hub's report-only failed-command flags
+// (docs/message-broker.md). An entry with no exit is "exit unknown": never
+// shown as passed or failed.
+function evidenceMarkup(message) {
+  const envelope = message?.envelope;
+  const evidence = envelope?.evidence || {};
+  const commands = Object.keys(evidence)
+    .filter((key) => evidence[key]?.type === "command")
+    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  const flags = (envelope?.flags || []).filter(
+    (flag) => flag?.kind === "failed_command",
+  );
+  if (!commands.length && !flags.length) return "";
+  const exits = commands.map((key) =>
+    Number.isInteger(evidence[key].exit)
+      ? `${key} exit ${evidence[key].exit}`
+      : `${key} exit unknown`,
+  );
+  return `${flags.map((flag) => `<div class="board-evidence-flag" role="note" data-evidence-flag="${esc(flag.field)}">Failed command: ${esc(flag.reason)}</div>`).join("")}${exits.length ? `<div class="board-evidence fine">${esc(exits.join(" · "))}</div>` : ""}`;
+}
 const BOARD_BOTTOM_FOLLOW_DISTANCE = 60;
 const BOARD_SCROLL_IDLE_MS = 120;
 const captureMessageScroll = (list) => {
@@ -1133,7 +1153,7 @@ export function createBoardView({
           : !record?.original
             ? `<button data-audit-retry="${message.seq}" data-view-control="audit-retry:${esc(selected)}:${message.seq}">Retry audit</button>`
             : `<button data-audit-history="${message.seq}" data-view-control="audit-history:${esc(selected)}:${message.seq}">History</button>${archived ? "" : `<button data-audit-correct-open="${message.seq}" data-view-control="audit-correct:${esc(selected)}:${message.seq}">Correct</button>${currentKind === "intake" ? `<button data-audit-resolve-open="${message.seq}" data-view-control="audit-resolve:${esc(selected)}:${message.seq}">Resolve</button>` : ""}`}`;
-        return `<article class="board-message" data-message="${message.seq}"><div class="board-meta"><strong>${esc(name(message))}</strong><span>${message.to ? "to " + esc(names.get(message.to) || message.to) : "Team announcement"}${message.broadcast ? " · Swarm broadcast" : ""} · ${esc(archived ? new Date(message.createdAt).toLocaleString() : new Date(message.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }))}</span></div>${message.replyTo ? `<div class="reply-context">Reply to #${message.replyTo}: ${esc(messages.find((candidate) => candidate.seq === message.replyTo)?.text.slice(0, 100) || "Earlier message")}</div>` : ""}<div class="board-text">${esc(displayText(message))}</div>${auditSupported ? auditContextMarkup(record) : ""}<div class="message-footer"><span>${receipt(message)}</span>${archived ? "" : `<button data-reply="${message.seq}" data-view-control="reply:${esc(selected)}:${message.seq}">Reply</button>`}${auditActions}</div>${auditHistoryMarkup(record, history)}${archived ? "" : renderAuditEditor(message)}</article>`;
+        return `<article class="board-message" data-message="${message.seq}"><div class="board-meta"><strong>${esc(name(message))}</strong><span>${message.to ? "to " + esc(names.get(message.to) || message.to) : "Team announcement"}${message.broadcast ? " · Swarm broadcast" : ""} · ${esc(archived ? new Date(message.createdAt).toLocaleString() : new Date(message.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }))}</span></div>${message.replyTo ? `<div class="reply-context">Reply to #${message.replyTo}: ${esc(messages.find((candidate) => candidate.seq === message.replyTo)?.text.slice(0, 100) || "Earlier message")}</div>` : ""}<div class="board-text">${esc(displayText(message))}</div>${evidenceMarkup(message)}${auditSupported ? auditContextMarkup(record) : ""}<div class="message-footer"><span>${receipt(message)}</span>${archived ? "" : `<button data-reply="${message.seq}" data-view-control="reply:${esc(selected)}:${message.seq}">Reply</button>`}${auditActions}</div>${auditHistoryMarkup(record, history)}${archived ? "" : renderAuditEditor(message)}</article>`;
       })
       .join("");
     const recoveryMarkup = (

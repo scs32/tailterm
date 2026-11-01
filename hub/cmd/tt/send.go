@@ -142,6 +142,10 @@ func cmdSend(e env, args []string) error {
 	case *to != "":
 		env.To = *to
 	}
+	// Exit codes and the failed-command flag are derived here as the hub
+	// derives them, so the sender sees the flag before posting. They report and
+	// never refuse: a flagged result is still posted.
+	api.DeriveEvidence(&env)
 	if problems := api.ValidateEnvelope(env); problems != nil {
 		return &exitError{2, problemsError(problems)}
 	}
@@ -152,6 +156,9 @@ func cmdSend(e env, args []string) error {
 	}
 	if report, ok := claimCheck(e.agent, env); ok {
 		writeClaimReport(os.Stderr, report, false)
+	}
+	for _, f := range env.Flags {
+		fmt.Fprintf(os.Stderr, "flag: %s; posted and marked on the Board\n", f.Reason)
 	}
 
 	if *task == "" {
@@ -181,7 +188,9 @@ func cmdSend(e env, args []string) error {
 		}
 	}
 	if *requestID == "" {
-		raw, _ := json.Marshal(env)
+		// Derived fields are left out, so this tt and one that predates them
+		// derive the same id for the same message.
+		raw, _ := json.Marshal(api.WithoutDerived(env))
 		digest := sha256.Sum256([]byte(e.runID + "\x00" + target + "\x00" + fmt.Sprint(*reply) + "\x00" + string(raw)))
 		*requestID = fmt.Sprintf("send-%x", digest[:12])
 	}
