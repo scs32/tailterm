@@ -748,6 +748,10 @@ test("owner helper template is a project role with its four labelled parts in or
   assert.equal(ownerHelper.title, "Owner helper");
   const { prompt } = ownerHelper;
   assert.match(prompt, /run tt ack SEQ before you start/);
+  // Review f1 (1): the owner shell has no agent identity, so a bare tt ack is
+  // refused; the helper acks through tt helper env.
+  assert.ok(prompt.includes('Acknowledge under your helper identity, as eval "$(tt helper env --task ID)" && tt ack SEQ'), "helper-env ack");
+  assert.match(prompt, /a bare tt ack there is refused/);
   assert.ok(
     prompt.includes(
       "Never ask through an interactive terminal prompt: ask the owner with tt ask, a teammate with tt send --kind question.",
@@ -789,6 +793,12 @@ test("owner helper night rules read hub settings and name each report and the mo
   ])
     assert.ok(night.includes(needle), `Night lacks ${needle}`);
   assert.match(night, /when the night ends, after the morning report, ask the primary database handler/);
+  // Review f1 (2): the lanes= line shows the window, not the hours; the hours
+  // are the saved lane policy, read in the list JSON.
+  assert.match(night, /saved with tt team queue lanes, which prints the saved policy with its night-hours/);
+  assert.ok(night.includes("tt team queue list --json under lanes.policy (nightStart, nightEnd, zone)"), "where the hours are read");
+  assert.match(night, /the lanes= line shows only the lanes now and window=day or night/);
+  assert.doesNotMatch(night, /night hours[^.]*shown on the lanes= line/);
   assert.doesNotMatch(ownerHelper.prompt, /\b\d{1,2}:\d{2}\b/, "a clock time");
   assert.doesNotMatch(ownerHelper.prompt, /America\/|Europe\/|UTC/, "a zone name");
 });
