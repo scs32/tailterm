@@ -2,12 +2,15 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/scs32/tailterm/hub/internal/api"
+	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -3548,4 +3551,269 @@ func TestUsageReportReadCostGrowsOnlyWithAgentsAndMessages(t *testing.T) {
 		t.Fatalf("report over 900 turns, 120 agents and 600 orders took %s", took)
 	}
 	t.Logf("900 turns, 120 agents, 600 orders: %s, %d obligation queries, %d message loads", took, q, l)
+}
+
+// Live-size read benchmark (wi_f8f4f32d4555aec5, plan r1). Every row is
+// synthetic and lives in an isolated temp store; the counts follow the plan's
+// assumption table. Turns, spans, obligations and item links scale with the
+// history; items and agents stay at their 1x size.
+
+type usageLiveSize struct {
+	items, agents, metered, messages, obligations, links, decisions, turns, spans int
+}
+
+func usageLiveSizeAt(scale float64) usageLiveSize {
+	n := func(v int) int { return int(float64(v) * scale) }
+	return usageLiveSize{items: 1457, agents: 3200, metered: 1500, messages: 54500, obligations: n(30000), links: n(40000), decisions: 300, turns: n(250000), spans: n(250000)}
+}
+
+// usageLiveEnd is the end of the seeded history; the measured window is the
+// hour before it.
+var usageLiveEnd = time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+
+const usageLiveHistory = 35 * 24 * time.Hour
+
+type usageLiveStore struct {
+	s     *Store
+	task  string
+	size  usageLiveSize
+	items []string
+}
+
+// seedUsageLiveSize builds the store. Items and agents go through the public
+// calls; the history is written in one transaction per table with the
+// columns ingest writes, which is what a report reads.
+func seedUsageLiveSize(tb testing.TB, dir string, size usageLiveSize) *usageLiveStore {
+	tb.Helper()
+	ctx := context.Background()
+	s, err := Open(filepath.Join(dir, "usage-live-size.sqlite"))
+	if err != nil {
+		tb.Fatal(err)
+	}
+	tb.Cleanup(func() { s.Close() })
+	s.MaxAgents = size.agents + 10
+	clock := usageLiveEnd.Add(-usageLiveHistory - time.Hour)
+	s.SetClockForTest(func() time.Time { return clock })
+	by := api.Caller{Node: "fixture", User: "owner"}
+	task, err := s.CreateTask(ctx, api.CreateTaskRequest{Name: "Synthetic live-size usage", Swarm: true}, by)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	out := &usageLiveStore{s: s, task: task.ID, size: size}
+	exec := func(tx *sql.Tx, query string, args ...any) {
+		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+			tb.Fatal(err)
+		}
+	}
+	begin := func() *sql.Tx {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			tb.Fatal(err)
+		}
+		return tx
+	}
+	commit := func(tx *sql.Tx) {
+		if err := tx.Commit(); err != nil {
+			tb.Fatal(err)
+		}
+	}
+	for i := 0; i < size.items; i++ {
+		item, err := s.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: fmt.Sprintf("Synthetic item %04d", i), RequestID: fmt.Sprintf("live-item-%d", i)}, by)
+		if err != nil {
+			tb.Fatal(err)
+		}
+		out.items = append(out.items, item.ID)
+	}
+	type agent struct{ id, run string }
+	agents := []agent{}
+	for i := 0; i < size.agents; i++ {
+		a, err := s.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: fmt.Sprintf("worker-%04d", i), AgentID: api.NewID("agt"), Host: "fixture", Session: fmt.Sprintf("live-%d", i), Runtime: "codex"}, by)
+		if err != nil {
+			tb.Fatal(err)
+		}
+		agents = append(agents, agent{a.ID, a.RunID})
+	}
+	step := func(i, n int) time.Time {
+		return usageLiveEnd.Add(-usageLiveHistory + time.Duration(int64(usageLiveHistory)/int64(n)*int64(i)))
+	}
+	// Board history: orders addressed to metered agents, most linked to an
+	// item, with an obligation each; the rest are plain posts.
+	request, _ := json.Marshal(usagePhaseRequest())
+	orders := make([][]int64, size.metered)
+	tx := begin()
+	insertMessage, err := tx.PrepareContext(ctx, `INSERT INTO messages(task_id,from_agent,from_node,from_user,to_agent,text,created_at,envelope) VALUES(?,?,'fixture','agent',?,'synthetic',?,?)`)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	for i := 0; i < size.messages; i++ {
+		at := step(i, size.messages)
+		to, envelope := "", ""
+		if i < size.obligations {
+			to, envelope = agents[i%size.metered].id, string(request)
+		}
+		r, err := insertMessage.ExecContext(ctx, task.ID, agents[(i+7)%size.agents].id, to, ts(at), envelope)
+		if err != nil {
+			tb.Fatal(err)
+		}
+		seq, _ := r.LastInsertId()
+		if i < size.obligations {
+			exec(tx, `INSERT INTO obligations (id,task_id,message_seq,agent_id,subject,source_kind,needs,state,created_at,ack_due_at,due_at,changed_at,closed_at,recipient_kind) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+				api.NewID("obl"), task.ID, seq, to, "Record the synthetic phase fixture", api.EnvelopeKindRequest, api.ObligationNeedsOutcome, api.ObligationClosed, ts(at), ts(at), ts(at), ts(at), ts(at.Add(20*time.Minute)), "agent")
+			orders[i%size.metered] = append(orders[i%size.metered], seq)
+		}
+		if i < size.links {
+			exec(tx, `INSERT INTO message_work_item_links(message_seq,message_task_id,item_task_id,item_id,item_revision,relationship,created_at) VALUES(?,?,?,?,1,'primary',?)`, seq, task.ID, task.ID, out.items[i%size.items], ts(at))
+		}
+		if i%(size.messages/size.decisions) == 0 {
+			exec(tx, `INSERT INTO decision_requests(message_seq,task_id,question,options,recommended_option_id,recommendation_reason,created_at) VALUES(?,?,?,?,?,?,?)`, seq, task.ID, "Synthetic decision?", `[{"id":"a","label":"A"},{"id":"b","label":"B"}]`, "a", "Synthetic.", ts(at))
+		}
+	}
+	insertMessage.Close()
+	commit(tx)
+	// Runs: one per metered agent, as ingest freezes it.
+	tx = begin()
+	for i := 0; i < size.metered; i++ {
+		exec(tx, `INSERT INTO usage_runs VALUES(?,?,?,?,?,?,?)`, task.ID, agents[i].id, agents[i].run, "synthetic-session", ts(usageLiveEnd.Add(-usageLiveHistory)), "synthetic complete", `{}`)
+	}
+	commit(tx)
+	evidence := func(i int) ([]api.UsageEvidence, []api.MessageReference, time.Time) {
+		list := orders[i%size.metered]
+		if len(list) == 0 {
+			return nil, []api.MessageReference{}, time.Time{}
+		}
+		seq := list[(i/size.metered)%len(list)]
+		return []api.UsageEvidence{{TaskID: task.ID, Seq: seq, Operation: "ack", At: step(i, size.turns)}}, []api.MessageReference{{TaskID: task.ID, Seq: seq}}, time.Time{}
+	}
+	// Turns, with their totals and item shares as ingest writes them.
+	tx = begin()
+	insertTurn, err := tx.PrepareContext(ctx, `INSERT INTO usage_turns VALUES(?,?,?,?,1,?,'',?)`)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	for i := 0; i < size.turns; i++ {
+		a, at, item := agents[i%size.metered], step(i, size.turns), out.items[i%size.items]
+		turn := syntheticUsageTurn(fmt.Sprintf("live-%07d", i))
+		turn.At = at
+		handled, refs, _ := evidence(i)
+		turn.Handled = handled
+		shares := []api.UsageAttribution{{TaskID: task.ID, ItemID: item, Denominator: 1, Reason: "work order binding"}}
+		p := api.UsageProjection{Turn: turn, AgentID: a.id, RunID: a.run, Role: "builder", RoleSource: "team slot", Phase: "build", PhaseReason: "open order", Shares: shares, Evidence: refs}
+		encoded, _ := json.Marshal(p)
+		if _, err := insertTurn.ExecContext(ctx, task.ID, a.id, a.run, turn.ID, ts(at), string(encoded)); err != nil {
+			tb.Fatal(err)
+		}
+		exec(tx, `INSERT INTO usage_turn_totals VALUES(?,?,?,?,1,'codex',?,110)`, task.ID, a.id, a.run, turn.ID, at.UnixNano())
+		exec(tx, `INSERT INTO usage_item_shares(task_id,agent_id,run_id,request_id,turn_revision,item_task_id,item_id,denominator,tokens,partial) VALUES(?,?,?,?,1,?,?,1,110,0)`, task.ID, a.id, a.run, turn.ID, task.ID, item)
+	}
+	insertTurn.Close()
+	// A live hub lists only the turns written since it last opened.
+	exec(tx, `DELETE FROM usage_item_share_checks`)
+	exec(tx, `DELETE FROM usage_turn_total_checks WHERE turn_rowid IN (SELECT rowid FROM usage_turns WHERE at<?)`, ts(usageLiveEnd.Add(-24*time.Hour)))
+	commit(tx)
+	// Spans: one 40 s chunk per turn, three requests, about 30% with a poll.
+	tx = begin()
+	insertSpan, err := tx.PrepareContext(ctx, `INSERT INTO usage_spans VALUES(?,?,?,?,?,?,?,?)`)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	digest := strings.Repeat("c", 64)
+	for i := 0; i < size.spans; i++ {
+		a, start, item := agents[i%size.metered], step(i, size.spans), out.items[i%size.items]
+		end := start.Add(40 * time.Second)
+		handled, refs, _ := evidence(i)
+		turn := fmt.Sprintf("live-turn-%07d", i)
+		span := api.UsageSpan{ID: turn + "#0", Turn: turn, Last: true, Start: start, End: end, SourceDigest: digest, Handled: handled,
+			Tool: [][2]time.Time{{start.Add(12 * time.Second), start.Add(20 * time.Second)}},
+			Segments: []api.UsageSpanSegment{{From: start, To: start.Add(10 * time.Second), At: start}, {From: start.Add(10 * time.Second), To: start.Add(25 * time.Second), At: start.Add(10 * time.Second), Poll: i%10 < 3}, {From: start.Add(25 * time.Second), To: end, At: start.Add(25 * time.Second)}}}
+		if i%4 == 0 {
+			span.Wait = [][2]time.Time{{start.Add(30 * time.Second), start.Add(35 * time.Second)}}
+		}
+		projection := usageSpanProjection{AgentID: a.id, RunID: a.run, Evidence: refs, Pieces: []usageSpanPiece{{From: start, To: end, Shares: []api.UsageAttribution{{TaskID: task.ID, ItemID: item, Denominator: 1, Reason: "work order binding"}}, Phase: "build", Role: "builder"}}}
+		payload, _ := json.Marshal(span)
+		encoded, _ := json.Marshal(projection)
+		if _, err := insertSpan.ExecContext(ctx, task.ID, a.id, a.run, span.ID, ts(start), ts(end), string(payload), string(encoded)); err != nil {
+			tb.Fatal(err)
+		}
+	}
+	insertSpan.Close()
+	commit(tx)
+	return out
+}
+
+// usageLiveCounts lists row counts per table; no content is read.
+func usageLiveCounts(tb testing.TB, s *Store) string {
+	tb.Helper()
+	parts := []string{}
+	for _, table := range []string{"work_items", "agents", "messages", "obligations", "message_work_item_links", "decision_requests", "usage_runs", "usage_turns", "usage_turn_totals", "usage_turn_total_checks", "usage_item_shares", "usage_spans"} {
+		var n int
+		if err := s.db.QueryRow(`SELECT count(*) FROM ` + table).Scan(&n); err != nil {
+			tb.Fatal(err)
+		}
+		parts = append(parts, fmt.Sprintf("%s=%d", table, n))
+	}
+	return strings.Join(parts, " ")
+}
+
+func (r *usageReadStats) total() (d time.Duration) {
+	for _, e := range r.elapsed {
+		d += e
+	}
+	return d
+}
+
+func BenchmarkUsageReportLiveSize(parent *testing.B) {
+	scales := []struct {
+		name  string
+		scale float64
+	}{{"smoke", 0.004}, {"quarter", 0.25}, {"1x", 1}, {"2x", 2}}
+	dir := parent.TempDir()
+	stores := map[string]*usageLiveStore{}
+	for _, sc := range scales {
+		parent.Run(sc.name, func(b *testing.B) {
+			live := stores[sc.name]
+			if live == nil {
+				began := time.Now()
+				sub := filepath.Join(dir, sc.name)
+				if err := os.MkdirAll(sub, 0o700); err != nil {
+					b.Fatal(err)
+				}
+				// Seeded once per scale for every b.N; the parent closes it.
+				live = seedUsageLiveSize(parent, sub, usageLiveSizeAt(sc.scale))
+				stores[sc.name] = live
+				b.Logf("%s seeded in %s: %s", sc.name, time.Since(began).Round(time.Millisecond), usageLiveCounts(b, live.s))
+			}
+			q := api.UsageQuery{From: usageLiveEnd.Add(-time.Hour), To: usageLiveEnd}
+			b.ResetTimer()
+			runs := []*usageReadStats{}
+			var walls []time.Duration
+			for i := 0; i < b.N; i++ {
+				cache := newUsagePhaseCache()
+				began := time.Now()
+				report, err := live.s.usageReport(context.Background(), live.task, q, cache)
+				walls = append(walls, time.Since(began))
+				if err != nil || report.Summary.Requests == 0 {
+					b.Fatal(report.Summary.Requests, err)
+				}
+				runs = append(runs, cache.stats)
+			}
+			b.StopTimer()
+			order := make([]int, len(walls))
+			for i := range order {
+				order[i] = i
+			}
+			sort.Slice(order, func(i, j int) bool { return walls[order[i]] < walls[order[j]] })
+			median := order[len(order)/2]
+			st := runs[median]
+			b.ReportMetric(float64(walls[median].Microseconds())/1000, "median-ms")
+			line := []string{fmt.Sprintf("%s N=%d median wall %s (stages %s)", sc.name, b.N, walls[median].Round(time.Millisecond), st.total().Round(time.Millisecond))}
+			for n := 0; n < usageStageCount; n++ {
+				share := 0.0
+				if walls[median] > 0 {
+					share = 100 * float64(st.elapsed[n]) / float64(walls[median])
+				}
+				line = append(line, fmt.Sprintf("%s: %s (%.1f%%) rows=%d kept=%d queries=%d", usageStageNames[n], st.elapsed[n].Round(time.Millisecond), share, st.rows[n], st.kept[n], st.queries[n]))
+			}
+			b.Log(strings.Join(line, "\n  "))
+		})
+	}
 }
