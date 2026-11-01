@@ -6,14 +6,14 @@ report, not the session that sends it, so it has the same shape whichever
 model or person runs the command.
 
 Source: owner principle #51832 ("This needs to be templeted and structured"),
-bug `wi_91bdb5b6f0f46f97`, work order #53136. The command only renders and
-prints. Sending the report on a schedule is not part of it: that is held
-follow-up `wi_546279658420371a`, which waits for `wi_8d18`.
+bug `wi_91bdb5b6f0f46f97`, work order #53136. The Up next section, the
+`--post` step that sends the report on the hub wake schedule and the short
+Shipped line come from bug `wi_546279658420371a`, work order #53584.
 
 ## Command
 
 ```
-tt owner report hourly|morning|evening [--task ID] [--tz ZONE] [--host H] [--now T] [--since T]
+tt owner report hourly|morning|evening [--task ID] [--tz ZONE] [--host H] [--now T] [--since T] [--post]
 ```
 
 - `--task`: the project ID. Required unless `TAILTERM_TASK` is set.
@@ -24,10 +24,15 @@ tt owner report hourly|morning|evening [--task ID] [--tz ZONE] [--host H] [--now
 - `--now`: the window's end, RFC3339. Default: the current time.
 - `--since`: the window's start, RFC3339, in place of the kind's default
   start. It must be before `--now`.
+- `--post`: end the window at the kind's latest slot at or before `--now`
+  and post the printed report to the Board once for that slot (see "Sending
+  on the hub schedule").
 
-The command reads from the hub and changes nothing. The owner terminal and
-agent sessions (such as the owner helper) may both run it. Other `tt owner`
-subcommands still refuse agent sessions.
+Without `--post` the command reads from the hub and changes nothing. The
+owner terminal and agent sessions (such as the owner helper) may both run
+it, with or without `--post`. Other `tt owner` subcommands still refuse
+agent sessions. The one-line summary in `tt`'s own help does not list
+`--post` yet; `tt owner report` with a bad argument prints the full usage.
 
 ## Windows
 
@@ -40,6 +45,19 @@ Each report covers the half-open window `[start, end)`, where `end` is
 | morning | the latest 21:00 local time strictly before `--now` |
 | evening | the latest 07:00 local time at or before `--now` |
 
+With `--post`, `--now` (or the current time) is first moved back to the
+kind's latest slot at or before it, and the window is computed from that
+end:
+
+| Kind | Slot (window end) |
+|---|---|
+| hourly | the top of the local hour |
+| morning | the latest 07:00 local time |
+| evening | the latest 21:00 local time |
+
+So a wake read late, or run again, still reports exactly its slot's window:
+`tt owner report hourly --post` at 14:25 reports 13:00–14:00.
+
 A release counts in the window when its `settledAt` is in it. An
 intervention counts when its message's `createdAt` is in it.
 
@@ -51,25 +69,25 @@ printed, even when the section is empty or could not be read.
 ```
 **Owner report: <Hourly|Morning|Evening>** <YYYY-MM-DD HH:MM>–<HH:MM> <ZONE>
 **Shipped** (<n>)
-- <item id> <title>: <delivered work>. Limits: <limitations>
+- <item id> <title>: <delivered work summary>. Limits: <limitations summary>
 **Releases**
 - released <r>, rolled back <b>, refused <f>, superseded <s> in this window; in line now: <a>
 **Running teams** (<n> of <limit>)
 - <item id> <title> (<template>, <state>)
-**Up next**
-- not yet available (waits for wi_35e9 / wi_475a)
+**Up next** (<n>)
+- <n>. <item id> <title> (<template>)
 **What went wrong** (<n>)
 - release <job id> for <item id> rolled back at <step>: <reason>
 - release <job id> for <item id> refused at <step>: <reason>
 - intervention #<seq> <kind> on <item id> by <actor>
 **Opened vs closed**
-- not yet available (waits for wi_35e9 / wi_475a)
+- not yet available (waits for wi_475a)
 **Usage**
 - <runtime> <window>: <used>% used, resets <Day HH:MM> (reading <age> old)
 - <runtime> <window>: <state>
 - project tokens in window: <class> <n>, <class> <n>, ...
 **Host health**
-- not yet available (waits for wi_35e9 / wi_475a)
+- not yet available (waits for wi_475a)
 **Needs you** (<n>)
 - #<seq> <source kind>: <subject or needs> (due <HH:MM>[, overdue <overdue>])
 ```
@@ -81,23 +99,37 @@ shows the end's date too (`2026-10-30 21:00–2026-10-31 07:00 UTC`).
 
 | Section | Hub read | What it shows |
 |---|---|---|
-| Shipped | settled releases (`GET /v1/tasks/{id}/releases?view=settled`, every page) and each item's narrative (`GET /v1/tasks/{id}/work-items/{wid}/narrative`, then the pinned completion report version) | Each item with a `released` or `superseded` job in the window, once, ordered by its first time in the window and then by item ID. Title from the work item; delivered work and limitations from the item's pinned completion report. |
+| Shipped | settled releases (`GET /v1/tasks/{id}/releases?view=settled`, every page) and each item's narrative (`GET /v1/tasks/{id}/work-items/{wid}/narrative`, then the pinned completion report version) | Each item with a `released` or `superseded` job in the window, once, ordered by its first time in the window and then by item ID. Title from the work item; a summary of the delivered work and limitations from the item's pinned completion report (see "The Shipped summary"). |
 | Releases | settled releases, plus every page of `view=active` | Settled jobs in the window by state. "In line now" counts every job not yet settled. |
 | Running teams | `GET /v1/tasks/{id}/team-queue?view=active` | Entries in state `launching` or `running`, ordered by queue position; the limit is the project's concurrency limit. |
-| Up next | none yet | A fixed line. |
+| Up next | the same `GET /v1/tasks/{id}/team-queue?view=active` read, and each item's narrative for its title | Every `queued` entry with an up-next number (`upNext`, 1..N in the order the queue admits them; `docs/project-queue.md`, "Team queue lanes and up next"), ordered by that number and then by item ID, with its template. An entry whose narrative cannot be read is listed without its title, and the read counts as a failure. |
 | What went wrong | settled releases and `GET /v1/tasks/{id}/interventions` (every page) | Refused and rolled-back jobs in the window, with the runner's fixed failure step and reason tag (never command output), and owner interventions in the window. Ordered by time, then ID. The actor reads `unknown` when the hub recorded none. |
-| Opened vs closed | none yet | A fixed line. |
+| Opened vs closed | none yet | A fixed line until `wi_475a` f4 fills it. |
 | Usage | `GET /v1/provider-usage?host=H` and `GET /v1/tasks/{id}/usage?from=&to=` | Each stored provider reading for the host, ordered by runtime and then window. A reading that is not `ok` prints its state. Then the project's token classes in the window, sorted by class, exactly as the hub reports them. |
-| Host health | none yet | A fixed line. |
+| Host health | none yet | A fixed line until `wi_475a` f4 fills it. |
 | Needs you | `GET /v1/tasks/{id}/obligations?owner=1&open=1` | Every open owner obligation, ordered by due time and then message number. The subject is shown, or what the obligation needs when it has no subject. A due time on another day than the window's end shows its date (`Oct 30 15:04`). |
 
-The narrative is read once per item, even when an item is both shipped and
-running.
+The narrative is read once per item, even when an item appears in more than
+one of Shipped, Running teams and Up next.
 
 Saved free text (titles, delivered work, limitations, subjects) is cleaned
 the same way every time. Runs of whitespace become single spaces, the ends are
-trimmed, and anything longer than 280 characters is cut and ends in `…`. A
-trailing full stop on delivered work is dropped before `. Limits:`.
+trimmed, and anything longer than 280 characters is cut and ends in `…`.
+
+### The Shipped summary
+
+A shipped item's line is a short summary, not the whole completion report:
+
+- Delivered work: its first sentence, cut at 160 runes.
+- Limitations: its first sentence, cut at 120 runes.
+
+Whitespace is collapsed first. A sentence ends at the first `.`, `!` or `?`
+followed by a space or the end of the text, so a file name such as
+`owner_report.go` or a version such as `v1.2` does not end one, while an
+abbreviation followed by a space (`e.g. `) does. Text longer than its limit
+is cut there, trailing spaces are trimmed, and it ends in `…`. A trailing
+full stop on the delivered-work summary is dropped before `. Limits:`. An
+empty field prints `none recorded`.
 
 ## Fixed lines
 
@@ -105,7 +137,8 @@ These lines are printed exactly as shown.
 
 | When | Line |
 |---|---|
-| Up next, Opened vs closed and Host health (always, until their data lands) | `- not yet available (waits for wi_35e9 / wi_475a)` |
+| Opened vs closed and Host health (always, until `wi_475a` f4 fills them) | `- not yet available (waits for wi_475a)` |
+| No queued entry has an up-next number | `- nothing queued` |
 | No item shipped in the window | `- none in this window` |
 | A shipped item has no pinned completion report | `- <item id> <title>: no saved completion report` |
 | A delivered-work or limitations field is empty | `none recorded` in its place |
@@ -121,16 +154,68 @@ The sources a failed read names are `the release ledger`, `the team queue`,
 `owner obligations` and, for a single shipped item,
 `the work item narrative` (as `- <item id> <title>: unavailable: could not
 read the work item narrative`). A section that could not be read prints its
-header without a count.
+header without a count. A failed team queue read shows the unavailable line
+under both Running teams and Up next.
 A running team whose narrative cannot be read is listed without its title,
 and the read counts as a failure (see Exit status).
+
+## Sending on the hub schedule
+
+The report is sent by the product, not written by the session that sends
+it. The hub's wake scheduler (`wi_8d18e0fe8bdf2ad6`; `docs/session-handoff.md`,
+"Wakes on the hub") delivers each due slot to the owner helper as a notice
+that says "Do what Board message #N says". Each kind's Board message is one
+fixed command, so the helper runs the same step every time and the report's
+shape never depends on the model. There is no second scheduler.
+
+Set up once per project, as the owner or the registered owner helper:
+
+1. Post three Board messages whose whole text is the command for one kind:
+
+   ```
+   tt owner report hourly --post
+   tt owner report morning --post
+   tt owner report evening --post
+   ```
+
+2. Schedule one hub wake per kind, naming each message's number:
+
+   ```
+   tt handoff wake schedule --kind hourly-update --schedule '0 * * * *' --message N1 --request-id owner-report-hourly-wake
+   tt handoff wake schedule --kind morning-summary --schedule '0 7 * * *' --message N2 --request-id owner-report-morning-wake
+   tt handoff wake schedule --kind evening-summary --schedule '0 21 * * *' --message N3 --request-id owner-report-evening-wake
+   ```
+
+   The zone defaults to `America/Los_Angeles`; give `--zone` to change it,
+   and run the report with the same `--tz`. Check with `tt handoff wake list`.
+
+The hub wakes deliver nothing until their activation, `wi_3b7daaaab7d0f188`,
+is released and switched on. Until then the command can be run by hand.
+
+What `--post` does:
+
+- It moves the window end to the kind's slot (see "Windows"), renders the
+  report and prints it exactly as without `--post`.
+- It posts the same bytes to the Board as one plain message with no
+  recipient, as the caller: the owner helper's agent and run, or the owner.
+- The post's request ID is `owner-report-<kind>-` followed by a hash of the
+  project, kind and window. Before posting, the command looks that ID up in
+  the caller's post receipts; when the slot was already posted it posts
+  nothing and prints `already posted #<seq> for this slot`, even when the
+  data has changed since. Otherwise it prints `posted #<seq>`. A run that
+  loses a race with another run of the same slot finds the other run's post
+  the same way.
+- A report with an unavailable section is still posted, so the owner sees
+  what could not be read, and the command still exits 1. A refused or failed
+  post prints the report, then exits 1 with "the report was not posted".
 
 ## Exit status
 
 The report is always printed to standard output. When every read succeeds,
 the command exits 0. When any read fails, the failed section shows its
 unavailable line, every other section is printed as usual, each failure is
-written to standard error, and the command exits 1.
+written to standard error, and the command exits 1. With `--post`, a post
+that fails also exits 1.
 
 Bad arguments (an unknown kind, an unparsable `--now`, `--since` or `--tz`,
 or `--since` not before `--now`) exit 1 before any hub read.
@@ -144,7 +229,12 @@ or `--since` not before `--now`) exit 1 before any hub read.
   hub, so no window can contain it. It is left out of Releases and What went
   wrong. Only a refusal recorded through the handler's reconcile carries a
   time.
-- Up next, opened vs closed counts (bugs vs features) and host health wait
-  for `wi_35e9` and `wi_475a`. Until then they print the fixed line above.
-  Filling them, and scheduled sending, are tracked in held item
-  `wi_546279658420371a`.
+- Opened vs closed counts (bugs vs features) and host health wait for
+  `wi_475a` f4, which follows this report's Up next work (from `wi_35e9`'s
+  up-next numbers) on the same files. Until then they print the fixed line
+  above.
+- The hub refuses a Board message over 8 KiB, so a report that long (a very
+  long queue or many open owner obligations) is printed but not posted.
+- Post receipts are per caller: the same slot posted once by the owner
+  helper and once from the owner terminal gives two posts.
+- `tt`'s one-line help summary does not list `--post`.

@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -20,22 +22,28 @@ import (
 // shape whichever model or person runs it. docs/owner-report.md is the
 // reference for every section, fixed line and window below.
 
-const ownerReportUsage = "usage: tt owner report hourly|morning|evening [--task ID] [--tz ZONE] [--host H] [--now T] [--since T]\n" +
+const ownerReportUsage = "usage: tt owner report hourly|morning|evening [--task ID] [--tz ZONE] [--host H] [--now T] [--since T] [--post]\n" +
 	"  --task is the project ID; required unless TAILTERM_TASK is set\n" +
 	"  --tz is the IANA zone for the window and times (default: this machine's zone)\n" +
 	"  --host names the provider-usage host (default: this machine)\n" +
-	"  --now and --since are RFC3339 times: the window's end and an optional start override"
+	"  --now and --since are RFC3339 times: the window's end and an optional start override\n" +
+	"  --post ends the window at the kind's slot at or before --now and posts the report to the Board once per slot"
 
 // Fixed lines. Each is printed verbatim; docs/owner-report.md quotes them.
 const (
-	ownerReportNotYet          = "- not yet available (waits for wi_35e9 / wi_475a)"
-	ownerReportNoShipped       = "- none in this window"
-	ownerReportNoRunning       = "- none running"
-	ownerReportNothingWrong    = "- none recorded (sources: refused or rolled-back releases, owner interventions)"
-	ownerReportNothingWaiting  = "- nothing waiting on you"
-	ownerReportNoCompletion    = "no saved completion report"
-	ownerReportNoneRecorded    = "none recorded"
-	ownerReportTextLimit       = 280
+	ownerReportNotYet         = "- not yet available (waits for wi_475a)"
+	ownerReportNoShipped      = "- none in this window"
+	ownerReportNothingQueued  = "- nothing queued"
+	ownerReportNoRunning      = "- none running"
+	ownerReportNothingWrong   = "- none recorded (sources: refused or rolled-back releases, owner interventions)"
+	ownerReportNothingWaiting = "- nothing waiting on you"
+	ownerReportNoCompletion   = "no saved completion report"
+	ownerReportNoneRecorded   = "none recorded"
+	ownerReportTextLimit      = 280
+	// The Shipped line is a summary: the first sentence of each field,
+	// cut at these rune limits (wi_546279658420371a f1c).
+	ownerReportDeliveredLimit  = 160
+	ownerReportLimitsLimit     = 120
 	ownerReportCallTimeout     = 10 * time.Second
 	ownerReportSettledPageSize = 200
 )
@@ -65,6 +73,11 @@ type ownerReportRunning struct {
 	item, title, template, state string
 }
 
+type ownerReportUpNext struct {
+	n                     int
+	item, title, template string
+}
+
 type ownerReportWrong struct {
 	at   time.Time
 	key  string
@@ -87,7 +100,9 @@ type ownerReportData struct {
 
 	running            []ownerReportRunning
 	runningLimit       int
-	runningUnavailable bool
+	runningUnavailable bool // the team queue read failed: Running teams and Up next
+
+	upNext []ownerReportUpNext
 
 	wrong            []ownerReportWrong
 	wrongUnavailable []string
@@ -143,8 +158,8 @@ func renderOwnerReport(d ownerReportData) string {
 		case s.noReport:
 			line("- %s: %s", head, ownerReportNoCompletion)
 		default:
-			delivered := strings.TrimRight(orNone(s.delivered), ".")
-			line("- %s: %s. Limits: %s", head, delivered, orNone(s.limitations))
+			delivered := strings.TrimRight(orNone(reportSummary(s.delivered, ownerReportDeliveredLimit)), ".")
+			line("- %s: %s. Limits: %s", head, delivered, orNone(reportSummary(s.limitations, ownerReportLimitsLimit)))
 		}
 	}
 
@@ -172,8 +187,22 @@ func renderOwnerReport(d ownerReportData) string {
 		line("- %s (%s, %s)", head, r.template, r.state)
 	}
 
-	line("**Up next**")
-	line(ownerReportNotYet)
+	if d.runningUnavailable {
+		line("**Up next**")
+		unavailable(ownerSourceTeamQueue)
+	} else {
+		line("**Up next** (%d)", len(d.upNext))
+		if len(d.upNext) == 0 {
+			line(ownerReportNothingQueued)
+		}
+	}
+	for _, u := range d.upNext {
+		head := u.item
+		if u.title != "" {
+			head += " " + u.title
+		}
+		line("- %d. %s (%s)", u.n, head, u.template)
+	}
 
 	line("**What went wrong**%s", count(len(d.wrong), len(d.wrongUnavailable) > 0))
 	for _, source := range d.wrongUnavailable {
@@ -277,6 +306,24 @@ func reportText(s string) string {
 	return strings.TrimRight(string(r[:ownerReportTextLimit]), " ") + "…"
 }
 
+// reportSummary is the first sentence of saved free text, whitespace
+// collapsed, cut at limit runes and then ending in "…". A sentence ends at
+// ".", "!" or "?" followed by a space or the end of the text.
+func reportSummary(s string, limit int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	for i := 0; i < len(s); i++ {
+		if (s[i] == '.' || s[i] == '!' || s[i] == '?') && (i+1 == len(s) || s[i+1] == ' ') {
+			s = s[:i+1]
+			break
+		}
+	}
+	if utf8.RuneCountInString(s) <= limit {
+		return s
+	}
+	r := []rune(s)
+	return strings.TrimRight(string(r[:limit]), " ") + "…"
+}
+
 func parseReportTime(s string) (time.Time, bool) {
 	if s == "" {
 		return time.Time{}, false
@@ -322,12 +369,45 @@ func ownerReportWindow(kind string, now time.Time, zone *time.Location) time.Tim
 	return now.Add(-time.Hour)
 }
 
+// ownerReportSlot is the scheduled end of the kind's latest slot at or
+// before now: the top of the local hour for hourly, the latest 07:00 local
+// for morning and the latest 21:00 local for evening. --post reports that
+// slot's window, so a wake read late still reports exactly its slot.
+func ownerReportSlot(kind string, now time.Time, zone *time.Location) time.Time {
+	local := now.In(zone)
+	at := func(hour int) time.Time {
+		t := time.Date(local.Year(), local.Month(), local.Day(), hour, 0, 0, 0, zone)
+		if t.After(now) {
+			t = t.AddDate(0, 0, -1)
+		}
+		return t
+	}
+	switch kind {
+	case "morning":
+		return at(7)
+	case "evening":
+		return at(21)
+	}
+	into := time.Duration(local.Minute())*time.Minute + time.Duration(local.Second())*time.Second + time.Duration(local.Nanosecond())
+	return now.Add(-into)
+}
+
+// ownerReportRequestID is the post's retry identity: one per project, kind
+// and window, so posting the same slot again finds the first post.
+func ownerReportRequestID(task, kind string, start, end time.Time) string {
+	sum := sha256.Sum256([]byte(task + "\x00" + kind + "\x00" + start.UTC().Format(time.RFC3339Nano) + "\x00" + end.UTC().Format(time.RFC3339Nano)))
+	return "owner-report-" + kind + "-" + hex.EncodeToString(sum[:12])
+}
+
 func inReportWindow(t, start, end time.Time) bool {
 	return !t.Before(start) && t.Before(end)
 }
 
-// cmdOwnerReport renders the owner's progress report. It only reads, so the
-// owner terminal and agent sessions (the owner helper) may both run it.
+// cmdOwnerReport renders the owner's progress report. Without --post it only
+// reads, so the owner terminal and agent sessions (the owner helper) may both
+// run it. With --post it also posts the printed bytes to the Board as the
+// caller, once per slot: this is the fixed step a hub wake's Board message
+// names (docs/owner-report.md, "Sending on the hub schedule").
 func cmdOwnerReport(e env, args []string) error {
 	if len(args) == 0 || ownerReportKinds[args[0]] == "" {
 		return errors.New(ownerReportUsage)
@@ -339,6 +419,7 @@ func cmdOwnerReport(e env, args []string) error {
 	host := fs.String("host", "", "provider-usage host")
 	nowFlag := fs.String("now", "", "window end, RFC3339")
 	sinceFlag := fs.String("since", "", "window start override, RFC3339")
+	post := fs.Bool("post", false, "end the window at the kind's slot and post the report to the Board once per slot")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -358,6 +439,9 @@ func cmdOwnerReport(e env, args []string) error {
 			return fmt.Errorf("--now must be RFC3339: %w", err)
 		}
 	}
+	if *post {
+		now = ownerReportSlot(kind, now, zone)
+	}
 	start := ownerReportWindow(kind, now, zone)
 	if *sinceFlag != "" {
 		if start, err = time.Parse(time.RFC3339Nano, *sinceFlag); err != nil {
@@ -375,7 +459,21 @@ func cmdOwnerReport(e env, args []string) error {
 		return err
 	}
 	d, failures := fetchOwnerReport(c, *task, kind, start, now, zone, *host)
-	fmt.Print(renderOwnerReport(d))
+	report := renderOwnerReport(d)
+	fmt.Print(report)
+	if *post {
+		// A report with unavailable sections is still posted: the owner sees
+		// what could not be read, and the command still exits 1 below.
+		seq, already, err := postOwnerReport(c, e, *task, ownerReportRequestID(*task, kind, start, now), report)
+		if err != nil {
+			return fmt.Errorf("the report was not posted: %w", err)
+		}
+		if already {
+			fmt.Printf("already posted #%d for this slot\n", seq)
+		} else {
+			fmt.Printf("posted #%d\n", seq)
+		}
+	}
 	if len(failures) > 0 {
 		for _, f := range failures {
 			fmt.Fprintf(os.Stderr, "tt owner report: %s\n", f)
@@ -383,6 +481,37 @@ func cmdOwnerReport(e env, args []string) error {
 		return fmt.Errorf("%d report source(s) could not be read; the report shows each as unavailable", len(failures))
 	}
 	return nil
+}
+
+// postOwnerReport posts the report as one plain undirected Board message
+// under requestID. A slot that was already posted (even with other bytes,
+// because the data has moved since) is found by its receipt and not posted
+// again; already reports that case.
+func postOwnerReport(c *api.Client, e env, task, requestID, report string) (seq int64, already bool, err error) {
+	found := func() (int64, bool) {
+		ctx, cancel := ctxTimeout(ownerReportCallTimeout)
+		defer cancel()
+		m, err := c.GetMessagePostReceipt(ctx, task, requestID, e.agent)
+		if err != nil || m.PostReceipt == nil || m.PostReceipt.RequestID != requestID || m.PostReceipt.MessageSeq <= 0 {
+			return 0, false
+		}
+		return m.PostReceipt.MessageSeq, true
+	}
+	if seq, ok := found(); ok {
+		return seq, true, nil
+	}
+	ctx, cancel := ctxTimeout(ownerReportCallTimeout)
+	defer cancel()
+	m, err := c.PostMessage(ctx, task, api.PostMessageRequest{Text: report, AgentID: e.agent, RunID: e.runID, RequestID: requestID})
+	if err != nil {
+		// A concurrent run may have posted the slot first.
+		if seq, ok := found(); ok {
+			return seq, true, nil
+		}
+		return 0, false, err
+	}
+	recordUsageContext(e, task, "post", m.Seq)
+	return m.Seq, false, nil
 }
 
 // fetchOwnerReport reads each source independently; a failed read marks only
@@ -399,7 +528,8 @@ func fetchOwnerReport(c *api.Client, task, kind string, start, end time.Time, zo
 		return fn(ctx)
 	}
 
-	// Narrative overviews are read once per item across Shipped and Running.
+	// Narrative overviews are read once per item across Shipped, Running and
+	// Up next.
 	type overview struct {
 		o   api.NarrativeOverview
 		err error
@@ -555,6 +685,14 @@ func fetchOwnerReport(c *api.Client, task, kind string, start, end time.Time, zo
 	} else {
 		d.runningLimit = queue.ConcurrencyLimit
 		for _, q := range queue.Entries {
+			if q.State == "queued" && q.UpNext > 0 {
+				u := ownerReportUpNext{n: q.UpNext, item: q.ItemID, template: q.Template}
+				if o := readOverview(q.ItemID); o.err == nil {
+					u.title = reportText(o.o.Item.Title)
+				}
+				d.upNext = append(d.upNext, u)
+				continue
+			}
 			if q.State != "launching" && q.State != "running" {
 				continue
 			}
@@ -569,6 +707,12 @@ func fetchOwnerReport(c *api.Client, task, kind string, start, end time.Time, zo
 				return d.running[i].position < d.running[j].position
 			}
 			return d.running[i].item < d.running[j].item
+		})
+		sort.SliceStable(d.upNext, func(i, j int) bool {
+			if d.upNext[i].n != d.upNext[j].n {
+				return d.upNext[i].n < d.upNext[j].n
+			}
+			return d.upNext[i].item < d.upNext[j].item
 		})
 	}
 
