@@ -67,6 +67,9 @@ type stallFixture struct {
 	sent         []string
 	notices      []claudeStall
 	notifyErrs   []error
+	// needsPersons records the second notice, for a turn that never ended.
+	needsPersons    []claudeStall
+	needsPersonErrs []error
 }
 
 func newStallFixture(t *testing.T) *stallFixture {
@@ -164,6 +167,15 @@ func (f *stallFixture) ops() claudeStallOps {
 			if len(f.notifyErrs) > 0 {
 				err := f.notifyErrs[0]
 				f.notifyErrs = f.notifyErrs[1:]
+				return err
+			}
+			return nil
+		},
+		needsPerson: func(_ context.Context, _ runtimeBinding, s claudeStall) error {
+			f.needsPersons = append(f.needsPersons, s)
+			if len(f.needsPersonErrs) > 0 {
+				err := f.needsPersonErrs[0]
+				f.needsPersonErrs = f.needsPersonErrs[1:]
 				return err
 			}
 			return nil
@@ -599,10 +611,11 @@ func (f *stallFixture) stallAgain(t *testing.T) string {
 	return f.detect("spinner-stalled-2")
 }
 
-// h5 (s2): a second stall in the same run is never interrupted. It posts one
-// notice marked as a repeat; a failed post is retried under the same text, and
-// neither a retry nor a restarted relay posts it twice. A third stall posts
-// its own repeat notice, once, and is not interrupted either.
+// h5 (s2): a stall after the run's interrupted one is never interrupted. It
+// posts one notice marked as a repeat that says which stall's key was sent; a
+// failed post is retried under the same text, and neither a retry nor a
+// restarted relay posts it twice. A third stall posts its own repeat notice,
+// once, and is not interrupted either (feature wi_af589ce1582e8b18 a1, a2).
 func TestClaudeStallRepeatEscalatesOnce(t *testing.T) {
 	f := newStallFixture(t)
 	f.setAction(`{"claudeStallAction":"interrupt"}`)
@@ -617,7 +630,8 @@ func TestClaudeStallRepeatEscalatesOnce(t *testing.T) {
 	f.notifyErrs = []error{errors.New("hub unavailable")}
 	out := f.stallAgain(t)
 	s := f.record()
-	if !s.active() || s.Count != 2 || s.Mode != claudeStallInterrupt || !s.InterruptedAt.IsZero() || !strings.Contains(s.NotInterrupted, "stall 2 of this run") {
+	const sentPhrase = "the relay sent this run's one interrupt key at its stall 1"
+	if !s.active() || s.Count != 2 || s.Mode != claudeStallInterrupt || !s.InterruptedAt.IsZero() || s.InterruptedStall != 1 || !s.InterruptKeySent || s.InterruptKeyFailed || s.NotInterrupted != sentPhrase+claudeStallOnceSuffix {
 		t.Fatalf("second stall record: %+v\n%s", s, out)
 	}
 	if len(f.keys) != keys || len(f.sent) != sent {
@@ -627,9 +641,14 @@ func TestClaudeStallRepeatEscalatesOnce(t *testing.T) {
 		t.Fatalf("failed repeat notice: notices=%d record=%+v\n%s", len(f.notices), s, out)
 	}
 	repeat := f.notices[1]
-	for _, want := range []string{"This is stall 2 of the run.", "This is a repeat, so the agent needs a person.", "it never interrupts a run after its first stall"} {
+	for _, want := range []string{"This is stall 2 of the run.", "because " + sentPhrase + "; a run is interrupted at most once. The agent needs a person."} {
 		if !strings.Contains(repeat.Notice, want) {
 			t.Fatalf("repeat notice lacks %q: %s", want, repeat.Notice)
+		}
+	}
+	for _, not := range []string{"tried to send", "never interrupts a run", "no result was recorded"} {
+		if strings.Contains(repeat.Notice, not) {
+			t.Fatalf("repeat notice says %q: %s", not, repeat.Notice)
 		}
 	}
 	// Inside a minute the failed post is not tried again.
@@ -679,7 +698,10 @@ func TestClaudeStallRepeatEscalatesOnce(t *testing.T) {
 		t.Fatalf("third stall posted %d notices, want one: %+v", len(f.notices)-posted, third)
 	}
 	last := f.notices[len(f.notices)-1]
-	for _, want := range []string{"This is stall 3 of the run.", "This is a repeat, so the agent needs a person."} {
+	if third.InterruptedStall != 1 || third.NotInterrupted != sentPhrase+claudeStallOnceSuffix {
+		t.Fatalf("third stall lost the run's interrupt history: %+v", third)
+	}
+	for _, want := range []string{"This is stall 3 of the run.", "because " + sentPhrase + "; a run is interrupted at most once. The agent needs a person."} {
 		if !strings.Contains(last.Notice, want) {
 			t.Fatalf("third stall notice lacks %q: %s", want, last.Notice)
 		}
@@ -821,6 +843,10 @@ func TestClaudeStallFailsClosed(t *testing.T) {
 	}
 	if s := f.record(); len(f.keys) != 1 || len(f.sent) != 0 || !s.active() || !s.EndedAt.IsZero() || !strings.Contains(s.Outcome, "never showed the turn ending") || !strings.Contains(out, "interrupted turn never ended in the transcript; nothing typed") {
 		t.Fatalf("unconfirmed interrupt: keys=%q sent=%q record=%+v\n%s", f.keys, f.sent, s, out)
+	}
+	// It says so once in a second notice (TestClaudeStallNeverEndedNoticeOnce).
+	if s := f.record(); len(f.needsPersons) != 1 || s.NeedsPersonNoticedAt.IsZero() {
+		t.Fatalf("never-ended turn: second notices %d, record %+v", len(f.needsPersons), s)
 	}
 }
 
@@ -1161,9 +1187,16 @@ func (h *stallHub) notices(t *testing.T) []api.Message {
 	return out
 }
 
-// stallRecord is a detected stall as the pass leaves it before the notice.
+// stallRecord is a detected stall as the pass leaves it before the notice. A
+// later stall comes after a stall 1 whose key was sent.
 func stallRecord(b runtimeBinding, mode string, count int) claudeStall {
-	s := claudeStall{Run: b.Run, Count: count, Since: stallLastOutput, DetectedAt: stallLastOutput.Add(17 * time.Minute), Mode: mode, Counter: "75"}
+	s := claudeStall{Run: b.Run, Count: count, Rule: claudeStallRule, Since: stallLastOutput, DetectedAt: stallLastOutput.Add(17 * time.Minute), Mode: mode, Counter: "75"}
+	if count > 1 {
+		s.InterruptedStall, s.InterruptKeySent = 1, true
+		if mode == claudeStallInterrupt {
+			s.NotInterrupted = claudeStallUsedPhrase(s) + claudeStallOnceSuffix
+		}
+	}
 	s.Notice = claudeStallNoticeText(b, s)
 	return s
 }
@@ -1250,7 +1283,7 @@ func TestClaudeStallNotice(t *testing.T) {
 	if err := nativeClaudeStallNotify(ctx, b, repeat); err != nil {
 		t.Fatal(err)
 	}
-	if got = h.notices(t); len(got) != 4 || got[3].Envelope.Refs["repeat"] != "true" || got[3].Envelope.Refs["stall"] != "2" || !strings.Contains(got[3].Text, "This is a repeat, so the agent needs a person.") {
+	if got = h.notices(t); len(got) != 4 || got[3].Envelope.Refs["repeat"] != "true" || got[3].Envelope.Refs["stall"] != "2" || !strings.Contains(got[3].Text, "because the relay sent this run's one interrupt key at its stall 1; a run is interrupted at most once. The agent needs a person.") {
 		t.Fatalf("repeat notice: %+v", got)
 	}
 	// A third stall posts too, under its own identity, still marked.
@@ -1376,7 +1409,9 @@ func TestClaudeStallActionSetting(t *testing.T) {
 	}
 	// The turn moves on and stalls again: the same process, the same ops, no
 	// restart, and the new setting applies. A run is interrupted at most
-	// once, and this run has not been.
+	// once, and this run has not been: a report-only first stall does not use
+	// its interrupt up (feature wi_af589ce1582e8b18 a1), so the second stall
+	// gets exactly one key.
 	f.appendAssistant(f.now)
 	f.advance(20 * time.Second)
 	f.pass()
@@ -1385,9 +1420,10 @@ func TestClaudeStallActionSetting(t *testing.T) {
 	if s.Count != 2 || s.Mode != claudeStallInterrupt {
 		t.Fatalf("second stall did not read the new setting: %+v\n%s", s, out)
 	}
-	if len(f.keys) != 0 || !strings.Contains(s.NotInterrupted, "stall 2 of this run") {
-		t.Fatalf("a second stall is never interrupted: keys=%q %+v", f.keys, s)
+	if len(f.keys) != 1 || s.InterruptedAt.IsZero() || s.InterruptedStall != 2 || !s.InterruptKeySent || s.NotInterrupted != "" {
+		t.Fatalf("a report-only first stall used up the run's interrupt: keys=%q %+v\n%s", f.keys, s, out)
 	}
+	stallNoticeUsesNoInterrupt(t, f.notices[len(f.notices)-1])
 	// A fresh run under the new setting is interrupted on its first stall,
 	// and switching back to report leaves that stall's saved mode alone.
 	g := newStallFixture(t)
@@ -1399,6 +1435,34 @@ func TestClaudeStallActionSetting(t *testing.T) {
 	g.pass()
 	if s := g.record(); len(g.keys) != 1 || s.Mode != claudeStallInterrupt || s.Count != 1 {
 		t.Fatalf("first stall under interrupt: keys=%q %+v", g.keys, s)
+	}
+	// That turn moves on and stalls again under report: the notice says the
+	// interrupt would still not be sent, and why, from the record.
+	g.advance(claudeStallEndLimit)
+	g.appendAssistant(g.now)
+	g.advance(20 * time.Second)
+	if out := g.pass(); !strings.Contains(out, "ended: the turn moved on") {
+		t.Fatalf("output did not end the interrupted stall: %q", out)
+	}
+	g.stallAgain(t)
+	s = g.record()
+	last := g.notices[len(g.notices)-1]
+	if !s.active() || s.Count != 2 || s.Mode != claudeStallReport || len(g.keys) != 1 || s.InterruptedStall != 1 || !s.InterruptKeySent || s.NotInterrupted != "" {
+		t.Fatalf("report-mode repeat: keys=%q %+v", g.keys, s)
+	}
+	if want := "With the setting on interrupt it would still not have interrupted, because the relay sent this run's one interrupt key at its stall 1."; !strings.Contains(last.Notice, want) || strings.Contains(last.Notice, "never interrupts a run") {
+		t.Fatalf("report-mode repeat notice lacks %q:\n%s", want, last.Notice)
+	}
+}
+
+// stallNoticeUsesNoInterrupt fails when a notice for a stall whose run still
+// has its interrupt speaks of an earlier one.
+func stallNoticeUsesNoInterrupt(t *testing.T, s claudeStall) {
+	t.Helper()
+	for _, not := range []string{"sent this run's one interrupt key", "tried to send", "kept no interrupt history", "This is a repeat, so the agent needs a person", "never interrupts a run"} {
+		if strings.Contains(s.Notice, not) {
+			t.Fatalf("notice of a run with its interrupt unused says %q:\n%s", not, s.Notice)
+		}
 	}
 }
 
@@ -1601,5 +1665,325 @@ func TestClaudeStallIsWiredIntoTheRelay(t *testing.T) {
 	ops := nativeClaudeStallOps(nil)
 	if ops.interrupt == nil || ops.wake == nil || ops.notify == nil || ops.capture == nil || ops.ended == nil || ops.cursor == nil || ops.action == nil {
 		t.Fatal("native stall ops are incomplete")
+	}
+}
+
+// Feature wi_af589ce1582e8b18 (order #54108): the run's one interrupt is
+// counted by the stall the relay tried to interrupt, notices say what
+// happened, and an interrupted turn that never ends gets a second notice.
+
+// seedStall writes a stall record as JSON exactly as given: an older relay's
+// record has none of the newer fields.
+func (f *stallFixture) seedStall(record map[string]any) {
+	f.t.Helper()
+	record["run"] = f.b.Run
+	data, err := json.Marshal(record)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(claudeStallPath(f.b)), 0700); err != nil {
+		f.t.Fatal(err)
+	}
+	if err := os.WriteFile(claudeStallPath(f.b), data, 0600); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+// a1: a stall whose counter could not be read is only reported, so the run
+// keeps its interrupt and the next stall gets exactly one key.
+func TestClaudeStallUnreadableKeepsInterrupt(t *testing.T) {
+	f := newStallFixture(t)
+	f.setAction(`{"claudeStallAction":"interrupt"}`)
+	f.screen("spinner-no-counter")
+	f.detect("spinner-no-counter")
+	if s := f.record(); !s.active() || s.Count != 1 || s.Unreadable == "" || s.interruptUsed() || len(f.keys) != 0 {
+		t.Fatalf("unreadable first stall: keys=%q %+v", f.keys, s)
+	}
+	f.appendAssistant(f.now)
+	f.advance(20 * time.Second)
+	if out := f.pass(); !strings.Contains(out, "ended: the turn produced output") {
+		t.Fatalf("output did not end the first stall: %q", out)
+	}
+	out := f.stallAgain(t)
+	s := f.record()
+	if !s.active() || s.Count != 2 || len(f.keys) != 1 || s.InterruptedStall != 2 || !s.InterruptKeySent || s.NotInterrupted != "" {
+		t.Fatalf("second stall after an unreadable one: keys=%q %+v\n%s", f.keys, s, out)
+	}
+	stallNoticeUsesNoInterrupt(t, f.notices[len(f.notices)-1])
+}
+
+// a1, a2: a key tmux could not send still uses the run's interrupt up (the
+// time was saved first and the key may have reached the pane), and the next
+// stall's refusal and notice say so in the same words.
+func TestClaudeStallFailedKeyUsesInterrupt(t *testing.T) {
+	f := newStallFixture(t)
+	f.setAction(`{"claudeStallAction":"interrupt"}`)
+	f.interruptErr = errors.New("tmux: no such pane")
+	f.detect("spinner-stalled-2")
+	s := f.record()
+	if len(f.keys) != 1 || s.InterruptedStall != 1 || !s.InterruptKeyFailed || s.InterruptKeySent || !strings.Contains(f.notices[0].Notice, "the key could not be sent. It will not try again in this run") {
+		t.Fatalf("failed key: keys=%q %+v", f.keys, s)
+	}
+	f.interruptErr = nil
+	f.appendAssistant(f.now)
+	f.advance(20 * time.Second)
+	if out := f.pass(); !strings.Contains(out, "ended: the turn produced output") {
+		t.Fatalf("output did not end the first stall: %q", out)
+	}
+	f.stallAgain(t)
+	s = f.record()
+	const phrase = "the relay tried to send this run's one interrupt key at its stall 1 and tmux reported the send failed, so the key may or may not have reached the pane"
+	if len(f.keys) != 1 || !s.active() || s.Count != 2 || s.NotInterrupted != phrase+claudeStallOnceSuffix {
+		t.Fatalf("second stall after a failed key: keys=%q %+v", f.keys, s)
+	}
+	last := f.notices[len(f.notices)-1].Notice
+	if !strings.Contains(last, "because "+phrase+"; a run is interrupted at most once. The agent needs a person.") || strings.Contains(last, "the relay sent this run's one interrupt key") || strings.Contains(last, "never interrupts a run") {
+		t.Fatalf("second stall notice after a failed key:\n%s", last)
+	}
+}
+
+// a1, a2: a record written by an older relay. Count 2 or more may have hidden
+// an interrupt of stall 1, so the run's interrupt is treated as used, in both
+// modes, without inventing a stall number. A Count 1 record is exact.
+func TestClaudeStallLegacyRecordInterrupt(t *testing.T) {
+	earlier := stallLastOutput.Add(-3 * time.Hour)
+	at := func(d time.Duration) string { return earlier.Add(d).Format(time.RFC3339Nano) }
+	const unknown = "an older relay recorded earlier stalls of this run and kept no interrupt history, so this run's one interrupt is treated as used"
+	for _, tc := range []struct {
+		name   string
+		mode   string
+		record map[string]any
+		keys   int
+		want   []string
+		phrase string
+	}{
+		{"count 2 interrupt mode", "interrupt", map[string]any{"count": 2, "since": at(0), "detectedAt": at(17 * time.Minute), "mode": "interrupt", "counter": "75",
+			"notInterrupted": "stall 2 of this run; a run is interrupted at most once", "clearedAt": at(20 * time.Minute)},
+			0, []string{"This is stall 3 of the run.", "because " + unknown + "; a run is interrupted at most once. The agent needs a person."}, unknown + claudeStallOnceSuffix},
+		{"count 2 report mode", "report", map[string]any{"count": 2, "since": at(0), "detectedAt": at(17 * time.Minute), "mode": "report", "counter": "75", "clearedAt": at(20 * time.Minute)},
+			0, []string{"This is stall 3 of the run.", "With the setting on interrupt it would still not have interrupted, because " + unknown + "."}, ""},
+		{"count 1 interrupted", "interrupt", map[string]any{"count": 1, "since": at(0), "detectedAt": at(17 * time.Minute), "mode": "interrupt", "counter": "75",
+			"interruptedAt": at(17 * time.Minute), "endedAt": at(17 * time.Minute), "outcome": "interrupted; resume line typed and confirmed", "clearedAt": at(18 * time.Minute)},
+			0, []string{"because the relay sent this run's one interrupt key at its stall 1; a run is interrupted at most once."}, "the relay sent this run's one interrupt key at its stall 1" + claudeStallOnceSuffix},
+		{"count 1 not interrupted", "interrupt", map[string]any{"count": 1, "since": at(0), "detectedAt": at(17 * time.Minute), "mode": "report", "counter": "75", "clearedAt": at(20 * time.Minute)},
+			1, []string{"This is stall 2 of the run.", "The relay interrupted the turn once at "}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newStallFixture(t)
+			f.setAction(`{"claudeStallAction":"` + tc.mode + `"}`)
+			f.seedStall(tc.record)
+			out := f.detect("spinner-stalled-2")
+			s := f.record()
+			if !s.active() || s.Count != tc.record["count"].(int)+1 || s.Rule != claudeStallRule || len(f.keys) != tc.keys || s.NotInterrupted != tc.phrase {
+				t.Fatalf("keys=%q record %+v\n%s", f.keys, s, out)
+			}
+			notice := f.notices[len(f.notices)-1].Notice
+			for _, want := range tc.want {
+				if !strings.Contains(notice, want) {
+					t.Fatalf("notice lacks %q:\n%s", want, notice)
+				}
+			}
+			for _, not := range []string{"stall -1", "stall 0", "never interrupts a run"} {
+				if strings.Contains(notice, not) {
+					t.Fatalf("notice says %q:\n%s", not, notice)
+				}
+			}
+			if strings.HasPrefix(tc.name, "count 2") && (!s.InterruptHistoryUnknown || s.InterruptedStall != 0 || strings.Contains(notice, "sent this run's one interrupt key")) {
+				t.Fatalf("legacy count 2: %+v\n%s", s, notice)
+			}
+		})
+	}
+}
+
+// Lead decision on #54180: a record saved before the key, with neither tmux's
+// success nor its failure saved after it (the relay stopped in between), is
+// never described as sent. A restarted relay sends no second key; its notices
+// and the next stall's refusal say no result was recorded.
+func TestClaudeStallUnconfirmedKeyWording(t *testing.T) {
+	const phrase = "the relay tried to send this run's one interrupt key at its stall 1 and no result was recorded, so the key may or may not have reached the pane"
+	for _, legacy := range []bool{false, true} {
+		t.Run(fmt.Sprintf("legacy=%v", legacy), func(t *testing.T) {
+			f := newStallFixture(t)
+			f.setAction(`{"claudeStallAction":"interrupt"}`)
+			f.now = stallLastOutput.Add(17 * time.Minute)
+			now := f.now.Format(time.RFC3339Nano)
+			record := map[string]any{"count": 1, "since": stallLastOutput.Format(time.RFC3339Nano), "detectedAt": now, "checkedAt": now, "mode": "interrupt", "counter": "75",
+				"interruptedAt": now, "outcome": "interrupt key being sent"}
+			if !legacy {
+				record["rule"], record["interruptedStall"] = claudeStallRule, 1
+			}
+			f.seedStall(record)
+			// The restarted relay follows the stall: one notice, no key.
+			out := ""
+			for i := 0; i < 5; i++ {
+				f.advance(40 * time.Second)
+				out += f.pass()
+			}
+			s := f.record()
+			if len(f.keys) != 0 || len(f.sent) != 0 || len(f.notices) != 1 || !s.active() || s.NoticedAt.IsZero() {
+				t.Fatalf("restarted relay: keys=%q notices=%d %+v\n%s", f.keys, len(f.notices), s, out)
+			}
+			first := f.notices[0].Notice
+			if !strings.Contains(first, "The relay began sending the interrupt key at "+now[:19]) || !strings.Contains(first, "no result was recorded, so the key may or may not have reached the pane") || strings.Contains(first, "The relay interrupted the turn") {
+				t.Fatalf("first notice of an unconfirmed key:\n%s", first)
+			}
+			if len(f.needsPersons) != 1 || !strings.Contains(f.needsPersons[0].NeedsPerson, "The relay began sending the interrupt key at") || strings.Contains(f.needsPersons[0].NeedsPerson, "The relay sent the interrupt key") {
+				t.Fatalf("second notice of an unconfirmed key: %+v", f.needsPersons)
+			}
+			f.appendAssistant(f.now)
+			f.advance(20 * time.Second)
+			if out := f.pass(); !strings.Contains(out, "ended: the turn moved on") {
+				t.Fatalf("output did not end the stall: %q", out)
+			}
+			f.stallAgain(t)
+			s = f.record()
+			if len(f.keys) != 0 || s.Count != 2 || s.InterruptedStall != 1 || s.InterruptKeySent || s.InterruptKeyFailed || s.NotInterrupted != phrase+claudeStallOnceSuffix {
+				t.Fatalf("next stall: keys=%q %+v", f.keys, s)
+			}
+			last := f.notices[len(f.notices)-1].Notice
+			if !strings.Contains(last, "because "+phrase+"; a run is interrupted at most once.") || strings.Contains(last, "the relay sent this run's one interrupt key") {
+				t.Fatalf("next stall notice:\n%s", last)
+			}
+		})
+	}
+}
+
+// a3: an interrupted turn the transcript never shows ending gets one second
+// notice, after the first is posted and two minutes after the key, while the
+// turn has not moved on. A failed post is tried again after a minute and not
+// before; a restarted relay posts nothing more.
+func TestClaudeStallNeverEndedNoticeOnce(t *testing.T) {
+	f := newStallFixture(t)
+	f.setAction(`{"claudeStallAction":"interrupt"}`)
+	f.escapeEnds = false
+	f.detect("spinner-stalled-2")
+	s := f.record()
+	if len(f.keys) != 1 || len(f.notices) != 1 || !strings.Contains(f.notices[0].Notice, "If it has not ended 2 minutes after the key, a second notice will say so.") {
+		t.Fatalf("first notice: keys=%q %+v", f.keys, f.notices)
+	}
+	// Not yet two minutes after the key: nothing more.
+	f.advance(claudeStallEndLimit - 10*time.Second)
+	f.pass()
+	if len(f.needsPersons) != 0 {
+		t.Fatalf("second notice before two minutes: %+v", f.needsPersons)
+	}
+	f.needsPersonErrs = []error{errors.New("hub unavailable")}
+	f.advance(20 * time.Second)
+	out := f.pass()
+	s = f.record()
+	if len(f.needsPersons) != 1 || !s.NeedsPersonNoticedAt.IsZero() || s.NeedsPersonTriedAt.IsZero() || !strings.Contains(out, "needs-a-person notice failed: hub unavailable") {
+		t.Fatalf("failed second notice: %d %+v\n%s", len(f.needsPersons), s, out)
+	}
+	text := f.needsPersons[0].NeedsPerson
+	for _, want := range []string{f.b.Agent, f.b.Run, f.b.Session, "stall 1 of the run", "The relay sent the interrupt key at " + s.InterruptedAt.Format(time.RFC3339),
+		"the transcript had not shown the turn ending more than 2 minutes later", "The relay typed nothing", "The agent needs a person."} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("second notice lacks %q:\n%s", want, text)
+		}
+	}
+	f.advance(30 * time.Second)
+	f.pass()
+	if len(f.needsPersons) != 1 {
+		t.Fatalf("second notice retried inside a minute: %d", len(f.needsPersons))
+	}
+	f.advance(31 * time.Second)
+	out = f.pass()
+	s = f.record()
+	if len(f.needsPersons) != 2 || f.needsPersons[1].NeedsPerson != text || s.NeedsPersonNoticedAt.IsZero() || !strings.Contains(out, "needs-a-person notice posted once (stall 1 of the run)") {
+		t.Fatalf("retried second notice: %d %+v\n%s", len(f.needsPersons), s, out)
+	}
+	restarted := *f
+	restarted.needsPersons, restarted.notices = nil, nil
+	for i := 0; i < 5; i++ {
+		restarted.advance(70 * time.Second)
+		restarted.pass()
+	}
+	if len(restarted.needsPersons) != 0 || len(restarted.notices) != 0 || len(restarted.keys) != 1 || len(restarted.sent) != 0 {
+		t.Fatalf("restarted relay acted again: needsPerson=%d notices=%d keys=%q sent=%q", len(restarted.needsPersons), len(restarted.notices), restarted.keys, restarted.sent)
+	}
+
+	// A turn that moved on before the two minutes gets no second notice.
+	g := newStallFixture(t)
+	g.setAction(`{"claudeStallAction":"interrupt"}`)
+	g.escapeEnds = false
+	g.detect("spinner-stalled-2")
+	g.advance(time.Minute)
+	g.appendAssistant(g.now)
+	g.advance(claudeStallEndLimit)
+	if out := g.pass(); !strings.Contains(out, "ended: the turn moved on") || len(g.needsPersons) != 0 {
+		t.Fatalf("moved-on turn: needsPerson=%d\n%s", len(g.needsPersons), out)
+	}
+	// While the first notice is still unposted, the second waits for it.
+	h := newStallFixture(t)
+	h.setAction(`{"claudeStallAction":"interrupt"}`)
+	h.escapeEnds = false
+	h.notifyErrs = []error{errors.New("down"), errors.New("down"), errors.New("down"), errors.New("down")}
+	h.detect("spinner-stalled-2")
+	for i := 0; i < 3; i++ {
+		h.advance(61 * time.Second)
+		h.pass()
+	}
+	if len(h.needsPersons) != 0 || !h.record().NoticedAt.IsZero() {
+		t.Fatalf("second notice before the first: %d %+v", len(h.needsPersons), h.record())
+	}
+	h.advance(61 * time.Second)
+	h.pass()
+	if s := h.record(); s.NoticedAt.IsZero() || len(h.needsPersons) != 1 || s.NeedsPersonNoticedAt.Before(s.NoticedAt) {
+		t.Fatalf("second notice after the first: %d %+v", len(h.needsPersons), s)
+	}
+}
+
+// a3: the second notice is posted as the relay to the live owner helper, or
+// to the Board with none, never to the stalled agent, under its own request
+// identity; replays post once.
+func TestClaudeStallNeverEndedNoticeReachesHelper(t *testing.T) {
+	ctx := context.Background()
+	h := newStallHub(t)
+	worker := h.add(t, "builder", "")
+	b := h.binding(worker)
+	s := stallRecord(b, claudeStallInterrupt, 1)
+	s.InterruptedAt, s.InterruptedStall, s.InterruptKeySent = s.DetectedAt, 1, true
+	s.Notice = claudeStallNoticeText(b, s)
+	s.NeedsPerson = claudeStallNeedsPersonText(b, s)
+	if err := nativeClaudeStallNotify(ctx, b, s); err != nil {
+		t.Fatal(err)
+	}
+	if err := nativeClaudeStallNeedsPerson(ctx, b, s); err != nil {
+		t.Fatal(err)
+	}
+	got := h.notices(t)
+	if len(got) != 2 || got[1].To != "" || got[1].Envelope.Subject != claudeStallNeedsPersonSubject || got[1].Envelope.Refs["needsPerson"] != "true" || got[1].Envelope.Refs["stall"] != "1" {
+		t.Fatalf("with no owner helper the second notice should reach the Board: %+v", got)
+	}
+	if id := got[1].PostReceipt.RequestID; id != claudeStallRequestID(b, s)+"-needs-person" || id == got[0].PostReceipt.RequestID {
+		t.Fatalf("second notice identity %q (first %q)", id, got[0].PostReceipt.RequestID)
+	}
+	if from := got[1].From; from != (api.Sender{Node: server.RelayNode, User: server.RelayUser}) {
+		t.Fatalf("second notice author %+v, want the relay", from)
+	}
+	helper := h.helper(t, "ohreg-stall-needs-person")
+	later := s
+	later.Since = s.Since.Add(time.Hour)
+	later.NeedsPerson = claudeStallNeedsPersonText(b, later)
+	for i := 0; i < 3; i++ { // a second pass, a retry, a restarted relay
+		if err := nativeClaudeStallNeedsPerson(ctx, b, later); err != nil {
+			t.Fatalf("post %d: %v", i, err)
+		}
+	}
+	got = h.notices(t)
+	if len(got) != 3 || got[2].To != helper.ID || got[2].To == worker.ID || got[2].Envelope.To != helper.Name || !strings.Contains(got[2].Text, "The agent needs a person.") {
+		t.Fatalf("want exactly one more second notice, to the owner helper: %+v", got)
+	}
+	// The stalled agent is the owner helper: the Board, never itself.
+	hb := h.binding(helper)
+	hs := stallRecord(hb, claudeStallInterrupt, 1)
+	hs.Since = s.Since.Add(3 * time.Hour)
+	hs.InterruptedAt, hs.InterruptedStall, hs.InterruptKeySent = hs.DetectedAt, 1, true
+	hs.NeedsPerson = claudeStallNeedsPersonText(hb, hs)
+	if err := nativeClaudeStallNeedsPerson(ctx, hb, hs); err != nil {
+		t.Fatal(err)
+	}
+	if got = h.notices(t); len(got) != 4 || got[3].To != "" {
+		t.Fatalf("a stalled owner helper's second notice should reach the Board: %+v", got)
 	}
 }

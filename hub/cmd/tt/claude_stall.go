@@ -32,6 +32,10 @@ import (
 // reported once. Only a host whose setting says "interrupt" presses Escape,
 // once per stall and never twice in a run, and then lets the normal wake path
 // deliver the unread input, or types one fixed resume line when there is none.
+// The run's one interrupt is counted by the stall the relay tried to interrupt,
+// not by the stall count, so a stall that was only reported, or not interrupted
+// for any other reason, does not use it up (feature wi_af589ce1582e8b18, order
+// #54108). An interrupted turn that never ends gets a second notice.
 
 const (
 	// claudeStallProbeGap is the least time between the two pane captures.
@@ -62,16 +66,39 @@ const (
 	// relay interrupted when nothing else is waiting for it.
 	claudeStallResumeLine = "Your previous turn stopped producing output and the relay interrupted it. Continue the work you were doing."
 
-	claudeStallSubject = "A Claude agent's turn has stopped producing output"
+	claudeStallSubject            = "A Claude agent's turn has stopped producing output"
+	claudeStallNeedsPersonSubject = "An interrupted Claude turn never ended and needs a person"
+
+	// claudeStallRule marks a record written by a relay that keeps the run's
+	// interrupt history (interruptedStall). An older record has none, so its
+	// second or later stall cannot say whether stall 1 was interrupted.
+	claudeStallRule = 2
 )
 
 // claudeStall is one run's stall record: private host state beside the wake
-// intent. It holds the reading being watched, the current stall and how many
-// stalls the run has had.
+// intent. It holds the reading being watched, the current stall, how many
+// stalls the run has had and which of them, if any, the relay interrupted.
 type claudeStall struct {
 	Run string `json:"run"`
-	// Count is the number of stalls detected in this run.
+	// Count is the number of stalls detected in this run, whatever happened
+	// to each. It numbers the stall; it does not limit the interrupt.
 	Count int `json:"count,omitempty"`
+	// Rule is claudeStallRule on every stall this relay detects, and on an
+	// older record once upgrade has read it.
+	Rule int `json:"rule,omitempty"`
+	// The run's one interrupt, carried from stall to stall. InterruptedStall
+	// is the number of the stall whose interrupt time was saved before its
+	// key; 0 means none. InterruptKeySent is saved only after tmux returned
+	// success for that key, InterruptKeyFailed only after tmux reported a
+	// failure; with neither, the relay stopped between the save and the
+	// result, and the key may or may not have reached the pane. Any of the
+	// three uses the interrupt up. InterruptHistoryUnknown says an older relay
+	// recorded earlier stalls of this run without that history, so the
+	// interrupt is treated as used.
+	InterruptedStall        int  `json:"interruptedStall,omitempty"`
+	InterruptKeySent        bool `json:"interruptKeySent,omitempty"`
+	InterruptKeyFailed      bool `json:"interruptKeyFailed,omitempty"`
+	InterruptHistoryUnknown bool `json:"interruptHistoryUnknown,omitempty"`
 	// Since is when the turn last wrote a transcript record or changed the
 	// worktree. It identifies the stall.
 	Since time.Time `json:"since,omitempty"`
@@ -114,6 +141,12 @@ type claudeStall struct {
 	NoticedAt     time.Time `json:"noticedAt,omitempty"`
 	NoticeTriedAt time.Time `json:"noticeTriedAt,omitempty"`
 	EscalatedAt   time.Time `json:"escalatedAt,omitempty"`
+	// NeedsPerson is the second notice, for an interrupted turn the transcript
+	// never showed ending: frozen before its first attempt and posted once,
+	// under its own request identity, like the first.
+	NeedsPerson          string    `json:"needsPerson,omitempty"`
+	NeedsPersonNoticedAt time.Time `json:"needsPersonNoticedAt,omitempty"`
+	NeedsPersonTriedAt   time.Time `json:"needsPersonTriedAt,omitempty"`
 	// ClearedAt ends the stall: the turn produced output again, ended, or was
 	// woken after the interrupt.
 	ClearedAt time.Time `json:"clearedAt,omitempty"`
@@ -129,6 +162,63 @@ type claudeStallReading struct {
 }
 
 func (s claudeStall) active() bool { return !s.DetectedAt.IsZero() && s.ClearedAt.IsZero() }
+
+// interruptUsed reports that the run's one interrupt is used up: a stall's
+// key was sent or tried, or an older relay left no history to tell.
+func (s claudeStall) interruptUsed() bool {
+	return s.InterruptedStall >= 1 || s.InterruptHistoryUnknown
+}
+
+// upgrade gives a stall record an older relay wrote (no rule) the interrupt
+// history it implies, once, as it is read and before this relay changes its
+// outcome. Under the older rule only stall 1 could be interrupted, and its
+// record was replaced at stall 2, so a record of stall 2 or later cannot
+// tell. An older record of an interrupted stall says what tmux answered only
+// in its outcome: "interrupt key failed" after a failure, "interrupt key
+// being sent" when the relay stopped before the answer, and any other
+// "interrupted…" or "resume line…" outcome was first written after success.
+// An older relay that restarted on a "being sent" record could still rewrite
+// it to "interrupted, but the transcript never showed…"; that is read as sent.
+func (s *claudeStall) upgrade() {
+	if s.Rule != 0 || s.Count < 1 {
+		return
+	}
+	s.Rule = claudeStallRule
+	switch {
+	case !s.InterruptedAt.IsZero():
+		s.InterruptedStall = s.Count
+		s.InterruptKeyFailed = strings.HasPrefix(s.Outcome, "interrupt key failed")
+		s.InterruptKeySent = !s.InterruptKeyFailed && (strings.HasPrefix(s.Outcome, "interrupted") || strings.HasPrefix(s.Outcome, "resume line"))
+	case s.Count >= 2:
+		s.InterruptHistoryUnknown = true
+	}
+}
+
+// carryInterrupt starts a new stall's record with the run's interrupt
+// history from the previous record p.
+func (s *claudeStall) carryInterrupt(p claudeStall) {
+	s.Rule = claudeStallRule
+	s.InterruptedStall, s.InterruptKeySent, s.InterruptKeyFailed, s.InterruptHistoryUnknown = p.InterruptedStall, p.InterruptKeySent, p.InterruptKeyFailed, p.InterruptHistoryUnknown
+}
+
+// claudeStallUsedPhrase says, from the record alone, why the run's one
+// interrupt is used up. The refusal and the notice both use it, so they
+// cannot disagree.
+func claudeStallUsedPhrase(s claudeStall) string {
+	switch {
+	case s.InterruptedStall >= 1 && s.InterruptKeySent:
+		return fmt.Sprintf("the relay sent this run's one interrupt key at its stall %d", s.InterruptedStall)
+	case s.InterruptedStall >= 1 && s.InterruptKeyFailed:
+		return fmt.Sprintf("the relay tried to send this run's one interrupt key at its stall %d and tmux reported the send failed, so the key may or may not have reached the pane", s.InterruptedStall)
+	case s.InterruptedStall >= 1:
+		return fmt.Sprintf("the relay tried to send this run's one interrupt key at its stall %d and no result was recorded, so the key may or may not have reached the pane", s.InterruptedStall)
+	default:
+		return "an older relay recorded earlier stalls of this run and kept no interrupt history, so this run's one interrupt is treated as used"
+	}
+}
+
+// claudeStallOnceSuffix ends the refusal for a used interrupt.
+const claudeStallOnceSuffix = "; a run is interrupted at most once"
 
 type claudeStallOps struct {
 	now   func() time.Time
@@ -146,6 +236,9 @@ type claudeStallOps struct {
 	wake func(context.Context, runtimeBinding, string) error
 	// notify posts the stall notice. Nil disables it; the stall is still recorded.
 	notify func(context.Context, runtimeBinding, claudeStall) error
+	// needsPerson posts the second notice, for an interrupted turn that never
+	// ended. Nil disables it; the outcome is still recorded.
+	needsPerson func(context.Context, runtimeBinding, claudeStall) error
 	// action reads the host setting.
 	action func() string
 }
@@ -162,6 +255,7 @@ func loadClaudeStall(b runtimeBinding) claudeStall {
 	if s.Run != b.Run {
 		return claudeStall{Run: b.Run}
 	}
+	s.upgrade()
 	return s
 }
 
@@ -435,8 +529,9 @@ func claudeStallPass(ctx context.Context, b runtimeBinding, ops claudeStallOps) 
 		save()
 		return
 	}
-	first := *s.Probe
-	s = claudeStall{Run: b.Run, Count: s.Count + 1, CheckedAt: now, Since: d.Since, DetectedAt: now, Mode: ops.action(), Counter: d.Counter, Unread: a.Unread, WakeSeqs: claudeStallHeldSeqs(b)}
+	first, prev := *s.Probe, s
+	s = claudeStall{Run: b.Run, Count: prev.Count + 1, CheckedAt: now, Since: d.Since, DetectedAt: now, Mode: ops.action(), Counter: d.Counter, Unread: a.Unread, WakeSeqs: claudeStallHeldSeqs(b)}
+	s.carryInterrupt(prev)
 	if s.Mode != claudeStallInterrupt {
 		s.Mode = claudeStallReport
 	}
@@ -470,10 +565,12 @@ func claudeStallHeldSeqs(b runtimeBinding) []int64 {
 }
 
 // claudeStallAct interrupts a newly detected stall when everything allows it.
-// Report mode, a repeat stall, an unreadable counter, the owner's own session
-// and any change since the second reading all leave the pane untouched. The
-// interrupt time is saved before the key is sent, so no later pass or
-// restarted relay can send a second one for this stall.
+// Report mode, a run whose one interrupt is used (an earlier stall's key was
+// sent or tried), an unreadable counter, the owner's own session and any
+// change since the second reading all leave the pane untouched. The interrupt
+// time and stall number are saved before the key is sent, so no later pass or
+// restarted relay can send a second one in this run; tmux's answer is saved
+// after it.
 func claudeStallAct(ctx context.Context, b runtimeBinding, ops claudeStallOps, s *claudeStall, a api.Agent, c activityCursor, second claudeStallReading, now time.Time) {
 	refuse := func(reason string) {
 		s.NotInterrupted = claudeClip(reason, 200)
@@ -486,8 +583,8 @@ func claudeStallAct(ctx context.Context, b runtimeBinding, ops claudeStallOps, s
 	case s.Mode != claudeStallInterrupt:
 		claudeStallSetOutcome(s, "no key sent and nothing typed: host setting is report")
 		return
-	case s.Count > 1:
-		refuse(fmt.Sprintf("stall %d of this run; a run is interrupted at most once", s.Count))
+	case s.interruptUsed():
+		refuse(claudeStallUsedPhrase(*s) + claudeStallOnceSuffix)
 		return
 	case s.Unreadable != "":
 		refuse(s.Unreadable)
@@ -512,20 +609,30 @@ func claudeStallAct(ctx context.Context, b runtimeBinding, ops claudeStallOps, s
 		refuse("transcript changed before the interrupt")
 		return
 	}
-	s.InterruptedAt = ops.now().UTC()
+	s.InterruptedAt, s.InterruptedStall = ops.now().UTC(), s.Count
 	claudeStallSetOutcome(s, "interrupt key being sent")
 	if err := writePrivateJSON(claudeStallPath(b), s); err != nil {
-		s.InterruptedAt = time.Time{}
+		s.InterruptedAt, s.InterruptedStall = time.Time{}, 0
 		refuse(fmt.Sprintf("stall record not saved: %v", err))
 		return
 	}
 	if err := ops.interrupt(ctx, last.Pane); err != nil {
+		s.InterruptKeyFailed = true
 		claudeStallSetOutcome(s, fmt.Sprintf("interrupt key failed: %v; not sent again", err))
 		claudeStallLog(now, b, "stalled turn interrupt failed, not sent again: %v", err)
+		if err := writePrivateJSON(claudeStallPath(b), s); err != nil {
+			claudeStallLog(now, b, "stall record not saved: %v", err)
+		}
 		return
 	}
+	// Saved only now that tmux returned success: a record without it after
+	// the save above says the result is not known.
+	s.InterruptKeySent = true
 	claudeStallLog(s.InterruptedAt, b, "stalled turn interrupted once (pane %s)", last.Pane)
 	claudeStallSetOutcome(s, "interrupted; waiting for the transcript to show the turn ended")
+	if err := writePrivateJSON(claudeStallPath(b), s); err != nil {
+		claudeStallLog(now, b, "stall record not saved: %v", err)
+	}
 	for deadline := ops.now().Add(claudeStallEndWait); ; ops.sleep(100 * time.Millisecond) {
 		if ops.ended(ctx, b) {
 			claudeStallEnded(b, s, ops.now().UTC())
@@ -555,7 +662,7 @@ func claudeStallFollow(ctx context.Context, b runtimeBinding, ops claudeStallOps
 	if s.NoticedAt.IsZero() {
 		claudeStallNotify(ctx, b, ops, s, now)
 	}
-	if s.InterruptedAt.IsZero() || strings.HasPrefix(s.Outcome, "interrupt key failed") {
+	if s.InterruptedAt.IsZero() || s.InterruptKeyFailed {
 		switch {
 		case c.TurnComplete:
 			clear("the turn ended")
@@ -573,7 +680,8 @@ func claudeStallFollow(ctx context.Context, b runtimeBinding, ops claudeStallOps
 		case now.Sub(s.InterruptedAt) > claudeStallEndLimit:
 			// Claude Code records nothing for an Escape pressed before a
 			// turn's first assistant record. The stall stands, nothing is
-			// typed, and only real progress clears it.
+			// typed, and only real progress clears it. While it stands, a
+			// second notice says it needs a person, once the first is posted.
 			const never = "interrupted, but the transcript never showed the turn ending; nothing typed; needs a person"
 			if s.Outcome != never {
 				claudeStallSetOutcome(s, never)
@@ -581,6 +689,10 @@ func claudeStallFollow(ctx context.Context, b runtimeBinding, ops claudeStallOps
 			}
 			if claudeStallQuietSince(c).After(s.InterruptedAt) {
 				clear("the turn moved on")
+				return
+			}
+			if !s.NoticedAt.IsZero() {
+				claudeStallNeedsPersonNotify(ctx, b, ops, s, now)
 			}
 			return
 		default:
@@ -686,6 +798,7 @@ func claudeStallNoteWake(b runtimeBinding, now time.Time) {
 	if json.Unmarshal(data, &s) != nil || s.Run != b.Run || !s.active() || s.InterruptedAt.IsZero() || !s.RewakeAt.IsZero() || !s.ResumeAt.IsZero() {
 		return
 	}
+	s.upgrade() // before the outcome below replaces what it is read from
 	// Only a wake the transcript confirmed after the interrupt counts; an
 	// earlier confirmed intent with the same prompt is not a re-delivery.
 	var intent claudeWakeIntent
@@ -733,17 +846,22 @@ func claudeStallNoticeText(b runtimeBinding, s claudeStall) string {
 			next += fmt.Sprintf(" (held wake sequences %v)", s.WakeSeqs)
 		}
 	}
+	// A repeat stall is told by its number above. What the relay did is said
+	// from the record: an earlier stall's interrupt only by the refusal or
+	// the used-interrupt phrase, never by the stall count alone.
 	switch {
-	case s.Count > 1:
-		text += "The relay sent no key and typed nothing: it never interrupts a run after its first stall. This is a repeat, so the agent needs a person."
-	case !s.InterruptedAt.IsZero() && strings.HasPrefix(s.Outcome, "interrupt key failed"):
-		text += "The relay tried to interrupt the turn at " + s.InterruptedAt.Format(time.RFC3339) + " and the key could not be sent. It will not try again for this stall and typed nothing. The agent needs a person."
+	case !s.InterruptedAt.IsZero() && s.InterruptKeyFailed:
+		text += "The relay tried to interrupt the turn at " + s.InterruptedAt.Format(time.RFC3339) + " and the key could not be sent. It will not try again in this run and typed nothing. The agent needs a person."
+	case !s.InterruptedAt.IsZero() && !s.InterruptKeySent:
+		text += "The relay began sending the interrupt key at " + s.InterruptedAt.Format(time.RFC3339) + " and no result was recorded, so the key may or may not have reached the pane. It will not send another in this run and typed nothing. The agent needs a person."
 	case !s.InterruptedAt.IsZero() && !s.EndedAt.IsZero():
 		text += "The relay interrupted the turn once at " + s.InterruptedAt.Format(time.RFC3339) + " and the transcript shows it ended. It will now " + next + "."
 	case !s.InterruptedAt.IsZero():
-		text += "The relay interrupted the turn once at " + s.InterruptedAt.Format(time.RFC3339) + ". The transcript had not shown the turn ending " + fmt.Sprint(int(claudeStallEndWait.Seconds())) + "s later; nothing is typed until it does. If it does, the relay will " + next + "."
+		text += "The relay interrupted the turn once at " + s.InterruptedAt.Format(time.RFC3339) + ". The transcript had not shown the turn ending " + fmt.Sprint(int(claudeStallEndWait.Seconds())) + "s later; nothing is typed until it does. If it does, the relay will " + next + ". If it has not ended " + fmt.Sprint(int(claudeStallEndLimit.Minutes())) + " minutes after the key, a second notice will say so."
 	case s.Mode == claudeStallInterrupt:
 		text += "The relay sent no key and typed nothing, because " + s.NotInterrupted + ". The agent needs a person."
+	case s.interruptUsed():
+		text += "The relay sent no key and typed nothing. With the setting on interrupt it would still not have interrupted, because " + claudeStallUsedPhrase(s) + "."
 	case s.Unreadable != "":
 		text += "The relay sent no key and typed nothing. With the setting on interrupt it would still not have interrupted, because the counter could not be compared."
 	default:
@@ -777,6 +895,35 @@ func claudeStallNotify(ctx context.Context, b runtimeBinding, ops claudeStallOps
 	claudeStallLog(now, b, "stall notice posted once (stall %d of the run)", s.Count)
 }
 
+// claudeStallNeedsPersonText writes the second notice, for an interrupted turn
+// the transcript never showed ending. Like the first, it uses only the record.
+func claudeStallNeedsPersonText(b runtimeBinding, s claudeStall) string {
+	key := "The relay sent the interrupt key at " + s.InterruptedAt.Format(time.RFC3339)
+	if !s.InterruptKeySent {
+		key = "The relay began sending the interrupt key at " + s.InterruptedAt.Format(time.RFC3339) + " and no result was recorded, so the key may or may not have reached the pane"
+	}
+	return fmt.Sprintf("Agent %s (run %s, tmux session %s), stall %d of the run: %s, and the transcript had not shown the turn ending more than %d minutes later. Claude Code writes nothing for an Escape pressed before a turn's first assistant record and puts the prompt back in the input box. The relay typed nothing and will type nothing for this stall; it will not send another key in this run. The agent needs a person.",
+		b.Agent, b.Run, b.Session, s.Count, key, int(claudeStallEndLimit.Minutes()))
+}
+
+// claudeStallNeedsPersonNotify posts the second notice once, with the same
+// freeze-then-retry rule as claudeStallNotify.
+func claudeStallNeedsPersonNotify(ctx context.Context, b runtimeBinding, ops claudeStallOps, s *claudeStall, now time.Time) {
+	if ops.needsPerson == nil || !s.NeedsPersonNoticedAt.IsZero() || (!s.NeedsPersonTriedAt.IsZero() && now.Sub(s.NeedsPersonTriedAt) < claudeStallNoticeRetry) {
+		return
+	}
+	if s.NeedsPerson == "" {
+		s.NeedsPerson = claudeStallNeedsPersonText(b, *s)
+	}
+	s.NeedsPersonTriedAt = now
+	if err := ops.needsPerson(ctx, b, *s); err != nil {
+		claudeStallLog(now, b, "needs-a-person notice failed: %v", err)
+		return
+	}
+	s.NeedsPersonNoticedAt = now
+	claudeStallLog(now, b, "needs-a-person notice posted once (stall %d of the run)", s.Count)
+}
+
 // claudeStallRecipient picks who hears about a stalled agent: the newest live
 // owner helper, never the stalled agent itself. The zero Agent means the Board.
 func claudeStallRecipient(agents []api.Agent, stalled string) api.Agent {
@@ -804,6 +951,26 @@ func claudeStallRequestID(b runtimeBinding, s claudeStall) string {
 // identity was stored before with other data, which only happens when the
 // record was lost after a successful post, so it counts as posted.
 func nativeClaudeStallNotify(ctx context.Context, b runtimeBinding, s claudeStall) error {
+	refs := map[string]string{"agent": b.Agent, "run": b.Run, "session": b.Session, "mode": s.Mode, "stall": fmt.Sprint(s.Count)}
+	if s.Count > 1 {
+		refs["repeat"] = "true"
+	}
+	return nativeClaudeStallPost(ctx, b, claudeStallSubject, s.Notice, refs, claudeStallRequestID(b, s))
+}
+
+// nativeClaudeStallNeedsPerson posts the frozen second notice the same way,
+// under the first notice's identity plus "-needs-person".
+func nativeClaudeStallNeedsPerson(ctx context.Context, b runtimeBinding, s claudeStall) error {
+	refs := map[string]string{"agent": b.Agent, "run": b.Run, "session": b.Session, "mode": s.Mode, "stall": fmt.Sprint(s.Count), "needsPerson": "true"}
+	if s.Count > 1 {
+		refs["repeat"] = "true"
+	}
+	return nativeClaudeStallPost(ctx, b, claudeStallNeedsPersonSubject, s.NeedsPerson, refs, claudeStallRequestID(b, s)+"-needs-person")
+}
+
+// nativeClaudeStallPost posts one stall notice as the relay to the stall
+// recipient (claudeStallRecipient).
+func nativeClaudeStallPost(ctx context.Context, b runtimeBinding, subject, text string, refs map[string]string, requestID string) error {
 	e := env{hub: b.Hub}
 	e.loadConfig()
 	c, err := e.client(3 * time.Second)
@@ -817,12 +984,8 @@ func nativeClaudeStallNotify(ctx context.Context, b runtimeBinding, s claudeStal
 		return err
 	}
 	to := claudeStallRecipient(agents, b.Agent)
-	refs := map[string]string{"agent": b.Agent, "run": b.Run, "session": b.Session, "mode": s.Mode, "stall": fmt.Sprint(s.Count)}
-	if s.Count > 1 {
-		refs["repeat"] = "true"
-	}
-	env := api.Envelope{Kind: api.EnvelopeKindNotice, To: to.Name, Subject: claudeStallSubject, Refs: refs, Body: api.EnvelopeBody{Text: s.Notice}}
-	_, err = c.PostMessage(ctx, b.Task, api.PostMessageRequest{Envelope: &env, Text: api.RenderText(env), To: to.ID, RequestID: claudeStallRequestID(b, s)})
+	env := api.Envelope{Kind: api.EnvelopeKindNotice, To: to.Name, Subject: subject, Refs: refs, Body: api.EnvelopeBody{Text: text}}
+	_, err = c.PostMessage(ctx, b.Task, api.PostMessageRequest{Envelope: &env, Text: api.RenderText(env), To: to.ID, RequestID: requestID})
 	var httpErr *api.HTTPError
 	if errors.As(err, &httpErr) && httpErr.Status == http.StatusConflict {
 		return nil
@@ -860,8 +1023,9 @@ func nativeClaudeStallOps(c *api.Client) claudeStallOps {
 			_, err := claudeTranscriptSnapshotContext(ctx, b, time.Now())
 			return err == nil
 		},
-		wake:   claudeQueue,
-		notify: nativeClaudeStallNotify,
-		action: relayStallAction,
+		wake:        claudeQueue,
+		notify:      nativeClaudeStallNotify,
+		needsPerson: nativeClaudeStallNeedsPerson,
+		action:      relayStallAction,
 	}
 }
