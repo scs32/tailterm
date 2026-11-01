@@ -271,6 +271,54 @@ func (s *Store) Usage(ctx context.Context, task string, q api.UsageQuery) (api.U
 	return s.usageReport(ctx, task, q, newUsagePhaseCache())
 }
 
+// Stages of one report read, in order (wi_f8f4f32d4555aec5): prices,
+// coverage and the item list; turns; spans; wait candidates; agent names;
+// per-item lifetime budgets.
+const (
+	usageStagePrices = iota
+	usageStageTurns
+	usageStageSpans
+	usageStageWaits
+	usageStageAgents
+	usageStageBudgets
+	usageStageCount
+)
+
+var usageStageNames = [usageStageCount]string{"S0 prices/items", "S1 turns", "S2 spans", "S3 waits", "S4 agents", "S5 budgets"}
+
+// usageReadStats is what one report read cost, per stage: the time it took,
+// the rows its queries returned, the rows that went on past the window and
+// item filters, and the queries it ran. Counts only; tests and the live-size
+// benchmark read it.
+type usageReadStats struct {
+	elapsed [usageStageCount]time.Duration
+	rows    [usageStageCount]int
+	kept    [usageStageCount]int
+	queries [usageStageCount]int
+}
+
+// stage times the rest of a stage: call it at the start, run the returned
+// function at the end.
+func (r *usageReadStats) stage(n int) func() {
+	began := time.Now()
+	return func() { r.elapsed[n] += time.Since(began) }
+}
+
+// usageCountingQuerier counts the queries a stage runs through it.
+type usageCountingQuerier struct {
+	q queryRower
+	n *int
+}
+
+func (c usageCountingQuerier) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	*c.n++
+	return c.q.QueryRowContext(ctx, query, args...)
+}
+func (c usageCountingQuerier) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	*c.n++
+	return c.q.QueryContext(ctx, query, args...)
+}
+
 const usageReportTurnsQuery = `SELECT projection FROM usage_turns WHERE task_id=? ORDER BY task_id,agent_id,run_id,request_id`
 
 func (s *Store) usageReport(ctx context.Context, task string, q api.UsageQuery, cache *usagePhaseCache) (api.UsageReport, error) {
@@ -291,6 +339,8 @@ func (s *Store) usageReport(ctx context.Context, task string, q api.UsageQuery, 
 		return out, err
 	}
 	defer tx.Rollback()
+	stats := cache.stats
+	done := stats.stage(usageStagePrices)
 	prices, err := readUsagePrices(ctx, tx, task)
 	if err != nil {
 		return out, err
@@ -307,6 +357,7 @@ func (s *Store) usageReport(ctx context.Context, task string, q api.UsageQuery, 
 			return out, err
 		}
 		out.Coverage = append(out.Coverage, c)
+		stats.rows[usageStagePrices]++
 	}
 	err = coverageRows.Err()
 	coverageRows.Close()
@@ -326,6 +377,7 @@ func (s *Store) usageReport(ctx context.Context, task string, q api.UsageQuery, 
 			rows.Close()
 			return out, err
 		}
+		stats.rows[usageStagePrices]++
 		if q.Item == "" || q.Item == id {
 			items[task+"/"+id] = newUsageItem(task, id, title)
 		}
@@ -335,6 +387,10 @@ func (s *Store) usageReport(ctx context.Context, task string, q api.UsageQuery, 
 	if err != nil {
 		return out, err
 	}
+	stats.queries[usageStagePrices] += 3
+	done()
+	done = stats.stage(usageStageTurns)
+	stats.queries[usageStageTurns]++
 	rows, err = tx.QueryContext(ctx, usageReportTurnsQuery, task)
 	if err != nil {
 		return out, err
@@ -344,6 +400,7 @@ func (s *Store) usageReport(ctx context.Context, task string, q api.UsageQuery, 
 		if err = rows.Scan(&raw); err != nil {
 			break
 		}
+		stats.rows[usageStageTurns]++
 		var p api.UsageProjection
 		if err = json.Unmarshal([]byte(raw), &p); err != nil {
 			break
@@ -352,6 +409,7 @@ func (s *Store) usageReport(ctx context.Context, task string, q api.UsageQuery, 
 		if (!q.From.IsZero() && t.At.Before(q.From)) || (!q.To.IsZero() && !t.At.Before(q.To)) {
 			continue
 		}
+		stats.kept[usageStageTurns]++
 		key := p.AgentID + "/" + p.RunID + "/" + t.ID
 		reported := false
 		for _, share := range p.Shares {
@@ -388,8 +446,9 @@ func (s *Store) usageReport(ctx context.Context, task string, q api.UsageQuery, 
 	if err != nil {
 		return out, err
 	}
+	done()
 	// Time sits next to tokens: per item and for project overhead.
-	times, err := usageTimeReports(ctx, tx, task, q)
+	times, err := usageTimeReports(ctx, tx, task, q, stats)
 	if err != nil {
 		return out, err
 	}
@@ -407,13 +466,17 @@ func (s *Store) usageReport(ctx context.Context, task string, q api.UsageQuery, 
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
+	done = stats.stage(usageStageBudgets)
+	defer done()
+	budgets := usageCountingQuerier{tx, &stats.queries[usageStageBudgets]}
 	for _, k := range keys {
 		report := items[k].finish()
 		report.Time = times[report.ItemID]
 		// The budget is lifetime: the From/To filter never changes it.
-		if report.Budget, err = loadTokenBudget(ctx, tx, task, report.ItemID); err != nil {
+		if report.Budget, err = loadTokenBudget(ctx, budgets, task, report.ItemID); err != nil {
 			return out, err
 		}
+		stats.kept[usageStageBudgets]++
 		out.Items = append(out.Items, report)
 	}
 	return out, nil

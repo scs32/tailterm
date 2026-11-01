@@ -272,10 +272,12 @@ type usagePhaseCache struct {
 	reviews      map[string]api.ReviewConvergence
 	orderQueries int
 	messageLoads int
+	// stats is what the report read that owns this cache cost per stage.
+	stats *usageReadStats
 }
 
 func newUsagePhaseCache() *usagePhaseCache {
-	return &usagePhaseCache{orders: map[string][]usageOrder{}, messages: map[string]*api.Message{}, reviews: map[string]api.ReviewConvergence{}}
+	return &usagePhaseCache{orders: map[string][]usageOrder{}, messages: map[string]*api.Message{}, reviews: map[string]api.ReviewConvergence{}, stats: &usageReadStats{}}
 }
 func (c *usagePhaseCache) agentOrders(ctx context.Context, q queryRower, agent string) ([]usageOrder, error) {
 	if orders, ok := c.orders[agent]; ok {

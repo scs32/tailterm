@@ -491,7 +491,7 @@ func (s *waitSweep) cause(from time.Time) (string, *waitCandidate) {
 // usageTimeReports assembles, per item id ("" is project overhead), where
 // its wall time went. Everything is read from durable tables, so the report
 // is the same after close and restart and costs no agent turn.
-func usageTimeReports(ctx context.Context, tx *sql.Tx, task string, q api.UsageQuery) (map[string]*api.UsageTime, error) {
+func usageTimeReports(ctx context.Context, tx *sql.Tx, task string, q api.UsageQuery, stats *usageReadStats) (map[string]*api.UsageTime, error) {
 	clip := func(from, to time.Time) (time.Time, time.Time, bool) {
 		if !q.From.IsZero() && from.Before(q.From) {
 			from = q.From
@@ -512,6 +512,8 @@ func usageTimeReports(ctx context.Context, tx *sql.Tx, task string, q api.UsageQ
 		return items[item][agent]
 	}
 	cache, legacy := newUsagePhaseCache(), map[string][]api.MessageReference{}
+	done := stats.stage(usageStageSpans)
+	stats.queries[usageStageSpans]++
 	// Only this project's spans, by the (task_id,start_at) index.
 	rows, err := tx.QueryContext(ctx, `SELECT agent_id,run_id,payload,projection FROM usage_spans WHERE task_id=? ORDER BY start_at`, task)
 	if err != nil {
@@ -522,6 +524,7 @@ func usageTimeReports(ctx context.Context, tx *sql.Tx, task string, q api.UsageQ
 		if err = rows.Scan(&agent, &run, &payload, &encoded); err != nil {
 			break
 		}
+		stats.rows[usageStageSpans]++
 		var span api.UsageSpan
 		var projection usageSpanProjection
 		if err = json.Unmarshal([]byte(payload), &span); err != nil {
@@ -540,6 +543,7 @@ func usageTimeReports(ctx context.Context, tx *sql.Tx, task string, q api.UsageQ
 		if pieces, err = spanPhases(ctx, tx, agent, run, span, projection, evidence, cache); err != nil {
 			break
 		}
+		stats.kept[usageStageSpans]++
 		busy := spanUnion(append(append(append([][2]time.Time(nil), span.Tool...), span.Wait...), span.Mixed...))
 		for _, p := range pieces {
 			from, to, ok := clip(p.From, p.To)
@@ -578,6 +582,8 @@ func usageTimeReports(ctx context.Context, tx *sql.Tx, task string, q api.UsageQ
 		err = rows.Err()
 	}
 	rows.Close()
+	stats.queries[usageStageSpans] += cache.orderQueries + cache.messageLoads
+	done()
 	if err != nil {
 		return nil, err
 	}
@@ -585,11 +591,17 @@ func usageTimeReports(ctx context.Context, tx *sql.Tx, task string, q api.UsageQ
 	if len(items) == 0 {
 		return out, nil
 	}
+	done = stats.stage(usageStageWaits)
 	candidates, err := loadWaitCandidates(ctx, tx, task)
+	done()
 	if err != nil {
 		return nil, err
 	}
+	stats.queries[usageStageWaits] += 3
+	stats.rows[usageStageWaits] += len(candidates)
+	done = stats.stage(usageStageAgents)
 	names := map[string]string{}
+	stats.queries[usageStageAgents]++
 	rows, err = tx.QueryContext(ctx, `SELECT id,name FROM agents`)
 	if err != nil {
 		return nil, err
@@ -600,11 +612,13 @@ func usageTimeReports(ctx context.Context, tx *sql.Tx, task string, q api.UsageQ
 			break
 		}
 		names[id] = name
+		stats.rows[usageStageAgents]++
 	}
 	if err == nil {
 		err = rows.Err()
 	}
 	rows.Close()
+	done()
 	if err != nil {
 		return nil, err
 	}
