@@ -28,25 +28,128 @@ separate item (`wi_88d921fdf8ab454e`).
 
 ## Configure
 
-Two environment variables on the bridge (`hub/cmd/tailterm-discord`):
+The owner sets the bridge up in **TailOS Settings** (the **Settings** entry in
+the left nav, Discord section; `wi_dc04ac6a9ccf7402`). The hub keeps the five
+non-secret settings; the bridge (`hub/cmd/tailterm-discord`) reads them at
+start, with its environment variables as the fallback:
 
-| Variable | Meaning |
-| --- | --- |
-| `DISCORD_HELPER_TASK` | The project whose owner helper the owner talks with. Unset: the feature is off. |
-| `DISCORD_HELPER_CHANNEL` | Optional. A guild text channel for helper conversations. Without it, only the DM works. |
+| Setting (Settings field) | Environment fallback | Meaning |
+| --- | --- | --- |
+| `guildId` (Discord server ID) | `DISCORD_GUILD_ID` | The Discord server. Required. |
+| `ownerIds` (Owner user IDs) | `DISCORD_OWNER_IDS` | 1 to 25 Discord user IDs allowed to write and act. |
+| `helperTask` (Owner helper project) | `DISCORD_HELPER_TASK` | The project whose owner helper the owner talks with. Empty: the feature is off. |
+| `helperChannelId` (Helper channel ID) | `DISCORD_HELPER_CHANNEL` | Optional. A guild text channel for helper conversations; needs `helperTask`. Without it, only the DM works. |
+| `tailosUrl` (TailOS link) | `TAILOS_URL` | Optional `https://` link used in Discord cards. |
 
-With `DISCORD_HELPER_TASK` unset, the bridge behaves exactly as before. It asks
+`TAILTERM_HUB_URL`, `TAILTERM_BRIDGE_STATE`, `DISCORD_APPLICATION_ID` and the
+category names stay environment variables.
+
+**Tokens stay token files on the bridge host.** The bot token
+(`DISCORD_TOKEN_FILE`) and the bridge's hub token (`TAILTERM_BRIDGE_TOKEN_FILE`)
+are never entered into, shown by, stored in or sent through TailOS or the hub.
+Settings shows each only as **Configured** (**Configured on the bridge host**
+for the bot token) once the bridge has reported since the hub started, and
+**Not confirmed** otherwise. The bridge cannot start without both files, so a
+report means both were read; it does not prove Discord accepts the bot token.
+
+### Routes
+
+- `GET /v1/bridge/settings`: the owner's view, and the bridge credential's only
+  route here (the one `api.BridgeRoutes` entry this adds). The bridge adds its
+  report as query parameters (below).
+- `PUT /v1/bridge/settings` (owner only): `{settings, expectedRevision}`. A
+  stale `expectedRevision` answers 409 and saves nothing; an invalid value
+  answers 400 with the field's rule; unknown fields (such as a token) answer
+  400. The bridge credential gets 403, as on every other route it never had.
+
+### What the bridge runs on
+
+The whole saved record or none of it; fields are never mixed. At each start the
+bridge reads the record and decides, in order:
+
+1. No record, or a hub too old to have the route (403/404): the fallback below.
+2. A revision it already refused: the fallback. A refused revision is never
+   tried again; only a new save is.
+3. The previous start on this revision never reached Discord's READY and did
+   not record a failure (killed or stopped during start): refuse it
+   (`stopped-during-start`), then the fallback.
+4. Values the bridge cannot use: refuse it (`invalid`), then the fallback in the
+   same process.
+5. The guild guard (below) fails: refuse it (`guild-change`), then the fallback.
+6. Otherwise start on it. Before each start the bridge clears its "started"
+   marker and records the attempt; the first Gateway READY marks the revision
+   started and stores the values as the **last good** settings. If the start
+   fails before READY, the bridge records the refusal (`startup-failed`) and
+   exits; a SIGTERM before READY (a deploy restart) refuses nothing.
+
+The **fallback** is the first of these whose guild matches the bound guild (any
+of them while the bridge has no project channels): the last good settings, then
+the deployment environment values. If none matches, the bridge does **not**
+connect to Discord and does not exit: it stays **parked**, keeps reading and
+reporting, and Settings shows "Bridge is not connected: the guild changed; save
+the bound guild again or re-set up (move the bridge state dir aside)".
+
+The markers live in the bridge's own `bridge.sqlite` kv table
+(`settings:attempt`, `settings:started`, `settings:refused`,
+`settings:lastGood`, `guild`); there is no bridge schema change.
+
+### Report and restart pickup
+
+The bridge reads its settings at start and every 30 seconds, and each read
+carries a report of what it runs on: `source` (`hub`, `last-good`,
+`deployment` or `none`), the applied revision, the five values in use, and any
+refused revision with one fixed reason code. The reason is a code, never error
+text; the full error stays in the bridge log. The hub validates the report (400
+and nothing recorded when malformed) and keeps the last one **in memory only**,
+so a hub restart clears it and a leaked bridge token can change only what
+Settings shows as "Bridge is using", never a setting. If the values in use break a
+field rule (for example an `http://` `TAILOS_URL` in the environment), the
+bridge logs it and reads without a report, and Settings shows the bridge as not
+reported.
+
+Settings shows each field as **Saved in TailOS** beside **Bridge is using**,
+with the source line (hub revision N, last good saved settings, deployment
+values, or "refused revision N: reason").
+
+When a revision other than the applied and refused ones is saved, the bridge
+logs "bridge settings changed to revision N; restarting to apply" and exits
+normally; the service's `restart: unless-stopped` policy starts it again on
+the new revision, within about 30 seconds. Read errors are logged and ignored.
+To retry a refused revision, save again (Settings offers **Save again to
+retry** while the bridge reports the refusal, even with unchanged values).
+
+### Guild guard and re-setup
+
+Project channel mappings in the bridge state belong to one Discord server, the
+**bound guild** (kv `guild`). The bridge writes it before any loop starts on a
+configuration; a state from before this change, with mappings and no bound
+guild, binds to `DISCORD_GUILD_ID`. A saved record naming another guild is
+refused (`guild-change`) while any mapping exists, archived ones included, and
+the bridge keeps running on its bound guild (last good settings, else the
+deployment values when they match). With no mappings a new guild is accepted
+and becomes the bound guild. Changing the server ID in Settings asks for one
+confirmation; no other field does.
+
+**Re-setup** on a new server: stop the bridge service, move its state
+directory aside, and start it. With an empty state the new guild is accepted.
+The old server's channels are left as they are.
+
+### Helper conversation switch
+
+With no helper project (`helperTask`, or `DISCORD_HELPER_TASK` in the fallback), the bridge behaves exactly as before. It asks
 for no DM intent, registers no global commands, adds no `/digest`, runs no helper
 loops and handles no DMs. If an earlier enabled run left the DM commands
 registered, the next start clears them.
 
-The bridge refuses to start when:
+The bridge refuses a configuration when:
 
-- `DISCORD_HELPER_CHANNEL` is a project's mapped channel;
-- `DISCORD_HELPER_CHANNEL` is set without `DISCORD_HELPER_TASK`;
-- `DISCORD_HELPER_TASK` is not a project ID.
+- the helper channel is a project's mapped channel;
+- the helper channel is set without a helper project;
+- the helper project is not a project ID.
 
-This way a misconfiguration can't change project-channel behavior.
+On deployment values it refuses to start; a saved record is refused
+(`invalid`) and the bridge falls back. This way a misconfiguration can't change
+project-channel behavior.
 
 While it is on, the bridge:
 
@@ -57,7 +160,7 @@ While it is on, the bridge:
 - opens each owner's DM channel at startup, so DMs sent while the bridge was down
   are read later.
 
-The TrueNAS deployment plan sets `DISCORD_HELPER_TASK` and `DISCORD_HELPER_CHANNEL`
+The TrueNAS deployment plan sets the fallbacks `DISCORD_HELPER_TASK` and `DISCORD_HELPER_CHANNEL`
 through the optional plan fields `discordHelperTask` and `discordHelperChannelId`; see
 [Plan fields](broker-phase-2b.md#plan-fields) in `docs/broker-phase-2b.md`.
 

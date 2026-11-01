@@ -162,6 +162,10 @@
       "mode": "both"
     },
     {
+      "file": "tests/settings-browser.mjs",
+      "mode": "both"
+    },
+    {
       "file": "tests/speech-browser.mjs",
       "mode": "selected"
     },

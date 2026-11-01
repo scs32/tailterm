@@ -13,6 +13,8 @@ import { createWorkItemsView } from "./work-items-view.js";
 import { createQueueView } from "./queue-view.js";
 import "./work-items.css";
 import "./queue.css";
+import { createSettingsView, addSettingsNav } from "./settings-view.js";
+import "./settings.css";
 import { createFilesView } from "./files-view.js";
 import { normalizeTaskRef } from "./task-ref.js";
 import {
@@ -164,6 +166,7 @@ let taskHub = null,
   bugsView = null,
   featuresView = null,
   queueView = null,
+  settingsView = null,
   filesView = null;
 let discoveryPending = false;
 applyChrome(appearance);
@@ -685,6 +688,7 @@ function mount() {
           bugs: bugsView,
           features: featuresView,
           queue: queueView,
+          settings: settingsView,
         }[modes?.get()];
         if (view) {
           view.hide();
@@ -833,6 +837,11 @@ function mount() {
       configure: () => taskHub.configure(),
       intentPersistence: localVault.queueIntentPersistence(),
     });
+    settingsView = createSettingsView({
+      client: () => taskHub.viewClient(),
+      configure: () => taskHub.configure(),
+      confirm: confirmDialog,
+    });
     filesView = createFilesView({
       getServers: () => data.servers,
       currentServer,
@@ -890,6 +899,7 @@ function mount() {
         bugsView.hide();
         featuresView.hide();
         queueView.hide();
+        settingsView.hide();
         filesView.hide();
         agentsView.hide();
         teamsView.hide();
@@ -913,6 +923,9 @@ function mount() {
         } else if (mode === "teams") {
           teamsView.mount(view);
           teamsView.show();
+        } else if (mode === "settings") {
+          settingsView.mount(view);
+          void settingsView.show();
         } else if (mode === "files") {
           filesView.mount(view);
           filesView.show();
@@ -926,6 +939,7 @@ function mount() {
         }
       },
     });
+    addSettingsNav($(".sidebar-bottom"), () => modes.set("settings"));
     const featureRoute = location.hash.match(
       /^#feature-history\/(tsk_[0-9a-f]{16})\/(wi_[0-9a-f]{16})$/,
     );

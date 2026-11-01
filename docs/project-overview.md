@@ -670,6 +670,29 @@ This is one active local profile per browser origin. Separate encrypted profiles
 on the hub do **not** make the task/message API a multi-tenant workspace. The task
 hub currently uses one shared trusted-workspace credential.
 
+### Settings and the Discord bridge
+
+**Settings** is an entry in the left nav's bottom group (above Lock). It opens a
+view in the mode area; while it is open the entry shows selected and no header
+tab does, and choosing a header tab leaves it. The view is a list of titled
+sections rendered from one registry (`SECTIONS` in `client/settings-view.js`), so
+a later setting is one more entry. Its first section is **Discord**.
+
+The Discord section edits the bridge's five non-secret settings (server ID,
+owner user IDs, owner helper project, helper channel ID, TailOS link). The hub
+stores them as one revisioned record (`bridge_settings`): `GET /v1/bridge/settings`
+reads it, and `PUT /v1/bridge/settings` (owner only) saves it with a revision
+check (409 when stale, 400 when invalid). The bridge credential's allowlist
+(`api.BridgeRoutes`) gains only the GET, so a leaked bridge token still cannot
+change any setting. On that read the bridge reports what it runs on (source,
+revision, values, any refusal as a fixed code); the hub keeps the report in
+memory only, and Settings shows it beside the saved values. Both tokens stay
+token files on the bridge host and are shown only as configured or not; they
+are never entered, stored or sent through TailOS or the hub. The bridge restarts
+itself within about 30 seconds to apply a new save, falls back to its last good
+settings or its environment values when it refuses a revision, and guards the
+Discord server its channels belong to. See [Configure](discord-helper-chat.md#configure).
+
 ## Source map
 
 | Area                                               | Main locations                                                                                                             |
@@ -687,6 +710,7 @@ hub currently uses one shared trusted-workspace credential.
 | Durable state and migrations                       | `hub/internal/store/`                                                                                                      |
 | Host CLI and relay                                 | `hub/cmd/tt/`, especially `relay.go`, `cleanup.go`, `startup.go`                                                           |
 | Process/tmux creation and runtime adapters         | `hub/internal/spawn/`, `hub/internal/adapters/`                                                                            |
+| Settings view and Discord bridge settings          | `client/settings-view.js`, `client/modes.js`, `hub/internal/*/bridge_settings.go`, `hub/cmd/tailterm-discord/`             |
 | Vault/profile encryption and synchronization       | `client/local-vault.js`, profile-related client files, `hub/internal/server/profiles.go`, `hub/internal/store/profiles.go` |
 | WASM transport and SSH/SFTP extensions             | `wasm/`, `client/browser-ssh.js`, `scripts/build-wasm.sh`                                                                  |
 | Static release packaging and verification          | `scripts/package-static.mjs`, `scripts/release-manifest.mjs`, `scripts/verify-release.mjs`                                 |

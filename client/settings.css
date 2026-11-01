@@ -1,0 +1,139 @@
+/* TailOS Settings (wi_dc04ac6a9ccf7402). Selection is a fill, hover is an
+   outline; inputs and buttons share one height; placeholders are muted. */
+#workspace .sidebar-bottom #settings-nav {
+  box-shadow: none;
+}
+#workspace
+  .sidebar-bottom
+  #settings-nav:not([aria-pressed="true"]):is(:hover, :focus-visible) {
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+#workspace .sidebar-bottom #settings-nav[aria-pressed="true"] {
+  background: color-mix(in srgb, var(--accent) 25%, #063c2d);
+  color: #f3fff9;
+}
+#workspace
+  .sidebar-bottom
+  #settings-nav[aria-pressed="true"]:is(:hover, :focus-visible) {
+  background: color-mix(in srgb, var(--accent) 25%, #063c2d);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.settings-view {
+  --settings-control: 32px;
+  max-width: 920px;
+  padding: 20px 0 32px;
+}
+.settings-section {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+.settings-section > h3 {
+  margin: 0 0 6px;
+  font-size: 14px;
+}
+.settings-source {
+  margin: 0 0 10px;
+}
+.settings-reported {
+  color: var(--muted);
+}
+.settings-fields {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+.settings-fields th,
+.settings-fields td {
+  padding: 4px 10px 4px 0;
+  text-align: left;
+  vertical-align: middle;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.settings-fields thead th {
+  color: var(--muted);
+  font-weight: normal;
+  font-size: 11px;
+}
+.settings-fields th[scope="row"] {
+  width: 24%;
+  font-weight: normal;
+}
+.settings-fields td[data-effective] {
+  width: 32%;
+}
+.settings-unset {
+  color: var(--muted);
+}
+.settings-view input,
+.settings-view .settings-actions button {
+  box-sizing: border-box;
+  height: var(--settings-control);
+  min-height: var(--settings-control);
+  margin: 0;
+}
+.settings-view input {
+  width: 100%;
+  padding: 0 9px;
+}
+.settings-view .settings-actions button {
+  padding: 0 13px;
+  line-height: 1;
+}
+#workspace .settings-view input::placeholder {
+  color: var(--placeholder);
+  opacity: 1;
+}
+.settings-secrets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 24px;
+  margin: 12px 0 0;
+  font-size: 12px;
+}
+.settings-secrets div {
+  display: flex;
+  gap: 8px;
+}
+.settings-secrets dt {
+  color: var(--muted);
+}
+.settings-secrets dd {
+  margin: 0;
+}
+.settings-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.settings-actions [data-settings-saved] {
+  color: var(--muted);
+}
+.settings-status:empty {
+  display: none;
+}
+.settings-status[data-kind="error"] {
+  color: #ffb4a8;
+}
+@media (max-width: 700px) {
+  .settings-fields thead {
+    display: none;
+  }
+  .settings-fields tr {
+    display: grid;
+    grid-template-columns: 1fr;
+    padding: 6px 0;
+  }
+  .settings-fields th[scope="row"],
+  .settings-fields td[data-effective] {
+    width: auto;
+  }
+  .settings-fields td[data-effective]::before {
+    content: "Bridge is using: ";
+    color: var(--muted);
+  }
+}

@@ -33,6 +33,9 @@ type Server struct {
 	// admitted, when set by a test, runs while an admitted request holds its
 	// slot, so the test can keep that request in flight.
 	admitted func(key string, r *http.Request)
+	// bridgeReports is the Discord bridge's last settings report, in memory
+	// only (bridge_settings.go).
+	bridgeReports bridgeReports
 }
 
 func New(st *store.Store, identity Identity) *Server {
@@ -206,6 +209,8 @@ func New(st *store.Store, identity Identity) *Server {
 	m.HandleFunc("GET /v1/tasks/{id}/work-items/{wid}/narrative/reports/{report}/versions/{version}", s.getNarrativeReportVersion)
 	m.HandleFunc("GET /v1/tasks/{id}/work-items/{wid}/narrative/receipts/{requestID}", s.getNarrativeReceipt)
 	m.HandleFunc("GET /v1/events", s.globalEvents)
+	m.HandleFunc("GET /v1/bridge/settings", s.getBridgeSettings)
+	m.HandleFunc("PUT /v1/bridge/settings", s.putBridgeSettings)
 	return s
 }
 

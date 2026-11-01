@@ -46,6 +46,11 @@ type Config struct {
 	HelperChannel  string           // optional guild channel for helper conversations
 	Now            func() time.Time // digest clock; time.Now when nil
 	DigestInterval time.Duration    // digest tick, default 1 min
+
+	// Started, when set, runs once on the first Gateway READY: the bridge
+	// registered its commands and reached Discord on this configuration
+	// (main marks a saved settings revision as started).
+	Started func()
 }
 
 // Bridge mirrors the hub to Discord and Discord owner input to the hub.
@@ -70,6 +75,8 @@ type Bridge struct {
 	snapshots       map[string]projectSnapshot
 	titles          map[string]string
 	titlesForbidden bool
+
+	started sync.Once
 }
 
 // GatewayIntents are the Gateway intents the bridge asks for: guild
@@ -254,6 +261,9 @@ func (b *Bridge) Dispatch(d discord.Dispatch) {
 			}()
 		}
 	case "MESSAGE_CREATE", "READY", "RESUMED":
+		if d.Type == "READY" && b.cfg.Started != nil {
+			b.started.Do(b.cfg.Started)
+		}
 		select {
 		case b.events <- d:
 		default:

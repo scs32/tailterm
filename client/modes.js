@@ -11,6 +11,9 @@ export const MODES = [
   ["features", "Features", "8"],
   ["queue", "Queue", "9"],
 ];
+// Modes opened from a left-nav entry ([data-nav-mode]) instead of a header
+// tab. While one is open no header tab shows selected and its nav entry does.
+export const NAV_MODES = ["settings"];
 export function setupModes({ header, main, onChange, available = () => true }) {
   let current = "terminals";
   const control = document.createElement("div");
@@ -28,7 +31,8 @@ export function setupModes({ header, main, onChange, available = () => true }) {
   main.append(view);
   const shell = () => main.querySelector(".terminal-shell");
   function set(mode, { silent = false } = {}) {
-    if (!MODES.some(([id]) => id === mode) || !available(mode)) return current;
+    const known = MODES.some(([id]) => id === mode) || NAV_MODES.includes(mode);
+    if (!known || !available(mode)) return current;
     const changed = mode !== current;
     current = mode;
     for (const b of control.querySelectorAll("[data-mode]")) {
@@ -36,6 +40,8 @@ export function setupModes({ header, main, onChange, available = () => true }) {
       b.setAttribute("aria-pressed", on);
       b.setAttribute("aria-selected", on);
     }
+    for (const b of document.querySelectorAll("[data-nav-mode]"))
+      b.setAttribute("aria-pressed", b.dataset.navMode === mode);
     const terminals = mode === "terminals";
     if (shell()) shell().hidden = !terminals;
     view.hidden = terminals;

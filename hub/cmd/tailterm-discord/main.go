@@ -51,13 +51,6 @@ func main() {
 	}
 	hub.Token = secret("TAILTERM_BRIDGE_TOKEN_FILE")
 	token := secret("DISCORD_TOKEN_FILE")
-	guild := env("DISCORD_GUILD_ID", "")
-	var owners []string
-	for _, id := range strings.Split(env("DISCORD_OWNER_IDS", ""), ",") {
-		if id = strings.TrimSpace(id); id != "" {
-			owners = append(owners, id)
-		}
-	}
 	stateDir := env("TAILTERM_BRIDGE_STATE", "/state")
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		log.Fatalf("state dir: %v", err)
@@ -86,35 +79,37 @@ func main() {
 		}
 		app = me.ID // a bot's user ID is its application ID
 	}
-	// The owner helper conversation (docs/discord-helper-chat.md) is off
-	// unless DISCORD_HELPER_TASK names its project; only then does the
-	// bridge ask for direct messages.
-	helperTask := env("DISCORD_HELPER_TASK", "")
-	b, err := bridge.New(bridge.Config{
-		Hub: hub, Discord: client,
-		Gateway: &discord.Gateway{
-			Token:   token,
-			Intents: bridge.GatewayIntents(helperTask != ""),
-			URL:     client.GatewayURL,
-			Log:     log.Printf,
+	// Guild, owners, helper project and channel and the TailOS link come
+	// from the settings the owner saves in TailOS Settings, with these
+	// deployment values as the fallback (settings.go). The owner helper
+	// conversation (docs/discord-helper-chat.md) is off unless a helper
+	// project is set; only then does the bridge ask for direct messages.
+	runner := &settingsRunner{
+		Hub: hub, State: state, Env: envSettings(env),
+		Base: bridge.Config{
+			Hub: hub, Discord: client, AppID: app,
+			ActiveCategory:  env("DISCORD_ACTIVE_CATEGORY", "Tailterm projects"),
+			ArchiveCategory: env("DISCORD_ARCHIVE_CATEGORY", "Tailterm archive"),
+			State:           state,
+			Log:             log.Printf,
 		},
-		HelperTask:    helperTask,
-		HelperChannel: env("DISCORD_HELPER_CHANNEL", ""),
-		AppID:         app, GuildID: guild, Owners: owners,
-		ActiveCategory:  env("DISCORD_ACTIVE_CATEGORY", "Tailterm projects"),
-		ArchiveCategory: env("DISCORD_ARCHIVE_CATEGORY", "Tailterm archive"),
-		TailOSURL:       env("TAILOS_URL", ""),
-		State:           state,
-		Log:             log.Printf,
-	})
-	if err != nil {
+		Gateway: func(helper bool) *discord.Gateway {
+			return &discord.Gateway{
+				Token:   token,
+				Intents: bridge.GatewayIntents(helper),
+				URL:     client.GatewayURL,
+				Log:     log.Printf,
+			}
+		},
+		Log: log.Printf,
+	}
+	restart, err := runner.run(ctx)
+	if err != nil && !errors.Is(err, context.Canceled) {
 		log.Fatal(err)
 	}
-	log.Printf("discord bridge starting for guild %s with %d owner(s)", guild, len(owners))
-	if helperTask != "" {
-		log.Printf("discord bridge: owner helper conversation on for project %s", helperTask)
-	}
-	if err := b.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-		log.Fatal(err)
+	if restart {
+		// Exit normally; the service's restart policy starts the bridge
+		// again on the new revision.
+		return
 	}
 }

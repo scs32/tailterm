@@ -52,6 +52,9 @@ func migrate(db *sql.DB) error {
 	if err := migrateBridge(db); err != nil {
 		return err
 	}
+	if err := migrateBridgeSettings(db); err != nil {
+		return err
+	}
 	if err := migratePhase3(db); err != nil {
 		return err
 	}
