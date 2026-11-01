@@ -26,8 +26,9 @@ revisit or a filter change, the first page's rows show as soon as that page
 arrives, and later pages are added below them as they arrive. Meanwhile the status
 line says more items are still loading. A search covers the pages read so far
 and reports its matches "so far" rather than "no match". The status and project
-filters always ask the hub, so they cover every item. A filter change starts its
-own read at once, and rows of the earlier filter never return. A background refresh
+filters always ask the hub, so they cover every item. During a filter change,
+the read in flight finishes on its own filter without showing any more of its
+pages, and then the new filter is read. A background refresh
 keeps the complete list on screen until its replacement is complete. The read
 ends at an empty page, or at a page shorter than an earlier one, so a hub that
 pages below 200 still lists every item (bug `wi_782e0ea7627f9fca`; measurements
