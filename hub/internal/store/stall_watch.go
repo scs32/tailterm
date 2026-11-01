@@ -77,6 +77,13 @@ const (
 	// stallActivityGate marks a team episode about a handler gate: judged
 	// by the handler's silence, it ends only when the gate is gone.
 	stallActivityGate = "handler-gate"
+	// stallActivityHostQueued marks a gate episode opened while its host
+	// wait was still queued behind host work, whose notice asked for no
+	// record. It ends with stallCloseHostUnqueued once nothing is ahead
+	// without the wait moving up (a holder closed, exited or retired with no
+	// ending report), so the ordinary gate notice follows.
+	stallActivityHostQueued = "host-queued"
+	stallCloseHostUnqueued  = "host-queue-ended"
 
 	stallHelperSubject    = "The owner helper has gone quiet while it owes the owner"
 	stallTeamSubject      = "A running team has gone quiet"
@@ -1143,7 +1150,11 @@ func (v *stallView) decide(ctx context.Context, q queryRower, now time.Time) (st
 			if now.Sub(since) < stallWatchTeamQuiet {
 				continue
 			}
-			o := stallOpen{id: api.NewID("swe"), kind: stallKindTeam, subject: t.entry, item: t.item, activity: stallActivityGate, quietSince: since, recipient: stallRecipientHelper}
+			activity := stallActivityGate
+			if gate.queued() {
+				activity = stallActivityHostQueued
+			}
+			o := stallOpen{id: api.NewID("swe"), kind: stallKindTeam, subject: t.entry, item: t.item, activity: activity, quietSince: since, recipient: stallRecipientHelper}
 			plan.opens = append(plan.opens, route(o, since))
 			continue
 		}
@@ -1227,9 +1238,13 @@ func (v *stallView) ended(e stallEpisode, team *stallTeam, now time.Time, reads 
 	// A gate episode ends only when its gate is gone; an ordinary one ends
 	// when a gate takes over, which opens its own episode.
 	gate := team.handlerGate(now)
-	if e.activity == stallActivityGate {
-		if gate == nil {
+	if e.activity == stallActivityGate || e.activity == stallActivityHostQueued {
+		switch {
+		case gate == nil:
 			return "gate-cleared", nil
+		case e.activity == stallActivityHostQueued && !gate.queued():
+			// Its notice said host work was ahead; that is no longer so.
+			return stallCloseHostUnqueued, nil
 		}
 		return "", nil
 	}

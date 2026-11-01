@@ -2730,6 +2730,14 @@ func TestQueueWaitHandlerGatedMetTellsHandlerOnce(t *testing.T) {
 		if n := len(f.notices(t, f.handler, queueWaitHandlerMetSubject)); n != 1 {
 			t.Fatalf("%d handler notices after sweeps and a reopen", n)
 		}
+		// A sweep that read the wait as waiting before another tick met it
+		// writes and posts nothing: the write re-reads the state.
+		before := f.messageCount(t)
+		stale := queueWaitRow{task: f.task.ID, entry: f.waiting.ID, item: f.items[1].ID, onEntry: f.pred.ID, onItem: f.items[0].ID, onKind: api.TeamQueueWaitOnEntry,
+			until: api.TeamQueueWaitAccepted, state: api.TeamQueueWaitWaiting, reason: waitGate, resume: api.TeamQueueWaitResumeHandler, hasLead: true}
+		if step, err := f.s.queueWaitMet(f.ctx, stale, waitAccepted, "accepted", f.clock); err != nil || step != nil || f.messageCount(t) != before {
+			t.Fatalf("stale met: %+v %v, %d more messages", step, err, f.messageCount(t)-before)
+		}
 	})
 	t.Run("automatic", func(t *testing.T) {
 		f := newWaitFixture(t)

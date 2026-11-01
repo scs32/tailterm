@@ -2935,7 +2935,7 @@ func TestStallWatchHostWaitQueuedNamesItsPlace(t *testing.T) {
 		if loc := stallActionWords.FindStringIndex(text); loc != nil {
 			t.Fatalf("queued notice has the action word %q: %s", text[loc[0]:loc[1]], text)
 		}
-		if env.Refs["gate"] != "host" || env.Refs["gateOn"] != "host" || env.Refs["hostQueued"] != "true" || env.Refs["hostPosition"] != "2" || f.episodeActivity() != stallActivityGate {
+		if env.Refs["gate"] != "host" || env.Refs["gateOn"] != "host" || env.Refs["hostQueued"] != "true" || env.Refs["hostPosition"] != "2" || f.episodeActivity() != stallActivityHostQueued {
 			t.Fatalf("refs %v, activity %q", env.Refs, f.episodeActivity())
 		}
 		f.advance(30 * time.Minute)
@@ -2995,5 +2995,49 @@ func TestStallWatchHostWaitBoundRestartsWhenHolderLeaves(t *testing.T) {
 	want := fmt.Sprintf("a wait on host admission set at %s, last moved up the host queue at %s, past its 60 min bound at %s", setAt.Format(time.RFC3339), moved.Format(time.RFC3339), moved.Add(time.Hour).Format(time.RFC3339))
 	if !strings.Contains(env.Body.Text, want) || env.Refs["gate"] != "host" || env.Refs["hostQueued"] != "" || env.Refs["hostPosition"] != "" {
 		t.Fatalf("gate notice lacks %q: %s %v", want, env.Body.Text, env.Refs)
+	}
+}
+
+// wi_ec424e58eb611c2b h3 (review 53526 b1): when the holder ahead of a queued
+// host wait closes, exits or is retired without a report that ends its
+// matrix wait, the wait does not move up but nothing is ahead. The queued
+// episode, whose notice asked for no record, ends as host-queue-ended and the
+// same sweep sends the ordinary handler-gate notice with its four parts.
+func TestStallWatchHostWaitHolderGoneWithoutEndPages(t *testing.T) {
+	root := newStallFixture(t, stallNoon)
+	for _, gone := range []string{api.AgentClosed, api.AgentExited, api.AgentRetired} {
+		t.Run(gone, func(t *testing.T) {
+			f := root.project(t, stallNoon)
+			h := f.helper()
+			f.state(h, "idle")
+			entry := f.entry(0)
+			f.member("lead-a", 0)
+			holder := f.member("verifier-b", 1)
+			f.report(holder, stallMatrixRun(api.MatrixWaitRunning, f.now(), f.items[1].ID))
+			f.hostWaitOf(entry, 0)
+			setAt := f.now()
+			f.advance(90 * time.Minute)
+			if _, env, _ := f.one(stallActionTeam); env.Refs["hostQueued"] != "true" || f.episodeActivity() != stallActivityHostQueued {
+				t.Fatalf("not a queued episode: %s %q", env.Body.Text, f.episodeActivity())
+			}
+			f.advance(5 * time.Minute)
+			f.none("the holder still runs")
+			f.exec(`UPDATE agents SET status=? WHERE id=?`, gone, holder.ID)
+			delete(f.online, holder.ID)
+			_, env, to := f.one(stallActionTeam)
+			if to != h.ID {
+				t.Fatalf("gate notice to %s", to)
+			}
+			checkStallText(t, env.Body.Text)
+			want := fmt.Sprintf("a wait on host admission set at %s, past its 60 min bound at %s", setAt.Format(time.RFC3339), setAt.Add(time.Hour).Format(time.RFC3339))
+			if !strings.Contains(env.Body.Text, want) || env.Refs["gate"] != "host" || env.Refs["hostQueued"] != "" || env.Refs["hostPosition"] != "" || f.episodeActivity() != stallActivityGate {
+				t.Fatalf("gate notice lacks %q: %s %v %q", want, env.Body.Text, env.Refs, f.episodeActivity())
+			}
+			if n := f.count(`SELECT count(*) FROM stall_watch_episodes WHERE task_id=? AND close_reason=?`, f.task.ID, stallCloseHostUnqueued); n != 1 || f.open() != 1 {
+				t.Fatalf("%d host-queue-ended closes, %d open", n, f.open())
+			}
+			f.advance(30 * time.Minute)
+			f.none("the ordinary gate episode stays open")
+		})
 	}
 }

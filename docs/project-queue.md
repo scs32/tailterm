@@ -986,7 +986,9 @@ hold the host at a time. Its bound follows the host queue, not the clock alone
   names the place instead of an unknown cause: the position, the holder (item,
   agent and start), the lock waiters, the earlier host waits and `Paused for:
   REASON`, and asks for no incident record ([stall-watch.md, Handler
-  gate](stall-watch.md#handler-gate)).
+  gate](stall-watch.md#handler-gate)). If what was ahead goes without a move,
+  such as a holder that closed, exited or was retired with no ending report,
+  that episode ends and the ordinary handler-gate notice follows at once.
 - **With nothing ahead**, a wait past its bound is reported as before: once,
   to the owner helper and the primary handler, `A queue wait still needs the
   database handler's resume past its due time`. When the wait moved after it
@@ -996,9 +998,12 @@ hold the host at a time. Its bound follows the host queue, not the clock alone
 Only the handler's `wait clear` ends a host wait.
 
 Cost: one indexed read per tick, which returns nothing while no wait is open.
-A host wait past its first 60 minutes adds three reads per tick (the project's
-host waits, the waiting team's hosts and the runs on them) to the wait sweep
-and to the stall watch.
+A host wait past its first 60 minutes costs up to three more reads (the
+project's host waits, the waiting team's hosts and the runs on them; two when
+its team has no live member) in the wait sweep each tick, and the same three
+again inside the write when it reports. The stall watch makes the same reads
+for a running team with such a wait in each decision: once per tick, and once
+more inside the write for a project with something to write.
 A tick where nothing changes writes nothing and takes no write lock: a met
 condition whose entry has no lead yet is seen in that one read, and a wait to
 report while the project has no primary handler costs two more reads per
