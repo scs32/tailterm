@@ -18,8 +18,10 @@ package store
 // does, and stays open until the handler clears it. A pathless wait may also
 // wait on a release job (rel_ID) until its matrix departs or it settles, or
 // on host admission (the key "host"), which only the handler's clear ends and
-// which is reported the same way after queueWaitHostBound
-// (docs/stall-watch.md, "Handler gate").
+// which is reported the same way queueWaitHostBound after its last move up the
+// host queue, once nothing is ahead of it (hostQueue; docs/stall-watch.md,
+// "Handler gate"). A gated wait whose condition is met also tells the primary
+// handler at once, as the team now waits for it.
 
 import (
 	"context"
@@ -122,6 +124,9 @@ const (
 	queueWaitOrphanedSubject = "A shared path wait needs a handler decision"
 	queueWaitOverdueSubject  = "A team is idle after its shared path wait was met"
 	queueWaitGateSubject     = "A queue wait still needs the database handler's resume past its due time"
+	// queueWaitHandlerMetSubject tells the primary handler at once that a
+	// gated wait is met and its team waits for the handler's resume.
+	queueWaitHandlerMetSubject = "A handler-gated queue wait is met and its team waits for your resume"
 
 	queueWaitNoCommit = "none recorded"
 	// queueWaitMaxReason caps wait_clear's reason.
@@ -141,10 +146,235 @@ func queueWaitIdleBound() time.Duration {
 	return time.Duration(v) * time.Minute
 }
 
-// queueWaitHostBound is how long a wait on host admission may stay open
-// before the owner helper and the primary handler are told: the hub cannot
-// see the host lock, so the handler's silence is bounded by time.
+// queueWaitHostBound is how long a wait on host admission may go without
+// moving up in the host queue before the owner helper and the primary handler
+// are told. The bound restarts each time the wait moves up (hostQueue), so it
+// covers one step of the queue: about one matrix run.
 const queueWaitHostBound = 60 * time.Minute
+
+// hostQueueListed caps the earlier host waits and holders a notice names.
+const hostQueueListed = 3
+
+// hostQueue is what the hub stores about the queue a host wait stands in,
+// read without a clock (wi_ec424e58eb611c2b). The hub cannot read a host's
+// matrix lock file, but each host's relay reads it every 15 seconds and saves
+// every run's place in it as the run's matrixWait activity
+// (cmd/tt/matrix_wait_activity.go), and the activity report saves when a
+// run's wait ended (stall_watch_progress.wait_ended_at). The hub also keeps
+// every host wait of the project. Ahead of the wait are the project's host
+// waits set before it and every live lock run on the waiting team's hosts
+// that is not the waiting item's own: the waiting team has not joined the
+// lock, as it waits for the handler's admission first.
+type hostQueue struct {
+	setAt   time.Time
+	earlier []hostQueueWait // open host waits of the project set before this one
+	closed  []time.Time     // when host waits set before this one closed, after it was set
+	runs    []hostQueueRun  // runs on the waiting team's hosts with a saved matrix wait
+	ended   []time.Time     // when runs on those hosts left the lock, after the wait was set
+}
+
+type hostQueueWait struct {
+	entry, item string
+	setAt       time.Time
+}
+
+type hostQueueRun struct {
+	agent, name, status string
+	activity            *api.AgentActivity
+}
+
+// hostPlace is a host wait's place in its queue at one time.
+type hostPlace struct {
+	// position is 1 plus everything ahead.
+	position int
+	holders  []hostQueueRun // runs that hold the host, one per lock entry
+	waiters  int            // lock waiters, one per lock entry
+	earlier  []hostQueueWait
+	// movedAt is the wait's last move up: its set time, or the latest time
+	// something ahead of it left. due is movedAt plus queueWaitHostBound.
+	movedAt, due time.Time
+}
+
+// queued reports that something is still ahead of the wait.
+func (p hostPlace) queued() bool { return len(p.holders)+p.waiters+len(p.earlier) > 0 }
+
+// at places the wait in its queue at now. A run counts while its saved
+// matrix wait counts (matrixWaitCounts); a run's wait that outlived its bound
+// left the queue at the end of the bound, as liftedAt treats it. A holder
+// that closed or exited without an ending report no longer counts and moves
+// nothing.
+func (q hostQueue) at(now time.Time) hostPlace {
+	p := hostPlace{earlier: q.earlier, movedAt: q.setAt}
+	move := func(at time.Time) {
+		if at.After(p.movedAt) && !at.After(now) {
+			p.movedAt = at
+		}
+	}
+	for _, at := range q.closed {
+		move(at)
+	}
+	for _, at := range q.ended {
+		move(at)
+	}
+	// Members of one item can each report the same agentless lock entry.
+	type lockEntry struct {
+		who, role string
+		since     time.Time
+	}
+	seen := map[lockEntry]bool{}
+	for _, r := range q.runs {
+		w := r.activity.MatrixWait
+		if !matrixWaitCounts(r.status, r.activity, now) {
+			if r.status != api.AgentRetired {
+				move(matrixWaitStart(r.activity).Add(defaultQueueMatrixWaitBound))
+			}
+			continue
+		}
+		key := lockEntry{who: w.Item, role: w.Role, since: w.Since.UTC()}
+		if key.who == "" {
+			key.who = r.agent
+		}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		if w.Role == api.MatrixWaitRunning {
+			p.holders = append(p.holders, r)
+		} else {
+			p.waiters++
+		}
+	}
+	sort.Slice(p.holders, func(i, j int) bool {
+		return p.holders[i].activity.MatrixWait.Since.Before(p.holders[j].activity.MatrixWait.Since)
+	})
+	p.position = 1 + len(p.holders) + p.waiters + len(p.earlier)
+	p.due = p.movedAt.Add(queueWaitHostBound)
+	return p
+}
+
+// aheadText names what is ahead of a queued wait, its lists cut to
+// hostQueueListed so a notice body stays small.
+func (p hostPlace) aheadText() string {
+	var parts []string
+	for i, r := range p.holders {
+		if i == hostQueueListed {
+			parts = append(parts, fmt.Sprintf("%d more holder(s)", len(p.holders)-i))
+			break
+		}
+		w := r.activity.MatrixWait
+		run := "the host holder, agent " + r.name
+		if w.Item != "" {
+			run = fmt.Sprintf("the host holder %s (agent %s)", w.Item, r.name)
+		}
+		parts = append(parts, run+", running since "+w.Since.UTC().Format(time.RFC3339))
+	}
+	if p.waiters > 0 {
+		parts = append(parts, fmt.Sprintf("%d run(s) waiting in the host's matrix lock", p.waiters))
+	}
+	if n := len(p.earlier); n > 0 {
+		var waits []string
+		for i, w := range p.earlier {
+			if i == hostQueueListed {
+				waits = append(waits, fmt.Sprintf("and %d more", n-i))
+				break
+			}
+			waits = append(waits, fmt.Sprintf("entry %s (item %s, set at %s)", w.entry, w.item, w.setAt.UTC().Format(time.RFC3339)))
+		}
+		parts = append(parts, fmt.Sprintf("%d earlier host wait(s): %s", n, strings.Join(waits, ", ")))
+	}
+	return strings.Join(parts, "; ")
+}
+
+// readHostQueue reads the rows a host wait's queue is judged from, in three
+// reads, each read to its end before the next.
+func readHostQueue(ctx context.Context, q queryRower, task, entry, item, setAt string) (hostQueue, error) {
+	out := hostQueue{setAt: parseTS(setAt)}
+	// A time compared as text is cut to the second: RFC 3339 text with
+	// trimmed fractions does not sort within one second. The exact
+	// comparison is made in at.
+	floor := setAt
+	if len(floor) > 19 {
+		floor = floor[:19]
+	}
+	rows, err := q.QueryContext(ctx, `SELECT entry_id,item_id,set_at,state,closed_at FROM team_queue_waits
+ WHERE task_id=? AND on_kind=? AND entry_id<>? AND (state=? OR closed_at>=?)`, task, api.TeamQueueWaitOnHost, entry, api.TeamQueueWaitWaiting, floor)
+	if err != nil {
+		return out, err
+	}
+	for rows.Next() {
+		var w hostQueueWait
+		var set, state, closed string
+		if err := rows.Scan(&w.entry, &w.item, &set, &state, &closed); err != nil {
+			rows.Close()
+			return out, err
+		}
+		w.setAt = parseTS(set)
+		if !w.setAt.Before(out.setAt) && !(w.setAt.Equal(out.setAt) && w.entry < entry) {
+			continue // set after this wait: behind it
+		}
+		if state == api.TeamQueueWaitWaiting {
+			out.earlier = append(out.earlier, w)
+		} else if at := parseTS(closed); at.After(out.setAt) {
+			out.closed = append(out.closed, at)
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return out, err
+	}
+	sort.Slice(out.earlier, func(i, j int) bool {
+		a, b := out.earlier[i], out.earlier[j]
+		return a.setAt.Before(b.setAt) || (a.setAt.Equal(b.setAt) && a.entry < b.entry)
+	})
+	// The waiting team's hosts: where its live members run.
+	rows, err = q.QueryContext(ctx, `SELECT DISTINCT a.host FROM agent_work_item_bindings b JOIN agents a ON a.id=b.agent_id AND a.run_id=b.run_id
+ WHERE b.item_task_id=? AND b.item_id=? AND a.role<>? AND a.status NOT IN (?,?) AND a.host<>''`, task, item, api.AgentRoleDatabaseHandler, api.AgentClosed, api.AgentExited)
+	if err != nil {
+		return out, err
+	}
+	var hosts []any
+	for rows.Next() {
+		var host string
+		if err := rows.Scan(&host); err != nil {
+			rows.Close()
+			return out, err
+		}
+		hosts = append(hosts, host)
+	}
+	if err := rows.Close(); err != nil || len(hosts) == 0 {
+		return out, err
+	}
+	// Runs on those hosts, in any project, that are not the waiting item's:
+	// live ones of an open project with a saved matrix wait, and any whose
+	// wait ended after this wait was set.
+	in := strings.TrimSuffix(strings.Repeat("?,", len(hosts)), ",")
+	args := append(hosts, task, item, api.AgentClosed, api.AgentExited, floor)
+	rows, err = q.QueryContext(ctx, `SELECT a.id,a.name,a.status,t.status,COALESCE(x.payload,''),COALESCE(p.wait_ended_at,'') FROM agents a JOIN tasks t ON t.id=a.task_id
+ LEFT JOIN agent_activity x ON x.agent_id=a.id AND x.run_id=a.run_id
+ LEFT JOIN stall_watch_progress p ON p.agent_id=a.id AND p.run_id=a.run_id
+ WHERE a.host IN (`+in+`) AND NOT EXISTS(SELECT 1 FROM agent_work_item_bindings b WHERE b.agent_id=a.id AND b.run_id=a.run_id AND b.item_task_id=? AND b.item_id=?)
+ AND ((a.status NOT IN (?,?) AND x.payload LIKE '%"matrixWait"%') OR p.wait_ended_at>=?)`, args...)
+	if err != nil {
+		return out, err
+	}
+	for rows.Next() {
+		var r hostQueueRun
+		var project, payload, ended string
+		if err := rows.Scan(&r.agent, &r.name, &r.status, &project, &payload, &ended); err != nil {
+			rows.Close()
+			return out, err
+		}
+		if at := parseTS(ended); at.After(out.setAt) {
+			out.ended = append(out.ended, at)
+		}
+		if r.status == api.AgentClosed || r.status == api.AgentExited || project != api.TaskOpen {
+			continue
+		}
+		if r.activity = stallActivity(payload, false); r.activity != nil && r.activity.MatrixWait.Valid() {
+			out.runs = append(out.runs, r)
+		}
+	}
+	return out, rows.Close()
+}
 
 // queueWaitJobSettled reports a release job state the job never leaves
 // (api/releases.go, releaseSettled).
@@ -845,6 +1075,31 @@ func (s *Store) queueWaitMet(ctx context.Context, w queueWaitRow, commit, kind s
 		if err != nil {
 			return false, err
 		}
+		if w.gated() {
+			// The team now waits for the handler, so the handler is told at
+			// once, in the same transaction as the lead's notice and the met
+			// state: a repeated tick reads met and posts neither again. With
+			// no handler to tell, the overdue report is the backstop.
+			handler, err := queueWaitHandler(ctx, tx, task)
+			if err != nil {
+				return false, err
+			}
+			if handler.ID != "" {
+				held := "Paths now free: " + queueWaitPathsText(w.paths)
+				if w.pathless() {
+					held = "Paused for: " + w.reason
+				}
+				text := fmt.Sprintf("Queue entry %s (item %s) waited on %s until %s. That condition is now met. Commit: %s. %s. Its lead was told in message %d to stay paused until you resume the team. "+
+					"Action: run the gate's checks, then send the waiting lead its resume and clear the wait with tt team queue wait clear --task %s --entry %s --on %s, or clear it. "+
+					"Nothing was restarted or signalled.",
+					w.entry, w.item, w.onText(), w.untilText(), shown, held, seq, w.task, w.entry, w.onEntry)
+				handlerRefs := w.refs("queue_wait_handler_met")
+				handlerRefs["commit"], handlerRefs["resume"], handlerRefs["notice"] = refs["commit"], api.TeamQueueWaitResumeHandler, strconv.FormatInt(seq, 10)
+				if _, err := s.postQueueWaitNotice(ctx, tx, task, handler, queueWaitHandlerMetSubject, text, handlerRefs); err != nil {
+					return false, err
+				}
+			}
+		}
 		if _, err := tx.ExecContext(ctx, `UPDATE team_queue_waits SET state=?,met_at=?,met_commit=?,notice_seq=? WHERE task_id=? AND entry_id=? AND on_entry_id=?`,
 			api.TeamQueueWaitMet, ts(now), commit, seq, w.task, w.entry, w.onEntry); err != nil {
 			return false, err
@@ -1044,7 +1299,8 @@ func (s *Store) queueWaitIdle(ctx context.Context, w queueWaitRow, now time.Time
 
 // queueWaitGateDue reports a wait that only the database handler's resume
 // ends, once it is past its due time: a gated met wait at met_at plus the
-// idle bound, a host wait at set_at plus queueWaitHostBound. The team's posts
+// idle bound, a host wait queueWaitHostBound after its last move up the host
+// queue and only while nothing is ahead of it (hostQueue). The team's posts
 // and work do not matter: what is judged is the handler's silence. The report
 // goes once to the owner helper and the primary handler; the wait stays open
 // and listed, and only the handler's wait clear closes it. With neither to
@@ -1061,6 +1317,21 @@ func (s *Store) queueWaitGateDue(ctx context.Context, w queueWaitRow, now time.T
 	if now.Sub(since) < bound {
 		return nil, nil
 	}
+	// A host wait is due a bound after its last move up the host queue, and
+	// only once nothing is ahead of it: while it is queued the handler's
+	// silence is the queue's, not the handler's. Nothing is written then.
+	var moved time.Time
+	if host {
+		hq, err := readHostQueue(ctx, s.db, w.task, w.entry, w.item, w.setAt)
+		if err != nil {
+			return nil, err
+		}
+		place := hq.at(now)
+		if place.queued() || now.Before(place.due) {
+			return nil, nil
+		}
+		moved = place.movedAt
+	}
 	// With no one to tell, nothing is locked or written.
 	if handler, helper, err := tellers(w.task); err != nil || (!handler && !helper) {
 		return nil, err
@@ -1071,6 +1342,18 @@ func (s *Store) queueWaitGateDue(ctx context.Context, w queueWaitRow, now time.T
 		if err := tx.QueryRowContext(ctx, `SELECT helper_seq,handler_seq FROM team_queue_waits WHERE task_id=? AND entry_id=? AND on_entry_id=?`, w.task, w.entry, w.onEntry).Scan(&helperSeq, &handlerSeq); err != nil || helperSeq != 0 || handlerSeq != 0 {
 			return false, err
 		}
+		if host {
+			// The queue is judged again in the write: it may have moved.
+			hq, err := readHostQueue(ctx, tx, w.task, w.entry, w.item, w.setAt)
+			if err != nil {
+				return false, err
+			}
+			place := hq.at(now)
+			if place.queued() || now.Before(place.due) {
+				return false, nil
+			}
+			moved = place.movedAt
+		}
 		held := "Paths free"
 		if w.pathless() {
 			held = "Paused for"
@@ -1079,6 +1362,11 @@ func (s *Store) queueWaitGateDue(ctx context.Context, w queueWaitRow, now time.T
 		text := fmt.Sprintf("Queue entry %s (item %s) has waited on host admission since %s, %d minutes or more, and the wait is still open: the database handler has not resumed the team or cleared the wait. ",
 			w.entry, w.item, w.setAt, minutes)
 		refs := w.refs("queue_wait_gate")
+		if host && moved.After(parseTS(w.setAt)) {
+			text = fmt.Sprintf("Queue entry %s (item %s) has waited on host admission since %s and last moved up the host queue at %s. %d minutes or more after that move nothing is ahead of it and the wait is still open: the database handler has not resumed the team or cleared the wait. ",
+				w.entry, w.item, w.setAt, ts(moved), minutes)
+			refs["movedAt"] = ts(moved)
+		}
 		if !host {
 			commit := w.metCommit
 			if commit == "" {

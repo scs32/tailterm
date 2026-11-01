@@ -762,7 +762,11 @@ tt team queue wait set --entry tqe_WAITING --on tqe_PREDECESSOR \
   --owns PATH [--owns PATH...] --until accepted|done|released [--resume handler]
 tt team queue wait set --entry tqe_WAITING --on tqe_PREDECESSOR \
   --reason TEXT --until accepted|done|released [--resume handler]
-tt team queue wait clear --entry tqe_WAITING --on tqe_PREDECESSOR [--reason TEXT]
+tt team queue wait set --entry tqe_WAITING --on rel_JOB \
+  --reason TEXT --until departed|settled [--resume handler]
+tt team queue wait set --entry tqe_WAITING --on host \
+  --reason TEXT [--until handler] [--resume handler]
+tt team queue wait clear --entry tqe_WAITING --on tqe_PREDECESSOR|rel_JOB|host [--reason TEXT]
 ```
 
 A requested pause that shares no path, such as a quiet host while a
@@ -782,6 +786,15 @@ is refused and asks the handler. `--until` names the resume condition:
 | `accepted` | the predecessor entry has a saved acceptance | the accepted commit |
 | `done` | the predecessor's item is saved done | the accepted commit when there is one, else `none recorded` |
 | `released` | the predecessor entry's latest release job is `released` | the integrated commit of that job, else its commit |
+| `departed` (`--on rel_JOB`) | the job's matrix departed: its integrated matrix result is in, or it merged, blocked or settled; a job reset to verified has not departed | the job's integrated commit; for a released job, its commit; else `none recorded` |
+| `settled` (`--on rel_JOB`) | the job settled: released, refused, rolled back or superseded | as for `departed` |
+| `handler` (`--on host`) | never: only the handler's `wait clear` ends a host wait | none |
+
+A wait on a release job or on host admission names a reason, never paths, and
+the hub reads the job's item from the job. A release wait is refused when the
+job is not one of the project's or has already met the condition. A host wait's
+condition and resume are both `handler`, whether given or omitted; any other
+`--until` or `--resume` on it is refused.
 
 The hub refuses a wait of an entry on itself, a predecessor that is not an
 entry of this project, a condition outside the three, neither a path nor a
@@ -814,9 +827,12 @@ paused and do not start on the notice. It never says to resume the paused
 work. After its checks the handler sends its own resume message to the lead
 and ends the wait with `wait clear`. Team activity never ends a gated wait: it
 stays met, and the listing keeps saying `until the database handler resumes
-it`, until the handler clears it. An open wait also keeps the stall watch from
-reporting the team as quiet, so the handler clears the wait when it resumes
-the team.
+it`, until the handler clears it. The stall watch counts an open wait as a
+planned wait, except a handler gate: a gated wait once its condition is met,
+and a host wait past its bound, are judged by the handler's silence, so the
+team is reported 30 minutes after the gate opens unless the handler clears the
+wait ([stall-watch.md, Handler gate](stall-watch.md#handler-gate)). The handler
+clears the wait when it resumes the team.
 
 These are separate pieces of evidence, and none stands in for another: the
 predecessor's acceptance, done save or release (the condition), a physical
@@ -860,6 +876,16 @@ HELD until CONDITION, then a handler resume`, then `wait on ITEM met
 resumes it`, or for paths `wait on ITEM met (CONDITION, commit SHA): the
 database handler resumes the team before it edits PATHS`.
 
+A release wait names the job: `waits on release rel_JOB (item ITEM) for
+REASON until its matrix departs` (or `until it settles`), with `, then a
+handler resume` when gated; once met, `wait on release rel_JOB met
+(CONDITION, commit SHA): resume the work paused for REASON`, or when gated
+`wait on release rel_JOB met (CONDITION, commit SHA): still paused for REASON
+until the database handler resumes it`; and `wait on release rel_JOB needs a
+handler decision: REASON` when the job was removed. A host wait reads `waits
+on host admission for REASON until the database handler resumes it` until the
+handler clears it; it is never met or orphaned.
+
 The sentence names the first path and then whole paths up to about 300 bytes,
 then `and N more`, so a wait with many paths keeps `blockReason` small (a stall
 notice carries that reason in a 4 KiB body). `waits[].paths` always lists
@@ -887,7 +913,17 @@ a repeated tick or a restarted hub posts nothing twice.
   but the handler must still resume this team` and refs `resume=handler`; it
   says the wait also needs an explicit resume from the database handler and
   not to start on the notice, and a path wait rebases only once the handler
-  resumes the team. It has no resume imperative.
+  resumes the team. It has no resume imperative. In the same transaction the
+  primary handler gets one directed NOTICE, `A handler-gated queue wait is met
+  and its team waits for your resume`, so its relay wakes it at once
+  (`wi_ec424e58eb611c2b`). It names the entry, item, predecessor, condition,
+  commit and paths or `Paused for: REASON`, and the lead's notice number, and
+  asks for the gate's checks, the resume to the lead and the `wait clear`. Its
+  refs are `activity=queue_wait_handler_met`, `resume=handler`, `commit` and
+  `notice` (the lead's). The met state commits with both notices, so a
+  repeated tick or a restarted hub posts neither again. With no primary
+  handler to tell, the lead is still told and the gated wait's report below
+  is the backstop. An automatic wait does not tell the handler.
 - **Idle after met.** If no member of the waiting team posts after that
   notice and every live member is done or idle for the bound, with none
   waiting for or holding the matrix host (the stall check's member rule), the
@@ -921,7 +957,48 @@ a repeated tick or a restarted hub posts nothing twice.
 `released` is judged once: a release that is rolled back after the notice is
 not evaluated again.
 
+### Host admission waits
+
+A host wait (`--on host`) holds a team until the database handler admits it to
+the verification host, for example while memory pressure lets one matrix run
+hold the host at a time. Its bound follows the host queue, not the clock alone
+(`wi_ec424e58eb611c2b`):
+
+- **Ahead of the wait** are the project's host waits set before it (by set
+  time, then entry) that are still open, and every live run of an open project
+  on the waiting team's hosts, other than the waiting item's own, whose saved
+  matrix wait still counts: the holder (`running`) and the lock's waiters. The
+  hub reads no lock file: each host's relay saves every run's place in the
+  host's matrix lock as its `matrixWait` activity, and the activity report
+  saves when a run's wait ended ([agent-activity.md](agent-activity.md)). The
+  waiting team has not joined the lock, so every lock run is ahead of it. One
+  lock entry reported by several members counts once. A run that closed or
+  exited, or was retired, no longer counts.
+- **Position** is one plus what is ahead.
+- **The bound restarts on each move up.** The wait moves up when something
+  ahead leaves: an earlier host wait closes, a run's matrix wait ends, or a
+  run's saved wait passes its 4 h 30 min bound. The 60 minute bound runs from
+  the latest of the set time and those moves, so it covers one step of the
+  queue, about one matrix run. A holder that closed or exited without an
+  ending report moves nothing.
+- **While anything is ahead**, the wait sweep reports nothing, however long
+  the wait, and writes nothing. Past its bound the stall watch's team notice
+  names the place instead of an unknown cause: the position, the holder (item,
+  agent and start), the lock waiters, the earlier host waits and `Paused for:
+  REASON`, and asks for no incident record ([stall-watch.md, Handler
+  gate](stall-watch.md#handler-gate)).
+- **With nothing ahead**, a wait past its bound is reported as before: once,
+  to the owner helper and the primary handler, `A queue wait still needs the
+  database handler's resume past its due time`. When the wait moved after it
+  was set, the report names that time and carries a `movedAt` ref. The stall
+  watch's handler-gate notice follows 30 minutes later.
+
+Only the handler's `wait clear` ends a host wait.
+
 Cost: one indexed read per tick, which returns nothing while no wait is open.
+A host wait past its first 60 minutes adds three reads per tick (the project's
+host waits, the waiting team's hosts and the runs on them) to the wait sweep
+and to the stall watch.
 A tick where nothing changes writes nothing and takes no write lock: a met
 condition whose entry has no lead yet is seen in that one read, and a wait to
 report while the project has no primary handler costs two more reads per

@@ -78,7 +78,7 @@ For a team:
 | Case | What the hub reads |
 | --- | --- |
 | owner pause | the project is paused or closed |
-| shared-path wait | the entry has a wait in state `waiting`, `met` or `orphaned` that is not a handler gate: a handler-gated `met` wait is a gate, and a host wait is planned only for its first 60 min (see [Handler gate](#handler-gate)) |
+| shared-path wait | the entry has a wait in state `waiting`, `met` or `orphaned` that is not a handler gate: a handler-gated `met` wait is a gate, and a host wait is planned only until 60 min after it was set or last moved up the host queue (see [Handler gate](#handler-gate)) |
 | held entry | the entry has a token budget hold in state `held` |
 | open owner decision | a member's run has an unanswered `tt ask` |
 | working | a member's effective state is `working` |
@@ -121,24 +121,25 @@ These times are compared to the second.
 
 ### Handler gate
 
-A **handler gate** is an open queue wait that only the database handler's explicit resume ends: a handler-gated wait (`--resume handler`) whose condition is met, or a wait on host admission that has passed its 60 minute bound. Its team is waiting for the handler, not for itself, so the watch judges the handler's silence:
+A **handler gate** is an open queue wait that only the database handler's explicit resume ends: a handler-gated wait (`--resume handler`) whose condition is met, or a wait on host admission that has passed its 60 minute bound, which restarts each time the wait moves up the host queue ([project-queue.md, Host admission waits](project-queue.md#host-admission-waits)). Its team is waiting for the handler, not for itself, so the watch judges the handler's silence:
 
 - The gate is not a planned wait and keeps nothing quiet. While no planned wait or held entry is open, the team is judged by the gate alone: its members' posts, `working` reports, matrix waits, owner decisions and owner-gated obligations neither keep it from being quiet nor move "team quiet since".
 - Team quiet since is the latest of the admission, the project's last resume, the last close of a wait or hold, and the gate's opening: the met time, or for a host wait the end of its bound. When two gates are open, the newer one counts.
-- 30 minutes after that, one team notice opens an episode with activity `handler-gate`, sent by the usual routing (the helper, or the owner). It names the gate: the predecessor's kind and key, its item, the condition, the met time and the wait notice number, or for a host wait its set time and the end of its bound. Its refs carry `gate`, `gateOn` and `gateNotice`. Its next step asks the database handler to run the gate's checks, then send the waiting lead its resume and clear the wait, or clear it.
+- 30 minutes after that, one team notice opens an episode with activity `handler-gate`, sent by the usual routing (the helper, or the owner). It names the gate: the predecessor's kind and key, its item, the condition, the met time and the wait notice number, or for a host wait its set time, its last move up the host queue when it moved, and the end of its bound. Its refs carry `gate`, `gateOn` and `gateNotice`. Its next step asks the database handler to run the gate's checks, then send the waiting lead its resume and clear the wait, or clear it.
+- **A host wait still queued.** When host work is still ahead of a host wait past its bound (a holder that has run for 60 minutes or more since the wait last moved, lock waiters, or earlier host waits), the notice says so instead: the position, the holder ahead (item, agent and start), the number of lock waiters, the earlier host waits (the first three, then a count), `Paused for: REASON` with the wait's saved reason, and that the bound starts again each time the queue moves. It carries neither the unknown cause nor the record-first sentence and says no incident record is asked for: the wait is planned, with a saved reason. Its refs add `hostQueued=true` and `hostPosition`. When the holder leaves, the wait moves up, its bound restarts and the episode ends as a planned wait (`shared-path-wait`); the ordinary handler-gate notice needs the full bound and 30 minutes more.
 - A member's post never ends a gate episode. It ends with close reason `gate-cleared` when the handler's `tt team queue wait clear` removes the gate, and, as any episode, when the entry stops running, the project pauses, or a planned wait or a hold opens. An ordinary episode that is open when a gate opens ends with close reason `handler-gate`. After the clear, a new episode needs a full 30 minutes from it.
 - An owner pause, a held entry and a team with no member still keep the watch silent, and the hold after a hub start still applies.
 
-The wait sweep reports the same gate from its own side, once, to the owner helper and the primary handler: a gated met wait 15 minutes after its met time (`TAILTERM_QUEUE_WAIT_IDLE_MINUTES`), a host wait 60 minutes after it was set. The report goes out whatever the team does, and the wait stays open and listed. So a silent handler gets that report first and the team notice 15 or 30 minutes later; the two reach different roles on purpose.
+The wait sweep reports the same gate from its own side, once, to the owner helper and the primary handler: a gated met wait 15 minutes after its met time (`TAILTERM_QUEUE_WAIT_IDLE_MINUTES`), a host wait 60 minutes after it was set or last moved up the host queue, and only once nothing is ahead of it. The report goes out whatever the team does, and the wait stays open and listed. So a silent handler gets that report first and the team notice 15 or 30 minutes later; the two reach different roles on purpose.
 
 Two waits exist for teams held behind something other than a queue entry. Both name a reason, never paths:
 
 | Wait | Set with | Planned while | Then |
 | --- | --- | --- | --- |
 | release job | `tt team queue wait set --entry tqe_WAITING --on rel_JOB --reason TEXT --until departed\|settled [--resume handler]` | the job's matrix has not departed (`departed`: the integrated matrix result is in, or the job merged, blocked or settled; a job reset to verified has not departed) or the job has not settled (`settled`: released, refused, rolled back or superseded) | the waiting lead is told once. An automatic wait then follows the shared-path rule and this watch counts from its close; a gated one is a handler gate. A removed job orphans the wait to the handler |
-| host admission | `tt team queue wait set --entry tqe_WAITING --on host --reason TEXT` | it was set less than 60 minutes ago | it is never met: it is a handler gate until the handler clears it |
+| host admission | `tt team queue wait set --entry tqe_WAITING --on host --reason TEXT` | it was set, or last moved up the host queue, less than 60 minutes ago | it is never met: it is a handler gate until the handler clears it |
 
-A host wait's condition and resume are both `handler`, whether given or omitted. The hub cannot see the host lock, so the 60 minute bound stands in for the handler's check.
+A host wait's condition and resume are both `handler`, whether given or omitted. The hub reads no lock file, but each relay saves its runs' places in the host's matrix lock, so the hub knows what is ahead of a host wait: earlier host waits of the project and the live lock runs on the waiting team's hosts ([project-queue.md, Host admission waits](project-queue.md#host-admission-waits)). The 60 minute bound covers one step of that queue and stands in for the handler's check once nothing is ahead.
 
 ## After a hub start
 
@@ -189,6 +190,8 @@ Every notice has four parts, in this order:
 2. "The hub does not know why it stopped. It typed, restarted and resumed nothing."
 3. "Before resuming, record why it stopped (the recovery prime directive: cause, incident, prevention)."
 4. One suggestion, introduced by "Once that is recorded, the usual next step for this state is:".
+
+One team notice is the exception: a host wait still queued behind host work names its place, the holder and its saved reason in place of parts 2 to 4, and asks for no record ([Handler gate](#handler-gate)).
 
 No notice names a cause that the state does not prove. As whole words, restart, resume, prompt and Escape appear only in part 4, after that condition.
 

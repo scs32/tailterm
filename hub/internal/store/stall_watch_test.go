@@ -2887,3 +2887,113 @@ func TestStallWatchReleaseAndHostWaitPlannedThenGate(t *testing.T) {
 		}
 	})
 }
+
+// hostWaitOf records an open host wait of entry for item i, set now.
+func (f *stallFixture) hostWaitOf(entry string, i int) {
+	f.t.Helper()
+	f.exec(`INSERT INTO team_queue_waits(task_id,entry_id,item_id,on_entry_id,on_item_id,paths_json,on_kind,until,state,set_at,reason,resume) VALUES(?,?,?,'host','','[]','host','handler','waiting',?,'a quiet host','handler')`,
+		f.task.ID, entry, f.items[i].ID, ts(f.now()))
+}
+
+// wi_ec424e58eb611c2b h2: a host wait past its bound while host work is still
+// ahead of it gets a team notice that names its place, the holder and the
+// saved reason, with no unknown cause and no incident record asked for.
+func TestStallWatchHostWaitQueuedNamesItsPlace(t *testing.T) {
+	root := newStallFixture(t, stallNoon)
+	t.Run("behind the holder", func(t *testing.T) {
+		f := root.project(t, stallNoon)
+		h := f.helper()
+		f.state(h, "idle")
+		entry := f.entry(0)
+		f.member("lead-a", 0)
+		holder := f.member("verifier-b", 1)
+		holderSince := f.now()
+		f.report(holder, stallMatrixRun(api.MatrixWaitRunning, holderSince, f.items[1].ID))
+		f.hostWaitOf(entry, 0)
+		setAt := f.now()
+		f.advance(60 * time.Minute)
+		f.none("the host bound has just passed")
+		f.advance(29 * time.Minute)
+		f.none("29 minutes after the bound")
+		f.advance(time.Minute)
+		_, env, to := f.one(stallActionTeam)
+		text := env.Body.Text
+		if to != h.ID {
+			t.Fatalf("queued notice to %s", to)
+		}
+		for _, want := range []string{entry, f.items[0].ID, "waits for host admission at position 2", "the host holder " + f.items[1].ID + " (agent verifier-b), running since " + holderSince.Format(time.RFC3339),
+			"Paused for: a quiet host.", "has not moved since " + setAt.Format(time.RFC3339), "passed at " + setAt.Add(time.Hour).Format(time.RFC3339), "no incident record is asked for"} {
+			if !strings.Contains(text, want) {
+				t.Fatalf("queued notice lacks %q: %s", want, text)
+			}
+		}
+		for _, unwanted := range []string{stallUnknownCause, stallRecordFirst, stallNextStep} {
+			if strings.Contains(text, unwanted) {
+				t.Fatalf("queued notice says %q: %s", unwanted, text)
+			}
+		}
+		if loc := stallActionWords.FindStringIndex(text); loc != nil {
+			t.Fatalf("queued notice has the action word %q: %s", text[loc[0]:loc[1]], text)
+		}
+		if env.Refs["gate"] != "host" || env.Refs["gateOn"] != "host" || env.Refs["hostQueued"] != "true" || env.Refs["hostPosition"] != "2" || f.episodeActivity() != stallActivityGate {
+			t.Fatalf("refs %v, activity %q", env.Refs, f.episodeActivity())
+		}
+		f.advance(30 * time.Minute)
+		f.none("the queued gate episode stays open")
+		if f.open() != 1 {
+			t.Fatalf("%d open episodes", f.open())
+		}
+	})
+	t.Run("behind an earlier host wait", func(t *testing.T) {
+		f := root.project(t, stallNoon)
+		h := f.helper()
+		f.state(h, "idle")
+		earlier := f.entry(1)
+		f.hostWaitOf(earlier, 1)
+		earlierAt := f.now()
+		f.advance(time.Minute)
+		entry := f.entry(0)
+		f.member("lead-a", 0)
+		f.hostWaitOf(entry, 0)
+		f.advance(90 * time.Minute)
+		_, env, _ := f.one(stallActionTeam)
+		want := fmt.Sprintf("1 earlier host wait(s): entry %s (item %s, set at %s)", earlier, f.items[1].ID, earlierAt.Format(time.RFC3339))
+		if !strings.Contains(env.Body.Text, "at position 2") || !strings.Contains(env.Body.Text, want) || strings.Contains(env.Body.Text, stallUnknownCause) || env.Refs["hostPosition"] != "2" {
+			t.Fatalf("queued notice lacks %q: %s %v", want, env.Body.Text, env.Refs)
+		}
+	})
+}
+
+// wi_ec424e58eb611c2b h1 and h3: when the holder ahead leaves, the queued gate
+// episode ends as a planned wait and the bound restarts from that move; once
+// it passes with nothing ahead, the team notice is today's handler gate, with
+// the four parts.
+func TestStallWatchHostWaitBoundRestartsWhenHolderLeaves(t *testing.T) {
+	f := newStallFixture(t, stallNoon)
+	h := f.helper()
+	f.state(h, "idle")
+	entry := f.entry(0)
+	f.member("lead-a", 0)
+	holder := f.member("verifier-b", 1)
+	f.report(holder, stallMatrixRun(api.MatrixWaitRunning, f.now(), f.items[1].ID))
+	f.hostWaitOf(entry, 0)
+	setAt := f.now()
+	f.advance(90 * time.Minute)
+	if _, env, _ := f.one(stallActionTeam); env.Refs["hostQueued"] != "true" {
+		t.Fatalf("not a queued notice: %s", env.Body.Text)
+	}
+	f.advance(5 * time.Minute)
+	moved := f.now()
+	f.report(holder, api.AgentActivity{State: "idle"})
+	f.none("the holder left")
+	f.closed("shared-path-wait")
+	f.advance(60*time.Minute + 29*time.Minute)
+	f.none("29 minutes after the restarted bound")
+	f.advance(time.Minute)
+	_, env, _ := f.one(stallActionTeam)
+	checkStallText(t, env.Body.Text)
+	want := fmt.Sprintf("a wait on host admission set at %s, last moved up the host queue at %s, past its 60 min bound at %s", setAt.Format(time.RFC3339), moved.Format(time.RFC3339), moved.Add(time.Hour).Format(time.RFC3339))
+	if !strings.Contains(env.Body.Text, want) || env.Refs["gate"] != "host" || env.Refs["hostQueued"] != "" || env.Refs["hostPosition"] != "" {
+		t.Fatalf("gate notice lacks %q: %s %v", want, env.Body.Text, env.Refs)
+	}
+}

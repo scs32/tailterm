@@ -1603,7 +1603,8 @@ func TestQueueWaitHandlerResumeMetNamesTheGate(t *testing.T) {
 	if steps := f.sweep(t); len(steps) != 1 || steps[0] != "wait-met" {
 		t.Fatalf("steps at acceptance: %v", steps)
 	}
-	if posted := f.messageCount(t) - before; posted != 1 {
+	// The lead's notice and the handler's (wi_ec424e58eb611c2b h5).
+	if posted := f.messageCount(t) - before; posted != 2 || len(f.notices(t, f.handler, queueWaitHandlerMetSubject)) != 1 {
 		t.Fatalf("%d messages posted at acceptance", posted)
 	}
 	if got := f.notices(t, f.lead, queueWaitMetSubject); len(got) != 0 {
@@ -2449,4 +2450,324 @@ func TestQueueWaitOnKindMigrates(t *testing.T) {
 			}
 		})
 	}
+}
+
+// hostRun adds a live agent on host that is not bound to the waiting item, as
+// another team's run in the host's matrix lock is.
+func (f *waitFixture) hostRun(t *testing.T, name, host string) api.Agent {
+	t.Helper()
+	a, err := f.s.AddAgent(f.ctx, f.task.ID, api.AddAgentRequest{Name: name, AgentID: api.NewID("agt"), Host: host, Session: name}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.exec(t, `UPDATE agents SET status='running',last_seen_at=? WHERE id=?`, ts(f.clock), a.ID)
+	return a
+}
+
+// lockReport saves the run's place in the host's matrix lock at the fixture
+// clock, as its relay reports it; a nil wait ends the run's place.
+func (f *waitFixture) lockReport(t *testing.T, a api.Agent, w *api.MatrixWait) {
+	t.Helper()
+	activity := api.AgentActivity{State: "idle", ObservedAt: f.clock, MatrixWait: w}
+	if _, err := f.s.ReportActivity(f.ctx, f.task.ID, a.ID, api.ActivityReport{RequestID: api.NewID("req"), RunID: a.RunID, Activity: activity}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// hostSweep runs one wait sweep and returns the waiting entry's actions; a
+// step for another entry's wait is left to its own test.
+func (f *waitFixture) hostSweep(t *testing.T) []string {
+	t.Helper()
+	steps, err := f.s.QueueWaitSweep(f.ctx, f.clock)
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	var out []string
+	for _, step := range steps {
+		if step.EntryID == f.waiting.ID {
+			out = append(out, step.Action)
+		}
+	}
+	return out
+}
+
+// hostReported is the number of host gate reports about the waiting entry.
+func (f *waitFixture) hostReported(t *testing.T, to api.Agent) []api.Message {
+	t.Helper()
+	var out []api.Message
+	for _, m := range f.notices(t, to, queueWaitGateSubject) {
+		if m.Envelope.Refs["entry"] == f.waiting.ID {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+func holderWait(item string, since time.Time) *api.MatrixWait {
+	return &api.MatrixWait{Role: api.MatrixWaitRunning, Item: item, Since: since}
+}
+
+// wi_ec424e58eb611c2b h1: a host wait's 60 min bound restarts each time it
+// moves up the host queue, and it is reported only once nothing is ahead. The
+// queue is read from rows the hub stores: earlier host waits of the project
+// and the runs each relay saves from the host's matrix lock.
+func TestQueueWaitHostQueueBoundRestartsOnEachMove(t *testing.T) {
+	f := newWaitFixture(t)
+	f.team(t)
+	helper := f.helper(t)
+	holder := f.hostRun(t, "holder-verifier", "mini")
+	f.lockReport(t, holder, holderWait(f.items[0].ID, f.clock))
+	// An earlier host wait, of the predecessor entry, then this one.
+	earlier := api.TeamQueueRequest{RequestID: api.NewID("req"), Operation: "wait_set", EntryID: f.pred.ID, WaitOnEntryID: api.TeamQueueWaitHostKey, WaitReason: "behind the holder",
+		HandlerAgentID: f.handler.ID, HandlerRunID: f.handler.RunID}
+	if _, err := f.s.TeamQueueAction(f.ctx, f.task.ID, earlier); err != nil {
+		t.Fatal(err)
+	}
+	f.clock = f.clock.Add(time.Minute)
+	setAt := f.clock
+	f.setOn(t, api.TeamQueueWaitHostKey, "", "")
+	place := func() hostPlace {
+		t.Helper()
+		hq, err := readHostQueue(f.ctx, f.s.db, f.task.ID, f.waiting.ID, f.items[1].ID, ts(setAt))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return hq.at(f.clock)
+	}
+	if p := place(); p.position != 3 || len(p.holders) != 1 || len(p.earlier) != 1 || p.earlier[0].entry != f.pred.ID || !p.movedAt.Equal(setAt) {
+		t.Fatalf("place %+v", p)
+	}
+	for _, after := range []time.Duration{60, 90, 120} {
+		f.clock = setAt.Add(after * time.Minute)
+		if steps := f.hostSweep(t); len(steps) != 0 || len(f.hostReported(t, helper)) != 0 {
+			t.Fatalf("queued %v after the set: %v", after, steps)
+		}
+	}
+	// The earlier wait clears: the wait moves up, still behind the holder.
+	f.clock = setAt.Add(125 * time.Minute)
+	moved := f.clock
+	if _, err := f.s.TeamQueueAction(f.ctx, f.task.ID, api.TeamQueueRequest{RequestID: api.NewID("req"), Operation: "wait_clear", EntryID: f.pred.ID, WaitOnEntryID: api.TeamQueueWaitHostKey}); err != nil {
+		t.Fatal(err)
+	}
+	if p := place(); p.position != 2 || len(p.earlier) != 0 || !p.movedAt.Equal(moved) || !p.due.Equal(moved.Add(queueWaitHostBound)) {
+		t.Fatalf("after the clear %+v", p)
+	}
+	f.clock = moved.Add(queueWaitHostBound)
+	if steps := f.hostSweep(t); len(steps) != 0 {
+		t.Fatalf("still behind the holder: %v", steps)
+	}
+	// The holder leaves the lock: nothing is ahead, and the bound restarts.
+	f.clock = moved.Add(100 * time.Minute)
+	ended := f.clock
+	f.lockReport(t, holder, nil)
+	if p := place(); p.queued() || p.position != 1 || !p.movedAt.Equal(ended) {
+		t.Fatalf("after the holder left %+v", p)
+	}
+	f.clock = ended.Add(59 * time.Minute)
+	if steps := f.hostSweep(t); len(steps) != 0 {
+		t.Fatalf("59 minutes after the last move: %v", steps)
+	}
+	f.clock = ended.Add(queueWaitHostBound)
+	if steps := f.hostSweep(t); len(steps) != 1 || steps[0] != "wait-overdue" {
+		t.Fatalf("at the restarted bound: %v", steps)
+	}
+	for _, to := range []api.Agent{helper, f.handler} {
+		got := f.hostReported(t, to)
+		if len(got) != 1 {
+			t.Fatalf("%d reports to %s", len(got), to.Name)
+		}
+		text, refs := got[0].Envelope.Body.Text, got[0].Envelope.Refs
+		for _, want := range []string{"has waited on host admission since " + ts(setAt), "last moved up the host queue at " + ts(ended), "60 minutes or more after that move nothing is ahead of it", "Paused for: " + waitPause + "."} {
+			if !strings.Contains(text, want) {
+				t.Fatalf("report lacks %q: %s", want, text)
+			}
+		}
+		if refs["movedAt"] != ts(ended) || refs["predecessorKind"] != api.TeamQueueWaitOnHost {
+			t.Fatalf("refs %v", refs)
+		}
+	}
+	f.clock = f.clock.Add(time.Hour)
+	if steps := f.hostSweep(t); len(steps) != 0 {
+		t.Fatalf("reported twice: %v", steps)
+	}
+
+	// The place itself, from stored rows only.
+	at := f.clock
+	mw := func(role, item string, since time.Time, agentless bool) *api.AgentActivity {
+		w := &api.MatrixWait{Role: role, Item: item, Since: since, Agentless: agentless}
+		if role == api.MatrixWaitWaiting {
+			w.Position, w.Length = 1, 2
+		}
+		return &api.AgentActivity{ObservedAt: since, MatrixWait: w}
+	}
+	recent := at.Add(-10 * time.Minute)
+	for _, c := range []struct {
+		name            string
+		q               hostQueue
+		position, ahead int
+		queued          bool
+		movedAt         time.Time
+	}{
+		{"nothing ahead", hostQueue{setAt: setAt}, 1, 0, false, setAt},
+		{"a holder and a waiter", hostQueue{setAt: setAt, runs: []hostQueueRun{{agent: "a", status: "running", activity: mw("running", f.items[0].ID, recent, false)}, {agent: "b", status: "running", activity: mw("waiting", f.items[1].ID, recent, false)}}}, 3, 1, true, setAt},
+		{"one agentless entry reported by two members", hostQueue{setAt: setAt, runs: []hostQueueRun{{agent: "a", status: "running", activity: mw("running", f.items[0].ID, recent, true)}, {agent: "b", status: "done", activity: mw("running", f.items[0].ID, recent, true)}}}, 2, 1, true, setAt},
+		{"a retired run is not counted", hostQueue{setAt: setAt, runs: []hostQueueRun{{agent: "a", status: api.AgentRetired, activity: mw("running", f.items[0].ID, recent, false)}}}, 1, 0, false, setAt},
+		{"a stale wait left at its bound", hostQueue{setAt: setAt, runs: []hostQueueRun{{agent: "a", status: "running", activity: mw("running", f.items[0].ID, setAt.Add(-time.Hour), false)}}}, 1, 0, false, setAt.Add(-time.Hour).Add(defaultQueueMatrixWaitBound)},
+		{"a move in the future is not a move", hostQueue{setAt: setAt, closed: []time.Time{at.Add(time.Minute)}, ended: []time.Time{setAt.Add(-time.Minute)}}, 1, 0, false, setAt},
+	} {
+		p := c.q.at(at)
+		if p.position != c.position || len(p.holders) != c.ahead || p.queued() != c.queued || !p.movedAt.Equal(c.movedAt) {
+			t.Fatalf("%s: %+v", c.name, p)
+		}
+	}
+	// A run on another host is not read, nor is the waiting team's own run.
+	other := f.hostRun(t, "air-verifier", "air")
+	f.lockReport(t, other, holderWait(f.items[0].ID, at))
+	f.lockReport(t, f.member, holderWait(f.items[1].ID, at))
+	if p := place(); p.queued() {
+		t.Fatalf("another host's run or the team's own run counted: %+v", p)
+	}
+}
+
+// wi_ec424e58eb611c2b h2 (wait sweep side): a host wait past its bound while
+// host work is still ahead of it posts and writes nothing.
+func TestQueueWaitHostQueuedSendsNoGateReport(t *testing.T) {
+	f := newWaitFixture(t)
+	f.team(t)
+	f.helper(t)
+	holder := f.hostRun(t, "holder-verifier", "mini")
+	f.lockReport(t, holder, holderWait(f.items[0].ID, f.clock))
+	setAt := f.clock
+	f.setOn(t, api.TeamQueueWaitHostKey, "", "")
+	before := f.messageCount(t)
+	for _, after := range []time.Duration{60, 61, 120, 180, 240} {
+		f.clock = setAt.Add(after * time.Minute)
+		if steps := f.sweep(t); len(steps) != 0 {
+			t.Fatalf("%v minutes in: %v", after, steps)
+		}
+	}
+	var helperSeq, handlerSeq int64
+	if err := f.s.db.QueryRow(`SELECT helper_seq,handler_seq FROM team_queue_waits WHERE entry_id=?`, f.waiting.ID).Scan(&helperSeq, &handlerSeq); err != nil || helperSeq != 0 || handlerSeq != 0 {
+		t.Fatalf("seqs %d %d %v", helperSeq, handlerSeq, err)
+	}
+	if f.messageCount(t) != before || f.state(t) != api.TeamQueueWaitWaiting {
+		t.Fatalf("%d messages posted, state %s", f.messageCount(t)-before, f.state(t))
+	}
+}
+
+// wi_ec424e58eb611c2b h3: with nothing ahead, because the holder closed or
+// exited without an ending report, a host wait is reported at its set time
+// plus the bound, as before.
+func TestQueueWaitHostNothingAheadReportsAtBound(t *testing.T) {
+	for _, gone := range []string{api.AgentClosed, api.AgentExited} {
+		t.Run(gone, func(t *testing.T) {
+			f := newWaitFixture(t)
+			f.team(t)
+			helper := f.helper(t)
+			holder := f.hostRun(t, "holder-verifier", "mini")
+			f.lockReport(t, holder, holderWait(f.items[0].ID, f.clock))
+			setAt := f.clock
+			f.setOn(t, api.TeamQueueWaitHostKey, "", "")
+			f.clock = setAt.Add(20 * time.Minute)
+			f.exec(t, `UPDATE agents SET status=? WHERE id=?`, gone, holder.ID)
+			f.clock = setAt.Add(59 * time.Minute)
+			if steps := f.sweep(t); len(steps) != 0 {
+				t.Fatalf("before the bound: %v", steps)
+			}
+			f.clock = setAt.Add(queueWaitHostBound)
+			if steps := f.sweep(t); len(steps) != 1 || steps[0] != "wait-overdue" {
+				t.Fatalf("at the bound: %v", steps)
+			}
+			got := f.notices(t, helper, queueWaitGateSubject)
+			if len(got) != 1 || !strings.Contains(got[0].Envelope.Body.Text, "has waited on host admission since "+ts(setAt)+", 60 minutes or more") || got[0].Envelope.Refs["movedAt"] != "" {
+				t.Fatalf("reports %+v", got)
+			}
+		})
+	}
+}
+
+// wi_ec424e58eb611c2b h5: a handler-gated wait whose condition is met tells
+// the primary handler at once, in one directed notice per wait: the same
+// transaction as the lead's notice and the met state, so repeated sweeps and
+// a hub restart post nothing again. An automatic wait does not tell the
+// handler, and with no handler to tell the lead is still told and the overdue
+// report stays the backstop.
+func TestQueueWaitHandlerGatedMetTellsHandlerOnce(t *testing.T) {
+	t.Run("gated", func(t *testing.T) {
+		f := newWaitFixture(t)
+		f.team(t)
+		f.setGated(t, api.TeamQueueWaitAccepted, waitGate)
+		f.clock = f.clock.Add(time.Minute)
+		f.meet(t, api.TeamQueueWaitAccepted)
+		if steps := f.sweep(t); len(steps) != 1 || steps[0] != "wait-met" {
+			t.Fatalf("steps %v", steps)
+		}
+		lead := f.notices(t, f.lead, queueWaitGatedSubject)
+		told := f.notices(t, f.handler, queueWaitHandlerMetSubject)
+		if len(lead) != 1 || len(told) != 1 {
+			t.Fatalf("%d lead and %d handler notices", len(lead), len(told))
+		}
+		text, refs := told[0].Envelope.Body.Text, told[0].Envelope.Refs
+		for _, want := range []string{f.waiting.ID, f.items[1].ID, f.pred.ID, "until it was accepted", "That condition is now met", "accepted commit " + waitAccepted, "Paused for: " + waitGate + ".",
+			fmt.Sprintf("told in message %d", lead[0].Seq), "run the gate's checks", fmt.Sprintf("tt team queue wait clear --task %s --entry %s --on %s", f.task.ID, f.waiting.ID, f.pred.ID)} {
+			if !strings.Contains(text, want) {
+				t.Fatalf("handler notice lacks %q: %s", want, text)
+			}
+		}
+		if refs["activity"] != "queue_wait_handler_met" || refs["resume"] != api.TeamQueueWaitResumeHandler || refs["commit"] != waitAccepted || refs["notice"] != fmt.Sprint(lead[0].Seq) ||
+			refs["entry"] != f.waiting.ID || refs["predecessorEntry"] != f.pred.ID || refs["obligation"] != "" {
+			t.Fatalf("refs %v", refs)
+		}
+		for i := 0; i < 3; i++ {
+			f.clock = f.clock.Add(30 * time.Second)
+			if steps := f.sweep(t); len(steps) != 0 {
+				t.Fatalf("sweep %d: %v", i, steps)
+			}
+		}
+		f.reopen(t)
+		f.clock = f.clock.Add(30 * time.Second)
+		f.sweep(t)
+		if n := len(f.notices(t, f.handler, queueWaitHandlerMetSubject)); n != 1 {
+			t.Fatalf("%d handler notices after sweeps and a reopen", n)
+		}
+	})
+	t.Run("automatic", func(t *testing.T) {
+		f := newWaitFixture(t)
+		f.team(t)
+		f.set(t, api.TeamQueueWaitAccepted)
+		f.meet(t, api.TeamQueueWaitAccepted)
+		if steps := f.sweep(t); len(steps) != 1 || steps[0] != "wait-met" {
+			t.Fatalf("steps %v", steps)
+		}
+		if n := len(f.notices(t, f.handler, queueWaitHandlerMetSubject)); n != 0 {
+			t.Fatalf("an automatic wait told the handler %d times", n)
+		}
+	})
+	t.Run("no handler", func(t *testing.T) {
+		f := newWaitFixture(t)
+		f.team(t)
+		helper := f.helper(t)
+		f.setGated(t, api.TeamQueueWaitAccepted, waitGate)
+		f.exec(t, `UPDATE agents SET status='retired' WHERE id=?`, f.handler.ID)
+		f.meet(t, api.TeamQueueWaitAccepted)
+		if steps := f.sweep(t); len(steps) != 1 || steps[0] != "wait-met" {
+			t.Fatalf("steps %v", steps)
+		}
+		if len(f.notices(t, f.lead, queueWaitGatedSubject)) != 1 || f.count(t, `SELECT count(*) FROM messages WHERE task_id=? AND from_node=? AND json_extract(envelope,'$.subject')=?`, f.task.ID, api.BrokerNode, queueWaitHandlerMetSubject) != 0 {
+			t.Fatal("lead not told, or a handler notice went somewhere")
+		}
+		f.clock = f.clock.Add(queueWaitIdleBound())
+		if steps := f.sweep(t); len(steps) != 1 || steps[0] != "wait-overdue" || len(f.notices(t, helper, queueWaitGateSubject)) != 1 {
+			t.Fatalf("backstop %v", steps)
+		}
+	})
+}
+
+func (f *waitFixture) count(t *testing.T, query string, args ...any) int {
+	t.Helper()
+	var n int
+	if err := f.s.db.QueryRow(query, args...).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
 }

@@ -405,18 +405,29 @@ type stallTeam struct {
 	waiting, held bool
 	gated         *stallGate // the newest gated met wait, if any
 	hostSet       time.Time  // when the open host wait was set, if any
-	lifts         stallLifts // project resume; hold released or shared-path wait closed
-	members       []stallAgent
+	hostReason    string     // the open host wait's saved reason
+	// host is the open host wait's place in the host queue, read by
+	// loadHostPlaces once the wait is past its first bound.
+	host    *hostPlace
+	lifts   stallLifts // project resume; hold released or shared-path wait closed
+	members []stallAgent
 }
 
 // stallGate is a wait only the database handler's resume ends: a gated met
 // wait, or a host wait past its bound. at is when the gate opened: the met
-// time, or the end of the host bound.
+// time, or the end of the host bound, which runs from the wait's last move up
+// the host queue (movedAt). place is set for a host wait still queued behind
+// other host work, and reason is the host wait's saved reason.
 type stallGate struct {
 	kind, on, item, until string
-	at, setAt             time.Time
+	at, setAt, movedAt    time.Time
 	notice                int64
+	place                 *hostPlace
+	reason                string
 }
+
+// queued reports a host gate with host work still ahead of it.
+func (g *stallGate) queued() bool { return g.place != nil && g.place.queued() }
 
 // stallGatedWait reads query 3's gated met wait.
 func stallGatedWait(raw string) *stallGate {
@@ -430,10 +441,39 @@ func stallGatedWait(raw string) *stallGate {
 	return &stallGate{kind: w.Kind, on: w.On, item: w.Item, until: w.Until, at: parseTS(w.At), notice: w.Notice}
 }
 
+// hostDue is when the open host wait's bound ends: a bound after its last
+// move up the host queue, or after its set time before its queue is read.
+func (t *stallTeam) hostDue() (moved, due time.Time) {
+	if t.host != nil {
+		return t.host.movedAt, t.host.due
+	}
+	return t.hostSet, t.hostSet.Add(queueWaitHostBound)
+}
+
 // hostPlanned reports an open host wait still inside its bound: a planned
 // wait, as the handler may still be checking the host.
 func (t *stallTeam) hostPlanned(now time.Time) bool {
-	return !t.hostSet.IsZero() && now.Before(t.hostSet.Add(queueWaitHostBound))
+	_, due := t.hostDue()
+	return !t.hostSet.IsZero() && now.Before(due)
+}
+
+// loadHostPlaces reads the host queue of each team whose open host wait is
+// past its first bound, so a team with no such wait costs no read. The queue
+// is read through q, so the write transaction judges it afresh.
+func (v *stallView) loadHostPlaces(ctx context.Context, q queryRower, now time.Time) error {
+	for _, t := range v.teams {
+		t.host = nil
+		if t.hostSet.IsZero() || now.Before(t.hostSet.Add(queueWaitHostBound)) {
+			continue
+		}
+		hq, err := readHostQueue(ctx, q, t.task, t.entry, t.item, ts(t.hostSet))
+		if err != nil {
+			return err
+		}
+		place := hq.at(now)
+		t.host = &place
+	}
+	return nil
 }
 
 // handlerGate is the gate that holds the team at now, the newest when there
@@ -444,8 +484,8 @@ func (t *stallTeam) handlerGate(now time.Time) *stallGate {
 	}
 	g := t.gated
 	if !t.hostSet.IsZero() {
-		if due := t.hostSet.Add(queueWaitHostBound); g == nil || due.After(g.at) {
-			g = &stallGate{kind: api.TeamQueueWaitOnHost, on: api.TeamQueueWaitHostKey, until: api.TeamQueueWaitHandler, at: due, setAt: t.hostSet}
+		if moved, due := t.hostDue(); g == nil || due.After(g.at) {
+			g = &stallGate{kind: api.TeamQueueWaitOnHost, on: api.TeamQueueWaitHostKey, until: api.TeamQueueWaitHandler, at: due, setAt: t.hostSet, movedAt: moved, place: t.host, reason: t.hostReason}
 		}
 	}
 	return g
@@ -454,7 +494,11 @@ func (t *stallTeam) handlerGate(now time.Time) *stallGate {
 // text names the gate in a notice: what it waits on and since when.
 func (g *stallGate) text() string {
 	if g.kind == api.TeamQueueWaitOnHost {
-		return fmt.Sprintf("a wait on host admission set at %s, past its %d min bound at %s", g.setAt.UTC().Format(time.RFC3339), int(queueWaitHostBound/time.Minute), g.at.UTC().Format(time.RFC3339))
+		moved := ""
+		if g.movedAt.After(g.setAt) {
+			moved = ", last moved up the host queue at " + g.movedAt.UTC().Format(time.RFC3339)
+		}
+		return fmt.Sprintf("a wait on host admission set at %s%s, past its %d min bound at %s", g.setAt.UTC().Format(time.RFC3339), moved, int(queueWaitHostBound/time.Minute), g.at.UTC().Format(time.RFC3339))
 	}
 	on := fmt.Sprintf("entry %s (item %s)", g.on, g.item)
 	if g.kind == api.TeamQueueWaitOnRelease {
@@ -608,6 +652,7 @@ func loadStallViews(ctx context.Context, q queryRower, task string) (map[string]
  COALESCE((SELECT json_object('kind',w.on_kind,'on',w.on_entry_id,'item',w.on_item_id,'until',w.until,'at',w.met_at,'notice',w.notice_seq) FROM team_queue_waits w
   WHERE w.task_id=e.task_id AND w.entry_id=e.id AND w.state='met' AND w.resume='handler' ORDER BY w.met_at DESC,w.on_entry_id LIMIT 1),''),
  COALESCE((SELECT w.set_at FROM team_queue_waits w WHERE w.task_id=e.task_id AND w.entry_id=e.id AND w.state='waiting' AND w.on_kind='host'),''),
+ COALESCE((SELECT w.reason FROM team_queue_waits w WHERE w.task_id=e.task_id AND w.entry_id=e.id AND w.state='waiting' AND w.on_kind='host'),''),
  EXISTS(SELECT 1 FROM team_queue_budget_holds h WHERE h.task_id=e.task_id AND h.entry_id=e.id AND h.state='held'),
  COALESCE(a.id,''),COALESCE(a.name,''),COALESCE(a.run_id,''),COALESCE(a.status,''),COALESCE(a.last_seen_at,''),COALESCE(b.created_at,''),COALESCE(b.context_through_message_seq,0),
  COALESCE(x.state,''),COALESCE(x.payload,''),COALESCE(p.last_working_at,''),CASE WHEN a.id IS NULL THEN 0 ELSE `+stallDecisionsSQL+` END,
@@ -626,9 +671,9 @@ func loadStallViews(ctx context.Context, q queryRower, task string) (map[string]
 	}
 	for rows.Next() {
 		var a stallAgent
-		var id, entry, item, created, admitted, gate, hostSet, seen, bound, payload, worked, waited, answered, resumed, released, cleared string
+		var id, entry, item, created, admitted, gate, hostSet, hostReason, seen, bound, payload, worked, waited, answered, resumed, released, cleared string
 		var waiting, held bool
-		if err := rows.Scan(&id, &entry, &item, &created, &admitted, &waiting, &gate, &hostSet, &held, &a.id, &a.name, &a.runID, &a.status, &seen, &bound, &a.contextSeq, &a.state, &payload, &worked, &a.decisions,
+		if err := rows.Scan(&id, &entry, &item, &created, &admitted, &waiting, &gate, &hostSet, &hostReason, &held, &a.id, &a.name, &a.runID, &a.status, &seen, &bound, &a.contextSeq, &a.state, &payload, &worked, &a.decisions,
 			&a.obligations, &waited, &answered, &resumed, &released, &cleared); err != nil {
 			rows.Close()
 			return nil, err
@@ -639,7 +684,7 @@ func loadStallViews(ctx context.Context, q queryRower, task string) (map[string]
 		if n := len(v.teams); n > 0 && v.teams[n-1].entry == entry {
 			team = v.teams[n-1]
 		} else {
-			team = &stallTeam{task: id, entry: entry, item: item, admission: parseTS(admitted), waiting: waiting, held: held, gated: stallGatedWait(gate), hostSet: parseTS(hostSet),
+			team = &stallTeam{task: id, entry: entry, item: item, admission: parseTS(admitted), waiting: waiting, held: held, gated: stallGatedWait(gate), hostSet: parseTS(hostSet), hostReason: hostReason,
 				lifts: stallLifts{resumed: v.resumed, released: latest(parseTS(released), parseTS(cleared))}}
 			if team.admission.IsZero() {
 				team.admission = parseTS(created)
@@ -987,6 +1032,9 @@ func (t *stallTeam) runs() map[stallRun]bool {
 // on a fresh view, so nothing is posted on a stale read.
 func (v *stallView) decide(ctx context.Context, q queryRower, now time.Time) (stallPlan, error) {
 	plan := stallPlan{advance: map[string]int64{}}
+	if err := v.loadHostPlaces(ctx, q, now); err != nil {
+		return plan, err
+	}
 	reads := &stallReads{ctx: ctx, q: q, task: v.task, now: now}
 	for i, e := range v.episodes {
 		if i == 0 || e.scanned < reads.from {
@@ -1290,7 +1338,16 @@ func (t *stallTeam) notice(episode string, since, now time.Time, helperState str
 	text := fmt.Sprintf("The team of queue entry %s (item %s) has been quiet for %s: no post, no working report and no matrix wait from its %d member(s) since %s. Members: %s.",
 		t.entry, t.item, stallDuration(now.Sub(since)), len(t.members), since.UTC().Format(time.RFC3339), providerNameList(members, 600))
 	gate := t.handlerGate(now)
-	if gate != nil {
+	switch {
+	case gate != nil && gate.queued():
+		// A host wait queued behind other host work: its reason is saved and
+		// the queue ahead is known, so the notice names them and asks for no
+		// record of why the team stopped.
+		p := gate.place
+		text = fmt.Sprintf("The team of queue entry %s (item %s) waits for host admission at position %d of the host queue, behind host work that has not moved since %s. Ahead: %s. Paused for: %s. "+
+			"Its %d min bound, which starts again each time the queue moves, passed at %s. Members: %s.",
+			t.entry, t.item, p.position, p.movedAt.UTC().Format(time.RFC3339), p.aheadText(), gate.reason, int(queueWaitHostBound/time.Minute), gate.at.UTC().Format(time.RFC3339), providerNameList(members, 600))
+	case gate != nil:
 		// The gate's words come before the next step, so they name no action.
 		text = fmt.Sprintf("The team of queue entry %s (item %s) has been held for %s by a gate only the database handler can lift, and the handler has not cleared it since %s. Gate: %s. "+
 			"Member posts and work do not count while the gate is open. Members: %s.",
@@ -1299,10 +1356,14 @@ func (t *stallTeam) notice(episode string, since, now time.Time, helperState str
 	if helperState != "" {
 		text += fmt.Sprintf(" The owner helper is %s, so this goes to the owner.", helperState)
 	}
-	if gate != nil {
+	switch {
+	case gate != nil && gate.queued():
+		text += " This is a planned wait with a saved reason and host work ahead of it, so no incident record is asked for. " +
+			"If the run ahead should have ended by now, look at it on its host; the database handler admits this team once nothing is ahead."
+	case gate != nil:
 		text += fmt.Sprintf(" %s %s %sask the database handler to run the gate's checks, then send the waiting lead its resume and clear the wait with tt team queue wait clear --task %s --entry %s --on %s, or clear it.",
 			stallUnknownCause, stallRecordFirst, stallNextStep, t.task, t.entry, gate.on)
-	} else {
+	default:
 		text += fmt.Sprintf(" %s %s %sread the team's last messages and look at its lead's session, then decide whether to prompt the lead.", stallUnknownCause, stallRecordFirst, stallNextStep)
 	}
 	n := stallNotice{action: stallActionTeam, subject: stallTeamSubject, toHelper: !owner, refs: stallNoticeRefs(stallKindTeam, episode, owner, night)}
@@ -1311,6 +1372,9 @@ func (t *stallTeam) notice(episode string, since, now time.Time, helperState str
 		n.refs["gate"], n.refs["gateOn"] = gate.kind, gate.on
 		if gate.notice > 0 {
 			n.refs["gateNotice"] = fmt.Sprint(gate.notice)
+		}
+		if gate.queued() {
+			n.refs["hostQueued"], n.refs["hostPosition"] = "true", fmt.Sprint(gate.place.position)
 		}
 	}
 	if owner {
@@ -1329,7 +1393,8 @@ func (t *stallTeam) notice(episode string, since, now time.Time, helperState str
 
 // StallWatchSweep opens, pings and closes the stall watch's episodes for
 // every open, active project and returns one step per notice it posted. With
-// nothing quiet and no open episode it makes three reads and no write. It
+// nothing quiet and no open episode it makes three reads and no write, plus
+// three for each running team whose host wait is past its first bound. It
 // decides from the given now and reads only durable rows.
 func (s *Store) StallWatchSweep(ctx context.Context, now time.Time) ([]StallWatchStep, error) {
 	views, err := loadStallViews(ctx, s.db, "")
