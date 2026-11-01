@@ -27,6 +27,37 @@ proposes batches, queue order, scopes and triage outcomes as `tt ask` decisions.
 Confirming those decisions, including triage outcomes, stays the owner's; the
 owner session relays them. See [Project roles](project-roles.md).
 
+## Its procedure
+
+Bug `wi_6923d3e2a8ee0016`, work order #53691 (owner principle #51832: nothing
+the helper does may live only in its notes). The helper's standing procedure
+is a product role template, `PROJECT_ROLE_TEMPLATES.owner_helper` in
+`client/team-examples.js`, quoted exactly in
+[team examples](team-examples.md#owner-helper--owner-helper). It holds four
+parts: the ordering flow (intake to the steward, owner decisions through
+`tt ask`, queueing each confirmed order at once, reading `lanes=` and
+`up next:`), the night rules (hub lanes and the release quiet window, which
+report to send at which hub wake, the morning unhold through the handler), the
+manual delegation renewal steps, and the process rules. It names no clock
+times, zones, IDs or paths: those are hub settings and records.
+
+A session gets it two ways:
+
+- `tt helper register` prints it after the receipt and the `act as the helper`
+  line. `--json` prints only the receipt, and the conditional registration of
+  `tt handoff restore` prints nothing. If the template cannot be read, register
+  still succeeds and prints one warning naming the command below.
+- `eval "$(tt helper env --task tsk_...)" && tt brief` prints the CLI preamble,
+  the helper's name and project, the primary database handler and steward, and
+  the template, without the item-team text other agents receive. It fails, and
+  prints nothing, when the template cannot be read.
+
+Both read the template through the embedded team plan, so they need Node.js
+on the host, as team launches do. A changed template reaches a session at its
+next registration after the `tt` release; a running session keeps what it was
+given. The helper's private notes are not a source of procedure: its state is
+the hub continuity record and wakes ([session handoff](session-handoff.md)).
+
 ## Register
 
 Run this in the owner's Claude Code or Codex session, in a dedicated one-pane tmux session:
@@ -421,6 +452,8 @@ go test ./internal/api ./internal/store ./internal/server -run 'OwnerHelper' -co
 go test ./cmd/tt -run 'Helper|OwnerHelper|WindowSizeSkipsOwnerHelper|CleanupSkipsOwnerHelper|RetryClaudeBindingSkipsOwnerHelper' -count=1
 cd ..
 node --test tests/owner-helper.test.js
+node --test tests/team-examples.test.js   # the owner-helper template and its doc copy
+node scripts/build-team-plan.mjs --check  # the embedded copy tt helper register and tt brief print
 ```
 
 All tests use temporary hubs and databases, private tmux sockets (`TT_TMUX_SOCKET`),

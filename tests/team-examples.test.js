@@ -721,3 +721,138 @@ test("every team member launches with 512 bytes of prompt headroom", (t) => {
       );
     }
 });
+
+// wi_6923d3e2a8ee0016 (owner principle: never keep procedure in notes): the
+// owner helper's standing procedure is a product role template, printed by
+// tt helper register and tt brief, and mirrored exactly in the docs.
+const ownerHelper = PROJECT_ROLE_TEMPLATES.owner_helper;
+const helperLabels = ["Ordering:", "Night:", "Delegation renewal:", "Process rules:"];
+function helperPart(label) {
+  const parts = ownerHelper.prompt.split("\n\n").filter((p) => p.startsWith(label));
+  assert.equal(parts.length, 1, `exactly one ${label} paragraph`);
+  return parts[0];
+}
+function inOrder(text, needles, name) {
+  let at = -1;
+  for (const needle of needles) {
+    const next = text.indexOf(needle, at + 1);
+    assert.ok(next > at, `${name}: ${needle} missing or out of order`);
+    at = next;
+  }
+}
+
+test("owner helper template is a project role with its four labelled parts in order", () => {
+  assert.equal(ownerHelper.role, "owner_helper");
+  assert.equal(ownerHelper.id, "owner_helper");
+  assert.equal(ownerHelper.name, "owner-helper");
+  assert.equal(ownerHelper.title, "Owner helper");
+  const { prompt } = ownerHelper;
+  assert.match(prompt, /run tt ack SEQ before you start/);
+  assert.ok(
+    prompt.includes(
+      "Never ask through an interactive terminal prompt: ask the owner with tt ask, a teammate with tt send --kind question.",
+    ),
+  );
+  for (const label of helperLabels) assert.equal(prompt.split(label).length - 1, 1, `${label} once`);
+  inOrder(prompt, helperLabels, "labels");
+  assert.ok(Buffer.byteLength(prompt) <= MAX_AGENT_PROMPT_BYTES, `owner helper prompt is ${Buffer.byteLength(prompt)} bytes`);
+});
+
+test("owner helper ordering flow queues confirmed orders at once and leaves reorder to the owner", () => {
+  const ordering = helperPart("Ordering:");
+  for (const needle of [
+    "role:backlog_steward",
+    "tt ask",
+    "tt team queue add",
+    "--planned-reason",
+    "tt team queue list",
+    "lanes=",
+    "up next:",
+    "tt team queue reorder",
+  ])
+    assert.ok(ordering.includes(needle), `Ordering lacks ${needle}`);
+  assert.match(ordering, /queue it at once with tt team queue add/);
+  assert.match(ordering, /Never hold a confirmed order back for a free lane/);
+  assert.match(ordering, /Only the owner, or you as delegate, reorders the queue \(tt team queue reorder\); item leads never do/);
+});
+
+test("owner helper night rules read hub settings and name each report and the morning unhold", () => {
+  const night = helperPart("Night:");
+  for (const needle of [
+    "tt team queue lanes",
+    "tt deployment window",
+    "tt owner report hourly",
+    "tt owner report morning",
+    "tt owner report evening",
+    "tt deployment unhold",
+    "primary database handler",
+  ])
+    assert.ok(night.includes(needle), `Night lacks ${needle}`);
+  assert.match(night, /when the night ends, after the morning report, ask the primary database handler/);
+  assert.doesNotMatch(ownerHelper.prompt, /\b\d{1,2}:\d{2}\b/, "a clock time");
+  assert.doesNotMatch(ownerHelper.prompt, /America\/|Europe\/|UTC/, "a zone name");
+});
+
+test("owner helper delegation renewal is the ordered manual procedure with no hub reminder", () => {
+  const renewal = helperPart("Delegation renewal:");
+  assert.match(renewal, /at most 7 days/);
+  assert.match(renewal, /Renew only while a standing owner grant on the Board is still in force/);
+  assert.match(renewal, /not under tt helper env: tt owner refuses agent sessions/);
+  inOrder(
+    renewal,
+    [
+      "(1) tt owner delegation list",
+      "(2) Answer every request routed to you first: closing hands unanswered routed requests back to the owner",
+      "(3) tt owner delegation close",
+      "(4) tt owner delegation open --delegate",
+      "(5) If the queue's host policy expires with the window, save the next tt team queue policy --policy-version",
+      "(6) Move the authority-expiry wake to the new end with tt handoff wake",
+    ],
+    "renewal steps",
+  );
+  assert.match(renewal, /If the owner revokes the grant, close the window, let running work finish and order nothing new/);
+  assert.doesNotMatch(ownerHelper.prompt, /remind/i);
+});
+
+test("owner helper process rules keep state in the product and name every rule", () => {
+  const rules = helperPart("Process rules:");
+  for (const needle of [
+    "tt handoff continuity",
+    "tt handoff wake",
+    "file it as a bug through role:backlog_steward",
+    "Relay the owner's words verbatim",
+    "one decision at a time",
+    "lettered options and your recommendation",
+    "Every work-item write goes through the database handler",
+    "structured queue wait (tt team queue wait set) recorded through the handler",
+    "Matrix approvals (verification-matrix-approval:) are never delegated",
+    "passwords and accounts, starting a new product, deleting work records or anything else irreversible",
+    "Close a REQUEST with a RESULT",
+    "a QUESTION with an ANSWER",
+    "tt helper env",
+  ])
+    assert.ok(rules.includes(needle), `Process rules lack ${needle}`);
+});
+
+test("owner helper template and its doc copy carry no live identifiers, paths, memory or tokens", () => {
+  const documentation = readFileSync(new URL("../docs/team-examples.md", import.meta.url), "utf8");
+  const heading = "### owner-helper — Owner helper";
+  assert.equal(documentation.split(heading).length - 1, 1);
+  const section = documentation.slice(documentation.indexOf(heading));
+  const block = section.slice(section.indexOf("```text\n") + 8, section.indexOf("\n```", section.indexOf("```text\n") + 8));
+  assert.equal(block, ownerHelper.prompt, "the doc block is the exact prompt");
+  const forbidden = [
+    /\b(wi|tsk|agt|dlw|tqe|run|nart)_[0-9a-f]{6,}/,
+    /#\d{3,}/,
+    /\/Users\//,
+    /\.claude/,
+    /MEMORY\.md|memory\//,
+    /Bearer |TAILTERM_TOKEN|hub\.json/,
+  ];
+  for (const [name, text] of [["template", ownerHelper.prompt], ["doc copy", block]])
+    for (const pattern of forbidden) assert.doesNotMatch(text, pattern, `${name} matches ${pattern}`);
+  const bundle = readFileSync(new URL("../hub/internal/teamplan/plan.mjs", import.meta.url), "utf8");
+  for (const label of helperLabels) assert.ok(bundle.includes(label), `plan.mjs lacks ${label}`);
+  const guide = readFileSync(new URL("../docs/owner-helper.md", import.meta.url), "utf8");
+  assert.ok(guide.includes("## Its procedure") && guide.includes("PROJECT_ROLE_TEMPLATES.owner_helper"), "owner-helper.md does not say where the procedure lives");
+});

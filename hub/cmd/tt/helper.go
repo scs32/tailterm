@@ -820,6 +820,14 @@ func registerHelperSession(e env, o helperRegistration) (api.OwnerActionResult, 
 		fmt.Fprintf(os.Stderr, "[tt] warning: tmux session %s has %d panes; wake-ups need exactly one\n", session.Name, session.Panes)
 	}
 	fmt.Printf("act as the helper: eval \"$(tt helper env --task %s)\"\n", *task)
+	// Every helper session registers, so registration hands it its procedure
+	// (docs/owner-helper.md "Its procedure"). The registration is already
+	// saved: a template that cannot be read is a warning, not a failure.
+	if prompt, err := ownerHelperPrompt(); err != nil {
+		fmt.Fprintf(os.Stderr, "[tt] could not %v; read it with: eval \"$(tt helper env --task %s)\" && tt brief\n", err, *task)
+	} else {
+		fmt.Printf("\n%s\n", strings.TrimRight(prompt, "\n"))
+	}
 	return out, nil
 }
 

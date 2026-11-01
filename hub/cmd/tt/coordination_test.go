@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"go/ast"
@@ -1319,5 +1320,82 @@ func TestHandlerBriefingCitesHeldReviewStub(t *testing.T) {
 		if strings.Count(text, lead) != 1 || strings.Count(text, reviewer) != 1 || strings.Contains(text, "Follow-ups are filed and held for triage.") {
 			t.Fatalf("%s: lead %d, reviewer %d, old lead sentence %v", path, strings.Count(text, lead), strings.Count(text, reviewer), strings.Contains(text, "Follow-ups are filed and held for triage."))
 		}
+	}
+}
+
+// TestOwnerHelperBriefingPrintsRoleTemplate: tt brief run as the project's
+// owner helper prints the CLI preamble, who it is, the handler and the
+// embedded owner-helper template verbatim, and none of the item-team text. A
+// template that cannot be read fails the command with nothing printed, and
+// every other role's briefing is unchanged and never loads the template
+// (wi_6923d3e2a8ee0016 a7).
+func TestOwnerHelperBriefingPrintsRoleTemplate(t *testing.T) {
+	f := newHelperFixture(t)
+	ctx := context.Background()
+	helper := *f.mustRegister(t).Agent
+	want, err := loadOwnerHelperTemplate(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(want.Prompt, "Delegation renewal:") {
+		t.Fatalf("embedded template:\n%s", want.Prompt)
+	}
+	brief := func(a api.Agent) (string, error) {
+		return captureStdout(t, func() error {
+			return cmdBrief(env{hub: f.owner.hub, task: f.task.ID, agent: a.ID, agentName: a.Name, runID: a.RunID})
+		})
+	}
+	out, err := brief(helper)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, part := range []string{
+		cliDiscoveryPreamble(selfPath()),
+		fmt.Sprintf("You are %s, the owner helper of task %s (%s).", helper.Name, f.task.Name, f.task.ID),
+		"This project's primary Database handler is database.",
+		"\n" + strings.TrimRight(want.Prompt, "\n") + "\n",
+	} {
+		if !strings.Contains(out, part) {
+			t.Fatalf("helper briefing lacks %q:\n%s", part, out)
+		}
+	}
+	if !strings.HasPrefix(out, cliDiscoveryPreamble(selfPath())) || !strings.HasSuffix(out, strings.TrimRight(want.Prompt, "\n")+"\n") {
+		t.Fatalf("helper briefing shape:\n%s", out)
+	}
+	for _, itemTeam := range []string{"FIRST ORDER OF BUSINESS", "WORK AUDIT", "Main orchestrator", "MAIN ORCHESTRATOR", "tt close for yourself"} {
+		if strings.Contains(out, itemTeam) {
+			t.Fatalf("helper briefing carries item-team text %q:\n%s", itemTeam, out)
+		}
+	}
+
+	// An unreadable template: the command fails naming it and prints nothing.
+	calls := stubOwnerHelperTemplate(t, "", errors.New("synthetic node failure"))
+	out, err = brief(helper)
+	if err == nil || !strings.Contains(err.Error(), "load the owner-helper template: synthetic node failure") || out != "" || calls.Load() != 1 {
+		t.Fatalf("failed load: %q %v (%d loads)", out, err, calls.Load())
+	}
+
+	// Every other role keeps the base briefing and never loads the template.
+	detail, err := f.c.GetTask(ctx, f.task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agents := primaryHandlerFirst(detail.Task, detail.Agents)
+	others := 0
+	for _, a := range agents {
+		if a.Role == api.AgentRoleOwnerHelper {
+			continue
+		}
+		others++
+		got, err := brief(a)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if base := agentTaskBriefingWithSteward(detail.Task, a.Name, a.Role, selfPath(), agents, 0, false, stewardBriefing{}); got != base {
+			t.Fatalf("%s briefing changed:\n%s", a.Name, got)
+		}
+	}
+	if others < 2 || calls.Load() != 1 {
+		t.Fatalf("checked %d other roles; another role loaded the owner-helper template (%d loads)", others, calls.Load())
 	}
 }

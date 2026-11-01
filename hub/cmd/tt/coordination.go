@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"github.com/scs32/tailterm/hub/internal/api"
 	"github.com/scs32/tailterm/hub/internal/spawn"
+	"github.com/scs32/tailterm/hub/internal/teamplan"
 	"io"
 	"os"
 	"strings"
@@ -441,8 +444,68 @@ func cmdBrief(e env) error {
 	if err != nil {
 		return err
 	}
+	if role == api.AgentRoleOwnerHelper {
+		prompt, err := ownerHelperPrompt()
+		if err != nil {
+			return err
+		}
+		fmt.Print(ownerHelperBriefing(d.Task, e.agentName, selfPath(), d.Agents, steward, prompt))
+		return nil
+	}
 	fmt.Print(agentTaskBriefingWithSteward(d.Task, e.agentName, role, selfPath(), d.Agents, 0, false, steward))
 	return nil
+}
+
+// ownerHelperTemplate is PROJECT_ROLE_TEMPLATES.owner_helper from
+// client/team-examples.js, read through the embedded team plan bundle. It is
+// the helper's standing procedure (docs/owner-helper.md "Its procedure").
+type ownerHelperTemplate struct {
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	Title  string `json:"title"`
+	Role   string `json:"role"`
+	Prompt string `json:"prompt"`
+}
+
+// loadOwnerHelperTemplate reads the template; tests replace it.
+var loadOwnerHelperTemplate = func(ctx context.Context) (ownerHelperTemplate, error) {
+	var out ownerHelperTemplate
+	if err := teamplan.Run(ctx, map[string]any{"action": "project-role", "role": api.AgentRoleOwnerHelper}, &out); err != nil {
+		return out, err
+	}
+	if out.Role != api.AgentRoleOwnerHelper || strings.TrimSpace(out.Prompt) == "" {
+		return out, errors.New("the embedded template is incomplete")
+	}
+	return out, nil
+}
+
+// ownerHelperPrompt loads the helper's procedure with its own deadline, apart
+// from the hub calls around it.
+func ownerHelperPrompt() (string, error) {
+	ctx, cancel := ctxTimeout(15 * time.Second)
+	defer cancel()
+	t, err := loadOwnerHelperTemplate(ctx)
+	if err != nil {
+		return "", fmt.Errorf("load the owner-helper template: %w", err)
+	}
+	return t.Prompt, nil
+}
+
+// ownerHelperBriefing is tt brief for the project's owner helper: the CLI
+// preamble, who it is, the handler and steward it works through, and its
+// template. It carries none of the item-team text (orchestrator introduction,
+// work audit, retire and close), which does not apply to the helper.
+func ownerHelperBriefing(t api.Task, name, selfPath string, agents []api.Agent, steward stewardBriefing, prompt string) string {
+	b := cliDiscoveryPreamble(selfPath) + fmt.Sprintf("You are %s, the owner helper of task %s (%s).\n", name, t.Name, t.ID)
+	if handler := activeDatabaseHandler(agents); handler != "" {
+		b += fmt.Sprintf("This project's primary Database handler is %s. Send it every work-item write as a typed REQUEST; retired, offline or unavailable is not permission to bypass it.\n", handler)
+	} else {
+		b += "No active Database handler is registered yet: work-item writes wait for one, and there is no direct write fallback.\n"
+	}
+	if steward.Active != "" {
+		b += fmt.Sprintf("This project's Backlog steward is %s. Send it new bug and feature intake with tt send --to role:backlog_steward.\n", steward.Active)
+	}
+	return b + "\n" + strings.TrimRight(prompt, "\n") + "\n"
 }
 
 func cmdDoctor(e env) error {

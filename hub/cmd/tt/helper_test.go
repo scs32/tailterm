@@ -2906,3 +2906,114 @@ func TestHelperRegisterAfterAnswerGaps(t *testing.T) {
 		}
 	})
 }
+
+// stubOwnerHelperTemplate replaces the template loader for one test and
+// counts its calls.
+func stubOwnerHelperTemplate(t *testing.T, prompt string, err error) *atomic.Int32 {
+	t.Helper()
+	calls := &atomic.Int32{}
+	previous := loadOwnerHelperTemplate
+	loadOwnerHelperTemplate = func(context.Context) (ownerHelperTemplate, error) {
+		calls.Add(1)
+		return ownerHelperTemplate{Role: api.AgentRoleOwnerHelper, Prompt: prompt}, err
+	}
+	t.Cleanup(func() { loadOwnerHelperTemplate = previous })
+	return calls
+}
+
+// TestHelperRegisterPrintsRoleTemplate: text registration ends with the
+// embedded owner-helper template, read through the real bundle, right after
+// the act-as line (wi_6923d3e2a8ee0016 a8).
+func TestHelperRegisterPrintsRoleTemplate(t *testing.T) {
+	f := newHelperFixture(t)
+	want, err := loadOwnerHelperTemplate(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, label := range []string{"Ordering:", "Night:", "Delegation renewal:", "Process rules:"} {
+		if !strings.Contains(want.Prompt, label) {
+			t.Fatalf("embedded template lacks %q", label)
+		}
+	}
+	text, err := captureCLIOutput(t, func() error { return cmdHelper(f.owner, []string{"register", "--task", f.task.ID}) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	tail := fmt.Sprintf("act as the helper: eval \"$(tt helper env --task %s)\"\n\n%s\n", f.task.ID, strings.TrimRight(want.Prompt, "\n"))
+	if !strings.HasSuffix(text, tail) || strings.Count(text, want.Prompt) != 1 {
+		t.Fatalf("register text does not end with the template:\n%s", text)
+	}
+	if !strings.HasPrefix(text, "owner helper "+api.DefaultOwnerHelperName) {
+		t.Fatalf("register text lost its receipt line:\n%s", text)
+	}
+}
+
+// TestHelperRegisterJSONOmitsRoleTemplate: --json stays one JSON document,
+// and the conditional registration tt handoff restore makes prints nothing;
+// neither loads the template.
+func TestHelperRegisterJSONOmitsRoleTemplate(t *testing.T) {
+	f := newHelperFixture(t)
+	const sentinel = "SYNTHETIC OWNER HELPER PROCEDURE"
+	calls := stubOwnerHelperTemplate(t, sentinel, nil)
+	raw, err := captureCLIOutput(t, func() error {
+		return cmdHelper(f.owner, []string{"register", "--task", f.task.ID, "--json"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dec := json.NewDecoder(strings.NewReader(raw))
+	var first api.OwnerActionResult
+	if err := dec.Decode(&first); err != nil || first.Agent == nil {
+		t.Fatalf("register --json %q: %v", raw, err)
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		t.Fatalf("register --json printed more than one document: %q (%v)", raw, err)
+	}
+	if strings.Contains(raw, sentinel) || calls.Load() != 0 {
+		t.Fatalf("register --json loaded or printed the template (%d calls): %q", calls.Load(), raw)
+	}
+	newHelperThread(t)
+	quiet, err := captureCLIOutput(t, func() error {
+		_, err := registerHelperSession(f.owner, helperRegistration{task: f.task.ID, name: api.DefaultOwnerHelperName, expectedRun: first.Agent.RunID})
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if quiet != "" || calls.Load() != 0 {
+		t.Fatalf("conditional registration printed %q (%d template loads)", quiet, calls.Load())
+	}
+}
+
+// TestHelperRegisterTemplateFailureStillRegisters: a template that cannot be
+// read is one stderr warning naming tt brief; the registration stands.
+func TestHelperRegisterTemplateFailureStillRegisters(t *testing.T) {
+	f := newHelperFixture(t)
+	calls := stubOwnerHelperTemplate(t, "", errors.New("synthetic node failure"))
+	var text string
+	stderr, err := captureStream(t, &os.Stderr, func() error {
+		var runErr error
+		text, runErr = captureCLIOutput(t, func() error { return cmdHelper(f.owner, []string{"register", "--task", f.task.ID}) })
+		return runErr
+	})
+	if err != nil {
+		t.Fatalf("register failed with an unreadable template: %v", err)
+	}
+	lines := strings.Split(strings.TrimRight(stderr, "\n"), "\n")
+	if calls.Load() != 1 || len(lines) != 1 || !strings.Contains(lines[0], "could not load the owner-helper template: synthetic node failure") ||
+		!strings.Contains(lines[0], fmt.Sprintf("eval \"$(tt helper env --task %s)\" && tt brief", f.task.ID)) {
+		t.Fatalf("stderr %q (%d loads)", stderr, calls.Load())
+	}
+	if !strings.HasSuffix(text, fmt.Sprintf("act as the helper: eval \"$(tt helper env --task %s)\"\n", f.task.ID)) {
+		t.Fatalf("stdout %q", text)
+	}
+	state, err := loadOwnerHelperFile(f.owner.hub, f.task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := f.c.GetAgent(context.Background(), f.task.ID, state.Agent)
+	if err != nil || a.Role != api.AgentRoleOwnerHelper || a.RunID != state.Run {
+		t.Fatalf("registration not saved: %+v %+v %v", state, a, err)
+	}
+}
