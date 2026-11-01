@@ -192,7 +192,8 @@ async function pagedCases(browser, engine, kind) {
       change === "status" ? ["open", ""] : ["", "tsk_other"];
     if (change === "status")
       await page.locator("[data-items-status]").selectOption("open");
-    else await page.locator("[data-items-project]").selectOption("tsk_other");
+    // The project list in the rail; its select is hidden in this layout.
+    else await page.locator('[data-items-scope="tsk_other"]').click();
     const expected = await page.evaluate(
       ([s, t]) => window.qa.count(s, t),
       [status, taskId],
