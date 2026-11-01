@@ -958,6 +958,27 @@ AND NOT EXISTS (SELECT 1 FROM agent_work_item_bindings r JOIN agents ra ON ra.id
 	if a.WorkItem != nil {
 		a.ReadUpTo = contextThrough
 	}
+	if a.Role == api.AgentRoleDatabaseHandler {
+		// A handler rotation successor reads from its launch on, as a new
+		// owner helper does: nothing is addressed to it before it registers,
+		// and the project's earlier Board history is not new input for it.
+		// Without this its cursor starts at 0 and the relay wakes it for the
+		// whole backlog before its handoff (bug wi_661eac81661da548).
+		var upTo int64
+		err = tx.QueryRowContext(ctx, `INSERT INTO read_cursors (task_id,agent_id,up_to)
+SELECT ?,?,(SELECT COALESCE(MAX(seq),0) FROM messages WHERE task_id=?)
+WHERE EXISTS (SELECT 1 FROM handler_rotations WHERE task_id=? AND successor_agent_id=? AND state=?)
+ON CONFLICT(task_id,agent_id) DO UPDATE SET up_to=MAX(up_to,excluded.up_to)
+RETURNING up_to`, taskID, a.ID, taskID, taskID, a.ID, api.HandlerRotationPrepared).Scan(&upTo)
+		switch {
+		case err == nil:
+			a.ReadUpTo = upTo
+		case errors.Is(err, sql.ErrNoRows):
+			err = nil
+		default:
+			return a, err
+		}
+	}
 	eventData := map[string]any{"host": a.Host, "session": a.Session, "runtime": a.Runtime, "parentAgentId": a.ParentAgentID, "role": a.Role, "runId": a.RunID}
 	if a.WorkItem != nil {
 		eventData["workItem"] = a.WorkItem

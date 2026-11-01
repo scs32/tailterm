@@ -1281,6 +1281,18 @@ func relayOne(ctx context.Context, b runtimeBinding, p *relayProgress, c *api.Cl
 	if b.Runtime == "claude" {
 		prompt = claudeWakeFor(b, claudeWakePromptFor(eligibleMsgs, b.Agent, deployers))
 	}
+	// One wake covers the agent's whole unread inbox. A full page may end
+	// before the newest message, so the newest inbox message is read once and
+	// a successful wake records progress through it: a backlog wakes the agent
+	// once after its run starts, not once per page turn after turn (bug
+	// wi_661eac81661da548). A page that is not full already ends at the
+	// newest message and makes no read; a failed read keeps the page end.
+	progress := through
+	if len(msgs) >= relayPageLimit {
+		if newest, err := c.ListMessagesPage(ctx, b.Task, api.MessagePageQuery{To: b.Agent, Newest: true, Limit: 1}); err == nil && len(newest) > 0 {
+			progress = max(progress, newest[len(newest)-1].Seq)
+		}
+	}
 	if err := queue(ctx, b, prompt); err != nil {
 		if b.Runtime == "claude" {
 			recordClaudeWake(p, prompt, err, now)
@@ -1291,7 +1303,7 @@ func relayOne(ctx context.Context, b runtimeBinding, p *relayProgress, c *api.Cl
 	if b.Runtime == "claude" {
 		recordClaudeWake(p, prompt, nil, now)
 	}
-	p.Through = through
+	p.Through = progress
 	p.ClaudePendingInbox, p.ClaudePendingSeqs = false, nil
 	p.Error = ""
 	p.Skip = nil
@@ -1512,6 +1524,15 @@ func (l *relaySlowLimiter) allow(now time.Time) (int, bool) {
 	skipped := l.skipped
 	l.last, l.skipped = now, 0
 	return skipped, true
+}
+
+// relayCleanupSkippedText is the loop's one line for a run of skipped session
+// cleanups: "session cleanup skipped 1 pass" or "... skipped N passes".
+func relayCleanupSkippedText(n int) string {
+	if n == 1 {
+		return "session cleanup skipped 1 pass"
+	}
+	return fmt.Sprintf("session cleanup skipped %d passes", n)
 }
 
 func relayNotLogged(skipped int, one, many string) string {
@@ -1781,7 +1802,7 @@ func cmdRelay(args []string) error {
 			// until the ones in flight end and cleanup runs.
 			if !rotation.inFlight() && !queue.inFlight() && !visitPool.inFlight() {
 				if cleanupSkips > 0 {
-					fmt.Fprintf(os.Stderr, "[tt relay] %s session cleanup skipped %d passes\n", relayPassClock().UTC().Format(time.RFC3339), cleanupSkips)
+					fmt.Fprintf(os.Stderr, "[tt relay] %s %s\n", relayPassClock().UTC().Format(time.RFC3339), relayCleanupSkippedText(cleanupSkips))
 					cleanupSkips = 0
 				}
 				relayLoopCleanup()

@@ -4882,3 +4882,358 @@ func TestRelayOnceWaitsForEveryVisit(t *testing.T) {
 		}
 	}
 }
+
+// relayBacklogHub is a temp store behind an httptest hub for the backlog wake
+// tests (bug wi_661eac81661da548). wrap, when set, wraps the hub handler.
+type relayBacklogHub struct {
+	st   *store.Store
+	task api.Task
+	by   api.Caller
+	c    *api.Client
+	url  string
+}
+
+func newRelayBacklogHub(t *testing.T, wrap func(http.Handler) http.Handler) *relayBacklogHub {
+	t.Helper()
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "hub.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	h := &relayBacklogHub{st: st, by: api.Caller{Node: "cli-test", User: "owner"}}
+	if h.task, err = st.CreateTask(ctx, api.CreateTaskRequest{Name: "Backlog wakes", Orchestrator: "lead"}, h.by); err != nil {
+		t.Fatal(err)
+	}
+	var handler http.Handler = server.New(st, func(*http.Request) (api.Caller, error) { return h.by, nil })
+	if wrap != nil {
+		handler = wrap(handler)
+	}
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	h.url = srv.URL
+	if h.c, err = api.NewClient(srv.URL, 0); err != nil {
+		t.Fatal(err)
+	}
+	return h
+}
+
+// ownerPosts posts n recipient-less owner Board messages, which wake every
+// agent that has not read them, and returns the last one's sequence.
+func (h *relayBacklogHub) ownerPosts(t *testing.T, n int) int64 {
+	t.Helper()
+	var last int64
+	for i := 0; i < n; i++ {
+		m, err := h.st.PostMessage(context.Background(), h.task.ID, api.PostMessageRequest{Text: fmt.Sprintf("synthetic owner board post %d", i)}, h.by)
+		if err != nil {
+			t.Fatal(err)
+		}
+		last = m.Seq
+	}
+	return last
+}
+
+func (h *relayBacklogHub) directed(t *testing.T, to string) int64 {
+	t.Helper()
+	m, err := h.st.PostMessage(context.Background(), h.task.ID, api.PostMessageRequest{To: to, Text: "synthetic owner message addressed to the agent"}, h.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m.Seq
+}
+
+func (h *relayBacklogHub) online(t *testing.T, a api.Agent) {
+	t.Helper()
+	if _, err := h.st.PostEvent(context.Background(), h.task.ID, api.PostEventRequest{Kind: api.EventHeartbeat, AgentID: a.ID, RunID: a.RunID}, h.by); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (h *relayBacklogHub) binding(a api.Agent, runtime string) runtimeBinding {
+	b := runtimeBinding{Hub: h.url, Task: h.task.ID, Agent: a.ID, Run: a.RunID, Thread: "00000000-0000-4000-8000-000000000001", Runtime: runtime, Role: a.Role}
+	if runtime == "claude" {
+		b.Session = a.Session
+	} else {
+		b.Codex = "/synthetic/codex"
+	}
+	return b
+}
+
+// passes runs relayOne every 15 simulated seconds from start for d and returns
+// the time after the last pass.
+func relayBacklogPasses(t *testing.T, b runtimeBinding, p *relayProgress, c *api.Client, start time.Time, d time.Duration, queue func(context.Context, runtimeBinding, string) error) time.Time {
+	t.Helper()
+	at := start
+	for ; at.Sub(start) < d; at = at.Add(15 * time.Second) {
+		if err := relayOne(context.Background(), b, p, c, at, queue); err != nil {
+			t.Fatalf("relay pass at +%s: %v", at.Sub(start), err)
+		}
+	}
+	return at
+}
+
+// A handler rotation successor registers with its read cursor at its launch
+// (store AddAgent), so the relay never wakes it for the Board backlog posted
+// before it; a message addressed to it after its launch wakes it once.
+func TestRelayRotationSuccessorNotWokenForBacklog(t *testing.T) {
+	ctx := context.Background()
+	h := newRelayBacklogHub(t, nil)
+	old, err := h.st.AddAgent(ctx, h.task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: "database", Host: "host", Session: "database", Runtime: "codex", Role: api.AgentRoleDatabaseHandler}, h.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.online(t, old)
+	now := time.Now().UTC()
+	if _, err = h.st.ReportActivity(ctx, h.task.ID, old.ID, api.ActivityReport{RequestID: api.NewID("act"), RunID: old.RunID, Activity: api.AgentActivity{State: "idle", ObservedAt: now, LastEventAt: now}}); err != nil {
+		t.Fatal(err)
+	}
+	h.ownerPosts(t, 300)
+	task, err := h.st.GetTask(ctx, h.task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := h.st.HandlerRotationAction(ctx, h.task.ID, api.HandlerRotationRequest{Operation: api.HandlerRotationPrepare, RequestID: "backlog-prepare", ExpectedHandlerRevision: task.HandlerRevision,
+		OldAgentID: old.ID, OldRunID: old.RunID, SuccessorAgentID: api.NewID("agt"), SuccessorName: api.HandlerSuccessorName(old.Name, task.HandlerRevision),
+		Reason: api.HandlerRotationReasonManual, Trigger: api.HandlerRotationTriggerOwner}, h.by)
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	launch := h.ownerPosts(t, 20) // posted while prepared, before the successor registers
+	successor, err := h.st.AddAgent(ctx, h.task.ID, api.AddAgentRequest{AgentID: r.SuccessorAgentID, Name: r.SuccessorName, Role: api.AgentRoleDatabaseHandler, Host: "host", Session: "database-r2", Runtime: "codex"}, h.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.online(t, successor)
+	if got, err := h.c.GetAgent(ctx, h.task.ID, successor.ID); err != nil || got.Unread != 0 || got.ReadUpTo != launch || !got.Online {
+		t.Fatalf("successor at launch: %+v %v; want no unread, cursor %d", got, err, launch)
+	}
+	var prompts []string
+	queue := func(_ context.Context, _ runtimeBinding, prompt string) error {
+		prompts = append(prompts, prompt)
+		return nil
+	}
+	b, p := h.binding(successor, "codex"), relayProgress{}
+	at := relayBacklogPasses(t, b, &p, h.c, time.Now(), 5*time.Minute, queue)
+	if len(prompts) != 0 {
+		t.Fatalf("successor woken %d times for the pre-launch backlog: %q", len(prompts), prompts)
+	}
+	directed := h.directed(t, successor.ID)
+	relayBacklogPasses(t, b, &p, h.c, at, 5*time.Minute, queue)
+	if len(prompts) != 1 || !strings.Contains(prompts[0], fmt.Sprintf("through message #%d", directed)) {
+		t.Fatalf("successor not woken once for directed message #%d: %q", directed, prompts)
+	}
+}
+
+// After a start, the relay wakes an agent once for the whole backlog it then
+// has, not once per 200-message page while the agent pages its inbox 50 at a
+// time; a later message wakes it once more.
+func TestRelayBacklogAfterStartWakesOnce(t *testing.T) {
+	for _, runtime := range []string{"codex", "claude"} {
+		t.Run(runtime, func(t *testing.T) {
+			ctx := context.Background()
+			h := newRelayBacklogHub(t, nil)
+			newest := h.ownerPosts(t, 1000)
+			a, err := h.st.AddAgent(ctx, h.task.ID, api.AddAgentRequest{Name: "worker", Host: "host", Session: "worker", Runtime: runtime}, h.by)
+			if err != nil {
+				t.Fatal(err)
+			}
+			h.online(t, a)
+			var prompts []string
+			// Each turn reads one 50-message page, as tt inbox --unread --mark-read does.
+			queue := func(ctx context.Context, _ runtimeBinding, prompt string) error {
+				prompts = append(prompts, prompt)
+				cursor, err := h.st.ReadCursor(ctx, h.task.ID, a.ID)
+				if err != nil {
+					return err
+				}
+				return h.st.MarkRead(ctx, h.task.ID, api.MarkReadRequest{AgentID: a.ID, UpTo: cursor + 50})
+			}
+			b, p := h.binding(a, runtime), relayProgress{}
+			at := relayBacklogPasses(t, b, &p, h.c, time.Now(), 30*time.Minute, queue)
+			if len(prompts) != 1 || p.Through != newest {
+				t.Fatalf("backlog of 1000 woke %d times, progress %d (want 1 wake, progress %d)", len(prompts), p.Through, newest)
+			}
+			if got, err := h.c.GetAgent(ctx, h.task.ID, a.ID); err != nil || got.Unread == 0 {
+				t.Fatalf("fixture: the backlog must still be unread after one turn: %+v %v", got, err)
+			}
+			directed := h.directed(t, a.ID)
+			relayBacklogPasses(t, b, &p, h.c, at, 5*time.Minute, queue)
+			if len(prompts) != 2 || p.Through != directed {
+				t.Fatalf("directed message #%d after the backlog: %d wakes, progress %d (want 2 wakes, progress #%d)", directed, len(prompts), p.Through, directed)
+			}
+		})
+	}
+}
+
+// A page that is not full already ends at the newest inbox message, so the
+// relay makes no extra newest read for it.
+func TestRelayNotFullPageMakesNoNewestRead(t *testing.T) {
+	ctx := context.Background()
+	var newestReads atomic.Int64
+	h := newRelayBacklogHub(t, func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, "/messages") && r.URL.Query().Get("latest") == "1" {
+				newestReads.Add(1)
+			}
+			next.ServeHTTP(w, r)
+		})
+	})
+	newest := h.ownerPosts(t, 20)
+	a, err := h.st.AddAgent(ctx, h.task.ID, api.AddAgentRequest{Name: "worker", Host: "host", Session: "worker", Runtime: "codex"}, h.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.online(t, a)
+	var prompts []string
+	queue := func(context.Context, runtimeBinding, string) error {
+		prompts = append(prompts, "wake")
+		return nil
+	}
+	b, p := h.binding(a, "codex"), relayProgress{}
+	at := relayBacklogPasses(t, b, &p, h.c, time.Now(), 5*time.Minute, queue)
+	h.directed(t, a.ID)
+	relayBacklogPasses(t, b, &p, h.c, at, 5*time.Minute, queue)
+	if len(prompts) != 2 || p.Through <= newest {
+		t.Fatalf("fixture: %d wakes, progress %d (want 2 wakes past #%d)", len(prompts), p.Through, newest)
+	}
+	if n := newestReads.Load(); n != 0 {
+		t.Fatalf("%d newest reads for pages that were not full, want 0", n)
+	}
+}
+
+// The loop's line for a run of skipped session cleanups reads "1 pass" for
+// one pass and "N passes" for more (wi_1328c6bd412ea61d fu3, bug
+// wi_661eac81661da548 b5).
+func TestRelayCleanupSkippedLineCountsPasses(t *testing.T) {
+	for n, want := range map[int]string{
+		1: "session cleanup skipped 1 pass",
+		2: "session cleanup skipped 2 passes",
+		6: "session cleanup skipped 6 passes",
+	} {
+		if got := relayCleanupSkippedText(n); got != want {
+			t.Fatalf("relayCleanupSkippedText(%d) = %q, want %q", n, got, want)
+		}
+	}
+}
+
+// relayCleanupHoldTicks runs the relay loop over the visit fixture with one
+// visit blocked past the cleanup bound, as
+// TestRelayCleanupSkipBoundHoldsVisitsForDetachedVisit does, after install
+// replaces a pass's tick with one that counts its calls. It returns the
+// calls counted after each pass, the passes cleanup ran in, and the bound.
+func relayCleanupHoldTicks(t *testing.T, install func(count func())) (callsAfter, cleanupPasses []int, bound int) {
+	t.Helper()
+	var f *relayVisitFixture
+	var calls atomic.Int64
+	entered, release := make(chan struct{}), make(chan struct{})
+	var enterOnce, releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	// The visit stays blocked this many passes past the bound, so a hold that
+	// stopped gating the tick shows calls in several held passes.
+	const pastBound = 4
+	var passes, releasedAfter, cleanupsAtRelease, heldCalls int
+	deadline := time.Now().Add(15 * time.Second)
+	oldCleanup := relayLoopCleanup
+	t.Cleanup(func() { relayLoopCleanup = oldCleanup })
+	relayLoopCleanup = func() {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		cleanupPasses = append(cleanupPasses, passes+1)
+	}
+	pause := func() bool {
+		passes++
+		if time.Now().After(deadline) {
+			t.Errorf("pass %d timed out: cleanups in passes %v, calls after each pass %v", passes, cleanupPasses, callsAfter)
+			return false
+		}
+		// A tick runs in its own goroutine; give the one this pass started
+		// time to run before counting.
+		time.Sleep(10 * time.Millisecond)
+		n := int(calls.Load())
+		callsAfter = append(callsAfter, n)
+		f.mu.Lock()
+		cleanups := len(cleanupPasses)
+		f.mu.Unlock()
+		switch {
+		case passes == 1:
+			select {
+			case <-entered:
+			case <-time.After(10 * time.Second):
+				t.Error("the blocked visit never started")
+				return false
+			}
+		case releasedAfter == 0 && passes == relayCleanupSkipBound+1+pastBound:
+			releasedAfter, cleanupsAtRelease, heldCalls = passes, cleanups, n
+			unblock()
+		case releasedAfter > 0 && cleanups > cleanupsAtRelease && n > heldCalls:
+			// Cleanup ran again and the tick ran after it; stop.
+			return false
+		}
+		return true
+	}
+	f = newRelayVisitFixture(t, 3, 2, 50*time.Millisecond, pause)
+	t.Cleanup(unblock)
+	install(func() { calls.Add(1) })
+	blockedAgent := f.bindings[0].Agent
+	hook := func(agent string) {
+		if agent != blockedAgent {
+			return
+		}
+		first := false
+		enterOnce.Do(func() { first = true; close(entered) })
+		if first {
+			<-release
+		}
+	}
+	f.onAgentRead.Store(&hook)
+	if _, err := captureRelayOutput(t, true, func() error { return cmdRelay(nil) }); err != nil {
+		t.Fatal(err)
+	}
+	if releasedAfter == 0 {
+		t.Fatalf("the blocked visit was never released after %d passes", passes)
+	}
+	return callsAfter, cleanupPasses, relayCleanupSkipBound
+}
+
+// assertCleanupHoldGates checks the counted tick ran before the bound, never
+// in a held pass (one late call from the last pass before the hold is
+// allowed: its goroutine may run after that pass), and again after cleanup.
+func assertCleanupHoldGates(t *testing.T, name string, callsAfter, cleanupPasses []int, bound int) {
+	t.Helper()
+	if len(cleanupPasses) < 2 || cleanupPasses[0] != 1 || cleanupPasses[1] <= bound+2 {
+		t.Fatalf("cleanups ran in passes %v, want pass 1 and one after the release past pass %d", cleanupPasses, bound+2)
+	}
+	if callsAfter[bound-1] == 0 {
+		t.Fatalf("%s ran in no pass before the bound: calls after each pass %v", name, callsAfter)
+	}
+	held := callsAfter[bound] // after pass bound+1, the first held pass
+	for p := bound + 2; p < cleanupPasses[1]; p++ {
+		if callsAfter[p-1] != held {
+			t.Fatalf("%s ran in held pass %d: calls after each pass %v, cleanup in pass %d", name, p, callsAfter, cleanupPasses[1])
+		}
+	}
+	if callsAfter[len(callsAfter)-1] <= held {
+		t.Fatalf("%s never ran after cleanup: calls after each pass %v", name, callsAfter)
+	}
+}
+
+// The cleanup hold stops new team queue passes: deleting !holdForCleanup from
+// the queue.start guard fails this test (wi_1328c6bd412ea61d fu2, bug
+// wi_661eac81661da548 b4).
+func TestRelayCleanupHoldStopsTeamQueuePasses(t *testing.T) {
+	callsAfter, cleanupPasses, bound := relayCleanupHoldTicks(t, func(count func()) {
+		stubRelayTeamQueue(t, func(context.Context) error { count(); return nil })
+	})
+	assertCleanupHoldGates(t, "the team queue tick", callsAfter, cleanupPasses, bound)
+}
+
+// The cleanup hold stops new rotation passes: deleting !holdForCleanup from
+// the rotation.start guard fails this test (wi_1328c6bd412ea61d fu2, bug
+// wi_661eac81661da548 b4).
+func TestRelayCleanupHoldStopsRotationPasses(t *testing.T) {
+	callsAfter, cleanupPasses, bound := relayCleanupHoldTicks(t, func(count func()) {
+		// The fixture restores both ticks.
+		relayHandlerRotation = func(context.Context) error { count(); return nil }
+	})
+	assertCleanupHoldGates(t, "the handler rotation tick", callsAfter, cleanupPasses, bound)
+}

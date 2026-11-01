@@ -203,7 +203,15 @@ whose successor cleanup is not yet confirmed.
    --handler-successor` with the saved spec. The successor gets the primary
    handler prompt, plus a line telling it to wait for the handoff NOTICE. Its
    template digest, model and reasoning are recorded for its exact run in the
-   same transaction as the registration that starts the run.
+   same transaction as the registration that starts the run. The successor's
+   read cursor starts at the newest message when it registers, as a new owner
+   helper's does, so its inbox holds only messages posted after its launch,
+   chiefly the handoff NOTICE, and the relay never wakes it for the Board
+   history before that. Earlier Board history stays readable with `tt inbox
+   --board`. Until bug `wi_661eac81661da548` its cursor started at 0 and the
+   relay woke it again and again to page thousands of backlog messages before
+   the handoff (`TestHandlerRotationSuccessorReadsFromLaunch`,
+   `TestRelayRotationSuccessorNotWokenForBacklog`).
 3. **Wait.** The routine waits up to two minutes for the successor to come
    online, then for its first completed turn, up to 10 minutes from its launch
    (see [Successor readiness](#successor-readiness)). Until then the rotation
@@ -282,7 +290,8 @@ a person. Online is therefore not readiness.
   without it starts the 10 minutes at its first resume) a successor that is
   not ready is a wait: the rotation stays prepared, the runner neither counts
   nor logs it, and the old handler keeps every obligation. Nothing is sent to
-  the successor, so the wait does not depend on a relay wake reaching it.
+  the successor, so the wait does not depend on a relay wake reaching it, and
+  with its read cursor at its launch it has no backlog to be woken for.
 - **After 10 minutes** each resume that still finds it not ready is a counted
   failure ("did not complete a turn or post a message within 10m0s"), and at
   the [ceiling](#a-successor-that-never-comes-online) the runner stops with

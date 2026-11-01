@@ -4011,3 +4011,117 @@ func provisionPrimary(t *testing.T, f *provisionFixture) api.Agent {
 	}
 	return primary
 }
+
+// ownerPost posts a recipient-less owner Board message, as a human would.
+func (f *rotationFixture) ownerPost(t *testing.T, text string) api.Message {
+	t.Helper()
+	m, err := f.s.PostMessage(context.Background(), f.task.ID, api.PostMessageRequest{Text: text}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
+func (f *rotationFixture) maxSeq(t *testing.T) int64 {
+	t.Helper()
+	var seq int64
+	if err := f.s.db.QueryRow(`SELECT COALESCE(MAX(seq),0) FROM messages WHERE task_id=?`, f.task.ID).Scan(&seq); err != nil {
+		t.Fatal(err)
+	}
+	return seq
+}
+
+// A rotation successor's read cursor starts at the newest message when it
+// registers, so the Board history before its launch is never unread input
+// for it; its handoff NOTICE and later posts are (bug wi_661eac81661da548).
+func TestHandlerRotationSuccessorReadsFromLaunch(t *testing.T) {
+	f := newRotationFixture(t)
+	ctx := context.Background()
+	f.ownerPost(t, "synthetic owner board post before the prepare")
+	f.send(t, f.worker, api.EnvelopeKindNotice, "", "Synthetic worker broadcast before the prepare", false)
+	r, err := f.prepare(t, "launch-cursor-prepare", api.Agent{}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.ownerPost(t, "synthetic owner board post during the prepare")
+	f.send(t, f.worker, api.EnvelopeKindNotice, "", "Synthetic worker broadcast during the prepare", false)
+	f.send(t, f.worker, api.EnvelopeKindRequest, f.old.ID, "Synthetic request to the old handler during the prepare", false)
+	launchSeq := f.maxSeq(t)
+	if launchSeq == 0 {
+		t.Fatal("fixture posted no messages")
+	}
+	successor, err := f.s.AddAgent(ctx, f.task.ID, api.AddAgentRequest{AgentID: r.SuccessorAgentID, Role: api.AgentRoleDatabaseHandler, Name: r.SuccessorName,
+		Host: "mini", Session: "tt-handler-launch-cursor", Runtime: f.old.Runtime, Cwd: f.old.Cwd}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if successor.ReadUpTo != launchSeq {
+		t.Fatalf("registered successor ReadUpTo %d, want the launch seq %d", successor.ReadUpTo, launchSeq)
+	}
+	if cursor, err := f.s.ReadCursor(ctx, f.task.ID, successor.ID); err != nil || cursor != launchSeq {
+		t.Fatalf("successor read cursor %d (%v), want %d", cursor, err, launchSeq)
+	}
+	if n, err := f.s.Unread(ctx, f.task.ID, successor.ID); err != nil || n != 0 {
+		t.Fatalf("successor unread at launch %d (%v), want 0", n, err)
+	}
+	// Replaying the same launch never moves the cursor back.
+	if again, err := f.s.AddAgent(ctx, f.task.ID, api.AddAgentRequest{AgentID: r.SuccessorAgentID, Role: api.AgentRoleDatabaseHandler, Name: r.SuccessorName,
+		Host: "mini", Session: "tt-handler-launch-cursor", Runtime: f.old.Runtime, Cwd: f.old.Cwd}, f.by); err != nil {
+		t.Fatalf("replayed successor launch: %+v %v", again, err)
+	}
+	if cursor, err := f.s.ReadCursor(ctx, f.task.ID, successor.ID); err != nil || cursor != launchSeq {
+		t.Fatalf("successor read cursor after replay %d (%v), want %d", cursor, err, launchSeq)
+	}
+	after := f.ownerPost(t, "synthetic owner board post after the launch")
+	if n, err := f.s.Unread(ctx, f.task.ID, successor.ID); err != nil || n != 1 {
+		t.Fatalf("successor unread after one post %d (%v), want 1", n, err)
+	}
+	if _, err = f.s.PostEvent(ctx, f.task.ID, api.PostEventRequest{AgentID: successor.ID, RunID: successor.RunID, Kind: api.EventStarted}, f.by); err != nil {
+		t.Fatal(err)
+	}
+	committed, err := f.commit(r, "launch-cursor-commit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if committed.Receipt == nil || committed.Receipt.NoticeSeq <= launchSeq {
+		t.Fatalf("committed receipt: %+v", committed.Receipt)
+	}
+	page, err := f.s.ListMessages(ctx, f.task.ID, launchSeq, successor.ID, 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var seqs []int64
+	for _, m := range page {
+		if m.Seq <= launchSeq {
+			t.Fatalf("successor unread page holds pre-launch message #%d", m.Seq)
+		}
+		seqs = append(seqs, m.Seq)
+	}
+	if !slices.Contains(seqs, after.Seq) || !slices.Contains(seqs, committed.Receipt.NoticeSeq) {
+		t.Fatalf("successor unread page %v must hold the post-launch post #%d and the handoff NOTICE #%d", seqs, after.Seq, committed.Receipt.NoticeSeq)
+	}
+}
+
+// A database handler registered with no prepared rotation for it, and a plain
+// agent, keep today's cursor: the Board history is unread input for them.
+func TestHandlerRotationOtherHandlerKeepsCursor(t *testing.T) {
+	f := newRotationFixture(t)
+	ctx := context.Background()
+	f.ownerPost(t, "synthetic owner board post one")
+	f.ownerPost(t, "synthetic owner board post two")
+	// A prepared rotation exists, but for another successor ID.
+	if _, err := f.prepare(t, "other-handler-prepare", api.Agent{}, ""); err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range []api.Agent{f.agent(t, "aux-handler", api.AgentRoleDatabaseHandler), f.agent(t, "plain-worker", "")} {
+		if a.ReadUpTo != 0 {
+			t.Fatalf("%s ReadUpTo %d, want 0", a.Name, a.ReadUpTo)
+		}
+		if cursor, err := f.s.ReadCursor(ctx, f.task.ID, a.ID); err != nil || cursor != 0 {
+			t.Fatalf("%s read cursor %d (%v), want 0", a.Name, cursor, err)
+		}
+		if n, err := f.s.Unread(ctx, f.task.ID, a.ID); err != nil || n < 2 {
+			t.Fatalf("%s unread %d (%v), want the earlier board posts counted", a.Name, n, err)
+		}
+	}
+}
