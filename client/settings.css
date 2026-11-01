@@ -1,23 +1,17 @@
-/* TailOS Settings (wi_dc04ac6a9ccf7402). Selection is a fill, hover is an
-   outline; inputs and buttons share one height; placeholders are muted. */
-#workspace .sidebar-bottom #settings-nav {
-  box-shadow: none;
-}
-#workspace
-  .sidebar-bottom
-  #settings-nav:not([aria-pressed="true"]):is(:hover, :focus-visible) {
-  background: transparent;
-  box-shadow: inset 0 0 0 1px var(--accent);
-}
+/* TailOS Settings (wi_dc04ac6a9ccf7402). The nav entry keeps the sidebar's
+   own hover and focus; selected, it is filled like a selected server (the
+   border shows hover/focus). Inputs and buttons share one height. */
 #workspace .sidebar-bottom #settings-nav[aria-pressed="true"] {
   background: color-mix(in srgb, var(--accent) 25%, #063c2d);
   color: #f3fff9;
+  border-color: var(--line);
 }
 #workspace
   .sidebar-bottom
   #settings-nav[aria-pressed="true"]:is(:hover, :focus-visible) {
   background: color-mix(in srgb, var(--accent) 25%, #063c2d);
-  box-shadow: inset 0 0 0 1px var(--accent);
+  color: #f3fff9;
+  border-color: var(--accent);
 }
 
 .settings-view {

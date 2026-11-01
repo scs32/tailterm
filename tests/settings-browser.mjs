@@ -245,14 +245,36 @@ try {
         ["keys", "settings-nav", "lock"],
       );
       assert.equal(await nav.getAttribute("aria-pressed"), "false");
-      // Hover is an outline, not a fill, while not selected.
-      await nav.hover();
-      const hover = await nav.evaluate((el) => {
+      // Unselected, the entry hovers and focuses exactly like the other
+      // sidebar buttons (tests/workspace-controls-browser.mjs's rule).
+      const look = (el) => {
         const s = getComputedStyle(el);
-        return { bg: s.backgroundColor, shadow: s.boxShadow };
-      });
-      assert.ok(transparent(hover.bg), `hover fill ${hover.bg}`);
-      assert.match(hover.shadow, /inset/, `hover outline ${hover.shadow}`);
+        return {
+          bg: s.backgroundColor,
+          border:
+            s.borderTopColor + " " + s.borderTopWidth + " " + s.borderTopStyle,
+          shadow: s.boxShadow,
+          color: s.color,
+        };
+      };
+      await page.locator("#keys").hover();
+      const sibling = await page.locator("#keys").evaluate(look);
+      await nav.hover();
+      assert.deepEqual(
+        await nav.evaluate(look),
+        sibling,
+        "nav hover matches the sidebar",
+      );
+      await page.mouse.move(700, 700);
+      await page.locator("#keys").focus();
+      const siblingFocus = await page.locator("#keys").evaluate(look);
+      await nav.focus();
+      assert.deepEqual(
+        await nav.evaluate(look),
+        siblingFocus,
+        "nav focus matches the sidebar",
+      );
+      await nav.evaluate((el) => el.blur());
       await nav.click();
       await page.locator(".settings-view h2").waitFor();
       assert.equal(await nav.getAttribute("aria-pressed"), "true");
