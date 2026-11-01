@@ -234,6 +234,7 @@ export function createWorkItemsView({
   // search cache and renders the whole view; later pages, and the last,
   // repaint only the list, at most once a frame.
   function showPage(token, key, nextTasks, next, pending) {
+    const added = itemsKey !== key || next.length !== items.length;
     tasks = nextTasks;
     items = next.slice();
     itemsKey = key;
@@ -243,7 +244,10 @@ export function createWorkItemsView({
       searchGeneration++;
       searchHistory.clear();
       render();
-    } else scheduleList();
+    } else if (added) scheduleList();
+    // The empty page that ends a read adds no rows: only the status changes,
+    // and the rows on screen (and any held control in them) stay as they are.
+    else if (renderedKey === filterKey()) updateSearchResults(false, true);
     if (query.trim()) {
       searchMore = true;
       void enrichSearchHistory();
@@ -269,10 +273,13 @@ export function createWorkItemsView({
   function updateList() {
     const key = filterKey();
     if (renderedKey !== key) return render();
-    // A held scroll keeps this DOM; its flush renders the whole view.
+    // A held scroll, or a held pointer, key or text entry, keeps this DOM;
+    // its flush renders the whole view.
     const frame = itemScroll.beforeRender(key);
     if (!frame) return;
+    if (!presentation.beforeRender(scope || "all")) return;
     updateSearchResults();
+    presentation.afterRender(scope || "all");
     itemScroll.afterRender(frame);
   }
   function render() {
@@ -394,7 +401,9 @@ export function createWorkItemsView({
             dispatch(items.find((i) => i.id === b.dataset.itemSend))),
       );
   }
-  function updateSearchResults(resetScroll = false) {
+  // statusOnly updates the count and status but keeps the rows on screen,
+  // unless the list is empty and its empty text may need to change.
+  function updateSearchResults(resetScroll = false, statusOnly = false) {
     const list = root?.querySelector(".work-items-list");
     if (!list) return;
     // Items of another filter are never shown: until the current filter's
@@ -422,6 +431,8 @@ export function createWorkItemsView({
         (query.trim() && current
           ? ` · ${pending ? "Searching current records and history…" : `${filtered.length} match${filtered.length === 1 ? "" : "es"}${morePages ? " so far" : ""}${unavailable ? ` · history unavailable for ${unavailable}` : ""}`}`
           : "") + loadingMore;
+    if (statusOnly && filtered.length && list.querySelector("[data-work-item]"))
+      return;
     list.innerHTML = filtered.length
       ? filtered.map(rowMarkup).join("")
       : `<p class="work-items-empty fine">${!current ? `Loading ${plural.toLowerCase()}…` : pending ? `Searching ${plural.toLowerCase()} history…` : morePages ? `Loading more ${plural.toLowerCase()}…` : `No ${plural.toLowerCase()} match this search and the selected filters.`}</p>`;
