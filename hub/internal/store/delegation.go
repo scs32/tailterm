@@ -3,7 +3,10 @@ package store
 // Owner delegation windows (docs/owner-delegation-windows.md). A window routes
 // the owner's covered decision requests in one project to a delegate agent
 // until it expires or the owner closes it; unanswered routed requests then
-// return to the owner. Matrix approvals are never routed.
+// return to the owner. Matrix approvals are never routed. Opening a window
+// also saves a one-time authority-expiry wake on the owner helper's hub wake
+// schedule, so the broker reminds before the window ends; ending the window
+// first cancels it.
 
 import (
 	"context"
@@ -374,6 +377,9 @@ func (s *Store) OpenDelegationWindow(ctx context.Context, taskID string, req api
 		if _, err := s.postDelegationNotice(ctx, tx, task, delegate, "The owner delegated decisions to you for a set time", text, map[string]string{"delegation": w.ID, "onBehalfOf": "owner"}, links, order, "delegation-open-"+w.ID); err != nil {
 			return api.OwnerActionResult{}, err
 		}
+		if err := s.scheduleWindowReminder(ctx, tx, task, w, by, now); err != nil {
+			return api.OwnerActionResult{}, err
+		}
 		waiting, err := openRequests(ctx, tx, taskID)
 		if err != nil {
 			return api.OwnerActionResult{}, err
@@ -443,6 +449,9 @@ func (s *Store) endWindow(ctx context.Context, tx *sql.Tx, task api.Task, w api.
 	}
 	if n, _ := res.RowsAffected(); n != 1 {
 		return ErrBrokerStale
+	}
+	if err := s.cancelWindowReminder(ctx, tx, task.ID, w, now); err != nil {
+		return err
 	}
 	rows, err := tx.QueryContext(ctx, `SELECT `+routeCols+` FROM owner_delegation_routes WHERE window_id=? AND answer_seq=0 AND returned_at='' ORDER BY request_seq`, w.ID)
 	if err != nil {
@@ -746,4 +755,90 @@ func recordDelegatedAnswer(ctx context.Context, tx *sql.Tx, d delegatedRoute, an
 
 func delegatedRefs(w api.DelegationWindow) map[string]string {
 	return map[string]string{"delegated": "true", "delegation": w.ID, "onBehalfOf": "owner"}
+}
+
+// ---- the reminder before the end (bug wi_9898f0ff7e8e1464) ----
+
+// windowReminderMaxLead is the longest lead time of a window's reminder.
+const windowReminderMaxLead = 24 * time.Hour
+
+// windowReminderRequestID is the request ID of a window's reminder wake. Its
+// owner_helper_wake_requests row is never rewritten, so it finds the wake
+// even after the owner helper changed it.
+func windowReminderRequestID(windowID string) string { return "delegation-reminder-" + windowID }
+
+// windowReminderAt is the reminder's slot: half the window before its end, at
+// most 24 hours, truncated to the whole UTC minute. ok is false when that slot
+// is not after now.
+func windowReminderAt(endsAt, now time.Time) (time.Time, bool) {
+	lead := endsAt.Sub(now) / 2
+	if lead > windowReminderMaxLead {
+		lead = windowReminderMaxLead
+	}
+	at := endsAt.Add(-lead).UTC().Truncate(time.Minute)
+	return at, at.After(now)
+}
+
+// scheduleWindowReminder saves w's reminder: one Board notice saying what to
+// do and one authority-expiry wake on the owner helper's hub wake schedule,
+// due once at the reminder slot and expiring at the window's end, so the
+// broker's wake sweep delivers it. It is not counted against
+// api.MaxOwnerHelperWakes: a project has one open window, and an open never
+// fails for the cap.
+func (s *Store) scheduleWindowReminder(ctx context.Context, tx *sql.Tx, task api.Task, w api.DelegationWindow, by api.Caller, now time.Time) error {
+	at, ok := windowReminderAt(w.EndsAt, now)
+	if !ok {
+		return nil
+	}
+	wakeID := api.NewID("ohw")
+	when := at.Format("Jan 2 15:04 UTC")
+	text := fmt.Sprintf("The owner delegation window %s to %s (%s) ends %s. The hub reminds before the end: at %s, wake %s (authority-expiry) goes to the owner helper, or to the owner when no helper is live. "+
+		"To keep the delegation, the owner closes this window and opens a new one before it ends: tt owner delegation close %s, then tt owner delegation open --delegate %s --until TIME. "+
+		"Otherwise it ends at %s and unanswered routed requests return to the owner. Ending the window first cancels this reminder.",
+		w.ID, w.DelegateName, scopeLabel(w.Scope), windowEnd(w), when, wakeID, w.ID, w.DelegateName, windowEnd(w))
+	m, err := s.postDelegationNotice(ctx, tx, task, api.Agent{}, "A reminder is set before the delegation window ends", text,
+		map[string]string{"delegationReminder": w.ID, "ownerWake": "authority-expiry", "wake": wakeID}, nil, nil, "")
+	if err != nil {
+		return err
+	}
+	ends := w.EndsAt.UTC()
+	req := api.SetOwnerHelperWakeRequest{Kind: "authority-expiry", Schedule: fmt.Sprintf("%d %d %d %d *", at.Minute(), at.Hour(), at.Day(), int(at.Month())),
+		TimeZone: "UTC", MessageSeq: m.Seq, ExpiresAt: &ends, RequestID: windowReminderRequestID(w.ID)}
+	hash := requestHash(req)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO owner_helper_wakes(`+ownerWakeCols+`,payload_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		wakeID, task.ID, req.Kind, req.Schedule, req.TimeZone, req.MessageSeq, api.OwnerHelperWakeActive, ts(ends), ownerWakeTS(at), 1, req.RequestID, "", "",
+		by.Node, by.User, ts(now), ts(now), hash); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO owner_helper_wake_requests(task_id,request_id,payload_hash,wake_id,revision,created,created_at) VALUES(?,?,?,?,?,?,?)`,
+		task.ID, req.RequestID, hash, wakeID, 1, true, ts(now)); err != nil {
+		return err
+	}
+	_, err = s.insertEvent(ctx, tx, task.ID, "task_updated", "", "Owner helper wake saved", map[string]any{"ownerHelperWake": wakeID, "revision": 1, "state": api.OwnerHelperWakeActive, "kind": req.Kind}, by)
+	return err
+}
+
+// cancelWindowReminder cancels w's reminder wake while it is still active, in
+// the transaction that ends w, so no reminder is posted for an ended window.
+// A reminder already fired (expired) or cancelled by the helper is left alone.
+func (s *Store) cancelWindowReminder(ctx context.Context, tx *sql.Tx, taskID string, w api.DelegationWindow, now time.Time) error {
+	var wakeID string
+	err := tx.QueryRowContext(ctx, `SELECT wake_id FROM owner_helper_wake_requests WHERE task_id=? AND request_id=?`, taskID, windowReminderRequestID(w.ID)).Scan(&wakeID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil // opened before reminders, or too short for one
+	}
+	if err != nil {
+		return err
+	}
+	var revision int64
+	err = tx.QueryRowContext(ctx, `UPDATE owner_helper_wakes SET state=?,next_due_at='',revision=revision+1,updated_at=? WHERE id=? AND task_id=? AND state=? RETURNING revision`,
+		api.OwnerHelperWakeCancelled, ts(now), wakeID, taskID, api.OwnerHelperWakeActive).Scan(&revision)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	_, err = s.insertEvent(ctx, tx, taskID, "task_updated", "", "Owner helper wake saved", map[string]any{"ownerHelperWake": wakeID, "revision": revision, "state": api.OwnerHelperWakeCancelled, "kind": "authority-expiry"}, BrokerCaller)
+	return err
 }

@@ -245,6 +245,8 @@ The hub decides who may write: the owner (no agent and no run), or the exact cur
 
 **Daylight saving.** A wall-clock minute that occurs twice (the fall back, such as 01:30 on 2026-11-01 in Pacific time) fires once, at its first occurrence; a minute the spring forward skips (02:30 on 2027-03-14) does not fire that day.
 
+**Delegation reminders.** Opening an owner delegation window saves one `authority-expiry` wake for it, written as the owner: due once, at the window's end minus half the window (at most 24 hours), in zone `UTC`, expiring at the end, with the window's reminder notice as its Board message (bug `wi_9898f0ff7e8e1464`; `docs/owner-delegation-windows.md`, "Reminder before the end"). It is delivered and reported like any wake, is saved even at the 20-wake cap (and counts toward it), and is cancelled when the window ends first. Windows opened before that release have none. A helper that kept its own `authority-expiry` wake for the same window should cancel it, or it is reminded twice.
+
 Routes, for any identified caller; the Discord bridge credential reaches neither:
 
 | Route | Does |

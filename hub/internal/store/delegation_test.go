@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -601,4 +602,380 @@ func TestDelegationUnroutedRequestStaleRunIsForbidden(t *testing.T) {
 	if _, err := f.delegateAnswer("current", merge.ID, "Merge it", "because", f.lead); !errors.Is(err, api.ErrConflict) || errors.Is(err, api.ErrDelegationForbidden) {
 		t.Fatalf("current run on an unrouted request: %v", err)
 	}
+}
+
+// ---- the reminder before the end (bug wi_9898f0ff7e8e1464) ----
+
+// reminderStart puts the fixture's fake clock on a whole UTC minute, so the
+// reminder slot's truncation is deterministic.
+func reminderStart(f delegationFixture) time.Time {
+	*f.clock = time.Date(2026, 11, 1, 18, 0, 0, 0, time.UTC)
+	return *f.clock
+}
+
+// reminderWakes lists the project's authority-expiry wakes.
+func (f delegationFixture) reminderWakes(t *testing.T) []api.OwnerHelperWake {
+	t.Helper()
+	list, err := f.s.ListOwnerHelperWakes(context.Background(), f.task.ID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []api.OwnerHelperWake
+	for _, w := range list.Wakes {
+		if w.Kind == "authority-expiry" {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
+func (f delegationFixture) wakeByID(t *testing.T, id string) api.OwnerHelperWake {
+	t.Helper()
+	w, err := scanOwnerWake(f.s.db.QueryRow(`SELECT `+ownerWakeCols+` FROM owner_helper_wakes WHERE id=?`, id))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return w
+}
+
+// reminderNotices lists the board notices that set windowID's reminder.
+func (f delegationFixture) reminderNotices(t *testing.T, windowID string) []api.Message {
+	t.Helper()
+	msgs, err := f.s.ListMessages(context.Background(), f.task.ID, 0, "", 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []api.Message
+	for _, m := range msgs {
+		if m.Envelope != nil && m.Envelope.Refs["delegationReminder"] == windowID {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// wakeNotices lists every authority-expiry wake notice and owner report the
+// broker posted.
+func (f delegationFixture) wakeNotices(t *testing.T) []api.Message {
+	t.Helper()
+	msgs, err := f.s.ListMessages(context.Background(), f.task.ID, 0, "", 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []api.Message
+	for _, m := range msgs {
+		if m.Envelope != nil && m.Envelope.Refs["ownerWake"] == "authority-expiry" && m.Envelope.Refs["delegationReminder"] == "" {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+func (f delegationFixture) wakeSweep(t *testing.T, at time.Time) []OwnerHelperWakeStep {
+	t.Helper()
+	*f.clock = at
+	steps, err := f.s.OwnerHelperWakeSweep(context.Background(), at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return steps
+}
+
+// tick runs the broker's two steps in Tick order: window expiry, then the
+// wake sweep.
+func (f delegationFixture) tick(t *testing.T, at time.Time) ([]string, []OwnerHelperWakeStep) {
+	t.Helper()
+	*f.clock = at
+	expired, err := f.s.BrokerExpireDelegationWindows(context.Background(), at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return expired, f.wakeSweep(t, at)
+}
+
+// reopen is a hub restart over the same database with the same fake clock.
+func (f *delegationFixture) reopen(t *testing.T) {
+	t.Helper()
+	f.s.Close()
+	s, err := Open(f.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock := f.clock
+	s.now = func() time.Time { return *clock }
+	f.s = s
+	t.Cleanup(func() { s.Close() })
+}
+
+// a1: opening a window saves one active authority-expiry wake at
+// trunc_minute(end - min(24h, half the window)), with one board notice that
+// says what to do; a window too short for a whole minute gets none.
+func TestDelegationReminderSchedule(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		window time.Duration
+		lead   time.Duration // end - slot; 0 means no reminder
+	}{
+		{"seven days", 7 * 24 * time.Hour, 24 * time.Hour},
+		{"three hours", 3 * time.Hour, 90 * time.Minute},
+		{"truncated to the minute", 3*time.Hour + 30*time.Second, 90*time.Minute + 30*time.Second},
+		{"two minutes", 2 * time.Minute, time.Minute},
+		{"no whole minute", 61 * time.Second, 0},
+		{"one minute", time.Minute, 0},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newDelegationFixture(t)
+			start := reminderStart(f)
+			w := f.open(t, "open-reminder", api.DelegationScopeDecisions, c.window)
+			wakes, notices := f.reminderWakes(t), f.reminderNotices(t, w.ID)
+			if c.lead == 0 {
+				if len(wakes) != 0 || len(notices) != 0 {
+					t.Fatalf("short window saved %+v %+v", wakes, notices)
+				}
+				return
+			}
+			if len(wakes) != 1 || len(notices) != 1 {
+				t.Fatalf("wakes %+v notices %+v", wakes, notices)
+			}
+			end := start.Add(c.window)
+			at := end.Add(-c.lead)
+			if at.Truncate(time.Minute) != at || !at.After(start) {
+				t.Fatalf("case slot %s is not a whole minute after the open", at)
+			}
+			wk, n := wakes[0], notices[0]
+			schedule := strconv.Itoa(at.Minute()) + " " + strconv.Itoa(at.Hour()) + " " + strconv.Itoa(at.Day()) + " " + strconv.Itoa(int(at.Month())) + " *"
+			if wk.State != api.OwnerHelperWakeActive || wk.TimeZone != "UTC" || wk.Schedule != schedule || wk.NextDueAt == nil || !wk.NextDueAt.Equal(at) ||
+				wk.ExpiresAt == nil || !wk.ExpiresAt.Equal(end) || wk.AgentID != "" || wk.RunID != "" || wk.Revision != 1 || wk.MessageSeq != n.Seq ||
+				wk.RequestID != "delegation-reminder-"+w.ID {
+				t.Fatalf("wake %+v; want slot %s schedule %q expiry %s message %d", wk, at, schedule, end, n.Seq)
+			}
+			env := n.Envelope
+			wantRefs := map[string]string{"delegationReminder": w.ID, "ownerWake": "authority-expiry", "wake": wk.ID}
+			if n.To != "" || n.From.Node != api.BrokerNode || env.Kind != api.EnvelopeKindNotice || env.Subject != "A reminder is set before the delegation window ends" || !sameRefs(env.Refs, wantRefs) {
+				t.Fatalf("notice %+v %+v", n, env)
+			}
+			for _, part := range []string{w.ID, f.lead.Name, windowEnd(w), at.Format("Jan 2 15:04 UTC"), wk.ID,
+				"tt owner delegation close " + w.ID, "tt owner delegation open --delegate " + f.lead.Name, "unanswered routed requests return to the owner"} {
+				if !strings.Contains(env.Body.Text, part) {
+					t.Fatalf("notice text lacks %q: %s", part, env.Body.Text)
+				}
+			}
+			if got := f.boardNotices(t, w.ID); len(got) != 0 {
+				t.Fatalf("the reminder notice must not count as a window notice: %+v", got)
+			}
+			out, err := f.s.OpenDelegationWindow(context.Background(), f.task.ID, api.OpenDelegationWindowRequest{Delegate: f.lead.Name, EndsAt: end, Scope: api.DelegationScopeDecisions, Source: &api.DelegationSource{Kind: api.DelegationSourceTT}, RequestID: "open-reminder"}, f.by)
+			if err != nil || !out.Replay {
+				t.Fatalf("replay %+v %v", out, err)
+			}
+			if len(f.reminderWakes(t)) != 1 || len(f.reminderNotices(t, w.ID)) != 1 {
+				t.Fatal("a replayed open added a reminder")
+			}
+		})
+	}
+}
+
+// a1: the reminder is not refused for the 20-wake cap, and counts toward it.
+func TestDelegationReminderCap(t *testing.T) {
+	f := newDelegationFixture(t)
+	reminderStart(f)
+	ctx := context.Background()
+	m, err := f.s.PostMessage(ctx, f.task.ID, api.PostMessageRequest{Text: "synthetic wake instructions"}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < api.MaxOwnerHelperWakes; i++ {
+		if _, _, err := f.s.SetOwnerHelperWake(ctx, f.task.ID, api.SetOwnerHelperWakeRequest{Kind: "hourly-update", Schedule: "14 7-20 * * *", MessageSeq: m.Seq, RequestID: "cap-" + strconv.Itoa(i)}, f.by); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w := f.open(t, "open-cap", api.DelegationScopeDecisions, 3*time.Hour)
+	if wakes := f.reminderWakes(t); len(wakes) != 1 || wakes[0].State != api.OwnerHelperWakeActive || wakes[0].RequestID != "delegation-reminder-"+w.ID {
+		t.Fatalf("reminder at the cap %+v", wakes)
+	}
+	if _, _, err := f.s.SetOwnerHelperWake(ctx, f.task.ID, api.SetOwnerHelperWakeRequest{Kind: "other", Schedule: "0 9 * * *", MessageSeq: m.Seq, RequestID: "cap-over"}, f.by); !errors.Is(err, api.ErrConflict) {
+		t.Fatalf("a wake past the cap with the reminder counted: %v", err)
+	}
+}
+
+// a2: at the slot the existing wake sweep posts the standard owner-helper
+// wake notice to the current helper once, across sweeps and a restart, and
+// the wake expires. broker.Tick needs no new step.
+func TestDelegationReminderDelivery(t *testing.T) {
+	f := newDelegationFixture(t)
+	start := reminderStart(f)
+	helper := *registerHelper(t, f.s, f.task.ID, helperRequest("reminder-reg"), f.by).Agent
+	w := f.open(t, "open-delivery", api.DelegationScopeDecisions, 3*time.Hour)
+	at := start.Add(90 * time.Minute)
+	wk := f.reminderWakes(t)[0]
+	reminder := f.reminderNotices(t, w.ID)[0]
+	if expired, steps := f.tick(t, at.Add(-time.Second)); len(expired) != 0 || len(steps) != 0 {
+		t.Fatalf("before the slot %v %+v", expired, steps)
+	}
+	expired, steps := f.tick(t, at.Add(20*time.Second))
+	if len(expired) != 0 || len(steps) != 1 || steps[0].Action != ownerWakeActionPosted || steps[0].WakeID != wk.ID {
+		t.Fatalf("at the slot %v %+v", expired, steps)
+	}
+	got := f.wakeNotices(t)
+	if len(got) != 1 || got[0].Seq != steps[0].MessageSeq || got[0].To != helper.ID {
+		t.Fatalf("wake notices %+v", got)
+	}
+	env := got[0].Envelope
+	wantRefs := map[string]string{"ownerWake": "authority-expiry", "wake": wk.ID, "due": at.Format(time.RFC3339), "message": strconv.FormatInt(reminder.Seq, 10)}
+	if env.Kind != api.EnvelopeKindNotice || env.Subject != "Owner-helper wake: authority expiry due "+at.Format("15:04")+" UTC" || env.To != helper.Name || !sameRefs(env.Refs, wantRefs) ||
+		!strings.Contains(env.Body.Text, "Do what Board message #"+strconv.FormatInt(reminder.Seq, 10)+" says.") {
+		t.Fatalf("wake notice %+v", env)
+	}
+	if after := f.wakeByID(t, wk.ID); after.State != api.OwnerHelperWakeExpired || after.NextDueAt != nil {
+		t.Fatalf("after firing %+v", after)
+	}
+	if steps := f.wakeSweep(t, at.Add(40*time.Second)); len(steps) != 0 {
+		t.Fatalf("second sweep %+v", steps)
+	}
+	f.reopen(t)
+	if steps := f.wakeSweep(t, at.Add(50*time.Second)); len(steps) != 0 || len(f.wakeNotices(t)) != 1 {
+		t.Fatalf("after a restart %+v", steps)
+	}
+	// A reminder already fired stays expired when the window later ends.
+	if expired, _ := f.tick(t, start.Add(3*time.Hour)); len(expired) != 1 || expired[0] != w.ID {
+		t.Fatalf("window expiry %v", expired)
+	}
+	if after := f.wakeByID(t, wk.ID); after.State != api.OwnerHelperWakeExpired || after.Revision != wk.Revision {
+		t.Fatalf("fired reminder after the end %+v", after)
+	}
+	toHelper := 0
+	for _, m := range f.wakeNotices(t) {
+		if m.To == helper.ID {
+			toHelper++
+		}
+	}
+	if toHelper != 1 {
+		t.Fatalf("the helper got %d reminders", toHelper)
+	}
+}
+
+// a2: with no live owner helper the slot is helper-absent and the owner gets
+// one report naming the reminder's Board message.
+func TestDelegationReminderHelperAbsent(t *testing.T) {
+	f := newDelegationFixture(t)
+	start := reminderStart(f)
+	w := f.open(t, "open-absent", api.DelegationScopeDecisions, 7*24*time.Hour)
+	at := start.Add(6 * 24 * time.Hour)
+	wk := f.reminderWakes(t)[0]
+	reminder := f.reminderNotices(t, w.ID)[0]
+	_, steps := f.tick(t, at.Add(10*time.Second))
+	if len(steps) != 1 || steps[0].Action != ownerWakeActionAbsent {
+		t.Fatalf("steps %+v", steps)
+	}
+	got := f.wakeNotices(t)
+	if len(got) != 1 || got[0].To != "" || got[0].Envelope.Refs["recipientKind"] != "owner" || got[0].Envelope.Refs["wake"] != wk.ID ||
+		!strings.Contains(got[0].Envelope.Body.Text, "Board message #"+strconv.FormatInt(reminder.Seq, 10)) {
+		t.Fatalf("owner report %+v", got)
+	}
+	if _, steps := f.tick(t, at.Add(time.Minute)); len(steps) != 0 || len(f.wakeNotices(t)) != 1 {
+		t.Fatalf("again %+v", steps)
+	}
+	list, err := ownerWakeFirings(context.Background(), f.s.db, wk.ID, 10)
+	if err != nil || len(list) != 1 || list[0].Outcome != api.OwnerHelperWakeHelperAbsent {
+		t.Fatalf("firings %+v %v", list, err)
+	}
+}
+
+// a3: ending the window before its slot cancels the reminder in the same
+// transaction, and no reminder is posted for it.
+func TestDelegationReminderCancel(t *testing.T) {
+	ctx := context.Background()
+	cancelled := func(t *testing.T, f delegationFixture, wk api.OwnerHelperWake, revision int64) {
+		t.Helper()
+		after := f.wakeByID(t, wk.ID)
+		if after.State != api.OwnerHelperWakeCancelled || after.Revision != revision || after.NextDueAt != nil {
+			t.Fatalf("reminder after the end %+v; want cancelled at revision %d", after, revision)
+		}
+	}
+	t.Run("owner close", func(t *testing.T) {
+		f := newDelegationFixture(t)
+		start := reminderStart(f)
+		registerHelper(t, f.s, f.task.ID, helperRequest("reminder-reg"), f.by)
+		w := f.open(t, "open-close", api.DelegationScopeDecisions, 3*time.Hour)
+		wk := f.reminderWakes(t)[0]
+		f.advance(time.Hour)
+		if _, err := f.s.CloseDelegationWindow(ctx, f.task.ID, w.ID, api.CloseDelegationWindowRequest{RequestID: "close-1"}, f.by); err != nil {
+			t.Fatal(err)
+		}
+		cancelled(t, f, wk, 2)
+		if _, steps := f.tick(t, start.Add(4*time.Hour)); len(steps) != 0 || len(f.wakeNotices(t)) != 0 {
+			t.Fatalf("a closed window reminded %+v", steps)
+		}
+	})
+	t.Run("hub down past the slot and the end", func(t *testing.T) {
+		f := newDelegationFixture(t)
+		start := reminderStart(f)
+		registerHelper(t, f.s, f.task.ID, helperRequest("reminder-reg"), f.by)
+		w := f.open(t, "open-down", api.DelegationScopeDecisions, 3*time.Hour)
+		wk := f.reminderWakes(t)[0]
+		f.reopen(t)
+		expired, steps := f.tick(t, start.Add(3*time.Hour+time.Minute))
+		if len(expired) != 1 || expired[0] != w.ID || len(steps) != 0 || len(f.wakeNotices(t)) != 0 {
+			t.Fatalf("down past the end %v %+v", expired, steps)
+		}
+		cancelled(t, f, wk, 2)
+	})
+	t.Run("open over a past-end window", func(t *testing.T) {
+		f := newDelegationFixture(t)
+		start := reminderStart(f)
+		first := f.open(t, "open-first", api.DelegationScopeDecisions, 3*time.Hour)
+		wk := f.reminderWakes(t)[0]
+		*f.clock = start.Add(3*time.Hour + time.Minute)
+		second := f.open(t, "open-second", api.DelegationScopeDecisions, 3*time.Hour)
+		cancelled(t, f, wk, 2)
+		var active []api.OwnerHelperWake
+		for _, x := range f.reminderWakes(t) {
+			if x.State == api.OwnerHelperWakeActive {
+				active = append(active, x)
+			}
+		}
+		if len(active) != 1 || active[0].RequestID != "delegation-reminder-"+second.ID || active[0].ID == wk.ID {
+			t.Fatalf("active reminders %+v (first %s)", active, first.ID)
+		}
+	})
+	t.Run("close then open", func(t *testing.T) {
+		f := newDelegationFixture(t)
+		reminderStart(f)
+		first := f.open(t, "open-a", api.DelegationScopeDecisions, 7*24*time.Hour)
+		f.advance(6 * 24 * time.Hour)
+		if _, err := f.s.CloseDelegationWindow(ctx, f.task.ID, first.ID, api.CloseDelegationWindowRequest{RequestID: "renew-close"}, f.by); err != nil {
+			t.Fatal(err)
+		}
+		second := f.open(t, "open-b", api.DelegationScopeDecisions, 7*24*time.Hour)
+		var active []api.OwnerHelperWake
+		for _, x := range f.reminderWakes(t) {
+			if x.State == api.OwnerHelperWakeActive {
+				active = append(active, x)
+			}
+		}
+		if len(active) != 1 || active[0].RequestID != "delegation-reminder-"+second.ID || !active[0].NextDueAt.Equal(f.s.now().Add(6*24*time.Hour)) {
+			t.Fatalf("after a renewal %+v", active)
+		}
+	})
+	t.Run("helper changed the wake", func(t *testing.T) {
+		f := newDelegationFixture(t)
+		start := reminderStart(f)
+		helper := *registerHelper(t, f.s, f.task.ID, helperRequest("reminder-reg"), f.by).Agent
+		w := f.open(t, "open-edit", api.DelegationScopeDecisions, 3*time.Hour)
+		wk := f.reminderWakes(t)[0]
+		later := start.Add(2 * time.Hour)
+		edited, _, err := f.s.SetOwnerHelperWake(ctx, f.task.ID, api.SetOwnerHelperWakeRequest{WakeID: wk.ID, ExpectedRevision: wk.Revision, Kind: "authority-expiry",
+			Schedule: strconv.Itoa(later.Minute()) + " " + strconv.Itoa(later.Hour()) + " " + strconv.Itoa(later.Day()) + " " + strconv.Itoa(int(later.Month())) + " *", TimeZone: "UTC",
+			MessageSeq: wk.MessageSeq, ExpiresAt: wk.ExpiresAt, RequestID: "helper-edit", AgentID: helper.ID, RunID: helper.RunID}, f.by)
+		if err != nil || edited.Revision != 2 || edited.RequestID != "helper-edit" || !edited.NextDueAt.Equal(later) {
+			t.Fatalf("helper edit %+v %v", edited, err)
+		}
+		f.advance(time.Hour)
+		if _, err := f.s.CloseDelegationWindow(ctx, f.task.ID, w.ID, api.CloseDelegationWindowRequest{RequestID: "close-edit"}, f.by); err != nil {
+			t.Fatal(err)
+		}
+		cancelled(t, f, wk, 3)
+		if _, steps := f.tick(t, start.Add(4*time.Hour)); len(steps) != 0 || len(f.wakeNotices(t)) != 0 {
+			t.Fatalf("an edited reminder of a closed window fired %+v", steps)
+		}
+	})
 }

@@ -125,6 +125,50 @@ repeated ticks and restarts post nothing more. Requests the owner already answer
 are not handed back. At most one window is open per project; change one by closing
 it and opening another.
 
+## Reminder before the end
+
+Bug `wi_9898f0ff7e8e1464` (work order #54280). The hub reminds before a delegation
+window ends, so renewing it does not depend on the owner helper remembering.
+
+- **When.** Opening a window saves one reminder at `endsAt` minus half the window,
+  at most 24 hours, truncated to the whole UTC minute: a 7-day window is reminded
+  24 hours before its end, a 3-hour window 90 minutes before. A window with no whole
+  minute between the open and that slot (windows shorter than about two minutes) gets no
+  reminder.
+- **How.** In the open's transaction the hub posts one undirected board NOTICE,
+  "A reminder is set before the delegation window ends", with refs
+  `delegationReminder=<window id>`, `ownerWake=authority-expiry` and `wake=<wake id>`.
+  It names the window, the delegate, the end and reminder times, and what to do: to
+  keep the delegation, close this window and open a new one before it ends
+  (`tt owner delegation close <id>`, then `tt owner delegation open ...`); otherwise
+  it ends and unanswered routed requests return to the owner. The hub then saves an
+  `authority-expiry` wake on the owner helper's hub wake schedule
+  (`docs/session-handoff.md`, "Wakes on the hub"): zone `UTC`, a single-minute
+  schedule due at the slot, `expiresAt = endsAt`, written as the owner (no agent or
+  run), with that notice as its Board message and request ID
+  `delegation-reminder-<window id>`.
+- **Delivery.** The broker's existing wake sweep delivers it; there is no second
+  sweep. At the slot the current owner helper (running, done or needs input) gets
+  the standard directed notice "Owner-helper wake: authority expiry due HH:MM UTC",
+  once across ticks and restarts, and the wake is then `expired`. With no live owner
+  helper the slot is `helper-absent` and the owner gets one report naming the
+  reminder's Board message. Late and undelivered slots are reported to the owner as
+  for any wake. In a paused project the slot is recorded `skipped-paused` with no
+  notice; the window still expires on time.
+- **Cancellation.** Ending the window before the slot (owner close, broker expiry,
+  or an open that expires a past-end window) cancels the reminder in the same
+  transaction, even after the helper changed the wake, so no reminder is posted for
+  an ended window. A renewal (close, then open) therefore leaves one active reminder,
+  for the new window. A reminder that already fired stays `expired`. The broker
+  expires windows before it sweeps wakes, so a hub down past both the slot and the
+  end posts no reminder.
+- **Cap.** The reminder is saved even when the project already has 20 active wakes
+  (an open never fails for the cap); it counts toward the 20 for later wake writes.
+- **Older windows.** A window opened before this release has no reminder; its next
+  renewal creates one. The hub does not backfill.
+- An owner helper that kept its own `authority-expiry` wake for a window should
+  cancel it (`tt handoff wake cancel`), or it is reminded twice.
+
 ## Surfaces
 
 **tt** (owner only; refused from agent sessions):
