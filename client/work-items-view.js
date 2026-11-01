@@ -81,6 +81,9 @@ export function createWorkItemsView({
     // The filter of the last full render, and the reload whose first page has
     // been shown.
     renderedKey = "",
+    // The filter the items in memory belong to. Rows of any other filter are
+    // never rendered.
+    itemsKey = "",
     shownGeneration = 0,
     listScheduled = false,
     narrativeGeneration = 0,
@@ -94,6 +97,7 @@ export function createWorkItemsView({
     },
   });
   const project = (id) => tasks.find((t) => t.id === id);
+  const filterKey = () => JSON.stringify([scope, state]);
   const itemScroll = createWorkItemsScroll({
     getContainer: () => root?.querySelector?.(".work-items-main"),
     render: () => render(),
@@ -118,7 +122,9 @@ export function createWorkItemsView({
     presentation.interrupt({ capture: wasVisible });
   }
   async function show(taskId) {
+    const previous = filterKey();
     if (taskId !== undefined) scope = taskId || "";
+    if (visible && renderedKey && filterKey() !== previous) filterChanged();
     visible = true;
     // An empty root means a fresh tab switch. Paint the loading shell before
     // the first await, so the tab shows at once even with nothing cached; the
@@ -185,7 +191,7 @@ export function createWorkItemsView({
         // A filter change while this read pages keeps it on its own filter,
         // and none of its pages is shown; the new filter reads after it.
         if (progressive && filter.taskId === scope && filter.status === state)
-          showPage(token, nextTasks, next, true);
+          showPage(token, key, nextTasks, next, true);
       }
       if (filter.taskId !== scope || filter.status !== state) {
         again = true;
@@ -193,12 +199,13 @@ export function createWorkItemsView({
       }
       completeKey = key;
       if (shownGeneration === token) {
-        showPage(token, nextTasks, next, false);
+        showPage(token, key, nextTasks, next, false);
         return;
       }
       morePages = false;
       tasks = nextTasks;
       items = next;
+      itemsKey = key;
       searchGeneration++;
       // Work-item notifications also cover separately versioned narrative and
       // message writes. A successful hub refresh is therefore the cache
@@ -226,9 +233,10 @@ export function createWorkItemsView({
   // Shows the pages read so far. The first page of a reload starts a new
   // search cache and renders the whole view; later pages, and the last,
   // repaint only the list, at most once a frame.
-  function showPage(token, nextTasks, next, pending) {
+  function showPage(token, key, nextTasks, next, pending) {
     tasks = nextTasks;
     items = next.slice();
+    itemsKey = key;
     morePages = pending;
     if (shownGeneration !== token) {
       shownGeneration = token;
@@ -252,19 +260,25 @@ export function createWorkItemsView({
       requestAnimationFrame(() => setTimeout(run, 0));
     else setTimeout(run, 0);
   }
+  // A filter or project change replaces the old filter's rows with the
+  // loading state at once, before any read for the new filter returns.
+  function filterChanged() {
+    render();
+    if (renderedKey !== filterKey()) updateSearchResults(true);
+  }
   function updateList() {
-    const filterKey = JSON.stringify([scope, state]);
-    if (renderedKey !== filterKey) return render();
+    const key = filterKey();
+    if (renderedKey !== key) return render();
     // A held scroll keeps this DOM; its flush renders the whole view.
-    const frame = itemScroll.beforeRender(filterKey);
+    const frame = itemScroll.beforeRender(key);
     if (!frame) return;
     updateSearchResults();
     itemScroll.afterRender(frame);
   }
   function render() {
-    if (!visible) return;
-    const filterKey = JSON.stringify([scope, state]);
-    const itemScrollFrame = itemScroll.beforeRender(filterKey);
+    if (!visible || !root) return;
+    const renderKey = filterKey();
+    const itemScrollFrame = itemScroll.beforeRender(renderKey);
     if (!itemScrollFrame) return;
     const open = tasks.filter((task) => task.status === "open"),
       closed = tasks.filter((task) => task.status === "closed"),
@@ -296,17 +310,20 @@ export function createWorkItemsView({
       (button) =>
         (button.onclick = () => {
           scope = button.dataset.itemsScope;
+          filterChanged();
           void reload();
         }),
     );
     root.querySelector("[data-items-project]").onchange = (e) => {
       presentation.commit(e.target, { flush: false });
       scope = e.target.value;
+      filterChanged();
       void reload();
     };
     root.querySelector("[data-items-status]").onchange = (e) => {
       presentation.commit(e.target, { flush: false });
       state = e.target.value;
+      filterChanged();
       void reload();
     };
     root.querySelector("[data-items-search]").oninput = (event) => {
@@ -316,7 +333,7 @@ export function createWorkItemsView({
     };
     root.querySelector("[data-items-new]").onclick = () => edit();
     root.querySelector("[data-items-new-rail]").onclick = () => edit();
-    renderedKey = filterKey;
+    renderedKey = renderKey;
     updateSearchResults();
     itemScroll.afterRender(itemScrollFrame);
   }
@@ -380,25 +397,34 @@ export function createWorkItemsView({
   function updateSearchResults(resetScroll = false) {
     const list = root?.querySelector(".work-items-list");
     if (!list) return;
-    const filtered = items.filter((item) =>
+    // Items of another filter are never shown: until the current filter's
+    // first page arrives the list shows its loading state.
+    const current = itemsKey === filterKey(),
+      shown = current ? items : [];
+    const filtered = shown.filter((item) =>
       workItemMatchesSearch(item, query, searchHistory.get(item.id)?.text),
     );
-    root.querySelector(".count-badge").textContent = String(filtered.length);
+    const badge = root.querySelector(".count-badge");
+    if (badge) badge.textContent = current ? String(filtered.length) : "";
     const pending =
-      query.trim() && items.some((item) => !searchHistory.has(item.id));
-    const unavailable = items.filter(
+      query.trim() && shown.some((item) => !searchHistory.has(item.id));
+    const unavailable = shown.filter(
       (item) => searchHistory.get(item.id)?.error,
     ).length;
-    const loadingMore = morePages
-      ? ` · Loading more ${plural.toLowerCase()}…`
-      : "";
-    root.querySelector("[data-items-search-status]").textContent =
-      (query.trim()
-        ? ` · ${pending ? "Searching current records and history…" : `${filtered.length} match${filtered.length === 1 ? "" : "es"}${morePages ? " so far" : ""}${unavailable ? ` · history unavailable for ${unavailable}` : ""}`}`
-        : "") + loadingMore;
+    const loadingMore = !current
+      ? ` · Loading ${plural.toLowerCase()}…`
+      : morePages
+        ? ` · Loading more ${plural.toLowerCase()}…`
+        : "";
+    const status = root.querySelector("[data-items-search-status]");
+    if (status)
+      status.textContent =
+        (query.trim() && current
+          ? ` · ${pending ? "Searching current records and history…" : `${filtered.length} match${filtered.length === 1 ? "" : "es"}${morePages ? " so far" : ""}${unavailable ? ` · history unavailable for ${unavailable}` : ""}`}`
+          : "") + loadingMore;
     list.innerHTML = filtered.length
       ? filtered.map(rowMarkup).join("")
-      : `<p class="work-items-empty fine">${pending ? `Searching ${plural.toLowerCase()} history…` : morePages ? `Loading more ${plural.toLowerCase()}…` : `No ${plural.toLowerCase()} match this search and the selected filters.`}</p>`;
+      : `<p class="work-items-empty fine">${!current ? `Loading ${plural.toLowerCase()}…` : pending ? `Searching ${plural.toLowerCase()} history…` : morePages ? `Loading more ${plural.toLowerCase()}…` : `No ${plural.toLowerCase()} match this search and the selected filters.`}</p>`;
     bindRows();
     if (resetScroll) root.querySelector(".work-items-main").scrollTop = 0;
   }

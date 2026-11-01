@@ -150,14 +150,18 @@ async function measureHub() {
     const seedStart = performance.now();
     for (let i = 0; i < ITEM_COUNT; i++) {
       await pause(52);
-      await call("POST", `/v1/tasks/${tasks[i % 5 === 4 ? 1 : 0].id}/work-items`, {
-        kind: kindOf(i),
-        // The hub refuses a title with surrounding spaces.
-        title: ("Synthetic work item " + i + " " + lorem(60, i)).trim(),
-        description: lorem(descriptionLength(i), i),
-        priority: ["normal", "high", "low"][i % 3],
-        requestId: "seed-" + i,
-      });
+      await call(
+        "POST",
+        `/v1/tasks/${tasks[i % 5 === 4 ? 1 : 0].id}/work-items`,
+        {
+          kind: kindOf(i),
+          // The hub refuses a title with surrounding spaces.
+          title: ("Synthetic work item " + i + " " + lorem(60, i)).trim(),
+          description: lorem(descriptionLength(i), i),
+          priority: ["normal", "high", "low"][i % 3],
+          requestId: "seed-" + i,
+        },
+      );
     }
     const seedSeconds = Math.round((performance.now() - seedStart) / 1000);
     const pages = {};
@@ -390,7 +394,9 @@ async function fixturePage({
     if (/^\/v1\/tasks\/[^/]+$/.test(p)) return "task detail (with agents)";
     if (/\/agents$/.test(p)) return "agents list";
     if (/\/messages$/.test(p))
-      return u.searchParams.get("after") ? "messages after cursor" : "messages latest";
+      return u.searchParams.get("after")
+        ? "messages after cursor"
+        : "messages latest";
     return "other";
   };
   async function transport(url, init = {}) {
@@ -446,7 +452,10 @@ async function fixturePage({
         await hold(25000, true);
         events = eventsAfter(task, after, limit);
       }
-      return respond({ events, next: events.length ? events.at(-1).seq : after });
+      return respond({
+        events,
+        next: events.length ? events.at(-1).seq : after,
+      });
     }
     if (p.endsWith("/changes")) {
       if (u.searchParams.get("wait")) await new Promise(() => {});
@@ -462,8 +471,12 @@ async function fixturePage({
       return respond({ error: "Synthetic fixture is read-only" }, 503);
     }
     if (p === "/v1/capabilities")
-      return respond({ messageAudit: { versions: [] }, queue: { versions: [1] } });
-    if (p === "/v1/whoami") return respond({ node: "workspace", user: "fixture" });
+      return respond({
+        messageAudit: { versions: [] },
+        queue: { versions: [1] },
+      });
+    if (p === "/v1/whoami")
+      return respond({ node: "workspace", user: "fixture" });
     if (p === "/v1/tasks") return respond({ tasks });
     if (p === "/v1/work-items") {
       const q = (name) => u.searchParams.get(name);
@@ -495,7 +508,8 @@ async function fixturePage({
         agents: agentsByTask.get(task.id),
         latestSeq: messageSeq,
       });
-    if (tail === "/agents") return respond({ agents: agentsByTask.get(task.id) });
+    if (tail === "/agents")
+      return respond({ agents: agentsByTask.get(task.id) });
     if (tail === "/messages") {
       const after = Number(u.searchParams.get("after") || 0);
       const limit = Math.min(1000, Number(u.searchParams.get("limit") || 50));
@@ -544,7 +558,12 @@ async function fixturePage({
   const reads = [];
   const listWorkItems = client.listWorkItems;
   client.listWorkItems = async (params) => {
-    const read = { start: performance.now(), end: 0, after: params.after, network: false };
+    const read = {
+      start: performance.now(),
+      end: 0,
+      after: params.after,
+      network: false,
+    };
     reads.push(read);
     const before = log.length;
     try {
@@ -556,8 +575,9 @@ async function fixturePage({
         .some(
           (entry) =>
             entry.route === "work-items" &&
-            new URL(entry.path, "http://x.invalid").searchParams.get("after") ===
-              String(params.after ?? 0),
+            new URL(entry.path, "http://x.invalid").searchParams.get(
+              "after",
+            ) === String(params.after ?? 0),
         );
     }
   };
@@ -647,7 +667,10 @@ async function fixturePage({
         clearTimeout(timer);
         const at = performance.now();
         requestAnimationFrame(() =>
-          setTimeout(() => resolve({ seen: at, painted: performance.now() }), 0),
+          setTimeout(
+            () => resolve({ seen: at, painted: performance.now() }),
+            0,
+          ),
         );
       };
       const observer = new MutationObserver(() => {
@@ -683,10 +706,16 @@ async function fixturePage({
       // page requested in the same task as the first render is started, not
       // answered.
       const before = net.filter((entry) => entry.start <= row.seen);
-      const answered = before.filter((entry) => entry.end && entry.end <= row.seen);
-      const pagesBefore = before.filter((entry) => entry.route === "work-items");
+      const answered = before.filter(
+        (entry) => entry.end && entry.end <= row.seen,
+      );
+      const pagesBefore = before.filter(
+        (entry) => entry.route === "work-items",
+      );
       const viewReads = reads.slice(readsFrom);
-      const readsBefore = viewReads.filter((read) => read.end && read.end <= row.seen);
+      const readsBefore = viewReads.filter(
+        (read) => read.end && read.end <= row.seen,
+      );
       // Fetch ends when the last read the first render depended on resolved.
       const fetchEnd = Math.max(t0, ...readsBefore.map((read) => read.end));
       // The tail: from the first page resolving to the last one resolving,
@@ -703,12 +732,15 @@ async function fixturePage({
         pagesBefore: pagesBefore.length,
         pageBytesBefore: sum(pagesBefore.map((entry) => entry.bytes)),
         answeredBefore: answered.length,
-        answeredPagesBefore: answered.filter((entry) => entry.route === "work-items").length,
+        answeredPagesBefore: answered.filter(
+          (entry) => entry.route === "work-items",
+        ).length,
         answeredBytesBefore: sum(answered.map((entry) => entry.bytes)),
         totalRequests: net.length,
         totalBytes: sum(net.map((entry) => entry.bytes)),
         readsBefore: readsBefore.length,
-        cacheServedReadsBefore: readsBefore.filter((read) => !read.network).length,
+        cacheServedReadsBefore: readsBefore.filter((read) => !read.network)
+          .length,
         rows: document.querySelectorAll(selector).length,
       };
     },
@@ -724,11 +756,15 @@ async function fixturePage({
             .map((entry) => entry.path)
             .filter(
               (p) =>
-                new URL(p, "http://x.invalid").searchParams.get("kind") === kind,
+                new URL(p, "http://x.invalid").searchParams.get("kind") ===
+                kind,
             ),
         ),
       ];
-      return { wanted: wanted.length, missing: wanted.filter((p) => !keys.has(p)).length };
+      return {
+        wanted: wanted.length,
+        missing: wanted.filter((p) => !keys.has(p)).length,
+      };
     },
     async idle() {
       await sleep(500);
@@ -762,7 +798,9 @@ async function fixturePage({
       }
       const delta = (key) => ({
         records: changed[key] - start[key],
-        bytesPerMin: Math.round((changedBytes[key] - startBytes[key]) / elapsed),
+        bytesPerMin: Math.round(
+          (changedBytes[key] - startBytes[key]) / elapsed,
+        ),
       });
       return {
         minutes: elapsed,
@@ -795,18 +833,27 @@ const SELECTORS = {
 };
 
 async function openPage(browser, origin, options) {
-  const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+  const context = await browser.newContext({
+    viewport: { width: 1440, height: 900 },
+  });
   const page = await context.newPage();
   const errors = [];
   page.on("pageerror", (error) => errors.push(error.message));
   const ready = async () => {
-    await page.waitForFunction(() => window.ready || window.fixtureError, null, {
-      timeout: 60000,
-    });
+    await page.waitForFunction(
+      () => window.ready || window.fixtureError,
+      null,
+      {
+        timeout: 60000,
+      },
+    );
     const fixtureError = await page.evaluate(() => window.fixtureError);
     if (fixtureError) throw new Error(fixtureError);
   };
-  await page.goto(`${origin}/work-items-fetch?` + new URLSearchParams({ o: JSON.stringify(options) }));
+  await page.goto(
+    `${origin}/work-items-fetch?` +
+      new URLSearchParams({ o: JSON.stringify(options) }),
+  );
   await ready();
   return { context, page, errors, ready };
 }
@@ -817,12 +864,16 @@ async function measureFirstRow(browser, origin, engine, pageMs) {
     for (const mode of ["bugs", "features"]) {
       const samples = mode === "bugs" ? SAMPLES : 1;
       for (let s = 0; s < samples; s++) {
-        const { context, page, errors, ready } = await openPage(browser, origin, {
-          latency: rtt,
-          pageMs,
-          backlog: 0,
-          refreshMs: REFRESH_MS,
-        });
+        const { context, page, errors, ready } = await openPage(
+          browser,
+          origin,
+          {
+            latency: rtt,
+            pageMs,
+            backlog: 0,
+            refreshMs: REFRESH_MS,
+          },
+        );
         try {
           const kind = mode === "bugs" ? "bug" : "feature";
           const cold = await page.evaluate(
@@ -830,14 +881,26 @@ async function measureFirstRow(browser, origin, engine, pageMs) {
             [mode, ROW, SETTLE_MS],
           );
           await page.evaluate(() => window.qa.idle());
-          const coverage = await page.evaluate((k) => window.qa.coverage(k), kind);
+          const coverage = await page.evaluate(
+            (k) => window.qa.coverage(k),
+            kind,
+          );
           await page.reload();
           await ready();
           const warm = await page.evaluate(
             ([m, sel, ms]) => window.qa.firstRow(m, sel, ms),
             [mode, ROW, SETTLE_MS],
           );
-          out.push({ engine, rtt, mode, sample: s, cold, warm, coverage, errors: [...errors] });
+          out.push({
+            engine,
+            rtt,
+            mode,
+            sample: s,
+            cold,
+            warm,
+            coverage,
+            errors: [...errors],
+          });
           console.error(
             `${engine} rtt=${rtt} ${mode} #${s}: cold ${Math.round(cold.firstRowMs)} ms, warm ${Math.round(warm.firstRowMs)} ms, coverage missing ${coverage.missing}/${coverage.wanted}`,
           );
@@ -853,9 +916,14 @@ async function measureFirstRow(browser, origin, engine, pageMs) {
 async function measureRefresh(browser, origin, engine, pageMs) {
   const out = [];
   const runs = [
-    ...["bugs", "board", "agents", "tasks"].map((mode) => [mode, LIVE_EVENT_MS]),
+    ...["bugs", "board", "agents", "tasks"].map((mode) => [
+      mode,
+      LIVE_EVENT_MS,
+    ]),
     // Quiet hub: what the refresh timer alone costs, Chromium only.
-    ...(engine === "chromium" ? ["bugs", "board"].map((mode) => [mode, 0]) : []),
+    ...(engine === "chromium"
+      ? ["bugs", "board"].map((mode) => [mode, 0])
+      : []),
   ];
   for (const [mode, eventMs] of runs) {
     const { context, page, errors } = await openPage(browser, origin, {
@@ -866,11 +934,14 @@ async function measureRefresh(browser, origin, engine, pageMs) {
     });
     try {
       const result = await page.evaluate(
-        ([m, sel, seconds, eventMs]) => window.qa.refresh(m, sel, seconds, eventMs),
+        ([m, sel, seconds, eventMs]) =>
+          window.qa.refresh(m, sel, seconds, eventMs),
         [mode, SELECTORS[mode], REFRESH_SECONDS, eventMs],
       );
       out.push({ engine, mode, eventMs, ...result, errors: [...errors] });
-      console.error(`${engine} refresh ${mode} events=${eventMs}: ${JSON.stringify(result.routes)}`);
+      console.error(
+        `${engine} refresh ${mode} events=${eventMs}: ${JSON.stringify(result.routes)}`,
+      );
     } finally {
       await context.close();
     }
@@ -910,7 +981,9 @@ function printRefresh(rows) {
   for (const row of rows) {
     const events = row.eventMs ? `1 per ${row.eventMs} ms` : "none";
     if (!Object.keys(row.routes).length)
-      lines.push(`| ${row.engine} | ${row.mode} | ${events} | (no hub reads) | 0 | 0 |`);
+      lines.push(
+        `| ${row.engine} | ${row.mode} | ${events} | (no hub reads) | 0 | 0 |`,
+      );
     for (const [route, v] of Object.entries(row.routes))
       lines.push(
         `| ${row.engine} | ${row.mode} | ${events} | ${route} | ${v.requestsPerMin} | ${kb(v.bytesPerMin)} |`,
@@ -938,7 +1011,9 @@ if (PHASES.has("hub")) {
   results.hub = await measureHub();
   if (process.env.MEASURE_OUT)
     await writeFile(process.env.MEASURE_OUT, JSON.stringify(results, null, 2));
-  console.log("\n## P1 hub pages (seeded in " + results.hub.seedSeconds + " s)\n");
+  console.log(
+    "\n## P1 hub pages (seeded in " + results.hub.seedSeconds + " s)\n",
+  );
   console.log(printHub(results.hub));
 }
 // The browser transport delays each work-items page by the hub's median
@@ -963,14 +1038,16 @@ if (PHASES.has("first") || PHASES.has("refresh")) {
         name: "work-items-fetch-fixture",
         configureServer(vite) {
           vite.middlewares.use("/work-items-fetch", (req, res) => {
-            const query = new URL(req.url, "http://fixture.invalid").searchParams;
+            const query = new URL(req.url, "http://fixture.invalid")
+              .searchParams;
             const options = JSON.parse(query.get("o"));
             res.setHeader("Content-Type", "text/html");
             res.end(
               html({
                 ...options,
                 itemCount: ITEM_COUNT,
-                kindSource: "((i * 247) % ITEM_COUNT < 247 ? 'feature' : 'bug')",
+                kindSource:
+                  "((i * 247) % ITEM_COUNT < 247 ? 'feature' : 'bug')",
                 descriptionSource:
                   "i % 20 === 0 ? 8039 : i % 2 ? 2905 + (i % 7) * 300 : 1500 + (i % 9) * 150",
               }),
@@ -990,15 +1067,22 @@ if (PHASES.has("first") || PHASES.has("refresh")) {
       try {
         const name = engine.name();
         if (PHASES.has("first"))
-          results.first.push(...(await measureFirstRow(browser, origin, name, pageMs)));
+          results.first.push(
+            ...(await measureFirstRow(browser, origin, name, pageMs)),
+          );
         if (PHASES.has("refresh"))
-          results.refresh.push(...(await measureRefresh(browser, origin, name, pageMs)));
+          results.refresh.push(
+            ...(await measureRefresh(browser, origin, name, pageMs)),
+          );
       } finally {
         await browser.close();
       }
       // Saved after each engine, so a stopped run keeps what it measured.
       if (process.env.MEASURE_OUT)
-        await writeFile(process.env.MEASURE_OUT, JSON.stringify(results, null, 2));
+        await writeFile(
+          process.env.MEASURE_OUT,
+          JSON.stringify(results, null, 2),
+        );
     }
   } finally {
     await server.close();
@@ -1006,11 +1090,15 @@ if (PHASES.has("first") || PHASES.has("refresh")) {
   console.log(`\n## P3 first row (work-items page delay ${pageMs} ms + RTT)\n`);
   if (results.first.length) console.log(printFirstRow(results.first));
   if (results.refresh.length) {
-    console.log(`\n## P4 background refresh (${REFRESH_SECONDS} s, event every ${LIVE_EVENT_MS} ms, RTT 80)\n`);
+    console.log(
+      `\n## P4 background refresh (${REFRESH_SECONDS} s, event every ${LIVE_EVENT_MS} ms, RTT 80)\n`,
+    );
     console.log(printRefresh(results.refresh));
     console.log("\nChanged records per minute (bytes):");
     for (const row of results.refresh)
-      console.log(`${row.engine} ${row.mode} events=${row.eventMs}: ${JSON.stringify(row.changed)} errors=${row.errors.length} unknown=${row.unknown} writes=${row.writes}`);
+      console.log(
+        `${row.engine} ${row.mode} events=${row.eventMs}: ${JSON.stringify(row.changed)} errors=${row.errors.length} unknown=${row.unknown} writes=${row.writes}`,
+      );
   }
 }
 if (process.env.MEASURE_OUT)

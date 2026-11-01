@@ -30,16 +30,16 @@ const items=[
 const extra=paged?Array.from({length:448},(_,i)=>({id:'wi_page'+String(i).padStart(4,'0'),taskId:i%2?task.id:other.id,kind,title:i===447?'Later omega record':'Paged record '+i,description:'Synthetic paged text',status:i%3?'done':'open',priority:'normal',revision:1})):[];
 const all=[...items,...extra].map((item,i)=>({...item,seq:i+1}));
 const requests=[];
-let gate=null;
-const holdPages=()=>{let release;const promise=new Promise(resolve=>release=resolve);gate={promise,release}};
-if(params.get('hold')==='1')holdPages();
+// Each held page waits on its own release, oldest first.
+const held=[];
+let holding=params.get('hold')==='1';
 let notify=()=>{}, messageText='Board epsilon evidence', reportText='Durable zeta report writeup', reportFetches=0, failReport=false;
 const client={base:'isolated://search',token:'fixture',cacheStatus:()=>({label:'Fixture current'}),subscribe:(_scope,callback)=>{notify=callback;return {stop(){}}},
  async listTasks(){return paged?[task,other]:[task]},
  async listWorkItems({taskId='',status='',after=0,limit=200}={}){
   if(!paged)return {items:items.map(item=>({...item})),next:0};
   requests.push({taskId,status,after});
-  if(after>0&&!taskId&&!status&&gate)await gate.promise;
+  if(after>0&&!taskId&&!status&&holding)await new Promise(resolve=>held.push(resolve));
   const page=all.filter(item=>item.seq>after&&(!status||item.status===status)&&(!taskId||item.taskId===taskId)).slice(0,Math.min(limit,cap));
   return {items:page.map(item=>({...item})),next:page.length?page.at(-1).seq:0};
  },
@@ -57,7 +57,7 @@ const dialogNode=document.querySelector('#dialog');
 const closeDialog=()=>{dialogNode.close();dialogNode.replaceChildren()};
 const dialog=(title,body)=>{dialogNode.innerHTML='<h2>'+title+'</h2>'+body;dialogNode.showModal()};
 const view=createWorkItemsView({kind,client:()=>client,dialog,closeDialog,notice(){},configure(){},openBoard(){}});
-view.mount(document.querySelector('#mode-view'));const shown=view.show();if(!paged)await shown;window.qa={view,refresh(){notify()},requests(){return requests.map(r=>({...r}))},release(){gate?.release();gate=null},
+view.mount(document.querySelector('#mode-view'));const shown=view.show();if(!paged)await shown;window.qa={view,refresh(){notify()},requests(){return requests.map(r=>({...r}))},release(){holding=false;held.splice(0).forEach(resolve=>resolve())},releaseNext(){held.shift()?.()},held(){return held.length},
  count(status,taskId){return all.filter(item=>(!status||item.status===status)&&(!taskId||item.taskId===taskId)).length},setMessage(text){messageText=text},setReport(text){reportText=text},setReportFailure(value){failReport=value},reportFetches(){return reportFetches}};
 </script></body></html>`;
 
@@ -89,28 +89,6 @@ const rows = (page) =>
   );
 const statusText = (page) =>
   page.locator("[data-items-search-status]").textContent();
-
-// Records every row inserted after it starts; returns the record.
-const watchRows = (page) =>
-  page.evaluate(() => {
-    window.inserted = [];
-    new MutationObserver((records) => {
-      for (const record of records)
-        for (const node of record.addedNodes)
-          for (const row of node.querySelectorAll
-            ? [
-                ...(node.matches?.("[data-work-item]") ? [node] : []),
-                ...node.querySelectorAll("[data-work-item]"),
-              ]
-            : [])
-            window.inserted.push(
-              row.querySelector(".work-item-copy .fine").textContent,
-            );
-    }).observe(document.querySelector("#mode-view"), {
-      childList: true,
-      subtree: true,
-    });
-  });
 
 async function openPaged(browser, kind, query) {
   const page = await browser.newPage();
@@ -187,13 +165,9 @@ async function pagedCases(browser, engine, kind) {
     await page.waitForFunction(
       () => document.querySelectorAll("[data-work-item]").length === 200,
     );
-    await watchRows(page);
+    await page.waitForFunction(() => window.qa.held() === 1);
     const [status, taskId] =
       change === "status" ? ["open", ""] : ["", "tsk_other"];
-    if (change === "status")
-      await page.locator("[data-items-status]").selectOption("open");
-    // The project list in the rail; its select is hidden in this layout.
-    else await page.locator('[data-items-scope="tsk_other"]').click();
     const expected = await page.evaluate(
       ([s, t]) => window.qa.count(s, t),
       [status, taskId],
@@ -202,21 +176,61 @@ async function pagedCases(browser, engine, kind) {
       change === "status"
         ? text.includes(" · Open · ")
         : text.startsWith("Other project");
-    // The held old-filter page arrives after the change and is not shown.
-    await page.waitForTimeout(100);
+    // Page 2 of the old filter arrives, and the filter changes while its
+    // list repaint is still pending. From the change on, every inserted
+    // row is recorded.
+    await page.evaluate(async (which) => {
+      window.qa.releaseNext();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      window.inserted = [];
+      new MutationObserver((records) => {
+        for (const record of records)
+          for (const node of record.addedNodes)
+            if (node.querySelectorAll)
+              for (const row of [
+                ...(node.matches?.("[data-work-item]") ? [node] : []),
+                ...node.querySelectorAll("[data-work-item]"),
+              ])
+                window.inserted.push(
+                  row.querySelector(".work-item-copy .fine").textContent,
+                );
+      }).observe(document.querySelector("#mode-view"), {
+        childList: true,
+        subtree: true,
+      });
+      if (which === "status") {
+        const select = document.querySelector("[data-items-status]");
+        select.value = "open";
+        select.dispatchEvent(new Event("change", { bubbles: true }));
+      } else document.querySelector('[data-items-scope="tsk_other"]').click();
+    }, change);
+    // The old read is still paging, held at page 3. Nothing of the old
+    // filter is on screen, before or after the pending repaint.
+    await page.waitForFunction(() => window.qa.held() === 1);
+    await page.waitForTimeout(300);
+    const whileHeld = await rows(page);
+    assert.deepEqual(
+      whileHeld.filter((row) => !matches(row.text)),
+      [],
+      `${label} ${change}: old-filter rows while the old read is held`,
+    );
+    assert.match(await statusText(page), /Loading (bugs|features)…/);
     await page.evaluate(() => window.qa.release());
     await page.waitForFunction(
       (n) =>
         document.querySelectorAll("[data-work-item]").length === n &&
         !document
           .querySelector("[data-items-search-status]")
-          .textContent.includes("Loading more"),
+          .textContent.includes("Loading"),
       expected,
     );
     await page.waitForTimeout(300);
     const shown = await rows(page);
     assert.equal(shown.length, expected, `${label} ${change}: row count`);
-    assert.ok(shown.every((row) => matches(row.text)), `${label} ${change}`);
+    assert.ok(
+      shown.every((row) => matches(row.text)),
+      `${label} ${change}`,
+    );
     const inserted = await page.evaluate(() => window.inserted);
     assert.ok(inserted.length > 0, `${label} ${change}: new rows rendered`);
     assert.deepEqual(
@@ -224,7 +238,6 @@ async function pagedCases(browser, engine, kind) {
       [],
       `${label} ${change}: old-filter rows after the change`,
     );
-    assert.doesNotMatch(await statusText(page), /Loading more/);
     // The old read finished on its own filter, unshown, before the new one.
     const requests = await page.evaluate(() => window.qa.requests());
     assert.deepEqual(
