@@ -1334,7 +1334,10 @@ hub reads the policy and the launch host's census:
    below one lane. Pressure the census did not observe is not strain.
 3. A fixed limit stays the ceiling.
 4. With `--matrix-waits hold` (the default), a census with one or more live
-   matrix waiters, or with the lock not observed, holds admission.
+   matrix waiters, or with the lock not observed, holds admission. Only
+   waiters of kind `run` (a full `verify-matrix run`) and `targeted` (a
+   `verify-matrix targeted` rerun) count; `exec` waiters, a builder's or a
+   load check run through `host-lock exec`, never hold admission.
 
 When the active teams fill the lanes the claim is refused with `lane policy
 admits N teams (night); all team slots are reserved` (the window reads `day,
@@ -1355,7 +1358,8 @@ one strained lane never turns a project serial.
 `memoryPressure`, 100 minus `kern.memorystatus_level` as the matrix host lock
 reads it (nil off macOS or when `sysctl` fails), and `matrixWaiters`, the
 waiters in this host's lock (`TAILTERM_MATRIX_HOST_LOCK`, else the account's
-shared lock) whose process is alive. A lock file that does not exist is 0; a
+shared lock) of kind `run` or `targeted` whose process is alive; `exec` and
+any other kind are not counted. A lock file that does not exist is 0; a
 lock path the relay cannot resolve, or a file that is not a confirmed read
 (version 1 or 2 JSON naming this host, as the relay's matrix-wait reports
 read it), is not observed. The hub refuses pressure outside 0 to 100 and a negative count. The

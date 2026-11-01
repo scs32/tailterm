@@ -3219,6 +3219,50 @@ func TestTeamQueueClaimLaneRefusalsAreWaits(t *testing.T) {
 	wait(err, "lane policy admits 1 teams")
 }
 
+// A lane hold counts only the matrix runs waiting for the host: one live
+// waiter each of kind run, targeted and exec reads 2, and a dead waiter
+// or an unknown kind adds nothing. The lock is a temporary file and liveness
+// is a fixed set of fake PIDs, never the host's own lock or processes.
+func TestTeamQueueHostCensusCountsMatrixWaiterKinds(t *testing.T) {
+	lock := filepath.Join(t.TempDir(), "host.json")
+	t.Setenv("TAILTERM_MATRIX_HOST_LOCK", lock)
+	host, err := os.Hostname()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldAlive := matrixWaitPIDAlive
+	t.Cleanup(func() { matrixWaitPIDAlive = oldAlive })
+	matrixWaitPIDAlive = func(pid int) bool { return pid >= 101 && pid <= 104 }
+	writeLock := func(waiters ...string) {
+		t.Helper()
+		body := fmt.Sprintf(`{"version":2,"host":%q,"holders":[{"pid":100,"kind":"run","item":"wi_0000000000000001","agent":"verifier"}],"waiters":[%s]}`, host, strings.Join(waiters, ","))
+		if err := os.WriteFile(lock, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	count := func() string {
+		if got := hostMatrixWaiters(); got != nil {
+			return fmt.Sprint(*got)
+		}
+		return "unobserved"
+	}
+	waiter := func(pid int, kind string) string {
+		return fmt.Sprintf(`{"pid":%d,"kind":%q,"item":"wi_0000000000000002","agent":"builder"}`, pid, kind)
+	}
+	writeLock(waiter(101, "run"), waiter(102, "targeted"), waiter(103, "exec"))
+	if got := count(); got != "2" {
+		t.Fatalf("run, targeted and exec waiters read %s, want 2", got)
+	}
+	writeLock(waiter(103, "exec"), waiter(104, "exec"))
+	if got := count(); got != "0" {
+		t.Fatalf("exec waiters only read %s, want 0", got)
+	}
+	writeLock(waiter(101, "run"), waiter(200, "targeted"), waiter(104, "matrix"))
+	if got := count(); got != "1" {
+		t.Fatalf("a dead targeted waiter or an unknown kind counted: %s", got)
+	}
+}
+
 // a7: the census carries memory pressure from its reader and the live
 // matrix waiters from the lock file, and posts again when the waiter count
 // changes or the pressure crosses the strain threshold.
@@ -3234,9 +3278,9 @@ func TestTeamQueueHostCensusLaneSignals(t *testing.T) {
 		t.Helper()
 		var entries []string
 		for _, pid := range waiters {
-			entries = append(entries, fmt.Sprintf(`{"pid":%d,"kind":"matrix","item":"wi_0000000000000001","agent":"verifier"}`, pid))
+			entries = append(entries, fmt.Sprintf(`{"pid":%d,"kind":"run","item":"wi_0000000000000001","agent":"verifier"}`, pid))
 		}
-		body := fmt.Sprintf(`{"version":2,"host":%q,"holders":[{"pid":%d,"kind":"matrix"}],"waiters":[%s]}`, host, os.Getpid(), strings.Join(entries, ","))
+		body := fmt.Sprintf(`{"version":2,"host":%q,"holders":[{"pid":%d,"kind":"run"}],"waiters":[%s]}`, host, os.Getpid(), strings.Join(entries, ","))
 		if err := os.WriteFile(lock, []byte(body), 0o600); err != nil {
 			t.Fatal(err)
 		}

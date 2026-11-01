@@ -167,10 +167,14 @@ var hostMemoryPressure = func() *int {
 }
 
 // hostMatrixWaiters counts the live matrix runs waiting in this host's lock
-// (matrix_wait_activity.go). A lock file that does not exist is a confirmed
-// 0: no run has used the host. It is nil when the lock path is unknown or the
-// file is not a confirmed read, so a lane policy that holds while a matrix
-// waits holds then too.
+// (matrix_wait_activity.go): waiters of kind run (a full verify-matrix run)
+// or targeted (a verify-matrix rerun of part of a plan on the previous
+// candidate), the verification a lead waits on before acceptance. Waiters of
+// kind exec, a builder's or a load check run through host-lock exec, and any
+// other kind are not counted, so they never hold lane admission. A lock file
+// that does not exist is a confirmed 0: no run has used the host. It is nil
+// when the lock path is unknown or the file is not a confirmed read, so a lane
+// policy that holds while a matrix waits holds then too.
 func hostMatrixWaiters() *int {
 	path := os.Getenv("TAILTERM_MATRIX_HOST_LOCK")
 	if path == "" {
@@ -188,7 +192,7 @@ func hostMatrixWaiters() *int {
 		return nil
 	}
 	for _, w := range lock.Waiters {
-		if matrixWaitPIDAlive(w.PID) {
+		if (w.Kind == "run" || w.Kind == "targeted") && matrixWaitPIDAlive(w.PID) {
 			waiting++
 		}
 	}
