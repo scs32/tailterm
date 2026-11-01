@@ -1,6 +1,6 @@
 # Work items first row and background refresh fetches, 2026-11-01
 
-Bug `wi_782e0ea7627f9fca` revision 2, work order #53690, builder ASSIGN #53761 (plan by planner-627f9fca, RESULT #53760). Measured at tasks-hub `f03f6a56` on Stephens-Mini. This is the measure-first phase: m1 (how the Bugs tab reaches its first row), m5 (what a background refresh fetches) and the m2 verdict. No client code was changed.
+Bug `wi_782e0ea7627f9fca` revision 2, work order #53690, builder ASSIGN #53761 (plan by planner-627f9fca, RESULT #53760). Measured at tasks-hub `f03f6a56` on Stephens-Mini. It covers m1 (how the Bugs tab reaches its first row), m5 (what a background refresh fetches), the m2 verdict, and the timing after the phase-2 first-page paint (lead REQUEST #53826).
 
 Everything ran on isolated synthetic state. The hub binary ran on 127.0.0.1 with a temporary `TAILTERM_STATE`. The harness stopped only that hub's own PID and removed its temporary directory. The browser pages used fresh Playwright contexts and an in-page synthetic transport. No live hub, profile, tmux pane or item text was read. Only counts come from the live hub (the 10-31 snapshot in the item text).
 
@@ -15,7 +15,8 @@ Everything ran on isolated synthetic state. The hub binary ran on 127.0.0.1 with
   | WebKit, cold, RTT 80 | 1,056 ms | 604 ms | 57% |
 
   WebKit cold at RTT 0 (402 ms, tail 27%) does not qualify. There, rendering all 1,089 rows is the larger share (270 ms). Every warm case is under 200 ms (88-136 ms): the saved cache serves all 7 pages, and the network refresh starts after paint. So the full read is the slow part of a cold load, and the owner's impression holds for an empty or evicted cache.
-- **m5:** see P4 below.
+- **m2 after the fix:** the first row now waits for `/v1/tasks` and one page. Cold Bugs at RTT 80 drops from 1,091 to 216 ms in Chromium and from 1,056 to 209 ms in WebKit (see "After" below).
+- **m5:** COST for the Bugs list and for the project detail with its full agents list (Board, Tasks). REPORT-ONLY for Board messages, which are already incremental, and for the Agents tab, which makes no hub reads (see P4). The COST verdicts are reported, not built.
 
 ## Fixture (counts only)
 
@@ -123,25 +124,109 @@ Reading the cold rows:
 
 Render share, a separate finding for the steward and not built here: WebKit spends 123-270 ms rendering all 1,089 rows, both warm and cold.
 
-## P4: background refresh (m5), pending
+## After: first page paint (a7)
 
-The 60 s measurement per tab has not run yet. It waits for host admission from db-handler-o5 (#53812) behind another team's matrix. The m5 verdicts below are therefore **pending**. Two inputs exist so far:
+Measured with the same harness and cases after the phase-2 change in `client/work-items-view.js` (lock 1293a29c, seq 2072, 12:40:37Z-12:48:27Z, harness and view at `a06aff7f`; the later commits change only tests/work-item-search-browser.mjs and this report). Both request counts are shown: requests started before the row, and in parentheses those answered before it.
 
-- what the code fetches, read at `f03f6a56`;
-- one 5 s Chromium smoke run of the same harness (RTT 80, page delay 10 ms, one live event per second). It is preliminary and is not the a2 measurement.
+| Engine | RTT ms | Tab | Cache | Time to first row ms (med / max) | Fetch ms | Render ms | Fetch share | First page resolved ms | Tail fetch ms (share) | Requests before row (answered) | Pages before row (answered) | KiB before row (answered) | Cache-served reads before row | Total requests | Total KiB | Rows |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| chromium | 0 | bugs | cold | 37 / 86 | 23 | 14 | 63% | 23 | 0 (0%) | 2 (2) | 1 (1) | 713 (713) | 0 of 1 | 7 | 3815 | 1089 |
+| chromium | 0 | bugs | warm | 22 / 48 | 9 | 16 | 39% | 9 | 0 (0%) | 0 (0) | 0 (0) | 0 (0) | 1 of 1 | 7 | 3815 | 1089 |
+| chromium | 0 | features | cold | 38 / 38 | 23 | 15 | 60% | 23 | 0 (0%) | 2 (2) | 1 (1) | 704 (704) | 0 of 1 | 3 | 872 | 247 |
+| chromium | 0 | features | warm | 23 / 23 | 10 | 13 | 42% | 10 | 0 (0%) | 0 (0) | 0 (0) | 0 (0) | 1 of 1 | 3 | 872 | 247 |
+| chromium | 80 | bugs | cold | 216 / 218 | 196 | 21 | 91% | 196 | 0 (0%) | 2 (2) | 1 (1) | 713 (713) | 0 of 1 | 7 | 3815 | 1089 |
+| chromium | 80 | bugs | warm | 22 / 34 | 9 | 13 | 41% | 9 | 0 (0%) | 0 (0) | 0 (0) | 0 (0) | 1 of 1 | 7 | 3815 | 1089 |
+| chromium | 80 | features | cold | 209 / 209 | 190 | 19 | 91% | 190 | 0 (0%) | 2 (2) | 1 (1) | 704 (704) | 0 of 1 | 3 | 872 | 247 |
+| chromium | 80 | features | warm | 17 / 17 | 3 | 15 | 16% | 3 | 0 (0%) | 0 (0) | 0 (0) | 0 (0) | 1 of 1 | 3 | 872 | 247 |
+| webkit | 0 | bugs | cold | 51 / 78 | 23 | 27 | 45% | 23 | 0 (0%) | 3 (2) | 2 (1) | 1403 (713) | 0 of 1 | 7 | 3815 | 1089 |
+| webkit | 0 | bugs | warm | 34 / 38 | 7 | 27 | 21% | 7 | 0 (0%) | 0 (0) | 0 (0) | 0 (0) | 1 of 1 | 7 | 3815 | 1089 |
+| webkit | 0 | features | cold | 48 / 48 | 22 | 26 | 46% | 22 | 0 (0%) | 3 (2) | 2 (1) | 872 (704) | 0 of 1 | 3 | 872 | 247 |
+| webkit | 0 | features | warm | 25 / 25 | 22 | 3 | 88% | 3 | 19 (76%) | 0 (0) | 0 (0) | 0 (0) | 2 of 2 | 3 | 872 | 247 |
+| webkit | 80 | bugs | cold | 209 / 210 | 182 | 27 | 87% | 182 | 0 (0%) | 3 (2) | 2 (1) | 1403 (713) | 0 of 1 | 7 | 3815 | 1089 |
+| webkit | 80 | bugs | warm | 35 / 39 | 7 | 27 | 20% | 7 | 0 (0%) | 0 (0) | 0 (0) | 0 (0) | 1 of 1 | 7 | 3815 | 1089 |
+| webkit | 80 | features | cold | 209 / 209 | 181 | 28 | 87% | 181 | 0 (0%) | 3 (2) | 2 (1) | 872 (704) | 0 of 1 | 3 | 872 | 247 |
+| webkit | 80 | features | warm | 28 / 28 | 25 | 3 | 89% | 3 | 22 (79%) | 0 (0) | 0 (0) | 0 (0) | 2 of 2 | 3 | 872 | 247 |
 
-| Tab | What a refresh reads (code) | Whole list or since cursor | Smoke, 5 s Chromium (per minute) |
+What changed:
+
+- **Cold Bugs, RTT 80:** 1,091 to 216 ms in Chromium, and 1,056 to 209 ms in WebKit.
+- **Cold Bugs, RTT 0:** 393 to 37 ms in Chromium, and 402 to 51 ms in WebKit.
+- **Warm Bugs:** 17-35 ms, against 88-136 ms before.
+
+On every cold load, the requests answered before the first row are `/v1/tasks` and one work-items page. That page is 713 KiB for Bugs and 704 KiB for Features.
+
+In WebKit the started count is one higher, a second page. Page 2 is requested in the same task that renders page 1, so it starts before the row is observed, but the row does not wait for it.
+
+The tail share is 0%: no read finishes between the first page and the row.
+
+The full read is now 7 requests, down from 8. The read stops at the short sixth page instead of reading an empty seventh. The rest of the list still loads, and all 1,089 rows are listed within the 5 s settle window in every case.
+
+Warm Features in WebKit shows 2 of 2 cache-served reads before the row, with a 22 ms tail. Its second, 47-item page was already read from the cache before the row appeared.
+
+In the before-table above, the two counts coincide. Its "cache-served reads before row" column shows all 7 page reads (0 of 7 from cache) finished before the row, and `/v1/tasks` finished before page 1 was requested. So the 8 requests started before the row were also the 8 answered before it.
+
+## P4: background refresh (m5)
+
+Measured under one exclusive hold, after the search browser rerun in the same hold: lock 3ec46deb, seq 2073, 12:54:38Z-13:05:26Z, at `16f5477c`.
+
+Each tab was opened alone, at RTT 80 with the 13 ms page delay. After its data painted and 3 s passed, requests were counted for 60 s. Each second a live event changed one work item, posted one message and changed one agent's activity. The cached client's real 20 s refresh timer ran throughout.
+
+A quiet run, with no events and only the timer, was added in Chromium for Bugs and Board. There were no page errors, unknown routes or writes.
+
+The view measured is the phase-2 one. A background refresh of a complete list reads every page before showing it, as before. It now reads 6 pages, not 7: there is no trailing empty page.
+
+| Engine | Tab | Live events | Route | Requests/min | KiB/min |
+|---|---|---|---|---|---|
+| chromium | bugs | 1 per 1000 ms | tasks list | 59 | 423 |
+| chromium | bugs | 1 per 1000 ms | work-items | 354 | 224619 |
+| chromium | board | 1 per 1000 ms | work-items (no kind) | 118 | 2 |
+| chromium | board | 1 per 1000 ms | tasks list | 59 | 423 |
+| chromium | board | 1 per 1000 ms | other | 177 | 4 |
+| chromium | board | 1 per 1000 ms | task detail (with agents) | 59 | 91413 |
+| chromium | board | 1 per 1000 ms | messages after cursor | 59 | 70 |
+| chromium | agents | 1 per 1000 ms | (no hub reads) | 0 | 0 |
+| chromium | tasks | 1 per 1000 ms | other | 239 | 5 |
+| chromium | tasks | 1 per 1000 ms | tasks list | 59 | 423 |
+| chromium | tasks | 1 per 1000 ms | task detail (with agents) | 118 | 92588 |
+| chromium | bugs | none | tasks list | 1 | 7 |
+| chromium | bugs | none | work-items | 9 | 5522 |
+| chromium | board | none | tasks list | 1 | 7 |
+| chromium | board | none | other | 3 | 0 |
+| chromium | board | none | task detail (with agents) | 1 | 1549 |
+| chromium | board | none | messages after cursor | 1 | 0 |
+| webkit | bugs | 1 per 1000 ms | tasks list | 59 | 423 |
+| webkit | bugs | 1 per 1000 ms | work-items | 354 | 224640 |
+| webkit | board | 1 per 1000 ms | work-items (no kind) | 118 | 2 |
+| webkit | board | 1 per 1000 ms | tasks list | 59 | 423 |
+| webkit | board | 1 per 1000 ms | other | 177 | 4 |
+| webkit | board | 1 per 1000 ms | task detail (with agents) | 59 | 91419 |
+| webkit | board | 1 per 1000 ms | messages after cursor | 59 | 70 |
+| webkit | agents | 1 per 1000 ms | (no hub reads) | 0 | 0 |
+| webkit | tasks | 1 per 1000 ms | other | 239 | 5 |
+| webkit | tasks | 1 per 1000 ms | tasks list | 59 | 423 |
+| webkit | tasks | 1 per 1000 ms | task detail (with agents) | 118 | 92595 |
+
+| Changed records per minute (events at 1 per s) | Records | KiB/min |
+|---|---|---|
+| Work items (Chromium / WebKit) | 60 / 59 | 209 / 206 |
+| Messages | 60 / 59 | 71 / 69 |
+| Agents | 60 / 59 | 29 / 29 |
+
+Verdicts by the rule. A view is COST if a background refresh refetches a whole list and moves at least 1 MiB/min, or at least 10x the bytes of the records that changed. Otherwise it is REPORT-ONLY.
+
+| Tab | Whole list or since cursor (code) | Measured | Verdict |
 |---|---|---|---|
-| Bugs | `reload()` rereads every page of `listWorkItems` (`client/work-items-view.js:141-152`) on every global feed notice (`:112`), through the cached client (`client/cached-hub-client.js:706`) | whole list (7 pages) | 336 work-items requests, about 178 MiB |
-| Board | `getTask(id)`, the project detail with its full agents list (`client/board-view.js:882`; `hub/internal/server/server.go` `getTask` returns `ListAgents`), plus `listMessages(id, {limit: 200, latest: 1})` (`:885`). The cached client turns that into `after=<last seq>` (`client/cached-hub-client.js:173-195`) | messages: since cursor; project detail with 3,199 agents: whole list | 48 project-detail reads, about 73 MiB; messages after cursor, 53 KiB |
-| Agents | The Agents tab lists local vault definitions only (`client/agents-view.js`) and makes no hub reads. The hub roster is reread elsewhere: whole `listAgents` in the sidebar task hub (`client/task-hub.js:481`, `client/cached-hub-client.js:688`; `server.go` route has no cursor) and the project detail above | none from the tab | no hub reads |
-| Tasks | `getTask` for every open project (`client/tasks-view.js:262`) | whole list (project detail with agents) | 96 project-detail reads, about 74 MiB |
+| Bugs | Whole list: `reload()` rereads every page (`client/work-items-view.js`), on every global feed notice (`subscribe("", ...)` in `show()`), through `client/cached-hub-client.js:706` | 354 page reads and about 219 MiB/min, about 1,070x the 209 KiB/min of changed work items. Quiet hub, timer only: 9 page reads and 5.4 MiB/min | **COST** |
+| Board | Messages: since cursor. `listMessages(id, {limit: 200, latest: 1})` (`client/board-view.js:885`) becomes `after=<last seq>` (`client/cached-hub-client.js:173-195`). Project detail: whole list. `getTask(id)` (`client/board-view.js:882`) returns the project with all 3,199 agents (`hub/internal/server/server.go` `getTask` calls `ListAgents`) | Messages: 70 KiB/min, about 1x the changed messages. Project detail: about 89 MiB/min, about 3,100x the 29 KiB/min of changed agents. Quiet: 1.5 MiB/min | Messages: **REPORT-ONLY** (already incremental). Project detail: **COST** |
+| Agents | The tab lists local vault definitions only (`client/agents-view.js`) and makes no hub reads. The sidebar task hub rereads the whole `listAgents` (`client/task-hub.js:481`, `client/cached-hub-client.js:688`; the hub route has no cursor), but this harness does not run it | No hub reads from the tab | **REPORT-ONLY** |
+| Tasks (added) | Whole list: `getTask` for every open project (`client/tasks-view.js:262`) | about 90 MiB/min | **COST** |
 
 What drives the rate:
 
-- Every non-heartbeat feed event marks every read path stale (`client/cached-hub-client.js:356-360`, `:380`, `:407`). Each view then reloads.
-- The cached client also refetches every path touched in the last 40 s every 20 s (`:792-801`), with or without events.
+- Every non-heartbeat feed event marks every read path stale (`client/cached-hub-client.js:356-360`, `:380`, `:407`), and each open view reloads.
+- Every 20 s the client also refetches each path touched in the last 40 s (`:792-801`).
+- One Bugs reload moves about 3.7 MiB, and one project detail about 1.5 MiB.
 
-In the smoke run the changed records were about 255 KiB/min for work items, 71 KiB/min for messages and 29 KiB/min for agents. So the Bugs and project-detail rereads were far above 10x the changed bytes.
+So the per-minute cost scales with the live hub's rate of non-heartbeat events, which this measurement did not read. The quiet run gives the floor: 5.4 MiB/min for an open Bugs tab and 1.5 MiB/min for an open Board.
 
-The rule (COST if a whole list is refetched and it moves at least 1 MiB/min or 10x the changed records' bytes) would mark Bugs, Board (project detail) and Tasks as COST, and Agents as REPORT-ONLY. Those verdicts wait for the real P4 run, which also covers WebKit and a quiet hub (timer only).
+As the order requires, the COST verdicts are reported, not built. A changes-since read for work items and agents (with a full reload kept as the fallback) needs a hub list parameter, which is outside this order's owned paths. It goes to the handler as an amendment or a new item.
