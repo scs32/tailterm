@@ -57,7 +57,7 @@ const dialogNode=document.querySelector('#dialog');
 const closeDialog=()=>{dialogNode.close();dialogNode.replaceChildren()};
 const dialog=(title,body)=>{dialogNode.innerHTML='<h2>'+title+'</h2>'+body;dialogNode.showModal()};
 const view=createWorkItemsView({kind,client:()=>client,dialog,closeDialog,notice(){},configure(){},openBoard(){}});
-view.mount(document.querySelector('#mode-view'));await view.show();window.qa={view,refresh(){notify()},requests(){return requests.map(r=>({...r}))},release(){gate?.release();gate=null},
+view.mount(document.querySelector('#mode-view'));const shown=view.show();if(!paged)await shown;window.qa={view,refresh(){notify()},requests(){return requests.map(r=>({...r}))},release(){gate?.release();gate=null},
  count(status,taskId){return all.filter(item=>(!status||item.status===status)&&(!taskId||item.taskId===taskId)).length},setMessage(text){messageText=text},setReport(text){reportText=text},setReportFailure(value){failReport=value},reportFetches(){return reportFetches}};
 </script></body></html>`;
 
@@ -201,11 +201,17 @@ async function pagedCases(browser, engine, kind) {
       change === "status"
         ? text.includes(" · Open · ")
         : text.startsWith("Other project");
+    // The held old-filter page arrives after the change and is not shown.
+    await page.waitForTimeout(100);
+    await page.evaluate(() => window.qa.release());
     await page.waitForFunction(
-      (n) => document.querySelectorAll("[data-work-item]").length === n,
+      (n) =>
+        document.querySelectorAll("[data-work-item]").length === n &&
+        !document
+          .querySelector("[data-items-search-status]")
+          .textContent.includes("Loading more"),
       expected,
     );
-    await page.evaluate(() => window.qa.release());
     await page.waitForTimeout(300);
     const shown = await rows(page);
     assert.equal(shown.length, expected, `${label} ${change}: row count`);
@@ -218,14 +224,16 @@ async function pagedCases(browser, engine, kind) {
       `${label} ${change}: old-filter rows after the change`,
     );
     assert.doesNotMatch(await statusText(page), /Loading more/);
-    // The new filter did not wait for the held page, and that page, once
-    // released, ended the old read.
+    // The old read finished on its own filter, unshown, before the new one.
+    const requests = await page.evaluate(() => window.qa.requests());
     assert.deepEqual(
-      (await page.evaluate(() => window.qa.requests()))
-        .filter((r) => !r.status && !r.taskId)
-        .map((r) => r.after),
-      [0, 200],
+      requests.filter((r) => !r.status && !r.taskId).map((r) => r.after),
+      [0, 200, 400],
       `${label} ${change}: old-filter reads`,
+    );
+    assert.ok(
+      requests.findIndex((r) => r.status || r.taskId) > 2,
+      `${label} ${change}: the new filter read after the old one`,
     );
     assert.deepEqual(errors, [], `${label} ${change}: page errors`);
     await page.close();

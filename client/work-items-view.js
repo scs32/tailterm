@@ -83,8 +83,6 @@ export function createWorkItemsView({
     renderedKey = "",
     shownGeneration = 0,
     listScheduled = false,
-    // The filter of the load in flight.
-    loadingKey = "",
     narrativeGeneration = 0,
     searchGeneration = 0,
     searchLoading = false,
@@ -138,9 +136,7 @@ export function createWorkItemsView({
   }
   async function reload() {
     if (!visible || !root) return;
-    // A refresh during a load runs after it; a filter change starts its own
-    // load at once, and the old one stops at its next page.
-    if (loading && loadingKey === JSON.stringify([scope, state])) {
+    if (loading) {
       again = true;
       return;
     }
@@ -155,7 +151,6 @@ export function createWorkItemsView({
     again = false;
     const token = ++generation;
     const filter = { taskId: scope, status: state };
-    loadingKey = JSON.stringify([scope, state]);
     try {
       const nextTasks = await client().listTasks(),
         next = [];
@@ -174,10 +169,6 @@ export function createWorkItemsView({
           limit: PAGE_LIMIT,
         });
         if (!visible || token !== generation) return;
-        if (filter.taskId !== scope || filter.status !== state) {
-          again = true;
-          return;
-        }
         next.push(...page.items);
         // The hub names a next cursor on every non-empty page, so the list
         // ends at an empty page, or at a page shorter than an earlier one of
@@ -191,7 +182,14 @@ export function createWorkItemsView({
           break;
         fullPage = Math.max(fullPage, page.items.length);
         after = page.next;
-        if (progressive) showPage(token, nextTasks, next, true);
+        // A filter change while this read pages keeps it on its own filter,
+        // and none of its pages is shown; the new filter reads after it.
+        if (progressive && filter.taskId === scope && filter.status === state)
+          showPage(token, nextTasks, next, true);
+      }
+      if (filter.taskId !== scope || filter.status !== state) {
+        again = true;
+        return;
       }
       completeKey = key;
       if (shownGeneration === token) {
