@@ -70,6 +70,8 @@ type stallFixture struct {
 	// needsPersons records the second notice, for a turn that never ended.
 	needsPersons    []claudeStall
 	needsPersonErrs []error
+	// wrap, when set, changes the ops a pass gets.
+	wrap func(*claudeStallOps)
 }
 
 func newStallFixture(t *testing.T) *stallFixture {
@@ -127,6 +129,14 @@ func (f *stallFixture) wakeOps() claudeWakeOps {
 }
 
 func (f *stallFixture) ops() claudeStallOps {
+	ops := f.baseOps()
+	if f.wrap != nil {
+		f.wrap(&ops)
+	}
+	return ops
+}
+
+func (f *stallFixture) baseOps() claudeStallOps {
 	return claudeStallOps{
 		now:    func() time.Time { return f.now },
 		sleep:  func(d time.Duration) { f.now = f.now.Add(d) },
@@ -1985,5 +1995,89 @@ func TestClaudeStallNeverEndedNoticeReachesHelper(t *testing.T) {
 	}
 	if got = h.notices(t); len(got) != 4 || got[3].To != "" {
 		t.Fatalf("a stalled owner helper's second notice should reach the Board: %+v", got)
+	}
+}
+
+// Review f1 (#54210): a restarted relay that finds its own pre-key record
+// (no answer from tmux saved) and a transcript showing the turn ended says
+// what it will do next, and does it: no "needs a person", the resume line
+// typed once, no second key and no second notice.
+func TestClaudeStallUnconfirmedKeyTurnEnds(t *testing.T) {
+	f := newStallFixture(t)
+	f.setAction(`{"claudeStallAction":"interrupt"}`)
+	f.now = stallLastOutput.Add(17 * time.Minute)
+	now := f.now.Format(time.RFC3339Nano)
+	f.seedStall(map[string]any{"count": 1, "rule": claudeStallRule, "interruptedStall": 1, "since": stallLastOutput.Format(time.RFC3339Nano), "detectedAt": now, "checkedAt": now,
+		"mode": "interrupt", "counter": "75", "interruptedAt": now, "outcome": "interrupt key being sent"})
+	appendClaudeRecords(t, f.transcript, f.interrupt) // the key did reach the pane
+	f.advance(10 * time.Second)
+	out := f.pass()
+	s := f.record()
+	if len(f.notices) != 1 || s.EndedAt.IsZero() || len(f.keys) != 0 {
+		t.Fatalf("restarted relay: keys=%q notices=%d %+v\n%s", f.keys, len(f.notices), s, out)
+	}
+	notice := f.notices[0].Notice
+	for _, want := range []string{"no result was recorded, so the key may or may not have reached the pane. It will not send another in this run.",
+		"Nothing is typed until the transcript shows the turn ended. If it does, the relay will type the resume line once."} {
+		if !strings.Contains(notice, want) {
+			t.Fatalf("notice lacks %q:\n%s", want, notice)
+		}
+	}
+	if strings.Contains(notice, "The agent needs a person") || strings.Contains(notice, "typed nothing") {
+		t.Fatalf("notice says the agent needs a person although the turn may end and be resumed:\n%s", notice)
+	}
+	// Built after the turn ended (a later restart), it says what comes next.
+	ended := claudeStallNoticeText(f.b, s)
+	if !strings.Contains(ended, "The transcript shows the turn ended. It will now type the resume line once.") || strings.Contains(ended, "The agent needs a person") {
+		t.Fatalf("notice after the turn ended:\n%s", ended)
+	}
+	for i := 0; i < 4; i++ {
+		f.advance(claudeStallResumeGrace)
+		f.pass()
+	}
+	s = f.record()
+	if fmt.Sprint(f.sent) != fmt.Sprint([]string{"text:" + claudeStallResumeLine, "Enter"}) || s.ResumeConfirmedAt.IsZero() || s.active() || len(f.keys) != 0 || len(f.notices) != 1 || len(f.needsPersons) != 0 {
+		t.Fatalf("after the turn ended: sent=%q keys=%q notices=%d needsPerson=%d %+v", f.sent, f.keys, len(f.notices), len(f.needsPersons), s)
+	}
+}
+
+// Review f2 (#54210): tmux's answer is on disk as soon as it is known, before
+// the pass that sent the key returns, so a relay stopped right after the key
+// still knows whether it was sent or failed.
+func TestClaudeStallKeyAnswerSavedAtOnce(t *testing.T) {
+	for _, failed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("failed=%v", failed), func(t *testing.T) {
+			f := newStallFixture(t)
+			f.setAction(`{"claudeStallAction":"interrupt"}`)
+			if failed {
+				f.interruptErr = errors.New("tmux: no such pane")
+			}
+			var seen []claudeStall
+			f.wrap = func(ops *claudeStallOps) {
+				// The first op after tmux answers: ended on success, the
+				// notice on failure.
+				ended, notify := ops.ended, ops.notify
+				ops.ended = func(ctx context.Context, b runtimeBinding) bool {
+					if len(f.keys) == 1 && len(seen) == 0 {
+						seen = append(seen, loadClaudeStall(b))
+					}
+					return ended(ctx, b)
+				}
+				ops.notify = func(ctx context.Context, b runtimeBinding, s claudeStall) error {
+					if len(f.keys) == 1 && len(seen) == 0 {
+						seen = append(seen, loadClaudeStall(b))
+					}
+					return notify(ctx, b, s)
+				}
+			}
+			f.detect("spinner-stalled-2")
+			if len(f.keys) != 1 || len(seen) != 1 {
+				t.Fatalf("keys=%q reads=%d", f.keys, len(seen))
+			}
+			on := seen[0]
+			if on.InterruptedStall != 1 || on.InterruptKeySent == failed || on.InterruptKeyFailed != failed {
+				t.Fatalf("record on disk right after tmux answered (failed=%v): %+v", failed, on)
+			}
+		})
 	}
 }

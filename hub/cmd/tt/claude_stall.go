@@ -853,7 +853,15 @@ func claudeStallNoticeText(b runtimeBinding, s claudeStall) string {
 	case !s.InterruptedAt.IsZero() && s.InterruptKeyFailed:
 		text += "The relay tried to interrupt the turn at " + s.InterruptedAt.Format(time.RFC3339) + " and the key could not be sent. It will not try again in this run and typed nothing. The agent needs a person."
 	case !s.InterruptedAt.IsZero() && !s.InterruptKeySent:
-		text += "The relay began sending the interrupt key at " + s.InterruptedAt.Format(time.RFC3339) + " and no result was recorded, so the key may or may not have reached the pane. It will not send another in this run and typed nothing. The agent needs a person."
+		// A relay that stopped between the save and tmux's answer. The
+		// stall is followed like an interrupted one, so the text says what
+		// the follow-up does if the turn ends, and if it does not.
+		text += "The relay began sending the interrupt key at " + s.InterruptedAt.Format(time.RFC3339) + " and no result was recorded, so the key may or may not have reached the pane. It will not send another in this run."
+		if !s.EndedAt.IsZero() {
+			text += " The transcript shows the turn ended. It will now " + next + "."
+		} else {
+			text += " Nothing is typed until the transcript shows the turn ended. If it does, the relay will " + next + ". If it has not ended " + fmt.Sprint(int(claudeStallEndLimit.Minutes())) + " minutes after the key, a second notice will say so."
+		}
 	case !s.InterruptedAt.IsZero() && !s.EndedAt.IsZero():
 		text += "The relay interrupted the turn once at " + s.InterruptedAt.Format(time.RFC3339) + " and the transcript shows it ended. It will now " + next + "."
 	case !s.InterruptedAt.IsZero():
