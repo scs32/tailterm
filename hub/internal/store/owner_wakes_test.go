@@ -1237,6 +1237,26 @@ func TestOwnerHelperWakeBusyStuck(t *testing.T) {
 	}
 }
 
+// Review f1 (#53505): a run working at due that turns stuck, or any other
+// stuck-type state, after due loses the excuse; unknown does not void it.
+func TestOwnerHelperWakeBusyStuckAfterDue(t *testing.T) {
+	t.Run("stuck", func(t *testing.T) {
+		f, w := busyWake(t, "working")
+		f.activity("act-stuck", "stuck", pst(2, 7, 16, 0), nil)
+		f.lateRead(w, pst(2, 7, 22, 0), 8, true)
+	})
+	t.Run("hung_tool", func(t *testing.T) {
+		f, w := busyWake(t, "working")
+		f.activity("act-hung", "hung_tool", pst(2, 7, 20, 0), nil)
+		f.lateRead(w, pst(2, 7, 22, 0), 8, true)
+	})
+	t.Run("unknown keeps the excuse", func(t *testing.T) {
+		f, w := busyWake(t, "working")
+		f.activity("act-unknown", "unknown", pst(2, 7, 16, 0), nil)
+		f.lateRead(w, pst(2, 7, 22, 0), 8, false)
+	})
+}
+
 // t8: activity of another run of the same agent is ignored.
 func TestOwnerHelperWakeBusyOtherRun(t *testing.T) {
 	f, w := busyWake(t, "idle")

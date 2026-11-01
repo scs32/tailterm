@@ -811,13 +811,19 @@ const ownerWakeBusyBound = 30 * time.Minute
 // still running (claudeTurnBusyReason in cmd/tt).
 const ownerWakeTurnBusy = "turn in progress"
 
+// ownerWakeStuck are the activity states that, reported after due, void a
+// mid-turn excuse: the run stopped making progress rather than working.
+var ownerWakeStuck = map[string]bool{"stuck": true, "hung_tool": true, "looping": true, "crashed": true, "finished_silent": true, "runtime_prompt": true, "provider_blocked": true}
+
 // ownerWakeHelperBusy reports whether a posted slot's late read, or its
 // unread state at end, is explained by the recipient run being mid-turn. It
 // reads that exact run's stored activity reports and compares their parsed
 // observedAt times. The run was busy when the latest report at or before due
 // was working, or a report after due and at or before end records the relay
 // skipping a wake because a turn was in progress; and no report after due and
-// more than OwnerHelperWakeLateAfter before end is idle, since a helper that
+// at or before end voids it. A report in a stuck-type state (ownerWakeStuck)
+// voids it, since late while stuck is still reported, and an idle report more
+// than OwnerHelperWakeLateAfter before end voids it, since a helper that
 // finished its turn and sat idle with the slot unread missed it. Any other
 // state at due, or no history, is not busy.
 func ownerWakeHelperBusy(ctx context.Context, tx *sql.Tx, firing api.OwnerHelperWakeFiring, end time.Time) (bool, error) {
@@ -831,7 +837,7 @@ func ownerWakeHelperBusy(ctx context.Context, tx *sql.Tx, firing api.OwnerHelper
 	defer rows.Close()
 	due := firing.DueAt
 	var atDue *api.AgentActivity
-	skipped, idleGap := false, false
+	skipped, voided := false, false
 	for rows.Next() {
 		var payload string
 		if err := rows.Scan(&payload); err != nil {
@@ -848,8 +854,8 @@ func ownerWakeHelperBusy(ctx context.Context, tx *sql.Tx, firing api.OwnerHelper
 				atDue = &a
 			}
 		case at.After(end):
-		case a.State == "idle" && end.Sub(at) > api.OwnerHelperWakeLateAfter:
-			idleGap = true
+		case ownerWakeStuck[a.State], a.State == "idle" && end.Sub(at) > api.OwnerHelperWakeLateAfter:
+			voided = true
 		case a.Wake != nil && a.Wake.Status == "skipped" && strings.Contains(a.Wake.Reason, ownerWakeTurnBusy):
 			skipped = true
 		}
@@ -857,7 +863,7 @@ func ownerWakeHelperBusy(ctx context.Context, tx *sql.Tx, firing api.OwnerHelper
 	if err := rows.Err(); err != nil {
 		return false, err
 	}
-	return !idleGap && (skipped || atDue != nil && atDue.State == "working"), nil
+	return !voided && (skipped || atDue != nil && atDue.State == "working"), nil
 }
 
 // ownerWakeSettle records a posted slot's read time, reporting it late when
