@@ -88,7 +88,7 @@ How each column is measured:
 - **Render:** from that read to paint.
 - **First page resolved:** click to the read with `after=0` resolving.
 - **Tail fetch:** first page resolved to last page resolved.
-- **Before row:** requests started before the row appeared.
+- **Before row:** requests started before the row appeared (`start <= row seen`). In the harness at `efeb4b90` and later, a second count in parentheses gives the requests answered before the row (`end <= row seen`): the reads the row waited for. a7 is judged on that answered count. In this before-table every read is sequential and finished before the row, so the two counts coincide, and the single count shown is both.
 - **Cache-served:** `listWorkItems` calls that the read cache answered without a network request.
 - **Totals:** include the 5 s after paint, so the warm background refresh is counted.
 
