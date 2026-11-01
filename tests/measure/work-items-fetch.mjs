@@ -678,9 +678,12 @@ async function fixturePage({
       const net = log
         .slice(logFrom)
         .filter((entry) => entry.route !== "events");
-      // Requests answered before the row appeared: what the row waited for.
-      // A later page requested in the same task as the first render is not.
-      const before = net.filter((entry) => entry.end && entry.end <= row.seen);
+      // Requests started before the row appeared (the a1 count), and of
+      // those, the ones answered before it: what the row waited for. A later
+      // page requested in the same task as the first render is started, not
+      // answered.
+      const before = net.filter((entry) => entry.start <= row.seen);
+      const answered = before.filter((entry) => entry.end && entry.end <= row.seen);
       const pagesBefore = before.filter((entry) => entry.route === "work-items");
       const viewReads = reads.slice(readsFrom);
       const readsBefore = viewReads.filter((read) => read.end && read.end <= row.seen);
@@ -699,6 +702,9 @@ async function fixturePage({
         bytesBefore: sum(before.map((entry) => entry.bytes)),
         pagesBefore: pagesBefore.length,
         pageBytesBefore: sum(pagesBefore.map((entry) => entry.bytes)),
+        answeredBefore: answered.length,
+        answeredPagesBefore: answered.filter((entry) => entry.route === "work-items").length,
+        answeredBytesBefore: sum(answered.map((entry) => entry.bytes)),
         totalRequests: net.length,
         totalBytes: sum(net.map((entry) => entry.bytes)),
         readsBefore: readsBefore.length,
@@ -876,7 +882,7 @@ const r = (n) => Math.round(n);
 const kb = (n) => (n / 1024).toFixed(0);
 function printFirstRow(rows) {
   const lines = [
-    "| Engine | RTT ms | Tab | Cache | Time to first row ms (med / max) | Fetch ms | Render ms | Fetch share | First page resolved ms | Tail fetch ms (share) | Requests answered before row | Pages before row | KiB before row | Cache-served reads before row | Total requests | Total KiB | Rows |",
+    "| Engine | RTT ms | Tab | Cache | Time to first row ms (med / max) | Fetch ms | Render ms | Fetch share | First page resolved ms | Tail fetch ms (share) | Requests before row (answered) | Pages before row (answered) | KiB before row (answered) | Cache-served reads before row | Total requests | Total KiB | Rows |",
     "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
   ];
   const groups = new Map();
@@ -891,7 +897,7 @@ function printFirstRow(rows) {
     const m = (f) => median(list.map(f));
     const first = list.map((x) => x.firstRowMs);
     lines.push(
-      `| ${engine} | ${rtt} | ${mode} | ${cache} | ${r(median(first))} / ${r(max(first))} | ${r(m((x) => x.fetchMs))} | ${r(m((x) => x.renderMs))} | ${r((100 * m((x) => x.fetchMs)) / Math.max(1, median(first)))}% | ${r(m((x) => x.firstPageMs))} | ${r(m((x) => x.tailMs))} (${r((100 * m((x) => x.tailMs)) / Math.max(1, median(first)))}%) | ${m((x) => x.requestsBefore)} | ${m((x) => x.pagesBefore)} | ${kb(m((x) => x.bytesBefore))} | ${m((x) => x.cacheServedReadsBefore)} of ${m((x) => x.readsBefore)} | ${m((x) => x.totalRequests)} | ${kb(m((x) => x.totalBytes))} | ${m((x) => x.rows)} |`,
+      `| ${engine} | ${rtt} | ${mode} | ${cache} | ${r(median(first))} / ${r(max(first))} | ${r(m((x) => x.fetchMs))} | ${r(m((x) => x.renderMs))} | ${r((100 * m((x) => x.fetchMs)) / Math.max(1, median(first)))}% | ${r(m((x) => x.firstPageMs))} | ${r(m((x) => x.tailMs))} (${r((100 * m((x) => x.tailMs)) / Math.max(1, median(first)))}%) | ${m((x) => x.requestsBefore)} (${m((x) => x.answeredBefore ?? x.requestsBefore)}) | ${m((x) => x.pagesBefore)} (${m((x) => x.answeredPagesBefore ?? x.pagesBefore)}) | ${kb(m((x) => x.bytesBefore))} (${kb(m((x) => x.answeredBytesBefore ?? x.bytesBefore))}) | ${m((x) => x.cacheServedReadsBefore)} of ${m((x) => x.readsBefore)} | ${m((x) => x.totalRequests)} | ${kb(m((x) => x.totalBytes))} | ${m((x) => x.rows)} |`,
     );
   }
   return lines.join("\n");
