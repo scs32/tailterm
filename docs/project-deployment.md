@@ -180,6 +180,17 @@ publication and settlement time. Compact terminal receipt and supersession
 fields retain commit/target/outcome baseline evidence. Plans, verification
 records, reconciliations, retries, paths and full receipts require detail.
 
+**Settlement time** (`settledAt`, wi_bd0310b7bbcd4a52). Every terminal state
+carries the hub time the job settled, which time-windowed reads such as the
+owner report compare as a time: `released` and `rolled_back` from the
+runner's finish, `refused` from the runner's refuse of a claimed job or from
+the handler's refuse reconcile, `superseded` from the covering hand release's
+`createdAt`, and each batch member from its lead's finish. A job refused by the
+runner before this change has no `settledAt` and stays untimed, so time
+windows leave it out; there is no backfill unless one is separately proposed
+and approved. The runner refuses only an unpublished claim, so the
+quiet-window ledger, which reads published jobs, is unchanged.
+
 - `tt deployment list --view active --limit 200` reads active work.
 - `tt deployment list --view settled --limit 200` starts settled history.
 - Continue with the returned `--after CURSOR --snapshot TOKEN` until

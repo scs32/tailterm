@@ -1204,6 +1204,10 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 					j.Refusal = &refusal
 				}
 				j.State = "refused"
+				// The hub time the job left the fence, as finish and the
+				// handler's refuse reconcile record it, so settled history
+				// and time-windowed reports can place the refusal.
+				j.SettledAt = ts(s.now())
 				if batch != nil {
 					batchState = "dissolved"
 				}

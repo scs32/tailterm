@@ -6401,6 +6401,48 @@ func TestReleaseRefuseKeepsRefusal(t *testing.T) {
 	}
 }
 
+// wi_bd0310b7bbcd4a52 f1, f2: the deployer's refuse of a claimed job records
+// the hub time as settledAt, like finish and the handler's refuse reconcile,
+// so a time window that holds the refusal counts it and one that ends before
+// it does not. Isolated store and fake clock only.
+func TestReleaseRunnerRefuseRecordsSettledTime(t *testing.T) {
+	ctx := context.Background()
+	s, task, h, d, entry := releaseFixture(t)
+	claimedAt := windowAt("2026-10-31T13:00:00-07:00")
+	setWindowClock(t, s, d, claimedAt)
+	j := claimedRelease(t, s, task, h, d, entry)
+	if j.State != "claimed" || j.SettledAt != "" {
+		t.Fatalf("claimed %+v", j)
+	}
+	refusedAt := claimedAt.Add(5*time.Minute + 250*time.Millisecond)
+	setWindowClock(t, s, d, refusedAt)
+	req := api.ReleaseRequest{RequestID: "refuse", Operation: "refuse", AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, Refusal: &api.ReleaseRefusal{Step: "select", Reason: "Unknown release path: tools/newthing/a.js"}}
+	refused, err := s.ReleaseAction(ctx, task.ID, req)
+	if err != nil || refused.State != "refused" || refused.SettledAt != ts(refusedAt) {
+		t.Fatalf("refused %+v %v", refused, err)
+	}
+	if saved, err := releaseLoad(ctx, s.db, task.ID, j.ID); err != nil || saved.SettledAt != ts(refusedAt) {
+		t.Fatalf("saved %q %v", saved.SettledAt, err)
+	}
+	summary := settledSummary(t, s, task, j.ID)
+	if summary.State != "refused" || summary.SettledAt != ts(refusedAt) {
+		t.Fatalf("summary %+v", summary)
+	}
+	at := parseTS(summary.SettledAt)
+	inside := func(start, end time.Time) bool { return !at.Before(start) && at.Before(end) }
+	if !inside(claimedAt, claimedAt.Add(time.Hour)) {
+		t.Fatal("a window holding the refusal leaves it out", at)
+	}
+	if inside(claimedAt.Add(-time.Hour), claimedAt.Add(5*time.Minute)) {
+		t.Fatal("a window ending before the refusal counts it", at)
+	}
+	// A later clock does not move it: the replay returns the saved job.
+	setWindowClock(t, s, d, refusedAt.Add(time.Hour))
+	if again, err := s.ReleaseAction(ctx, task.ID, req); err != nil || again.SettledAt != ts(refusedAt) {
+		t.Fatalf("replay %+v %v", again, err)
+	}
+}
+
 // a2 (f1): a refusal that breaks the receipt failure rules is invalid and
 // leaves the job claimed at its generation, with no refusal. Fake values only.
 func TestReleaseRefuseRefusesBadRefusal(t *testing.T) {
