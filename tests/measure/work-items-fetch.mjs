@@ -678,7 +678,9 @@ async function fixturePage({
       const net = log
         .slice(logFrom)
         .filter((entry) => entry.route !== "events");
-      const before = net.filter((entry) => entry.start <= row.seen);
+      // Requests answered before the row appeared: what the row waited for.
+      // A later page requested in the same task as the first render is not.
+      const before = net.filter((entry) => entry.end && entry.end <= row.seen);
       const pagesBefore = before.filter((entry) => entry.route === "work-items");
       const viewReads = reads.slice(readsFrom);
       const readsBefore = viewReads.filter((read) => read.end && read.end <= row.seen);
@@ -874,7 +876,7 @@ const r = (n) => Math.round(n);
 const kb = (n) => (n / 1024).toFixed(0);
 function printFirstRow(rows) {
   const lines = [
-    "| Engine | RTT ms | Tab | Cache | Time to first row ms (med / max) | Fetch ms | Render ms | Fetch share | First page resolved ms | Tail fetch ms (share) | Requests before row | Pages before row | KiB before row | Cache-served reads before row | Total requests | Total KiB | Rows |",
+    "| Engine | RTT ms | Tab | Cache | Time to first row ms (med / max) | Fetch ms | Render ms | Fetch share | First page resolved ms | Tail fetch ms (share) | Requests answered before row | Pages before row | KiB before row | Cache-served reads before row | Total requests | Total KiB | Rows |",
     "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
   ];
   const groups = new Map();
