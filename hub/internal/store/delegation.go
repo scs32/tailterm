@@ -793,9 +793,9 @@ func (s *Store) scheduleWindowReminder(ctx context.Context, tx *sql.Tx, task api
 	wakeID := api.NewID("ohw")
 	when := at.Format("Jan 2 15:04 UTC")
 	text := fmt.Sprintf("The owner delegation window %s to %s (%s) ends %s. The hub reminds before the end: at %s, wake %s (authority-expiry) goes to the owner helper, or to the owner when no helper is live. "+
-		"To keep the delegation, the owner closes this window and opens a new one before it ends: tt owner delegation close %s, then tt owner delegation open --delegate %s --until TIME. "+
+		"To keep the delegation, the owner closes this window and opens a new one before it ends: tt owner delegation close %s, then tt owner delegation open --delegate %s --scope %s --until TIME. "+
 		"Otherwise it ends at %s and unanswered routed requests return to the owner. Ending the window first cancels this reminder.",
-		w.ID, w.DelegateName, scopeLabel(w.Scope), windowEnd(w), when, wakeID, w.ID, w.DelegateName, windowEnd(w))
+		w.ID, w.DelegateName, scopeLabel(w.Scope), windowEnd(w), when, wakeID, w.ID, w.DelegateName, strings.ReplaceAll(w.Scope, "_", "-"), windowEnd(w))
 	m, err := s.postDelegationNotice(ctx, tx, task, api.Agent{}, "A reminder is set before the delegation window ends", text,
 		map[string]string{"delegationReminder": w.ID, "ownerWake": "authority-expiry", "wake": wakeID}, nil, nil, "")
 	if err != nil {

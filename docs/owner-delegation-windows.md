@@ -140,7 +140,8 @@ window ends, so renewing it does not depend on the owner helper remembering.
   `delegationReminder=<window id>`, `ownerWake=authority-expiry` and `wake=<wake id>`.
   It names the window, the delegate, the end and reminder times, and what to do: to
   keep the delegation, close this window and open a new one before it ends
-  (`tt owner delegation close <id>`, then `tt owner delegation open ...`); otherwise
+  (`tt owner delegation close <id>`, then `tt owner delegation open --delegate <name>
+  --scope <the window's scope> --until TIME`); otherwise
   it ends and unanswered routed requests return to the owner. The hub then saves an
   `authority-expiry` wake on the owner helper's hub wake schedule
   (`docs/session-handoff.md`, "Wakes on the hub"): zone `UTC`, a single-minute

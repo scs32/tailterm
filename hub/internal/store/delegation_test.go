@@ -755,7 +755,7 @@ func TestDelegationReminderSchedule(t *testing.T) {
 				t.Fatalf("notice %+v %+v", n, env)
 			}
 			for _, part := range []string{w.ID, f.lead.Name, windowEnd(w), at.Format("Jan 2 15:04 UTC"), wk.ID,
-				"tt owner delegation close " + w.ID, "tt owner delegation open --delegate " + f.lead.Name, "unanswered routed requests return to the owner"} {
+				"tt owner delegation close " + w.ID, "tt owner delegation open --delegate " + f.lead.Name + " --scope decisions --until TIME", "unanswered routed requests return to the owner"} {
 				if !strings.Contains(env.Body.Text, part) {
 					t.Fatalf("notice text lacks %q: %s", part, env.Body.Text)
 				}
@@ -771,6 +771,25 @@ func TestDelegationReminderSchedule(t *testing.T) {
 				t.Fatal("a replayed open added a reminder")
 			}
 		})
+	}
+}
+
+// a1: the suggested renewal keeps the window's saved scope, in the form
+// tt owner delegation open --scope takes (review finding f1, #54368).
+func TestDelegationReminderRenewKeepsScope(t *testing.T) {
+	f := newDelegationFixture(t)
+	reminderStart(f)
+	w := f.open(t, "open-scope", api.DelegationScopeDecisionsMergesDeploys, 3*time.Hour)
+	notices := f.reminderNotices(t, w.ID)
+	if len(notices) != 1 {
+		t.Fatalf("notices %+v", notices)
+	}
+	want := "tt owner delegation open --delegate " + f.lead.Name + " --scope decisions-merges-deploys --until TIME"
+	if text := notices[0].Envelope.Body.Text; !strings.Contains(text, want) || !strings.Contains(text, "(decisions, merges and deploys)") {
+		t.Fatalf("notice text lacks %q: %s", want, text)
+	}
+	if got := api.NormalizeDelegationScope("decisions-merges-deploys"); got != w.Scope {
+		t.Fatalf("the suggested scope normalizes to %q, not the window's %q", got, w.Scope)
 	}
 }
 
