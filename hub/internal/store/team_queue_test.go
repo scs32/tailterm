@@ -2705,6 +2705,140 @@ func TestTeamQueueClaimSkipsStaleQueuedEntry(t *testing.T) {
 	}
 }
 
+// heldWaitFixture is a wait fixture whose predecessor holds a team, so the
+// waiting entry is the queue head.
+func heldWaitFixture(t *testing.T) *waitFixture {
+	t.Helper()
+	f := newWaitFixture(t)
+	// A claim reads the host census, observed when the fixture was made, so
+	// the fixture's clock moves to the present; agents stay live at it.
+	f.clock = time.Now().UTC()
+	f.exec(t, `UPDATE agents SET last_seen_at=? WHERE task_id=?`, ts(f.clock), f.task.ID)
+	syntheticHostUsage(t, f.s, f.task.ID, "mini")
+	if q, err := waitFixtureClaim(t, f, f.pred); err != nil || q.State != "launching" {
+		t.Fatalf("claim predecessor %+v %v", q, err)
+	}
+	return f
+}
+
+// waitFixtureClaim claims an entry at its listed revision, as the runner does.
+func waitFixtureClaim(t *testing.T, f *waitFixture, q api.TeamQueueEntry) (api.TeamQueueEntry, error) {
+	t.Helper()
+	current := listedEntry(t, f.s, f.task.ID, q.ID)
+	return f.s.TeamQueueAction(f.ctx, f.task.ID, api.TeamQueueRequest{RequestID: api.NewID("req"), Operation: "claim", EntryID: q.ID, ExpectedRevision: current.Revision, Host: "mini"})
+}
+
+// requireHeldClaim checks that a claim of the waiting entry is refused as not
+// the queue head, naming the wait, and that it stays queued with its rank and
+// a listing reason of that sentence and then its wait sentence.
+func requireHeldClaim(t *testing.T, f *waitFixture, hold string) {
+	t.Helper()
+	_, err := waitFixtureClaim(t, f, f.waiting)
+	if !errors.Is(err, api.ErrConflict) || !strings.HasSuffix(err.Error(), "not queue head") || !strings.Contains(err.Error(), hold) {
+		t.Fatalf("claim of the held entry = %v, want a not-queue-head conflict naming %q", err, hold)
+	}
+	held := listedEntry(t, f.s, f.task.ID, f.waiting.ID)
+	if held.State != "queued" || held.UpNext != 1 || held.Position != f.waiting.Position || len(held.Waits) != 1 || held.BlockReason != hold+". "+held.Waits[0].Text() {
+		t.Fatalf("held entry state=%s upNext=%d position=%d (was %d) waits %+v reason %q, want it queued first with %q before its wait", held.State, held.UpNext, held.Position, f.waiting.Position, held.Waits, held.BlockReason, hold)
+	}
+}
+
+// wi_bc90399c9878907e a1, a2, a3: a queued head whose wait on an unlanded
+// predecessor is open is skipped at admission. Its own claim is refused as
+// not the queue head and names the wait; the next eligible entry is admitted;
+// the held entry keeps its place and up-next number, its reason says why
+// while nothing else holds it, and the wait record is unchanged.
+func TestTeamQueueClaimSkipsHeadHeldByOpenWait(t *testing.T) {
+	f := heldWaitFixture(t)
+	item, err := f.s.CreateWorkItem(f.ctx, f.task.ID, api.CreateWorkItemRequest{Kind: "feature", Title: "Queued work", Priority: "normal", RequestID: api.NewID("req")}, f.by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := addCheckoutEntry(t, f.s, f.task, item, contextLinkedMessage(t, f.s, f.task, item, "bounded order", api.NewID("req"), nil), "/worktrees/next", "docs/next")
+	f.set(t, api.TeamQueueWaitReleased)
+	hold := fmt.Sprintf("Admission skips %s while its wait on %s until released is open", f.waiting.ID, f.items[0].ID)
+	requireHeldClaim(t, f, hold)
+	sentence := fmt.Sprintf("waits on %s for %s until released", f.items[0].ID, waitPath)
+	if held := listedEntry(t, f.s, f.task.ID, f.waiting.ID); !strings.Contains(held.BlockReason, sentence) || len(held.Waits) != 1 {
+		t.Fatalf("held entry reason %q waits %+v, want the wait %q", held.BlockReason, held.Waits, sentence)
+	}
+	if behind := listedEntry(t, f.s, f.task.ID, next.ID); behind.UpNext != 2 || behind.BlockReason != "" {
+		t.Fatalf("entry behind the held head upNext=%d reason %q", behind.UpNext, behind.BlockReason)
+	}
+	claimed, err := waitFixtureClaim(t, f, next)
+	if err != nil || claimed.State != "launching" {
+		t.Fatalf("next eligible entry behind a held head %+v %v", claimed, err)
+	}
+	// With both slots taken, the slots are what the listing names first.
+	if still := listedEntry(t, f.s, f.task.ID, f.waiting.ID); still.State != "queued" || still.UpNext != 1 || still.BlockReason != "All team slots are reserved. "+sentence {
+		t.Fatalf("held entry after the next launched: state=%s upNext=%d reason %q", still.State, still.UpNext, still.BlockReason)
+	}
+	if state := f.state(t); state != api.TeamQueueWaitWaiting {
+		t.Fatalf("admission changed the wait to %s", state)
+	}
+}
+
+// wi_bc90399c9878907e a1, a2, a3: a held head with nothing behind it admits
+// nothing; a release wait holds as an entry wait does.
+func TestTeamQueueClaimHoldsLoneHeadHeldByOpenWait(t *testing.T) {
+	f := heldWaitFixture(t)
+	job := f.releaseJob(t, "verified", nil)
+	f.setOn(t, job, api.TeamQueueWaitDeparted, "")
+	requireHeldClaim(t, f, fmt.Sprintf("Admission skips %s while its wait on release %s until departed is open", f.waiting.ID, job))
+	if n := f.count(t, `SELECT count(*) FROM team_queue_entries WHERE task_id=? AND state='launching'`, f.task.ID); n != 1 {
+		t.Fatalf("%d entries launching, want only the predecessor", n)
+	}
+}
+
+// wi_bc90399c9878907e a3: the wait stops holding the head as soon as the
+// predecessor meets the condition, judged at the claim since the sweep never
+// marks a queued entry's wait met, or once the wait is cleared. A host wait
+// is a handler gate, never an admission hold.
+func TestTeamQueueClaimAdmitsHeadOnceWaitClears(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		set  func(f *waitFixture) string
+		end  func(f *waitFixture)
+	}{
+		{"accepted", func(f *waitFixture) string {
+			f.set(t, api.TeamQueueWaitAccepted)
+			return fmt.Sprintf("Admission skips %s while its wait on %s until accepted is open", f.waiting.ID, f.items[0].ID)
+		}, func(f *waitFixture) { f.meet(t, api.TeamQueueWaitAccepted) }},
+		{"released", func(f *waitFixture) string {
+			f.set(t, api.TeamQueueWaitReleased)
+			return fmt.Sprintf("Admission skips %s while its wait on %s until released is open", f.waiting.ID, f.items[0].ID)
+		}, func(f *waitFixture) { f.meet(t, api.TeamQueueWaitReleased) }},
+		{"departed", func(f *waitFixture) string {
+			job := f.releaseJob(t, "verified", nil)
+			f.setOn(t, job, api.TeamQueueWaitDeparted, "")
+			return fmt.Sprintf("Admission skips %s while its wait on release %s until departed is open", f.waiting.ID, job)
+		}, func(f *waitFixture) { f.jobState(t, f.on, "merged", nil) }},
+		{"cleared", func(f *waitFixture) string {
+			f.set(t, api.TeamQueueWaitReleased)
+			return fmt.Sprintf("Admission skips %s while its wait on %s until released is open", f.waiting.ID, f.items[0].ID)
+		}, func(f *waitFixture) { f.clear(t) }},
+		{"host", func(f *waitFixture) string {
+			f.setOn(t, api.TeamQueueWaitHostKey, "", "")
+			return ""
+		}, nil},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := heldWaitFixture(t)
+			if hold := c.set(f); hold != "" {
+				requireHeldClaim(t, f, hold)
+				c.end(f)
+			}
+			if listed := listedEntry(t, f.s, f.task.ID, f.waiting.ID); strings.Contains(listed.BlockReason, "Admission skips") {
+				t.Fatalf("reason still says the entry is skipped: %q", listed.BlockReason)
+			}
+			claimed, err := waitFixtureClaim(t, f, f.waiting)
+			if err != nil || claimed.State != "launching" {
+				t.Fatalf("claim once the wait no longer holds %+v %v", claimed, err)
+			}
+		})
+	}
+}
+
 // capFiller registers a plain open agent that counts toward the project agent
 // cap.
 func capFiller(t *testing.T, s *Store, task api.Task, name string) api.Agent {
@@ -3392,8 +3526,9 @@ func TestTeamQueueMigrationCreatesWaitTable(t *testing.T) {
 
 // wi_44cabd7e6233bc1b a2 and a7: a wait's sentence is appended to the reason
 // a queued entry already has, never put before it, in the full listing and
-// the active page alike. A listing evaluates nothing: a wait whose condition
-// already holds still reads waiting until the broker's sweep.
+// the active page alike. A listing changes nothing: a wait whose condition
+// already holds still reads waiting until the broker's sweep, and adds no
+// admission hold (wi_bc90399c9878907e).
 func TestTeamQueueListingAppendsWaitAndEvaluatesNothing(t *testing.T) {
 	s, task, items, orders := queueFixture(t)
 	ctx := context.Background()

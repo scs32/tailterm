@@ -806,10 +806,54 @@ changes nothing; a different wait on the same pair of entries is a conflict
 that names `wait clear`. Neither command reads or moves the waiting entry's
 revision.
 
-A wait is a record and a notice trigger only. It does not hold a queued entry
-out of admission and changes no ownership check. A project's lane policy is
+### Waits hold admission
+
+Bug `wi_bc90399c9878907e`, work order #54915: a queued entry whose wait on a
+predecessor release could not clear for hours was admitted anyway, and its
+team sat parked in a lane.
+
+An open entry or release wait holds its queued entry out of admission while
+the predecessor has not met the condition. The claim skips the held entry as
+it skips one waiting for a rebind: the entry keeps its position and up-next
+number, and the next eligible entry in up-next order is admitted instead. A
+claim of the held entry itself is refused with `Admission skips ENTRY while
+its wait on ITEM until CONDITION is open, so it is not queue head`, which the
+runner reads as an ordinary race.
+
+The condition is judged at each claim and listing from the predecessor's
+rows, as the broker tick judges it, not from the wait's recorded state: the
+tick never marks a queued entry's wait met, since the entry has no lead to
+tell yet. So the hold ends as soon as the predecessor is accepted, saved done
+or released, or its release job departs or settles, whichever the wait names,
+or when the wait is cleared. Nothing is written; the wait stays `waiting`
+until its own notice.
+
+These do not hold admission:
+
+- a wait whose predecessor can no longer meet the condition (orphaned); the
+  tick reports it to the handler;
+- a host wait, whose gate is the handler's own;
+- a gated entry or release wait once its condition is met: the entry is
+  admitted as before, and the gate's notice tells its lead to stay paused for
+  the handler's resume ([Handler-gated waits](#handler-gated-waits)); until
+  then a gated wait holds as an automatic one does;
+- any wait of an entry that is already launching or running: there the wait
+  is a record and a notice trigger only.
+
+A wait changes no ownership check. In a serial project the runner tries only
+the first queued entry on each pass, so a held head holds that queue: it stays
+queued with its reason until the hold ends. A project's lane policy remains
 the admission control for host-wide holds such as a waiting matrix run
 ([Team queue lanes and up next](#team-queue-lanes-and-up-next)).
+
+When nothing else holds a held entry, its `blockReason` starts `Admission
+skips ENTRY while its wait on ITEM until CONDITION is open` (`on release
+rel_JOB` for a release wait), followed by its wait sentences, which still end
+the reason. An entry that something else already holds, such as full slots,
+a lane, the token budget, a rebind or an active team's paths or checkout,
+keeps that reason with its wait sentences after it, unchanged. The lanes line
+does not name the skipped entry yet; owner decision #55839 moved that to a
+follow-up.
 
 ### Handler-gated waits
 
@@ -891,8 +935,11 @@ then `and N more`, so a wait with many paths keeps `blockReason` small (a stall
 notice carries that reason in a 4 KiB body). `waits[].paths` always lists
 every path.
 
-A listing shows the recorded state and evaluates nothing: a wait whose
-condition already holds reads `waiting` until the next broker tick.
+A listing shows each wait's recorded state and changes nothing: a wait whose
+condition already holds reads `waiting` until the next broker tick, and a
+queued entry's wait until its team has a lead. Only the admission hold
+([Waits hold admission](#waits-hold-admission)) is judged from the
+predecessor's rows.
 
 ### What the broker tick does
 
@@ -1280,7 +1327,7 @@ concurrency limit, beside the project agent cap and host capacity
 four teams by day, three by night, fewer while the host is under memory
 strain, and none while a matrix run waits for the verification host. The hub
 had no clock window, never saw memory pressure or the matrix lock, and a wait
-does not hold admission (see [shared-path waits](#team-queue-shared-path-waits)).
+did not hold admission then (see [Waits hold admission](#waits-hold-admission)).
 Queueing an order therefore admitted it under whatever the limit was at that
 moment, so the helper kept orders in its notes and applied the rules in cron
 prompts. Neither the CLI nor TailOS showed the queued entries as a list in

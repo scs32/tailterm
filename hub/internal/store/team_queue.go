@@ -998,8 +998,78 @@ func (s *Store) explainTeamQueue(ctx context.Context, task string, out *api.Team
 			e.BlockReason = fmt.Sprintf("Item is at revision %d; entry is bound to %d. %s", current, e.ItemRevision, queueRebindCommand(task, e.ID))
 		}
 	}
+	// A queued entry that only its wait keeps out of admission says so,
+	// before the wait sentences, which end the reason. One that something
+	// else already holds keeps that reason. Either way it keeps its up-next
+	// number: the claim skips it without moving it.
+	holds, err := queueAdmissionHolds(ctx, reader, task)
+	if err != nil {
+		return err
+	}
+	for i := range out.Entries {
+		e := &out.Entries[i]
+		if hold, ok := holds[e.ID]; ok && e.State == "queued" && e.BlockReason == "" && len(e.BlockedBy) == 0 {
+			e.BlockReason = hold.text(e.ID)
+		}
+	}
 	// Shared-path waits come last and only append to a reason.
 	return attachQueueWaits(ctx, reader, task, out)
+}
+
+// queueAdmissionHold is the open wait that holds a queued entry out of
+// admission.
+type queueAdmissionHold struct{ onKind, onEntry, onItem, until string }
+
+func (h queueAdmissionHold) text(entry string) string {
+	on := h.onItem
+	if h.onKind == api.TeamQueueWaitOnRelease {
+		on = "release " + h.onEntry
+	}
+	return fmt.Sprintf("Admission skips %s while its wait on %s until %s is open", entry, on, h.until)
+}
+
+// queueAdmissionHolds reads a project's open entry and release waits and
+// returns, by waiting entry, the oldest one that holds it out of admission:
+// its predecessor has not met the condition and still can. The condition is
+// judged now, from the predecessor's rows, because the sweep never marks a
+// queued entry's wait met (it has no lead to tell yet). A met condition, an
+// orphaned wait and a host wait (a handler gate) do not hold; a gated wait
+// holds only until its condition is met, as an automatic one does. Nothing
+// is written.
+func queueAdmissionHolds(ctx context.Context, q queryRower, task string) (map[string]queueAdmissionHold, error) {
+	rows, err := q.QueryContext(ctx, `SELECT w.entry_id,w.on_entry_id,w.on_item_id,w.on_kind,w.until,w.state,
+ pe.id IS NOT NULL,COALESCE(pe.state,''),COALESCE(pe.released_at,''),COALESCE(pe.acceptance_json,''),COALESCE(pe.owner_integration_json,''),
+ COALESCE(pi.status,''),COALESCE(rj.state,''),COALESCE(rj.record_json,'')
+ FROM team_queue_waits w
+ LEFT JOIN team_queue_entries pe ON pe.task_id=w.task_id AND pe.id=w.on_entry_id
+ LEFT JOIN work_items pi ON pi.task_id=w.task_id AND pi.id=w.on_item_id
+ LEFT JOIN release_jobs rj ON rj.task_id=w.task_id AND ((w.on_kind='release' AND rj.id=w.on_entry_id) OR (w.on_kind='entry' AND rj.entry_id=w.on_entry_id
+  AND rj.rowid=(SELECT max(rowid) FROM release_jobs WHERE task_id=w.task_id AND entry_id=w.on_entry_id)))
+ WHERE w.task_id=? AND w.state IN ('waiting','met','orphaned')
+ ORDER BY w.set_at,w.on_entry_id`, task)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]queueAdmissionHold{}
+	for rows.Next() {
+		var w queueWaitRow
+		if err := rows.Scan(&w.entry, &w.onEntry, &w.onItem, &w.onKind, &w.until, &w.state,
+			&w.predExists, &w.predState, &w.predReleased, &w.predAcceptance, &w.predOwner, &w.itemStatus, &w.jobState, &w.jobRecord); err != nil {
+			return nil, err
+		}
+		if w.state != api.TeamQueueWaitWaiting || w.onKind == api.TeamQueueWaitOnHost {
+			continue
+		}
+		if _, held := out[w.entry]; held {
+			continue
+		}
+		if ok, _, _ := w.met(); ok || w.orphaned() != "" {
+			continue
+		}
+		out[w.entry] = queueAdmissionHold{onKind: w.onKind, onEntry: w.onEntry, onItem: w.onItem, until: w.until}
+	}
+	return out, rows.Err()
 }
 
 func sharedCheckoutHint(e api.TeamQueueEntry, active string) string {
@@ -2161,6 +2231,11 @@ func (s *Store) teamQueueAction(ctx context.Context, task string, req api.TeamQu
 			if err := checkProjectAgentCap(ctx, tx, task, s.MaxAgents, queueTeamSeats(kind, e.Template), s.now()); err != nil {
 				return zero, err
 			}
+			// One read of the project's open waits serves every candidate.
+			holds, err := queueAdmissionHolds(ctx, tx, task)
+			if err != nil {
+				return zero, err
+			}
 			var head string
 			budget := newQueueBudgetCheck(task, s.now())
 			for _, candidate := range candidates {
@@ -2170,6 +2245,11 @@ func (s *Store) teamQueueAction(ctx context.Context, task string, req api.TeamQu
 					return zero, err
 				}
 				if current != candidate.ItemRevision {
+					continue
+				}
+				// Nor does one whose predecessor has not met its wait: it
+				// keeps its place and later entries launch.
+				if _, held := holds[candidate.ID]; held {
 					continue
 				}
 				// Nor does one the token budget cannot cover yet: it stays
@@ -2192,6 +2272,11 @@ func (s *Store) teamQueueAction(ctx context.Context, task string, req api.TeamQu
 				}
 			}
 			if head != e.ID {
+				// The runner reads a refusal ending "not queue head" as an
+				// ordinary race, so a held entry's refusal ends that way too.
+				if hold, held := holds[e.ID]; held {
+					return zero, fmt.Errorf("%w: %s, so it is not queue head", api.ErrConflict, hold.text(e.ID))
+				}
 				return zero, fmt.Errorf("%w: not queue head", api.ErrConflict)
 			}
 			chosen, armLease, err := leaseQueueHandler(ctx, tx, task, e.ID, activeEntries, s.now())
