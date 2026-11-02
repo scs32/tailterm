@@ -79,7 +79,10 @@ func migrateUsage(db *sql.DB) error {
 	if err != nil {
 		return err
 	}
-	return backfillUsageTurnTotals(db)
+	if err = backfillUsageTurnTotals(db); err != nil {
+		return err
+	}
+	return backfillUsageSpanInstants(db)
 }
 
 // replaceUsageTurnTotal writes one stored turn's row in usage_turn_totals: its

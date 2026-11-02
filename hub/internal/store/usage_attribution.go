@@ -588,6 +588,67 @@ CREATE TRIGGER IF NOT EXISTS usage_item_share_checks_share_update AFTER UPDATE O
  BEGIN INSERT INTO usage_item_share_checks SELECT t.rowid FROM usage_turns t WHERE t.task_id=OLD.task_id AND t.agent_id=OLD.agent_id AND t.run_id=OLD.run_id AND t.request_id=OLD.request_id
  AND NOT EXISTS (SELECT 1 FROM usage_item_share_checks c WHERE c.turn_rowid=t.rowid); END;`
 
+// usageItemShareTotalsSchema keeps, per item and share denominator, the sum
+// of the item's share rows: their tokens, how many there are and how many are
+// partial. Budgets read these rows, so one item's lifetime figure costs its
+// denominators, not its share rows. The triggers keep it in the transaction
+// of the statement that writes the share row, whichever binary makes the
+// change; a group whose last row goes is deleted. A share row's tokens are
+// bounded at ingest, so the sums stay integers (an overflow to REAL would fail
+// the int64 scan loudly, as sum() did). The triggers update a group and then
+// insert it only when it is missing, so their own statements never conflict
+// and the conflict policy of the statement that fires them never applies. No
+// writer uses INSERT OR REPLACE on share rows: its implicit delete fires no
+// trigger, and the next totals recompute would be needed.
+const usageItemShareTotalsSchema = `CREATE TABLE IF NOT EXISTS usage_item_share_totals(
+ item_task_id TEXT NOT NULL,item_id TEXT NOT NULL,task_id TEXT NOT NULL,denominator INTEGER NOT NULL,
+ tokens INTEGER NOT NULL,share_rows INTEGER NOT NULL,partial_rows INTEGER NOT NULL,
+ PRIMARY KEY(item_task_id,item_id,task_id,denominator));
+CREATE TRIGGER IF NOT EXISTS usage_item_share_totals_insert AFTER INSERT ON usage_item_shares
+ BEGIN UPDATE usage_item_share_totals SET tokens=tokens+NEW.tokens,share_rows=share_rows+1,partial_rows=partial_rows+(NEW.partial<>0)
+ WHERE item_task_id=NEW.item_task_id AND item_id=NEW.item_id AND task_id=NEW.task_id AND denominator=NEW.denominator;
+ INSERT INTO usage_item_share_totals SELECT NEW.item_task_id,NEW.item_id,NEW.task_id,NEW.denominator,NEW.tokens,1,NEW.partial<>0
+ WHERE NOT EXISTS (SELECT 1 FROM usage_item_share_totals WHERE item_task_id=NEW.item_task_id AND item_id=NEW.item_id AND task_id=NEW.task_id AND denominator=NEW.denominator); END;
+CREATE TRIGGER IF NOT EXISTS usage_item_share_totals_delete AFTER DELETE ON usage_item_shares
+ BEGIN UPDATE usage_item_share_totals SET tokens=tokens-OLD.tokens,share_rows=share_rows-1,partial_rows=partial_rows-(OLD.partial<>0)
+ WHERE item_task_id=OLD.item_task_id AND item_id=OLD.item_id AND task_id=OLD.task_id AND denominator=OLD.denominator;
+ DELETE FROM usage_item_share_totals WHERE item_task_id=OLD.item_task_id AND item_id=OLD.item_id AND task_id=OLD.task_id AND denominator=OLD.denominator AND share_rows<=0; END;
+CREATE TRIGGER IF NOT EXISTS usage_item_share_totals_update AFTER UPDATE OF item_task_id,item_id,task_id,denominator,tokens,partial ON usage_item_shares
+ BEGIN UPDATE usage_item_share_totals SET tokens=tokens-OLD.tokens,share_rows=share_rows-1,partial_rows=partial_rows-(OLD.partial<>0)
+ WHERE item_task_id=OLD.item_task_id AND item_id=OLD.item_id AND task_id=OLD.task_id AND denominator=OLD.denominator;
+ DELETE FROM usage_item_share_totals WHERE item_task_id=OLD.item_task_id AND item_id=OLD.item_id AND task_id=OLD.task_id AND denominator=OLD.denominator AND share_rows<=0;
+ UPDATE usage_item_share_totals SET tokens=tokens+NEW.tokens,share_rows=share_rows+1,partial_rows=partial_rows+(NEW.partial<>0)
+ WHERE item_task_id=NEW.item_task_id AND item_id=NEW.item_id AND task_id=NEW.task_id AND denominator=NEW.denominator;
+ INSERT INTO usage_item_share_totals SELECT NEW.item_task_id,NEW.item_id,NEW.task_id,NEW.denominator,NEW.tokens,1,NEW.partial<>0
+ WHERE NOT EXISTS (SELECT 1 FROM usage_item_share_totals WHERE item_task_id=NEW.item_task_id AND item_id=NEW.item_id AND task_id=NEW.task_id AND denominator=NEW.denominator); END;`
+
+// usageItemShareTotalsTriggers names the triggers of usageItemShareTotalsSchema.
+const usageItemShareTotalsTriggers = `'usage_item_share_totals_insert','usage_item_share_totals_delete','usage_item_share_totals_update'`
+
+// recomputeUsageItemShareTotals builds usage_item_share_totals from the share
+// rows when any of its triggers is missing: a store from before the table, or
+// a share table rebuilt without them. It creates the table and triggers and
+// recomputes every total in the caller's transaction, so no share write is
+// counted twice or missed; with every trigger present it does nothing.
+func recomputeUsageItemShareTotals(ctx context.Context, tx *sql.Tx) error {
+	var triggers int
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name IN (`+usageItemShareTotalsTriggers+`)`).Scan(&triggers); err != nil {
+		return err
+	}
+	if triggers == 3 {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, usageItemShareTotalsSchema); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM usage_item_share_totals`); err != nil {
+		return err
+	}
+	_, err := tx.ExecContext(ctx, `INSERT INTO usage_item_share_totals(item_task_id,item_id,task_id,denominator,tokens,share_rows,partial_rows)
+ SELECT item_task_id,item_id,task_id,denominator,sum(tokens),count(*),sum(partial<>0) FROM usage_item_shares GROUP BY item_task_id,item_id,task_id,denominator`)
+	return err
+}
+
 // usageItemShareChecked is nil in production. Tests set it to count the turns
 // each backfill batch examined, or to return an error that stops the backfill
 // after a committed batch.
@@ -621,6 +682,11 @@ func backfillUsageItemShares(db *sql.DB) error {
 			tx.Rollback()
 			return err
 		}
+	}
+	// Totals first, so the share rows the loop below rewrites update them.
+	if err = recomputeUsageItemShareTotals(ctx, tx); err != nil {
+		tx.Rollback()
+		return err
 	}
 	if err = tx.Commit(); err != nil {
 		return err
@@ -787,8 +853,8 @@ func loadEntryTokenActual(ctx context.Context, q queryRower, task, item string) 
 // loadTokenBudget reads an item's saved estimate and its lifetime attributed
 // tokens over every run, open and closed, and, while the item has a running
 // queue entry, what that entry's team has spent on it. It reads
-// usage_item_shares by item, so its cost does not grow with the project's
-// usage history.
+// usage_item_share_totals by item, so its cost is the item's denominators, not
+// its share rows or the project's usage history.
 func loadTokenBudget(ctx context.Context, q queryRower, task, item string) (*api.TokenBudget, error) {
 	budget, _, _, err := loadTokenBudgetActual(ctx, q, task, item)
 	return budget, err
@@ -810,7 +876,9 @@ func loadTokenBudgetActual(ctx context.Context, q queryRower, task, item string)
 		budget.Estimate = &estimate
 	}
 	// Like the report, only the project's own turns count toward its items.
-	rows, err := q.QueryContext(ctx, `SELECT denominator,sum(tokens),max(partial) FROM usage_item_shares WHERE item_task_id=? AND item_id=? AND task_id=? GROUP BY denominator`, task, item, task)
+	// The stored totals give each denominator's group as the share rows'
+	// sum(tokens) and max(partial) did.
+	rows, err := q.QueryContext(ctx, `SELECT denominator,tokens,partial_rows>0 FROM usage_item_share_totals WHERE item_task_id=? AND item_id=? AND task_id=?`, task, item, task)
 	if err != nil {
 		return nil, nil, nil, err
 	}

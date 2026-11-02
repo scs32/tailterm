@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"math/big"
 	"reflect"
 	"sort"
@@ -27,6 +28,211 @@ const usageSpansSchema = `CREATE TABLE IF NOT EXISTS usage_spans(
  start_at TEXT NOT NULL,end_at TEXT NOT NULL,payload TEXT NOT NULL,projection TEXT NOT NULL,
  PRIMARY KEY(task_id,agent_id,run_id,span_id));
  CREATE INDEX IF NOT EXISTS usage_spans_time ON usage_spans(task_id,start_at);`
+
+// usageSpanInstantsSchema stores each span's start and end, and the request
+// instant of each of its polls, as Unix nanoseconds, so a windowed report
+// finds the spans that can touch its window through an index instead of
+// reading every span's text (usageWindowSpans). They live in side tables
+// keyed by the span's natural key, not in new usage_spans columns: an older
+// binary inserts spans by position, and a VACUUM may renumber their rowids.
+// An instant that does not parse, is zero or lies outside the int64
+// nanosecond range is NULL, and a NULL span or poll is always read.
+//
+// usage_span_instant_checks lists the spans whose rows may be missing, as
+// usage_turn_total_checks does for turn totals. Its triggers add a span when it
+// is inserted or changed, whichever binary makes the change, so a span an
+// older binary writes after a rollback is listed too; ingest clears the span
+// it has just written. Changing or deleting a span drops the rows of its old
+// key. Names start with usage_span_, never usage_spans.
+const usageSpanInstantsSchema = `CREATE TABLE IF NOT EXISTS usage_span_instants(
+ task_id TEXT NOT NULL,agent_id TEXT NOT NULL,run_id TEXT NOT NULL,span_id TEXT NOT NULL,
+ start_ns INTEGER,end_ns INTEGER,PRIMARY KEY(task_id,agent_id,run_id,span_id));
+CREATE INDEX IF NOT EXISTS usage_span_instants_window ON usage_span_instants(task_id,end_ns,start_ns);
+CREATE TABLE IF NOT EXISTS usage_span_polls(
+ task_id TEXT NOT NULL,agent_id TEXT NOT NULL,run_id TEXT NOT NULL,span_id TEXT NOT NULL,
+ segment INTEGER NOT NULL,at_ns INTEGER,PRIMARY KEY(task_id,agent_id,run_id,span_id,segment));
+CREATE INDEX IF NOT EXISTS usage_span_polls_at ON usage_span_polls(task_id,at_ns);
+CREATE TABLE IF NOT EXISTS usage_span_instant_checks(span_rowid INTEGER PRIMARY KEY);
+CREATE TRIGGER IF NOT EXISTS usage_span_instant_checks_span_insert AFTER INSERT ON usage_spans
+ BEGIN INSERT INTO usage_span_instant_checks SELECT NEW.rowid WHERE NOT EXISTS (SELECT 1 FROM usage_span_instant_checks WHERE span_rowid=NEW.rowid); END;
+CREATE TRIGGER IF NOT EXISTS usage_span_instant_checks_span_update AFTER UPDATE OF task_id,agent_id,run_id,span_id,start_at,end_at,payload ON usage_spans
+ BEGIN DELETE FROM usage_span_instants WHERE task_id=OLD.task_id AND agent_id=OLD.agent_id AND run_id=OLD.run_id AND span_id=OLD.span_id;
+ DELETE FROM usage_span_polls WHERE task_id=OLD.task_id AND agent_id=OLD.agent_id AND run_id=OLD.run_id AND span_id=OLD.span_id;
+ INSERT INTO usage_span_instant_checks SELECT NEW.rowid WHERE NOT EXISTS (SELECT 1 FROM usage_span_instant_checks WHERE span_rowid=NEW.rowid); END;
+CREATE TRIGGER IF NOT EXISTS usage_span_instant_checks_span_delete AFTER DELETE ON usage_spans
+ BEGIN DELETE FROM usage_span_instants WHERE task_id=OLD.task_id AND agent_id=OLD.agent_id AND run_id=OLD.run_id AND span_id=OLD.span_id;
+ DELETE FROM usage_span_polls WHERE task_id=OLD.task_id AND agent_id=OLD.agent_id AND run_id=OLD.run_id AND span_id=OLD.span_id; END;`
+
+// usageSpanNs is an instant as stored in the span side tables: Unix
+// nanoseconds, or NULL (nil) when the text does not parse, is zero or lies
+// outside the range strictly between the int64 extremes, which the window
+// bounds use for an open end.
+func usageSpanNs(text string) any {
+	t, err := time.Parse(time.RFC3339Nano, text)
+	if err != nil || t.IsZero() || !t.After(usageNsMin) || !t.Before(usageNsMax) {
+		return nil
+	}
+	return t.UnixNano()
+}
+
+var usageNsMin, usageNsMax = time.Unix(0, math.MinInt64), time.Unix(0, math.MaxInt64)
+
+// usageNsBound is a window bound as Unix nanoseconds; a zero bound is open.
+func usageNsBound(t time.Time, open int64) int64 {
+	switch {
+	case t.IsZero():
+		return open
+	case !t.After(usageNsMin):
+		return math.MinInt64
+	case !t.Before(usageNsMax):
+		return math.MaxInt64
+	}
+	return t.UnixNano()
+}
+
+// writeUsageSpanInstants replaces one span's instants row and poll rows from
+// its stored text and payload. The polls are the payload's segments with
+// "poll" true, each at its request instant, the set the windowed read counts
+// (usageTimeReports). Both start and end are NULL when either is.
+func writeUsageSpanInstants(ctx context.Context, tx *sql.Tx, task, agent, run, span, start, end string, payload []byte) error {
+	for _, table := range []string{"usage_span_instants", "usage_span_polls"} {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM `+table+` WHERE task_id=? AND agent_id=? AND run_id=? AND span_id=?`, task, agent, run, span); err != nil {
+			return err
+		}
+	}
+	startNs, endNs := usageSpanNs(start), usageSpanNs(end)
+	if startNs == nil || endNs == nil {
+		startNs, endNs = nil, nil
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO usage_span_instants(task_id,agent_id,run_id,span_id,start_ns,end_ns) VALUES(?,?,?,?,?,?)`, task, agent, run, span, startNs, endNs); err != nil {
+		return err
+	}
+	if len(payload) == 0 {
+		return nil
+	}
+	var p struct {
+		Segments []struct {
+			At   json.RawMessage `json:"at"`
+			Poll bool            `json:"poll"`
+		} `json:"segments"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		// The report cannot decode it either; one NULL poll keeps it read.
+		_, err = tx.ExecContext(ctx, `INSERT INTO usage_span_polls(task_id,agent_id,run_id,span_id,segment,at_ns) VALUES(?,?,?,?,-1,NULL)`, task, agent, run, span)
+		return err
+	}
+	for i, segment := range p.Segments {
+		if !segment.Poll {
+			continue
+		}
+		var at string
+		var ns any
+		if json.Unmarshal(segment.At, &at) == nil {
+			ns = usageSpanNs(at)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO usage_span_polls(task_id,agent_id,run_id,span_id,segment,at_ns) VALUES(?,?,?,?,?,?)`, task, agent, run, span, i, ns); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// usageSpanInstantChecked is nil in production. Tests set it to count the
+// spans each backfill batch examined, or to return an error that stops the
+// backfill after a committed batch.
+var usageSpanInstantChecked func(examined int) error
+
+// backfillUsageSpanInstants gives instants and poll rows to every span
+// usage_span_instant_checks lists: spans stored before the side tables
+// existed, and spans an older binary wrote after a rollback. When any of the
+// list's triggers is missing it creates the schema and lists every span once.
+// Like backfillUsageTurnTotals it reads only the listed spans, is idempotent
+// and works in bounded transactions that clear the spans they checked, so an
+// interrupted open resumes. Only a span with a poll has its payload copied.
+func backfillUsageSpanInstants(db *sql.DB) error {
+	ctx := context.Background()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	var triggers int
+	if err = tx.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name IN ('usage_span_instant_checks_span_insert','usage_span_instant_checks_span_update','usage_span_instant_checks_span_delete')`).Scan(&triggers); err != nil {
+		tx.Rollback()
+		return err
+	}
+	if triggers < 3 {
+		if _, err = tx.ExecContext(ctx, usageSpanInstantsSchema); err != nil {
+			tx.Rollback()
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO usage_span_instant_checks SELECT rowid FROM usage_spans`); err != nil {
+			tx.Rollback()
+			return err
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	type span struct {
+		task, agent, run, id, start, end string
+		payload                          sql.NullString
+	}
+	for {
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		var examined int
+		var last sql.NullInt64
+		if err = tx.QueryRowContext(ctx, `SELECT count(*),max(span_rowid) FROM (SELECT span_rowid FROM usage_span_instant_checks ORDER BY span_rowid LIMIT 500)`).Scan(&examined, &last); err != nil {
+			tx.Rollback()
+			return err
+		}
+		if examined == 0 {
+			return tx.Rollback()
+		}
+		rows, err := tx.QueryContext(ctx, `SELECT s.task_id,s.agent_id,s.run_id,s.span_id,s.start_at,s.end_at,CASE WHEN instr(s.payload,'"poll":true')>0 THEN s.payload END
+ FROM usage_span_instant_checks c JOIN usage_spans s ON s.rowid=c.span_rowid WHERE c.span_rowid<=? ORDER BY c.span_rowid`, last.Int64)
+		if err != nil {
+			tx.Rollback()
+			return err
+		}
+		batch := []span{}
+		for rows.Next() {
+			var x span
+			if err = rows.Scan(&x.task, &x.agent, &x.run, &x.id, &x.start, &x.end, &x.payload); err != nil {
+				rows.Close()
+				tx.Rollback()
+				return err
+			}
+			batch = append(batch, x)
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			tx.Rollback()
+			return err
+		}
+		for _, x := range batch {
+			if err = writeUsageSpanInstants(ctx, tx, x.task, x.agent, x.run, x.id, x.start, x.end, []byte(x.payload.String)); err != nil {
+				tx.Rollback()
+				return err
+			}
+		}
+		if _, err = tx.ExecContext(ctx, `DELETE FROM usage_span_instant_checks WHERE span_rowid<=?`, last.Int64); err != nil {
+			tx.Rollback()
+			return err
+		}
+		if err = tx.Commit(); err != nil {
+			return err
+		}
+		if usageSpanInstantChecked != nil {
+			if err = usageSpanInstantChecked(examined); err != nil {
+				return err
+			}
+		}
+	}
+}
 
 const usageSpanMaxEntries = 32
 
@@ -125,7 +331,19 @@ func storeUsageSpans(ctx context.Context, tx *sql.Tx, task, agent, run string, s
 			return err
 		}
 		encoded, _ := json.Marshal(projection)
-		if _, err = tx.ExecContext(ctx, `INSERT INTO usage_spans VALUES(?,?,?,?,?,?,?,?)`, task, agent, run, span.ID, ts(span.Start), ts(span.End), string(payload), string(encoded)); err != nil {
+		r, err := tx.ExecContext(ctx, `INSERT INTO usage_spans VALUES(?,?,?,?,?,?,?,?)`, task, agent, run, span.ID, ts(span.Start), ts(span.End), string(payload), string(encoded))
+		if err != nil {
+			return err
+		}
+		// Its instants go in with it, so only an older binary's spans stay listed.
+		rowid, err := r.LastInsertId()
+		if err != nil {
+			return err
+		}
+		if err = writeUsageSpanInstants(ctx, tx, task, agent, run, span.ID, ts(span.Start), ts(span.End), payload); err != nil {
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, `DELETE FROM usage_span_instant_checks WHERE span_rowid=?`, rowid); err != nil {
 			return err
 		}
 	}
@@ -488,52 +706,52 @@ func (s *waitSweep) cause(from time.Time) (string, *waitCandidate) {
 	return "unknown", nil
 }
 
-// usageWindowSpansQuery reads, in report order, each span's bounds and, for
-// a span with a poll, its poll requests' instants, without copying its
-// payload or projection. json.Marshal writes "poll":true only for a poll.
-const usageWindowSpansQuery = `SELECT rowid,start_at,end_at,CASE WHEN instr(payload,'"poll":true')>0 THEN
- (SELECT group_concat(json_extract(s.value,'$.at'),' ') FROM json_each(payload,'$.segments') s WHERE json_extract(s.value,'$.poll')=1) END
- FROM usage_spans WHERE task_id=? ORDER BY start_at`
+// usageWindowSpansQuery lists, in report order (start_at text, then rowid,
+// as the usage_spans_time index orders them), the spans a windowed report must
+// read, by the side tables' indexes and without reading usage_spans beyond the
+// listed rows: spans whose time meets [?2,?3) by usage_span_instants_window,
+// spans with a poll whose request instant is in it by usage_span_polls_at (a
+// poll counts even when its chunk lies outside), spans or polls whose instants
+// are NULL, and listed spans that have no instants row yet, so a span an older
+// binary wrote is never missed.
+const usageWindowSpansQuery = `SELECT s.rowid,s.start_at FROM usage_span_instants i CROSS JOIN usage_spans s ON s.task_id=i.task_id AND s.agent_id=i.agent_id AND s.run_id=i.run_id AND s.span_id=i.span_id
+ WHERE i.task_id=?1 AND i.end_ns>?2 AND i.start_ns<?3
+UNION SELECT s.rowid,s.start_at FROM usage_span_polls p CROSS JOIN usage_spans s ON s.task_id=p.task_id AND s.agent_id=p.agent_id AND s.run_id=p.run_id AND s.span_id=p.span_id
+ WHERE p.task_id=?1 AND p.at_ns>=?2 AND p.at_ns<?3
+UNION SELECT s.rowid,s.start_at FROM usage_span_instants i CROSS JOIN usage_spans s ON s.task_id=i.task_id AND s.agent_id=i.agent_id AND s.run_id=i.run_id AND s.span_id=i.span_id
+ WHERE i.task_id=?1 AND i.end_ns IS NULL
+UNION SELECT s.rowid,s.start_at FROM usage_span_polls p CROSS JOIN usage_spans s ON s.task_id=p.task_id AND s.agent_id=p.agent_id AND s.run_id=p.run_id AND s.span_id=p.span_id
+ WHERE p.task_id=?1 AND p.at_ns IS NULL
+UNION SELECT s.rowid,s.start_at FROM usage_span_instant_checks c CROSS JOIN usage_spans s ON s.rowid=c.span_rowid
+ WHERE s.task_id=?1 AND NOT EXISTS (SELECT 1 FROM usage_span_instants i WHERE i.task_id=s.task_id AND i.agent_id=s.agent_id AND i.run_id=s.run_id AND i.span_id=s.span_id)
+ORDER BY 2,1`
 
 // usageWindowSpans lists, in report order, the spans a windowed report must
 // read: those whose time meets [from,to) and those with a poll whose request
 // instant is in it, which counts even when the chunk lies outside
 // (usageTimeReports). Every other span adds nothing to the window, so it is
-// neither decoded nor classified. Instants are compared as times: the stored
-// text drops trailing zeros and does not sort.
+// neither read nor classified. Instants are compared as Unix nanoseconds from
+// the side tables (usageSpanInstantsSchema), never as stored text, which drops
+// trailing zeros and does not sort. A span whose instants are NULL is read,
+// and the report's own clip decides, as before. With an end index a trailing
+// window, such as the hub's last hour, touches only its own spans; a window
+// deep in history also reads the index entries of every later span.
 func usageWindowSpans(ctx context.Context, tx *sql.Tx, task string, from, to time.Time, stats *usageReadStats) ([]int64, error) {
 	stats.queries[usageStageSpans] += 2
-	rows, err := tx.QueryContext(ctx, usageWindowSpansQuery, task)
+	rows, err := tx.QueryContext(ctx, usageWindowSpansQuery, task, usageNsBound(from, math.MinInt64), usageNsBound(to, math.MaxInt64))
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	inside := func(at time.Time) bool {
-		return (from.IsZero() || !at.Before(from)) && (to.IsZero() || at.Before(to))
-	}
 	var keep []int64
 	for rows.Next() {
 		var rowid int64
-		var start, end string
-		var polls sql.NullString
-		if err := rows.Scan(&rowid, &start, &end, &polls); err != nil {
+		var start string
+		if err := rows.Scan(&rowid, &start); err != nil {
 			return nil, err
 		}
 		stats.scanned[usageStageSpans]++
-		s, e := parseTS(start), parseTS(end)
-		// A zero-length span has no time to clip; its polls still count.
-		meets := (to.IsZero() || s.Before(to)) && (from.IsZero() || e.After(from))
-		for _, at := range strings.Fields(polls.String) {
-			if meets {
-				break
-			}
-			if t, err := time.Parse(time.RFC3339Nano, at); err != nil || inside(t) {
-				meets = true // an unreadable instant is read in full, as before
-			}
-		}
-		if meets || s.IsZero() || e.IsZero() {
-			keep = append(keep, rowid)
-		}
+		keep = append(keep, rowid)
 	}
 	return keep, rows.Err()
 }

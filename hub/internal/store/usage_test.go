@@ -2,11 +2,14 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/scs32/tailterm/hub/internal/api"
+	"math/big"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -3716,6 +3719,15 @@ func seedUsageLiveSize(tb testing.TB, dir string, size usageLiveSize) *usageLive
 	if err != nil {
 		tb.Fatal(err)
 	}
+	// Each span's instants and poll rows, as ingest writes them with it.
+	insertInstants, err := tx.PrepareContext(ctx, `INSERT INTO usage_span_instants(task_id,agent_id,run_id,span_id,start_ns,end_ns) VALUES(?,?,?,?,?,?)`)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	insertPoll, err := tx.PrepareContext(ctx, `INSERT INTO usage_span_polls(task_id,agent_id,run_id,span_id,segment,at_ns) VALUES(?,?,?,?,?,?)`)
+	if err != nil {
+		tb.Fatal(err)
+	}
 	digest := strings.Repeat("c", 64)
 	for i := 0; i < size.spans; i++ {
 		a, start, item := agents[i%size.metered], step(i, size.spans), out.items[i%size.items]
@@ -3734,8 +3746,22 @@ func seedUsageLiveSize(tb testing.TB, dir string, size usageLiveSize) *usageLive
 		if _, err := insertSpan.ExecContext(ctx, task.ID, a.id, a.run, span.ID, ts(start), ts(end), string(payload), string(encoded)); err != nil {
 			tb.Fatal(err)
 		}
+		if _, err := insertInstants.ExecContext(ctx, task.ID, a.id, a.run, span.ID, start.UnixNano(), end.UnixNano()); err != nil {
+			tb.Fatal(err)
+		}
+		for k, segment := range span.Segments {
+			if segment.Poll {
+				if _, err := insertPoll.ExecContext(ctx, task.ID, a.id, a.run, span.ID, k, segment.At.UnixNano()); err != nil {
+					tb.Fatal(err)
+				}
+			}
+		}
 	}
 	insertSpan.Close()
+	insertInstants.Close()
+	insertPoll.Close()
+	// Ingest clears the spans it wrote from the instants check list.
+	exec(tx, `DELETE FROM usage_span_instant_checks`)
 	commit(tx)
 	return out
 }
@@ -3744,7 +3770,7 @@ func seedUsageLiveSize(tb testing.TB, dir string, size usageLiveSize) *usageLive
 func usageLiveCounts(tb testing.TB, s *Store) string {
 	tb.Helper()
 	parts := []string{}
-	for _, table := range []string{"work_items", "agents", "messages", "obligations", "message_work_item_links", "decision_requests", "usage_runs", "usage_turns", "usage_turn_totals", "usage_turn_total_checks", "usage_item_shares", "usage_spans"} {
+	for _, table := range []string{"work_items", "agents", "messages", "obligations", "message_work_item_links", "decision_requests", "usage_runs", "usage_turns", "usage_turn_totals", "usage_turn_total_checks", "usage_item_shares", "usage_item_share_totals", "usage_spans", "usage_span_instants", "usage_span_polls", "usage_span_instant_checks"} {
 		var n int
 		if err := s.db.QueryRow(`SELECT count(*) FROM ` + table).Scan(&n); err != nil {
 			tb.Fatal(err)
@@ -3813,9 +3839,26 @@ func BenchmarkUsageReportLiveSize(parent *testing.B) {
 				}
 				line = append(line, fmt.Sprintf("%s: %s (%.1f%%) rows=%d scanned=%d kept=%d queries=%d", usageStageNames[n], st.elapsed[n].Round(time.Millisecond), share, st.rows[n], st.scanned[n], st.kept[n], st.queries[n]))
 			}
+			// S5 share rows (derived, outside the timed reads): the share rows the
+			// 60c680e7 per-item sum would read for the report's items, against
+			// the totals rows the budgets now read.
+			shares, totals := usageBudgetRowsRead(b, live.s, live.task, live.items)
+			line = append(line, fmt.Sprintf("S5 share rows (derived): %d share rows before, %d totals rows read for %d items", shares, totals, len(live.items)))
 			b.Log(strings.Join(line, "\n  "))
 		})
 	}
+}
+
+// usageBudgetRowsRead counts, for the given items, the share rows the
+// 60c680e7 lifetime budget read summed and the totals rows it reads now.
+func usageBudgetRowsRead(tb testing.TB, s *Store, task string, items []string) (shares, totals int) {
+	tb.Helper()
+	list, _ := json.Marshal(items)
+	if err := s.db.QueryRow(`SELECT (SELECT count(*) FROM json_each(?1) k JOIN usage_item_shares s ON s.item_task_id=?2 AND s.item_id=k.value AND s.task_id=?2),
+ (SELECT count(*) FROM json_each(?1) k JOIN usage_item_share_totals t ON t.item_task_id=?2 AND t.item_id=k.value AND t.task_id=?2)`, string(list), task).Scan(&shares, &totals); err != nil {
+		tb.Fatal(err)
+	}
+	return shares, totals
 }
 
 // usageWindowFixture is one project with a metered agent whose orders are
@@ -4012,8 +4055,9 @@ func TestUsageWindowedReadCostBounded(t *testing.T) {
 	if small.rows[usageStageTurns] != 3 || large.rows[usageStageTurns] != 3 {
 		t.Fatalf("turn rows decoded: %d, then %d with four times the history", small.rows[usageStageTurns], large.rows[usageStageTurns])
 	}
-	if small.rows[usageStageSpans] != 2 || large.rows[usageStageSpans] != 2 || large.scanned[usageStageSpans] != 2+2*40 {
-		t.Fatalf("span rows decoded: %d, then %d; keys scanned %d", small.rows[usageStageSpans], large.rows[usageStageSpans], large.scanned[usageStageSpans])
+	// Only the window's own spans are listed, by their stored instants.
+	if small.rows[usageStageSpans] != 2 || large.rows[usageStageSpans] != 2 || small.scanned[usageStageSpans] != 2 || large.scanned[usageStageSpans] != 2 {
+		t.Fatalf("span rows decoded: %d, then %d; spans listed %d, then %d", small.rows[usageStageSpans], large.rows[usageStageSpans], small.scanned[usageStageSpans], large.scanned[usageStageSpans])
 	}
 }
 
@@ -4043,5 +4087,802 @@ func TestUsageWindowedTurnsQueryUsesTotalsIndex(t *testing.T) {
 	}
 	if !ranged || scanned {
 		t.Fatal("windowed turn read does not search the totals index by instant")
+	}
+}
+
+// The windowed span read lists spans by the instants and poll indexes with a
+// range, and never walks the project's spans.
+func TestUsageWindowedSpanQueryUsesInstantIndexes(t *testing.T) {
+	s, task, _, _, _ := usageFixture(t)
+	rows, err := s.db.QueryContext(context.Background(), "EXPLAIN QUERY PLAN "+usageWindowSpansQuery, task.ID, int64(1), int64(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	window, polls, scanned := false, false, false
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatal(err)
+		}
+		t.Log(detail)
+		window = window || (strings.Contains(detail, "usage_span_instants_window") && strings.Contains(detail, "end_ns>?"))
+		polls = polls || (strings.Contains(detail, "usage_span_polls_at") && strings.Contains(detail, "at_ns>? AND at_ns<?"))
+		scanned = scanned || strings.HasPrefix(detail, "SCAN s") || strings.HasPrefix(detail, "SCAN i") || strings.HasPrefix(detail, "SCAN p") || strings.Contains(detail, "usage_spans_time")
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !window || !polls || scanned {
+		t.Fatal("windowed span read does not search the instant indexes by range")
+	}
+}
+
+// Bounded span and budget reads (wi_dd392009b4f40b18, plan v0). All data is
+// synthetic and lives in isolated temp stores.
+
+// usageWindowSpansTextQuery and usageWindowSpansTextScan are verbatim copies
+// of the 60c680e7 windowed span listing, which compared every span's text
+// instants in Go. The golden checks compare the indexed listing with it.
+const usageWindowSpansTextQuery = `SELECT rowid,start_at,end_at,CASE WHEN instr(payload,'"poll":true')>0 THEN
+ (SELECT group_concat(json_extract(s.value,'$.at'),' ') FROM json_each(payload,'$.segments') s WHERE json_extract(s.value,'$.poll')=1) END
+ FROM usage_spans WHERE task_id=? ORDER BY start_at`
+
+func usageWindowSpansTextScan(ctx context.Context, tx *sql.Tx, task string, from, to time.Time) ([]int64, error) {
+	rows, err := tx.QueryContext(ctx, usageWindowSpansTextQuery, task)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	inside := func(at time.Time) bool {
+		return (from.IsZero() || !at.Before(from)) && (to.IsZero() || at.Before(to))
+	}
+	var keep []int64
+	for rows.Next() {
+		var rowid int64
+		var start, end string
+		var polls sql.NullString
+		if err := rows.Scan(&rowid, &start, &end, &polls); err != nil {
+			return nil, err
+		}
+		s, e := parseTS(start), parseTS(end)
+		meets := (to.IsZero() || s.Before(to)) && (from.IsZero() || e.After(from))
+		for _, at := range strings.Fields(polls.String) {
+			if meets {
+				break
+			}
+			if t, err := time.Parse(time.RFC3339Nano, at); err != nil || inside(t) {
+				meets = true
+			}
+		}
+		if meets || s.IsZero() || e.IsZero() {
+			keep = append(keep, rowid)
+		}
+	}
+	return keep, rows.Err()
+}
+
+// usageSpanLists returns the indexed and the 60c680e7 span listings of one
+// window.
+func usageSpanLists(tb testing.TB, s *Store, task string, from, to time.Time) (indexed, text []int64) {
+	tb.Helper()
+	ctx := context.Background()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	defer tx.Rollback()
+	if indexed, err = usageWindowSpans(ctx, tx, task, from, to, &usageReadStats{}); err != nil {
+		tb.Fatal(err)
+	}
+	if text, err = usageWindowSpansTextScan(ctx, tx, task, from, to); err != nil {
+		tb.Fatal(err)
+	}
+	return indexed, text
+}
+
+// usageBudgetReference is the item's budget with its lifetime figure read as
+// 60c680e7 read it: every share row of the item, summed per denominator.
+func usageBudgetReference(tb testing.TB, s *Store, task, item string) (got, want *api.TokenBudget) {
+	tb.Helper()
+	ctx := context.Background()
+	got, err := loadTokenBudget(ctx, s.db, task, item)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	ref := *got
+	rows, err := s.db.QueryContext(ctx, `SELECT denominator,sum(tokens),max(partial) FROM usage_item_shares WHERE item_task_id=? AND item_id=? AND task_id=? GROUP BY denominator`, task, item, task)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	actual := new(big.Rat)
+	if ref.ActualState, err = sumUsageItemShares(rows, actual, "not measured"); err != nil {
+		tb.Fatal(err)
+	}
+	ref.ActualTokens, ref.Ratio = actual.RatString(), ""
+	if ref.Estimate != nil && ref.ActualState != "not measured" {
+		ref.Ratio = new(big.Rat).Quo(actual, big.NewRat(ref.Estimate.Tokens, 1)).RatString()
+	}
+	return got, &ref
+}
+
+// usageShareTotalsDrift lists the totals groups that differ from a recompute
+// over the share rows; empty means the stored totals are exact.
+func usageShareTotalsDrift(tb testing.TB, s *Store) string {
+	tb.Helper()
+	rows, err := s.db.Query(`WITH want AS (SELECT item_task_id,item_id,task_id,denominator,sum(tokens) tokens,count(*) share_rows,sum(partial<>0) partial_rows FROM usage_item_shares GROUP BY 1,2,3,4)
+ SELECT 'missing',w.item_id,w.denominator FROM want w WHERE NOT EXISTS (SELECT 1 FROM usage_item_share_totals t WHERE t.item_task_id=w.item_task_id AND t.item_id=w.item_id AND t.task_id=w.task_id AND t.denominator=w.denominator AND t.tokens=w.tokens AND t.share_rows=w.share_rows AND t.partial_rows=w.partial_rows)
+ UNION ALL SELECT 'extra',t.item_id,t.denominator FROM usage_item_share_totals t WHERE NOT EXISTS (SELECT 1 FROM want w WHERE t.item_task_id=w.item_task_id AND t.item_id=w.item_id AND t.task_id=w.task_id AND t.denominator=w.denominator)`)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var kind, item string
+		var den int64
+		if err := rows.Scan(&kind, &item, &den); err != nil {
+			tb.Fatal(err)
+		}
+		out = append(out, fmt.Sprintf("%s %s/%d", kind, item, den))
+	}
+	if err := rows.Err(); err != nil {
+		tb.Fatal(err)
+	}
+	return strings.Join(out, "; ")
+}
+
+// usageBoundedSchemaDrop returns a store to the 60c680e7 schema: no span
+// side tables, no share totals and none of their triggers.
+var usageBoundedSchemaDrop = []string{
+	`DROP TRIGGER IF EXISTS usage_span_instant_checks_span_insert`, `DROP TRIGGER IF EXISTS usage_span_instant_checks_span_update`, `DROP TRIGGER IF EXISTS usage_span_instant_checks_span_delete`,
+	`DROP TRIGGER IF EXISTS usage_item_share_totals_insert`, `DROP TRIGGER IF EXISTS usage_item_share_totals_delete`, `DROP TRIGGER IF EXISTS usage_item_share_totals_update`,
+	`DROP TABLE IF EXISTS usage_span_instants`, `DROP TABLE IF EXISTS usage_span_polls`, `DROP TABLE IF EXISTS usage_span_instant_checks`, `DROP TABLE IF EXISTS usage_item_share_totals`,
+}
+
+func dropUsageBoundedSchema(tb testing.TB, db *sql.DB) {
+	tb.Helper()
+	for _, statement := range usageBoundedSchemaDrop {
+		if _, err := db.Exec(statement); err != nil {
+			tb.Fatal(err)
+		}
+	}
+}
+
+// usageSpanInstantRows lists the side tables' rows of a task as text.
+func usageSpanInstantRows(tb testing.TB, s *Store) string {
+	tb.Helper()
+	var out strings.Builder
+	for _, query := range []string{
+		`SELECT span_id||' '||coalesce(start_ns,'NULL')||' '||coalesce(end_ns,'NULL') FROM usage_span_instants ORDER BY task_id,agent_id,run_id,span_id`,
+		`SELECT span_id||' poll '||segment||' '||coalesce(at_ns,'NULL') FROM usage_span_polls ORDER BY task_id,agent_id,run_id,span_id,segment`,
+		`SELECT 'listed '||span_rowid FROM usage_span_instant_checks ORDER BY span_rowid`,
+	} {
+		rows, err := s.db.Query(query)
+		if err != nil {
+			tb.Fatal(err)
+		}
+		for rows.Next() {
+			var line string
+			if err := rows.Scan(&line); err != nil {
+				tb.Fatal(err)
+			}
+			out.WriteString(line + "\n")
+		}
+		if err := rows.Err(); err != nil {
+			tb.Fatal(err)
+		}
+		rows.Close()
+	}
+	return out.String()
+}
+
+// Ingest writes a span's instants and poll rows in its own transaction and
+// leaves it off the check list.
+func TestUsageSpanInstantsWrittenWithSpan(t *testing.T) {
+	f := newUsageWindowFixture(t)
+	plain := testSpan("w1", "10:00:00", "10:00:40")
+	poll := testSpan("w2", "09:50:00", "09:50:40")
+	poll.Segments[0].At, poll.Segments[0].Poll = timeAt("10:30:00").Add(123456789), true
+	f.spans(0, plain, poll)
+	want := fmt.Sprintf("w1#0 %d %d\nw2#0 %d %d\nw2#0 poll 0 %d\n", timeAt("10:00:00").UnixNano(), timeAt("10:00:40").UnixNano(), timeAt("09:50:00").UnixNano(), timeAt("09:50:40").UnixNano(), timeAt("10:30:00").Add(123456789).UnixNano())
+	if got := usageSpanInstantRows(t, f.s); got != want {
+		t.Fatalf("side rows after ingest:\n%s\nwant:\n%s", got, want)
+	}
+	// A replayed batch writes nothing more.
+	f.serial--
+	f.spans(0, plain, poll)
+	if got := usageSpanInstantRows(t, f.s); got != want {
+		t.Fatalf("side rows after a replay:\n%s", got)
+	}
+}
+
+// A span an older binary writes by position after a rollback is listed and
+// read until the next open fills its rows. Missing triggers list every span
+// once. Unreadable, zero and out-of-range instants are NULL and always read.
+// Deleting a span drops its rows, and a VACUUM changes no report.
+func TestUsageSpanInstantsBackfillAndRollback(t *testing.T) {
+	f := newUsageWindowFixture(t)
+	from, to := timeAt("10:00:00"), timeAt("11:00:00")
+	poll := testSpan("b3", "08:00:00", "08:00:40")
+	poll.Segments[0].At, poll.Segments[0].Poll = timeAt("10:15:00"), true
+	f.spans(0, testSpan("b1", "10:05:00", "10:05:40"), testSpan("b2", "12:00:00", "12:00:40"), poll)
+	f.reopen()
+	golden, all := f.report(from, to), f.report(time.Time{}, time.Time{})
+	sideRows := usageSpanInstantRows(t, f.s)
+	// The rollback: the base binary's positional insert of an in-window span.
+	var agent, run, payload, projection string
+	if err := f.s.db.QueryRow(`SELECT agent_id,run_id,payload,projection FROM usage_spans WHERE span_id='b1#0'`).Scan(&agent, &run, &payload, &projection); err != nil {
+		t.Fatal(err)
+	}
+	older := strings.Replace(payload, `"b1#0"`, `"b9#0"`, 1)
+	if _, err := f.s.db.Exec(`INSERT INTO usage_spans VALUES(?,?,?,?,?,?,?,?)`, f.task.ID, agent, run, "b9#0", ts(timeAt("10:40:00")), ts(timeAt("10:40:40")), older, projection); err != nil {
+		t.Fatal(err)
+	}
+	indexed, text := usageSpanLists(t, f.s, f.task.ID, from, to)
+	if !reflect.DeepEqual(indexed, text) || len(indexed) != 3 {
+		t.Fatalf("an older binary's span before the open: listed %v, the text scan %v", indexed, text)
+	}
+	f.reopen()
+	var listed, filled int
+	if err := f.s.db.QueryRow(`SELECT (SELECT count(*) FROM usage_span_instant_checks),(SELECT count(*) FROM usage_span_instants WHERE span_id='b9#0' AND start_ns=? AND end_ns=?)`, timeAt("10:40:00").UnixNano(), timeAt("10:40:40").UnixNano()).Scan(&listed, &filled); err != nil || listed != 0 || filled != 1 {
+		t.Fatalf("after the open: %d listed, %d filled: %v", listed, filled, err)
+	}
+	if _, err := f.s.db.Exec(`DELETE FROM usage_spans WHERE span_id='b9#0'`); err != nil {
+		t.Fatal(err)
+	}
+	if got := usageSpanInstantRows(t, f.s); got != sideRows {
+		t.Fatalf("deleting a span left its rows:\n%s\nwant:\n%s", got, sideRows)
+	}
+	// NULL rule: text that does not parse, the zero time, a year past the
+	// int64 nanosecond range and a poll instant that does not parse.
+	for i, bounds := range [][2]string{{"not a time", ts(timeAt("10:00:00"))}, {"0001-01-01T00:00:00Z", ts(timeAt("10:00:00"))}, {"2300-01-01T00:00:00Z", "2300-01-01T00:01:00Z"}} {
+		if _, err := f.s.db.Exec(`INSERT INTO usage_spans VALUES(?,?,?,?,?,?,?,?)`, f.task.ID, agent, run, fmt.Sprintf("n%d#0", i), bounds[0], bounds[1], payload, projection); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(payload), &doc); err != nil {
+		t.Fatal(err)
+	}
+	segment := doc["segments"].([]any)[0].(map[string]any)
+	segment["at"], segment["poll"] = "later", true
+	encodedPoll, _ := json.Marshal(doc)
+	badPoll := string(encodedPoll)
+	if _, err := f.s.db.Exec(`INSERT INTO usage_spans VALUES(?,?,?,?,?,?,?,?)`, f.task.ID, agent, run, "n3#0", ts(timeAt("07:00:00")), ts(timeAt("07:00:40")), badPoll, projection); err != nil {
+		t.Fatal(err)
+	}
+	f.reopen()
+	var nulls, nullPolls int
+	if err := f.s.db.QueryRow(`SELECT (SELECT count(*) FROM usage_span_instants WHERE span_id LIKE 'n%' AND start_ns IS NULL AND end_ns IS NULL),(SELECT count(*) FROM usage_span_polls WHERE span_id='n3#0' AND at_ns IS NULL)`).Scan(&nulls, &nullPolls); err != nil || nulls != 3 || nullPolls != 1 {
+		t.Fatalf("NULL rule: %d NULL spans, %d NULL polls: %v", nulls, nullPolls, err)
+	}
+	indexed, _ = usageSpanLists(t, f.s, f.task.ID, from, to)
+	if len(indexed) != 6 {
+		t.Fatalf("NULL spans and polls are not read: %v", indexed)
+	}
+	for _, id := range []string{"n0#0", "n1#0", "n2#0", "n3#0"} {
+		if _, err := f.s.db.Exec(`DELETE FROM usage_spans WHERE span_id=?`, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := usageSpanInstantRows(t, f.s); got != sideRows {
+		t.Fatalf("rows after deleting the NULL spans:\n%s", got)
+	}
+	// A missing trigger lists every span once, and the open fills them again
+	// with the same values.
+	if _, err := f.s.db.Exec(`DROP TRIGGER usage_span_instant_checks_span_update`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.s.db.Exec(`DELETE FROM usage_span_instants`); err != nil {
+		t.Fatal(err)
+	}
+	examined := 0
+	usageSpanInstantChecked = func(n int) error { examined += n; return nil }
+	defer func() { usageSpanInstantChecked = nil }()
+	f.reopen()
+	if examined != 3 {
+		t.Fatalf("the open examined %d spans, want every span once", examined)
+	}
+	if got := usageSpanInstantRows(t, f.s); got != sideRows {
+		t.Fatalf("rows after relisting:\n%s\nwant:\n%s", got, sideRows)
+	}
+	examined = 0
+	f.reopen()
+	if examined != 0 {
+		t.Fatalf("an open with nothing listed examined %d spans", examined)
+	}
+	// VACUUM may renumber rowids; the side tables are keyed by span.
+	if _, err := f.s.db.Exec(`VACUUM`); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.report(from, to); !reflect.DeepEqual(got, golden) {
+		t.Fatalf("windowed report after VACUUM changed:\n%+v\nwant:\n%+v", got, golden)
+	}
+	if got := f.report(time.Time{}, time.Time{}); !reflect.DeepEqual(got, all) {
+		t.Fatal("unwindowed report after VACUUM changed")
+	}
+}
+
+// g2: for a grid of windows the indexed listing equals, in order, the
+// 60c680e7 text scan, including sub-second instants whose text does not sort,
+// zero-length spans, bounds on a span's start or end and polls outside their
+// chunk.
+func TestUsageWindowedSpansMatchTextScan(t *testing.T) {
+	f := newUsageWindowFixture(t)
+	sub := func(turn string, start time.Time, length time.Duration) api.UsageSpan {
+		return api.UsageSpan{ID: turn + "#0", Turn: turn, Last: true, Start: start, End: start.Add(length), Segments: []api.UsageSpanSegment{{From: start, To: start.Add(length), At: start}}, SourceDigest: strings.Repeat("c", 64)}
+	}
+	spans := []api.UsageSpan{
+		testSpan("g1", "09:59:30", "10:00:30"), testSpan("g2", "10:00:00", "10:00:40"), testSpan("g3", "10:59:40", "11:00:20"),
+		testSpan("g4", "11:00:00", "11:00:40"), testSpan("g5", "08:00:00", "08:00:40"), testSpan("g6", "10:30:00", "10:30:00"),
+		testSpan("g7", "09:00:00", "09:59:59"), testSpan("g8", "11:00:00", "11:00:00"), testSpan("g9", "10:00:00", "10:00:00"),
+		sub("h1", timeAt("10:20:00").Add(500*time.Millisecond), 10*time.Second), sub("h2", timeAt("10:20:00").Add(50*time.Millisecond), 10*time.Second),
+		sub("h3", timeAt("10:20:00"), 10*time.Second), sub("h4", timeAt("10:20:00").Add(123456789), time.Nanosecond),
+	}
+	pollOut := testSpan("p1", "07:00:00", "07:00:40")
+	pollOut.Segments[0].At, pollOut.Segments[0].Poll = timeAt("10:45:00"), true
+	pollEdge := testSpan("p2", "12:00:00", "12:00:40")
+	pollEdge.Segments[0].At, pollEdge.Segments[0].Poll = timeAt("11:00:00"), true
+	pollFrom := testSpan("p3", "12:10:00", "12:10:40")
+	pollFrom.Segments[0].At, pollFrom.Segments[0].Poll = timeAt("10:00:00"), true
+	spans = append(spans, pollOut, pollEdge, pollFrom)
+	f.spans(0, spans[:8]...)
+	f.spans(1, spans[8:]...)
+	f.reopen()
+	z := time.Time{}
+	windows := [][2]time.Time{
+		{timeAt("10:00:00"), timeAt("11:00:00")}, {timeAt("08:00:00"), timeAt("09:00:00")}, {timeAt("10:00:00"), z}, {z, timeAt("10:00:00")},
+		{timeAt("10:00:30"), timeAt("10:59:40")}, {timeAt("10:30:00"), timeAt("10:30:00").Add(time.Nanosecond)}, {timeAt("11:00:00"), timeAt("12:00:00")},
+		{timeAt("10:20:00").Add(50 * time.Millisecond), timeAt("10:20:00").Add(500 * time.Millisecond)}, {timeAt("10:20:00").Add(123456789), timeAt("10:20:00").Add(123456790)},
+		{timeAt("12:00:00"), timeAt("13:00:00")}, {timeAt("00:00:00"), timeAt("23:59:59")}, {timeAt("10:45:00"), timeAt("10:45:00").Add(time.Nanosecond)},
+	}
+	for _, w := range windows {
+		indexed, text := usageSpanLists(t, f.s, f.task.ID, w[0], w[1])
+		if !reflect.DeepEqual(indexed, text) {
+			t.Fatalf("window %s - %s: indexed %v, text scan %v", w[0], w[1], indexed, text)
+		}
+		if len(text) == 0 && w[0].Equal(timeAt("10:00:00")) {
+			t.Fatal("the grid lists nothing")
+		}
+	}
+}
+
+// Share totals follow every share write in its own transaction, from ingest,
+// the share rewrite and an older binary's raw statements, and a first open
+// recomputes them. Budgets equal the 60c680e7 sum over share rows throughout.
+func TestUsageItemShareTotalsFollowShares(t *testing.T) {
+	f := newUsageWindowFixture(t)
+	ctx := context.Background()
+	f.turns(0, timeAt("10:00:00"), timeAt("10:10:00"))
+	f.turns(1, timeAt("10:20:00"))
+	check := func(step string) {
+		t.Helper()
+		if drift := usageShareTotalsDrift(t, f.s); drift != "" {
+			t.Fatalf("%s: totals drift %s", step, drift)
+		}
+		for _, item := range f.items {
+			if got, want := usageBudgetReference(t, f.s, f.task.ID, item.ID); !reflect.DeepEqual(got, want) {
+				t.Fatalf("%s: budget %+v, want %+v", step, got, want)
+			}
+		}
+	}
+	check("ingest")
+	var groups int
+	if err := f.s.db.QueryRow(`SELECT count(*) FROM usage_item_share_totals`).Scan(&groups); err != nil || groups != 2 {
+		t.Fatalf("%d totals groups after ingest: %v", groups, err)
+	}
+	// The share rewrite: a partial revision shared by both items at
+	// denominator 2.
+	var request string
+	if err := f.s.db.QueryRow(`SELECT request_id FROM usage_item_shares WHERE item_id=? LIMIT 1`, f.items[0].ID).Scan(&request); err != nil {
+		t.Fatal(err)
+	}
+	turn := syntheticUsageTurn(request)
+	// 111 tokens, so a half stays a fraction with denominator 2.
+	turn.Revision, turn.Complete, turn.Tokens["output"] = 2, false, 8
+	p := api.UsageProjection{Turn: turn, Shares: []api.UsageAttribution{{TaskID: f.task.ID, ItemID: f.items[0].ID, Denominator: 2}, {TaskID: f.task.ID, ItemID: f.items[1].ID, Denominator: 2}}}
+	tx, err := f.s.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = replaceUsageItemShares(ctx, tx, f.task.ID, f.agent.ID, f.agent.RunID, p); err != nil {
+		t.Fatal(err)
+	}
+	if err = tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	check("rewrite")
+	var partial int
+	if err := f.s.db.QueryRow(`SELECT sum(partial_rows) FROM usage_item_share_totals WHERE denominator=2`).Scan(&partial); err != nil || partial != 2 {
+		t.Fatalf("partial rows at denominator 2: %d, %v", partial, err)
+	}
+	if b, _ := usageBudgetReference(t, f.s, f.task.ID, f.items[1].ID); b.ActualState != "partial" {
+		t.Fatalf("a partial share leaves item 1 %s", b.ActualState)
+	}
+	// An older binary's raw writes: a key and figure change, then deletes
+	// down to an empty group.
+	for _, statement := range []string{
+		`UPDATE usage_item_shares SET tokens=tokens+5,partial=0 WHERE denominator=2 AND item_id='` + f.items[1].ID + `'`,
+		`UPDATE usage_item_shares SET item_id='` + f.items[1].ID + `' WHERE item_id='` + f.items[0].ID + `' AND denominator=1`,
+		`DELETE FROM usage_item_shares WHERE denominator=2`,
+	} {
+		if _, err := f.s.db.Exec(statement); err != nil {
+			t.Fatal(err)
+		}
+		check(statement)
+	}
+	if err := f.s.db.QueryRow(`SELECT count(*) FROM usage_item_share_totals WHERE item_id=? OR denominator=2`, f.items[0].ID).Scan(&groups); err != nil || groups != 0 {
+		t.Fatalf("%d emptied groups kept: %v", groups, err)
+	}
+	// A first open (a trigger missing) recomputes wrong totals.
+	if _, err := f.s.db.Exec(`UPDATE usage_item_share_totals SET tokens=0,share_rows=7`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.s.db.Exec(`DROP TRIGGER usage_item_share_totals_update`); err != nil {
+		t.Fatal(err)
+	}
+	f.reopen()
+	check("recompute")
+	f.reopen()
+	check("second open")
+}
+
+// g1-g3 at smoke scale: the live-size fixture's budgets equal the 60c680e7
+// sum, its span listings equal the text scan, and the whole report and every
+// budget are unchanged after the new tables are dropped and an open rebuilds
+// them from the stored rows.
+func TestUsageBoundedReadGoldenSmoke(t *testing.T) {
+	if raceBuilt() {
+		t.Skip("the smoke-size fixture is too slow under -race; the small golden tests cover it there")
+	}
+	dir := t.TempDir()
+	live := seedUsageLiveSize(t, dir, usageLiveSizeAt(0.004))
+	usageBoundedGolden(t, live, dir, true)
+}
+
+// usageBoundedGolden runs g1-g3 on a seeded live-size store and returns the
+// reopened store. It reads the unwindowed report only when asked, as it
+// costs every span at 1x.
+func usageBoundedGolden(tb testing.TB, live *usageLiveStore, dir string, unwindowed bool) {
+	tb.Helper()
+	ctx := context.Background()
+	hour := api.UsageQuery{From: usageLiveEnd.Add(-time.Hour), To: usageLiveEnd}
+	read := func(q api.UsageQuery) api.UsageReport {
+		report, err := live.s.Usage(ctx, live.task, q)
+		if err != nil || report.Summary.Requests == 0 {
+			tb.Fatal(report.Summary, err)
+		}
+		return report
+	}
+	budgets := func() []*api.TokenBudget {
+		out := []*api.TokenBudget{}
+		for _, item := range live.items {
+			got, want := usageBudgetReference(tb, live.s, live.task, item)
+			if !reflect.DeepEqual(got, want) {
+				tb.Fatalf("g1: item %s budget %+v, want %+v", item, got, want)
+			}
+			out = append(out, got)
+		}
+		return out
+	}
+	day := usageLiveEnd.Add(-usageLiveHistory / 2)
+	windows := [][2]time.Time{{hour.From, hour.To}, {day, day.Add(time.Hour)}, {usageLiveEnd.Add(-24 * time.Hour), time.Time{}}, {time.Time{}, usageLiveEnd.Add(-usageLiveHistory).Add(time.Hour)}}
+	lists := func() [][]int64 {
+		out := [][]int64{}
+		for _, w := range windows {
+			indexed, text := usageSpanLists(tb, live.s, live.task, w[0], w[1])
+			if !reflect.DeepEqual(indexed, text) || len(indexed) == 0 {
+				tb.Fatalf("g2: window %s - %s lists %d spans, the text scan %d", w[0], w[1], len(indexed), len(text))
+			}
+			out = append(out, indexed)
+		}
+		return out
+	}
+	goldenHour, goldenBudgets, goldenLists := read(hour), budgets(), lists()
+	var goldenAll api.UsageReport
+	if unwindowed {
+		goldenAll = read(api.UsageQuery{})
+	}
+	if drift := usageShareTotalsDrift(tb, live.s); drift != "" {
+		tb.Fatalf("seeded totals drift %s", drift)
+	}
+	// g3: back to the base schema, then an open rebuilds the rows.
+	dropUsageBoundedSchema(tb, live.s.db)
+	if err := live.s.Close(); err != nil {
+		tb.Fatal(err)
+	}
+	s, err := Open(filepath.Join(dir, "usage-live-size.sqlite"))
+	if err != nil {
+		tb.Fatal(err)
+	}
+	tb.Cleanup(func() { s.Close() })
+	live.s = s
+	if got := read(hour); !reflect.DeepEqual(got, goldenHour) {
+		tb.Fatal("g3: the 1h report changed after the rebuild")
+	}
+	if unwindowed {
+		if got := read(api.UsageQuery{}); !reflect.DeepEqual(got, goldenAll) {
+			tb.Fatal("g3: the unwindowed report changed after the rebuild")
+		}
+	}
+	if got := budgets(); !reflect.DeepEqual(got, goldenBudgets) {
+		tb.Fatal("g3: budgets changed after the rebuild")
+	}
+	if got := lists(); !reflect.DeepEqual(got, goldenLists) {
+		tb.Fatal("g3: span listings changed after the rebuild")
+	}
+}
+
+// The span backfill runs at every open. On a file-backed store with 60,000
+// spans and no side tables the first open fills them within its bound, and
+// the next open, with nothing listed, is fast and changes nothing.
+func TestUsageSpanInstantsBackfillOpenTime(t *testing.T) {
+	if raceBuilt() {
+		t.Skip("open time bounds are not checked in race runs; TestUsageSpanInstantsBackfillAndRollback covers the backfill there")
+	}
+	path := filepath.Join(t.TempDir(), "usage.sqlite")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			s.Close()
+		}
+	}()
+	dropUsageBoundedSchema(t, s.db)
+	const spans = 60000
+	task, agent, run := "tsk_00000000000000aa", "agt_00000000000000aa", "run_00000000000000aa"
+	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	tx, err := s.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	insert, err := tx.Prepare(`INSERT INTO usage_spans VALUES(?,?,?,?,?,?,?,?)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < spans; i++ {
+		start := now.Add(-time.Duration(i) * 40 * time.Second)
+		end := start.Add(30 * time.Second)
+		span := api.UsageSpan{ID: fmt.Sprintf("t%d#0", i), Turn: fmt.Sprintf("t%d", i), Last: true, Start: start, End: end, SourceDigest: strings.Repeat("c", 64),
+			Segments: []api.UsageSpanSegment{{From: start, To: end, At: start, Poll: i%10 < 3}}}
+		payload, _ := json.Marshal(span)
+		if _, err := insert.Exec(task, agent, run, span.ID, ts(start), ts(end), string(payload), `{}`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insert.Close()
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopen := func() time.Duration {
+		t.Helper()
+		started := time.Now()
+		if s, err = Open(path); err != nil {
+			t.Fatal(err)
+		}
+		return time.Since(started)
+	}
+	first := reopen()
+	var count, polls, oldest, newest int64
+	if err := s.db.QueryRow(`SELECT count(*),min(start_ns),max(start_ns),(SELECT count(*) FROM usage_span_polls WHERE task_id=?1) FROM usage_span_instants WHERE task_id=?1`, task).Scan(&count, &oldest, &newest, &polls); err != nil {
+		t.Fatal(err)
+	}
+	if count != spans || polls != spans*3/10 || oldest != now.Add(-time.Duration(spans-1)*40*time.Second).UnixNano() || newest != now.UnixNano() {
+		t.Fatalf("after the first open: %d spans, %d polls, from %d to %d", count, polls, oldest, newest)
+	}
+	rows := usageSpanInstantRows(t, s)
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	second := reopen()
+	same := usageSpanInstantRows(t, s) == rows
+	closed = true
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("open with %d spans to backfill took %s; the next open took %s", spans, first, second)
+	if !same {
+		t.Fatal("the second open changed the side rows")
+	}
+	if first >= 30*time.Second {
+		t.Fatalf("the first open with %d spans to backfill took %s, want under 30s", spans, first)
+	}
+	if second >= 3*time.Second {
+		t.Fatalf("the second open with nothing to backfill took %s, want under 3s", second)
+	}
+}
+
+// usageBoundedCounts is the exact backfill census of a live-size store's new
+// tables, plus a digest of their rows.
+type usageBoundedCounts struct {
+	instants, polls, nullInstants, nullPolls, wrongInstants, totals, shareRows, tokens int64
+	digest                                                                             string
+}
+
+func readUsageBoundedCounts(tb testing.TB, s *Store) usageBoundedCounts {
+	tb.Helper()
+	var c usageBoundedCounts
+	if err := s.db.QueryRow(`SELECT (SELECT count(*) FROM usage_span_instants),(SELECT count(*) FROM usage_span_polls),
+ (SELECT count(*) FROM usage_span_instants WHERE start_ns IS NULL OR end_ns IS NULL),(SELECT count(*) FROM usage_span_polls WHERE at_ns IS NULL),
+ (SELECT count(*) FROM usage_item_share_totals),(SELECT coalesce(sum(share_rows),0) FROM usage_item_share_totals),(SELECT coalesce(sum(tokens),0) FROM usage_item_share_totals)`).
+		Scan(&c.instants, &c.polls, &c.nullInstants, &c.nullPolls, &c.totals, &c.shareRows, &c.tokens); err != nil {
+		tb.Fatal(err)
+	}
+	// Every stored instant equals its text parsed, in a full scan.
+	rows, err := s.db.Query(`SELECT s.start_at,s.end_at,i.start_ns,i.end_ns FROM usage_spans s JOIN usage_span_instants i ON i.task_id=s.task_id AND i.agent_id=s.agent_id AND i.run_id=s.run_id AND i.span_id=s.span_id`)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	for rows.Next() {
+		var start, end string
+		var startNs, endNs sql.NullInt64
+		if err := rows.Scan(&start, &end, &startNs, &endNs); err != nil {
+			tb.Fatal(err)
+		}
+		if startNs.Int64 != parseTS(start).UnixNano() || endNs.Int64 != parseTS(end).UnixNano() {
+			c.wrongInstants++
+		}
+	}
+	if err := rows.Err(); err != nil {
+		tb.Fatal(err)
+	}
+	rows.Close()
+	h := sha256.New()
+	for _, query := range []string{
+		`SELECT task_id,agent_id,run_id,span_id,start_ns,end_ns FROM usage_span_instants ORDER BY task_id,agent_id,run_id,span_id`,
+		`SELECT task_id,agent_id,run_id,span_id,segment,at_ns FROM usage_span_polls ORDER BY task_id,agent_id,run_id,span_id,segment`,
+		`SELECT item_task_id,item_id,task_id,denominator,tokens,share_rows,partial_rows FROM usage_item_share_totals ORDER BY item_task_id,item_id,task_id,denominator`,
+	} {
+		rows, err := s.db.Query(query)
+		if err != nil {
+			tb.Fatal(err)
+		}
+		columns, _ := rows.Columns()
+		values := make([]any, len(columns))
+		pointers := make([]any, len(columns))
+		for i := range values {
+			pointers[i] = &values[i]
+		}
+		for rows.Next() {
+			if err := rows.Scan(pointers...); err != nil {
+				tb.Fatal(err)
+			}
+			fmt.Fprintf(h, "%q\n", values)
+		}
+		if err := rows.Err(); err != nil {
+			tb.Fatal(err)
+		}
+		rows.Close()
+	}
+	c.digest = hex.EncodeToString(h.Sum(nil))
+	return c
+}
+
+// m3: the migration rehearsed on a copy of an isolated 1x store. The store is
+// seeded as ingest writes it, its golden report, budgets and span listings are
+// recorded, and it is returned to the 60c680e7 schema. A copy is opened (the
+// backfill and the totals recompute), its exact counts and every golden are
+// checked, and a second open must examine nothing and change nothing.
+func BenchmarkUsageBoundedBackfillLiveSize(parent *testing.B) {
+	for _, sc := range []struct {
+		name  string
+		scale float64
+	}{{"smoke", 0.004}, {"1x", 1}} {
+		parent.Run(sc.name, func(b *testing.B) { rehearseUsageBoundedBackfill(b, usageLiveSizeAt(sc.scale)) })
+	}
+}
+
+func rehearseUsageBoundedBackfill(b *testing.B, size usageLiveSize) {
+	{
+		if b.N > 1 {
+			b.Skip("run once: -benchtime=1x")
+		}
+		dir, copyDir := b.TempDir(), b.TempDir()
+		began := time.Now()
+		live := seedUsageLiveSize(b, dir, size)
+		b.Logf("seeded in %s: %s", time.Since(began).Round(time.Millisecond), usageLiveCounts(b, live.s))
+		ctx := context.Background()
+		hour := api.UsageQuery{From: usageLiveEnd.Add(-time.Hour), To: usageLiveEnd}
+		goldenHour, err := live.s.Usage(ctx, live.task, hour)
+		if err != nil || goldenHour.Summary.Requests == 0 {
+			b.Fatal(goldenHour.Summary, err)
+		}
+		goldenBudgets := map[string]*api.TokenBudget{}
+		for _, item := range live.items {
+			got, want := usageBudgetReference(b, live.s, live.task, item)
+			if !reflect.DeepEqual(got, want) {
+				b.Fatalf("g1 seeded: item %s budget %+v, want %+v", item, got, want)
+			}
+			goldenBudgets[item] = got
+		}
+		day := usageLiveEnd.Add(-usageLiveHistory / 2)
+		windows := [][2]time.Time{{hour.From, hour.To}, {day, day.Add(time.Hour)}}
+		goldenLists := [][]int64{}
+		for _, w := range windows {
+			indexed, text := usageSpanLists(b, live.s, live.task, w[0], w[1])
+			if !reflect.DeepEqual(indexed, text) || len(indexed) == 0 {
+				b.Fatalf("g2 seeded: window %s lists %d spans, the text scan %d", w[0], len(indexed), len(text))
+			}
+			goldenLists = append(goldenLists, indexed)
+		}
+		seeded := readUsageBoundedCounts(b, live.s)
+		dropUsageBoundedSchema(b, live.s.db)
+		if _, err := live.s.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+			b.Fatal(err)
+		}
+		if err := live.s.Close(); err != nil {
+			b.Fatal(err)
+		}
+		source, target := filepath.Join(dir, "usage-live-size.sqlite"), filepath.Join(copyDir, "usage-live-size.sqlite")
+		for _, suffix := range []string{"", "-wal", "-shm"} {
+			raw, err := os.ReadFile(source + suffix)
+			if errors.Is(err, os.ErrNotExist) && suffix != "" {
+				continue
+			}
+			if err != nil {
+				b.Fatal(err)
+			}
+			if err := os.WriteFile(target+suffix, raw, 0o600); err != nil {
+				b.Fatal(err)
+			}
+		}
+		examined := 0
+		usageSpanInstantChecked = func(n int) error { examined += n; return nil }
+		defer func() { usageSpanInstantChecked = nil }()
+		began = time.Now()
+		s, err := Open(target)
+		firstOpen := time.Since(began)
+		if err != nil {
+			b.Fatal(err)
+		}
+		live.s = s
+		first := readUsageBoundedCounts(b, s)
+		b.Logf("m3 first open of the copy took %s, examined %d spans: instants=%d polls=%d null_instants=%d null_polls=%d wrong_instants=%d totals=%d share_rows=%d tokens=%d",
+			firstOpen.Round(time.Millisecond), examined, first.instants, first.polls, first.nullInstants, first.nullPolls, first.wrongInstants, first.totals, first.shareRows, first.tokens)
+		// The seeder gives turn i to item i mod items and a poll to span i when
+		// i mod 10 < 3.
+		polls := size.spans/10*3 + min(size.spans%10, 3)
+		want := usageBoundedCounts{instants: int64(size.spans), polls: int64(polls), totals: int64(min(size.items, size.turns)), shareRows: int64(size.turns), tokens: int64(size.turns) * 110, digest: seeded.digest}
+		if first != want || examined != size.spans {
+			b.Fatalf("m3 backfill counts %+v (examined %d), want %+v", first, examined, want)
+		}
+		if got, err := s.Usage(ctx, live.task, hour); err != nil || !reflect.DeepEqual(got, goldenHour) {
+			b.Fatalf("g3: the 1h report changed after the backfill: %v", err)
+		}
+		for item, golden := range goldenBudgets {
+			got, want := usageBudgetReference(b, s, live.task, item)
+			if !reflect.DeepEqual(got, want) || !reflect.DeepEqual(got, golden) {
+				b.Fatalf("g1/g3: item %s budget %+v, reference %+v, golden %+v", item, got, want, golden)
+			}
+		}
+		for i, w := range windows {
+			indexed, text := usageSpanLists(b, s, live.task, w[0], w[1])
+			if !reflect.DeepEqual(indexed, text) || !reflect.DeepEqual(indexed, goldenLists[i]) {
+				b.Fatalf("g2/g3: window %s listing changed after the backfill", w[0])
+			}
+		}
+		if err := s.Close(); err != nil {
+			b.Fatal(err)
+		}
+		examined = 0
+		began = time.Now()
+		if s, err = Open(target); err != nil {
+			b.Fatal(err)
+		}
+		secondOpen := time.Since(began)
+		defer s.Close()
+		second := readUsageBoundedCounts(b, s)
+		b.Logf("m3 second open took %s, examined %d spans, digest unchanged=%t", secondOpen.Round(time.Millisecond), examined, second == first)
+		if examined != 0 || second != first {
+			b.Fatalf("m3 re-run is not idempotent: examined %d, counts %+v, then %+v", examined, first, second)
+		}
 	}
 }
