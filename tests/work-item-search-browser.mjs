@@ -36,7 +36,7 @@ const requests=[];
 const cursorMode=params.get('cursor')==='1';
 const live=[...items,{id:'wi_closed',taskId:task.id,kind,title:'Closed record',description:'Done text',status:'done',priority:'low',revision:1}].map((item,i)=>({...item,seq:i+1}));
 const savedPages=new Map(), changeLog=[], changeReads=[];
-let changeSeq=0, resetNext=false, listCalls=0;
+let changeSeq=0, resetNext=false, failChanges=false, listCalls=0;
 // Each held page waits on its own release, oldest first.
 const held=[];
 let holding=params.get('hold')==='1';
@@ -71,6 +71,7 @@ const client={base:'isolated://search',token:'fixture',cacheStatus:()=>({label:'
 };
 if(cursorMode)client.listWorkItemChanges=async({taskId='',since})=>{
  changeReads.push(since);
+ if(failChanges)throw new Error('synthetic changes read failure');
  if(resetNext){resetNext=false;savedPages.clear();return {items:[],next:0,cursor:changeSeq+'.0',reset:true}}
  const after=Number(String(since).split('.')[0]);
  const ids=new Set(changeLog.filter(entry=>entry.seq>after).map(entry=>entry.id));
@@ -84,6 +85,7 @@ view.mount(document.querySelector('#mode-view'));const shown=view.show();if(!pag
  event(kind){notify([{seq:Date.now(),kind,taskId:task.id,data:{}}],0)},
  change(id,patch){const item=live.find(entry=>entry.id===id);Object.assign(item,patch,{revision:item.revision+1});changeLog.push({seq:++changeSeq,id})},
  resetNext(){resetNext=true},
+ failChanges(value){failChanges=value},
  reads(){return {pages:listCalls,changes:changeReads.slice()}},requests(){return requests.map(r=>({...r}))},release(){holding=false;held.splice(0).forEach(resolve=>resolve())},releaseNext(){held.shift()?.()},held(){return held.length},
  count(status,taskId){return all.filter(item=>(!status||item.status===status)&&(!taskId||item.taskId===taskId)).length},setMessage(text){messageText=text},setReport(text){reportText=text},setReportFailure(value){failReport=value},reportFetches(){return reportFetches}};
 </script></body></html>`;
@@ -415,6 +417,39 @@ async function cursorCases(browser, engine, kind) {
       `${label}: saved pages reread`,
     );
     assert.equal(after.changes.length, before.changes.length + 1);
+    // A failing changes read falls back to one full reload and no further
+    // changes read until the next relevant notice (review blocker b1).
+    await page.evaluate(() => window.qa.failChanges(true));
+    for (let notice = 1; notice <= 2; notice++) {
+      before = await reads(page);
+      await page.evaluate(() => window.qa.event("work_item_updated"));
+      await page.waitForFunction(
+        (pages) => window.qa.reads().pages >= pages,
+        before.pages + perReload,
+      );
+      await page.waitForTimeout(400);
+      after = await reads(page);
+      assert.equal(
+        after.changes.length,
+        before.changes.length + 1,
+        `${label}: notice ${notice} after a failed changes read: one changes read`,
+      );
+      assert.equal(
+        after.pages,
+        before.pages + perReload,
+        `${label}: notice ${notice} after a failed changes read: one reload`,
+      );
+    }
+    await page.evaluate(() => {
+      window.qa.failChanges(false);
+      window.qa.change("wi_current", { title: "Recovered alpha" });
+      window.qa.event("work_item_updated");
+    });
+    await page.waitForFunction(() =>
+      document
+        .querySelector('[data-item-edit="wi_current"]')
+        ?.textContent.includes("Recovered alpha"),
+    );
     assert.deepEqual(errors, [], `${label}: page errors`);
     await page.close();
   }

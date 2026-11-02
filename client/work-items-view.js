@@ -117,9 +117,10 @@ export function createWorkItemsView({
     // changes read is waiting behind a read in flight.
     listCursor = null,
     followAgain = false,
-    // A reload that a reset asked for is not followed by another changes
-    // read at once, so a hub that keeps resetting cannot loop.
-    resetReload = false,
+    // A reload that a failed, reset or malformed changes read asked for is
+    // not followed by another changes read: the next one waits for the next
+    // relevant notice, so a failing or resetting hub cannot loop.
+    fallbackReload = false,
     listScheduled = false,
     narrativeGeneration = 0,
     searchGeneration = 0,
@@ -153,6 +154,7 @@ export function createWorkItemsView({
     renderedKey = "";
     listCursor = null;
     followAgain = false;
+    fallbackReload = false;
     subscription?.stop();
     subscription = null;
     itemScroll.interrupt();
@@ -203,8 +205,8 @@ export function createWorkItemsView({
     followAgain = false;
     const token = ++generation;
     const filter = { taskId: scope, status: state };
-    const afterReset = resetReload;
-    resetReload = false;
+    const afterFallback = fallbackReload;
+    fallbackReload = false;
     let followNext = false;
     try {
       const nextTasks = await client().listTasks(),
@@ -258,8 +260,8 @@ export function createWorkItemsView({
       completeKey = key;
       listCursor = cursor || null;
       // Cached pages may be older than the hub: a changes read brings them
-      // current, unless this reload itself answered a reset.
-      followNext = !afterReset && Boolean(listCursor);
+      // current, unless this reload is itself the fallback of one.
+      followNext = !afterFallback && Boolean(listCursor);
       if (shownGeneration === token) {
         showPage(token, key, nextTasks, next, false);
         return;
@@ -330,15 +332,18 @@ export function createWorkItemsView({
         }),
       ]);
       if (!visible || token !== generation) return;
+      // A filter change reads the new filter, which may follow as usual.
+      if (filterKey() !== key) {
+        again = true;
+        return;
+      }
       if (
-        filterKey() !== key ||
         !changes?.changes ||
         changes.reset ||
         !parseCursor(changes.cursor) ||
         !Array.isArray(changes.items)
       ) {
         fallback = true;
-        resetReload = Boolean(changes?.reset);
         return;
       }
       listCursor = changes.cursor;
@@ -372,6 +377,7 @@ export function createWorkItemsView({
     } finally {
       if (token === generation) {
         loading = false;
+        if (fallback) fallbackReload = true;
         if (fallback || again) void reload();
         else if (followAgain) void follow();
         else itemScroll.flush();
