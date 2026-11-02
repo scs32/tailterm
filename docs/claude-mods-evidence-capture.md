@@ -123,15 +123,20 @@ return and ANSI colour codes dropped first; the text is never kept.
   output was read;
 - `timeout` also when reading passes the 120 ms output budget (checked every
   4096 lines; 4 MiB of output reads in about 13 ms on the Mini);
+- `interrupted`: the call was interrupted (`is_interrupt`). What it printed
+  may look finished, since go prints each package whole, while the run was
+  cut short, so it is never counted;
 - `no-summary`: the text holds no summary at all, for example `go test
   -json` output, a failure text that is only `Exit code 1`, or empty output;
 - `truncated`: some part the reader can see is unfinished (below);
 - `mixed`: both a go summary and a node summary were found (a compound
   command), so which count belongs to which is not guessed.
 
-**Counts are taken only when every part is finished.** Any unfinished part,
-anywhere in the output, gives `countSkip: "truncated"` and no counts at all,
-even when other parts completed. Counts are never taken from part of a run.
+**Counts are taken only when every part the reader can see is finished.** Any
+unfinished part, anywhere in the output, gives `countSkip: "truncated"` and no
+counts at all, even when other parts completed. A cut that leaves no
+unfinished part cannot be seen, so counts can still come from part of a run
+(see the known limit below).
 
 **go** (`go-test`). A package result line starts at column 0 with `ok`, `FAIL`
 or `?` and has at least one more field (`ok  \tpkg\t0.1s`, `ok  \tpkg\t(cached)`,
@@ -172,9 +177,14 @@ Several complete blocks are summed (`countSource: "node-summary"`).
   allowed.
 - No footer line at all is `no-summary`.
 
-**Known limit.** A cut that removes whole parts cleanly, for example one that
-drops whole packages from the middle and leaves no partial line, cannot be
-seen in the text and gives counts that are too low. Whether Claude Code cuts a
+**Known limit.** A cut that leaves no unfinished part cannot be seen in the
+text and gives counts that are too low: one that removes whole packages from
+the middle, and one inside a `-v` package at or between test bodies, which
+keeps that package's `=== RUN` lines and results equal in number (for example
+a tail of the output, or a middle cut from one test's log line to a later
+test's). The claim checker compares only a single isolated command, so a
+`| tail` run is never compared; an isolated command is affected only if Claude
+Code cuts its output before the hook runs. Whether Claude Code cuts a
 long output before the hook sees it has not been observed; no live payload was
 read for this feature.
 

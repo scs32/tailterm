@@ -2399,6 +2399,12 @@ func TestToolLedgerEvidenceCountsRow(t *testing.T) {
 			map[string]any{"kinds": []any{"go-test"}, "exitCode": float64(0), "exitSource": "success", "outputSource": "stdout+stderr", "countSkip": "truncated"}},
 		{"go test ./x", "PostToolUse", map[string]any{"tool_response": map[string]any{"stdout": 7}},
 			map[string]any{"kinds": []any{"go-test"}, "exitCode": float64(0), "exitSource": "success", "outputSkip": "unreadable", "countSkip": "unreadable"}},
+		// Interrupted after whole packages printed: they look finished, but
+		// the run was cut short, so nothing is counted (review finding f1).
+		{"go test ./... -v", "PostToolUseFailure", map[string]any{"error": "Exit code 130\n" + countGoV, "is_interrupt": true},
+			map[string]any{"kinds": []any{"go-test"}, "outputSource": "error", "countSkip": "interrupted"}},
+		{"node --test", "PostToolUseFailure", map[string]any{"error": "Exit code 130\n" + countNodeTAP, "is_interrupt": true},
+			map[string]any{"kinds": []any{"node-test"}, "outputSource": "error", "countSkip": "interrupted"}},
 	} {
 		call := evidenceBash(fmt.Sprintf("u%d", i), c.command, "/no/repo")
 		toolHook(t, e, "PreToolUse", call)

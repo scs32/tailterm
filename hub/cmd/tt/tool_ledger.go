@@ -679,7 +679,7 @@ type toolEvidence struct {
 	// reason there are none. Numbers and fixed-list values only.
 	Counts      *toolEvidenceCounts `json:"counts,omitempty"`
 	CountSource string              `json:"countSource,omitempty"` // go-test-v | go-test-packages | node-summary
-	CountSkip   string              `json:"countSkip,omitempty"`   // background | unreadable | timeout | no-summary | truncated | mixed
+	CountSkip   string              `json:"countSkip,omitempty"`   // background | unreadable | timeout | interrupted | no-summary | truncated | mixed
 }
 
 // toolEvidenceCounts are a test run's counts. Every field is written, 0
@@ -899,7 +899,7 @@ func (l toolLedger) evidence(call toolEvidenceCall, p toolHookInput, data []byte
 	default:
 		texts = ev.output(p, data)
 	}
-	ev.count(texts, l.started.Add(l.evidenceBudget))
+	ev.count(texts, p.IsInterrupt, l.started.Add(l.evidenceBudget))
 	switch {
 	case call.moved:
 		ev.CommitSkip = "changed-directory" // cwd's commit may not be the one it ran at
@@ -993,8 +993,10 @@ func (ev *toolEvidence) output(p toolHookInput, data []byte) []string {
 
 // count sets the test counts of a go-test, node-test or npm-test row from
 // its decoded output, or the reason there are none. Any other row gets
-// neither, so it is written exactly as before the counts existed.
-func (ev *toolEvidence) count(texts []string, deadline time.Time) {
+// neither, so it is written exactly as before the counts existed. An
+// interrupted call is never counted: what it printed may look finished (go
+// prints each package whole) while the run itself was cut short.
+func (ev *toolEvidence) count(texts []string, interrupted bool, deadline time.Time) {
 	goTest, node := false, false
 	for _, k := range ev.Kinds {
 		switch k {
@@ -1010,6 +1012,9 @@ func (ev *toolEvidence) count(texts []string, deadline time.Time) {
 	case ev.OutputSkip != "": // background | unreadable | timeout
 		ev.CountSkip = ev.OutputSkip
 		return
+	case interrupted:
+		ev.CountSkip = "interrupted"
+		return
 	}
 	ev.Counts, ev.CountSource, ev.CountSkip = toolEvidenceCount(texts, goTest, node, deadline)
 }
@@ -1023,7 +1028,9 @@ const toolEvidenceCountLines = 4096
 // text is never kept. It returns the counts and their source, or a skip
 // reason: timeout past the deadline, truncated when any part it can see is
 // unfinished, mixed when both a go and a node summary are present,
-// no-summary when there is none. Counts are never taken from part of a run.
+// no-summary when there is none. Counts are not taken from a run with any
+// visible unfinished part; a cut that leaves no unfinished part (whole
+// packages, or whole tests inside a -v package) cannot be seen.
 func toolEvidenceCount(texts []string, goTest, node bool, deadline time.Time) (*toolEvidenceCounts, string, string) {
 	var g toolCountGo
 	var n toolCountNode
