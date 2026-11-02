@@ -117,7 +117,7 @@ export function createWorkItemsView({
     // changes read is waiting behind a read in flight.
     listCursor = null,
     followAgain = false,
-    // A reload that a failed, reset or malformed changes read asked for is
+    // A reload that a reset or malformed changes read asked for is
     // not followed by another changes read: the next one waits for the next
     // relevant notice, so a failing or resetting hub cannot loop.
     fallbackReload = false,
@@ -301,7 +301,8 @@ export function createWorkItemsView({
   // Brings the complete list on screen current with one changes read: an
   // item still matching the status filter replaces its row or is inserted by
   // seq, and one that no longer matches leaves. Without a cursor (an older
-  // hub), on a reset or on a failed read, the whole list is reloaded.
+  // hub), or on a reset or malformed answer, the whole list is reloaded from
+  // the hub; a failed read keeps the list until the next notice.
   async function follow() {
     if (!visible || !root) return;
     if (loading) {
@@ -372,8 +373,9 @@ export function createWorkItemsView({
       else if (itemsChanged) updateList();
       if (itemsChanged && query.trim()) void enrichSearchHistory();
     } catch {
-      if (!visible || token !== generation) return;
-      fallback = true;
+      // A failed read (offline, a hub error) keeps the rows and cursor on
+      // screen: the saved pages may be older than them. The next relevant
+      // notice asks again.
     } finally {
       if (token === generation) {
         loading = false;

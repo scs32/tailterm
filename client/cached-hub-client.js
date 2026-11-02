@@ -861,14 +861,15 @@ export function createCachedHubClient({
       if (follow) followed.add(path);
       return read(path);
     },
-    // An uncached changes-since read. A reset marks every work-items read
+    // An uncached changes-since read. A reset, or an answer that is not a
+    // changes answer (a hub that ignored since), marks every work-items read
     // dirty, so the caller's full reload waits for the network.
     listWorkItemChanges: async (params) => {
       if (disposed) throw new Error("Workspace is locked.");
       const data = await client.request("/v1/work-items" + query(params), {
         timeoutMs: 15000,
       });
-      if (data?.reset) {
+      if (data?.reset || !data?.changes) {
         revision++;
         for (const path of paths)
           if (new URL(path, client.base).pathname === "/v1/work-items") {

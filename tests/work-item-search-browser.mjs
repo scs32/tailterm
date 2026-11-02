@@ -417,31 +417,49 @@ async function cursorCases(browser, engine, kind) {
       `${label}: saved pages reread`,
     );
     assert.equal(after.changes.length, before.changes.length + 1);
-    // A failing changes read falls back to one full reload and no further
-    // changes read until the next relevant notice (review blocker b1).
+    // A failing changes read makes one changes read per notice and keeps
+    // the rows on screen, which may be newer than the saved pages (review
+    // blockers b1 and b2): no reload, no retry until the next notice.
+    const newest = await titles(page);
+    assert.ok(
+      newest.some(([id, title]) => id === "wi_history" && title.includes("Hidden change")),
+      `${label}: the row is newer than its saved page`,
+    );
     await page.evaluate(() => window.qa.failChanges(true));
     for (let notice = 1; notice <= 2; notice++) {
       before = await reads(page);
       await page.evaluate(() => window.qa.event("work_item_updated"));
-      await page.waitForFunction(
-        (pages) => window.qa.reads().pages >= pages,
-        before.pages + perReload,
-      );
+      await changesAfter(page, before.changes.length);
       await page.waitForTimeout(400);
       after = await reads(page);
       assert.equal(
         after.changes.length,
         before.changes.length + 1,
-        `${label}: notice ${notice} after a failed changes read: one changes read`,
+        `${label}: notice ${notice} with a failing changes read: one changes read`,
       );
       assert.equal(
         after.pages,
-        before.pages + perReload,
-        `${label}: notice ${notice} after a failed changes read: one reload`,
+        before.pages,
+        `${label}: notice ${notice} with a failing changes read: no reload`,
+      );
+      assert.deepEqual(
+        await titles(page),
+        newest,
+        `${label}: notice ${notice} with a failing changes read: rows kept`,
       );
     }
+    // Recovery: the next notice reads changes once and the rows keep their
+    // newest content.
+    before = await reads(page);
     await page.evaluate(() => {
       window.qa.failChanges(false);
+      window.qa.event("work_item_updated");
+    });
+    await changesAfter(page, before.changes.length);
+    await page.waitForTimeout(200);
+    assert.deepEqual(await titles(page), newest, `${label}: recovered rows`);
+    assert.equal((await reads(page)).pages, before.pages, `${label}: recovery needs no page`);
+    await page.evaluate(() => {
       window.qa.change("wi_current", { title: "Recovered alpha" });
       window.qa.event("work_item_updated");
     });

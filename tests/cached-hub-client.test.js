@@ -1685,7 +1685,7 @@ test("a followed page with a cursor is left to its caller; one without is refres
   }
 });
 
-test("a changes read that resets makes the next work-items read wait for the hub", async () => {
+test("a changes read that resets, or is not a changes answer, makes the next work-items read wait for the hub", async () => {
   let page = {
     items: [{ id: "wi_1", title: "Before" }],
     next: 0,
@@ -1722,6 +1722,20 @@ test("a changes read that resets makes the next work-items read wait for the hub
     assert.equal(reloaded.items[0].title, "After");
     assert.deepEqual(f.since(before), [
       "/v1/work-items?kind=bug&since=1.0",
+      "/v1/work-items?kind=bug",
+    ]);
+    // A hub that ignores since answers with a page, not changes: the same.
+    changes = { items: [{ id: "wi_1", title: "Ignored since" }], next: 0 };
+    page = { items: [{ id: "wi_1", title: "Newest" }], next: 0 };
+    before = f.requests.length;
+    await view.listWorkItemChanges({ kind: "bug", since: "9.0" });
+    const refetched = await view.listWorkItems(
+      { kind: "bug" },
+      { followed: true },
+    );
+    assert.equal(refetched.items[0].title, "Newest");
+    assert.deepEqual(f.since(before), [
+      "/v1/work-items?kind=bug&since=9.0",
       "/v1/work-items?kind=bug",
     ]);
   } finally {
