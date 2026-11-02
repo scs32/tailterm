@@ -1,13 +1,13 @@
 # Warm-first tab switch timing on a loaded and a quiet host, 2026-11-01
 
-Bug `wi_d69dee767211ca54` revision 1, work order #54502, builder ASSIGN #54662 from lead-7211ca54. Measurement only: no product or test code changed. Measured on Stephens-Mini at tasks-hub `ab429d9d7dae02c618950afbefd0a02ae59e1a2c` (pinned by lead NOTICE #54705; it contains the launch base `7afd864d` and the landed wi_0b8f candidate `1c1680f6`). `git diff 7afd864d..ab429d9d` touches neither `tests/tab-switch-browser.mjs` nor `client/main.js`.
+Bug `wi_d69dee767211ca54` revision 1, work order #54502, builder ASSIGN #54662 from lead-7211ca54. Measurement only: no product or test code changed. Measured on Stephens-Mini at tasks-hub `ab429d9d7dae02c618950afbefd0a02ae59e1a2c` (pinned by lead NOTICE #54705; it contains the launch base `7afd864d` and `26456e6c`, the landed form of the accepted wi_0b8f candidate `1c1680f6`; `1c1680f6` itself is not an ancestor of `ab429d9d`, but `tests/tab-switch-browser.mjs`, `tests/static-browser.mjs`, `client/main.js`, `client/board-view.js` and `client/work-items-view.js` are identical between the two). `git diff 7afd864d..ab429d9d` touches neither `tests/tab-switch-browser.mjs` nor `client/main.js`.
 
 Everything ran on isolated synthetic state: fresh Playwright browsers and contexts, the test's own in-page synthetic hub transport and a Vite server on 127.0.0.1. No live hub, profile, task data, relay or tmux pane was touched, and no synthetic load was added.
 
 ## Verdict
 
 - **No miss on either host.** Set A (normal hold, the host's real load) and set B (exclusive hold, quiet host) each produced 40 valid engine rows, 20 runs per engine. None of the 640 warm-first samples was over 200 ms. The slowest were 129 ms (set A, Chromium, Tasks) and 103 ms (set B, Chromium Tasks and WebKit Board). The parent failure's 305 ms Features sample is about 4x the slowest Features sample here (77 ms).
-- **Host load versus the switch itself is not decided at the loads observed.** Set A's real load was close to set B's quiet host: 1-minute load 2.59-5.9 (median 3.65) against 1.63-3.72 (median 2.79), with 15-22% free memory in both. At those loads the switch never missed in either engine (max 129 ms in set A, 103 ms in set B). Set A's tail is slightly longer (10 samples over 100 ms against 2), but that does not reach a miss. The recorded misses came from other runs: a full matrix (`tests/static-browser.mjs`, #52783) and builder and reviewer runs (#52573, #52226). Their host load is not in the log lines read for this report, so whether a heavier load causes the misses stays open.
+- **Host load versus the switch itself is not decided at the loads observed.** Set A's real load was close to set B's quiet host: 1-minute load 2.59-5.9 (median 3.65) against 1.63-3.72 (median 2.79), with 15-22% free memory in both. At those loads the switch never missed in either engine (max 129 ms in set A, 103 ms in set B); set A's tail is slightly longer (10 samples over 100 ms against 2). The parent miss came under a heavier load. Its matrix hold (`tailterm-artifacts/wi_0b8f0005264a8360/matrix-1c1680f-logs/host-lock.json`, seq 2035, verifier-264a8360) sampled a 1-minute load of 12.73, 12.65, 10.62, 9.53 and 10.69 at 11:21-11:25Z on 10-31, the five minutes before the failing attempt-1 log was written (11:25:33Z), after a peak of 33.94 at 11:17Z. During the passing retry (attempt-2 log written 11:30:09Z) it was 8.22, 7.25, 7.74, 7.59 and 7.8 (11:26-11:30Z). So the miss came at about 1.6-2.2x set A's highest load, the retry passed at about 7.5, and no set here reached either load. That fits load-driven outliers but does not prove them.
 - **The check has no margin for one outlier.** Each tab's "median" is a single switch (`tests/tab-switch-browser.mjs:696-699`, `:740-746`), so one slow switch fails the whole test, while the per-tab medians measured here are 2-90 ms.
 - **The root emptying paints the loading shell on every warm switch of a shell tab.** `client/main.js:906` (line 878 at `1c1680f6`) empties the view on every switch. In every one of the 80 rows, 5 of the 8 warm-first switches showed the shell before data (100/160 per engine per set): Bugs, Board, Projects, Features and Queue, the tabs that have a shell. The parent log shows 109/160 across the whole test. Painting the shell is not enough by itself to cause a miss: the data time is measured from the click to the data, and it stayed under 130 ms on every shell-tab switch, each of which painted the shell.
 - **Proposed fix (separate build item, not filed here; lead routes it):** take several warm-first samples per tab and hold the median to 200 ms (see "Proposed fix").
@@ -90,7 +90,7 @@ Both holds ended with no harness, runner or browser process left and the host lo
 | queue | webkit | 19 | 47 | 23 | 39 |
 | terminals | webkit | 3 | 5 | 3 | 4 |
 
-Medians use the test's own rule (`tests/tab-switch-browser.mjs:626-629`: the upper middle of the sorted values). Samples over 100 ms: set A 10 of 320, set B 2 of 320. Over 150 ms: none in either set.
+Medians use the test's own rule (`tests/tab-switch-browser.mjs:626-629`: the upper middle of the sorted values). The p90 columns below take the sorted value at index floor(0.9n), the 19th of 20. Samples over 100 ms: set A 10 of 320, set B 2 of 320. Over 150 ms: none in either set.
 
 ## Every sample
 
@@ -289,7 +289,7 @@ A product change, keeping the view's root on warm switches so the shell does not
 
 ## Limits
 
-- Set A ran in a quiet hour, so the "real load" condition was light (1-minute load 2.59-5.9), close to set B. No load like the one under which the misses were seen was reproduced, and none was added artificially, by design (w1). That load was not recorded.
+- Set A started as the host came down from a busier spell: `setA/host-before.txt` reads load averages 6.16 10.07 6.62 (1, 5 and 15 minutes) at 05:01Z. Its rows then ran at a 1-minute load of 2.59-5.9, close to set B. Neither set reached the 9.5-12.7 recorded before the parent miss, or the 7.25-8.22 of its passing retry (see Verdict). No load was added artificially, by design (w1).
 - The harness runs only the cold pass, the reload and the warm-first switches of the test. The repeat and revisit cases that follow warm-first in the test, and their effect on later timing, were not run.
 - `wasm/tailserve.wasm` came from an Oct 19 build in the main checkout, not from the `ab429d9d` sources. The fixture needs the file to resolve and, by lead's reading of `client/local-vault.js`, never runs it.
 - 20 runs per engine per set show no miss in 160 tab switches per engine per set. They do not give a miss rate for a loaded host.
