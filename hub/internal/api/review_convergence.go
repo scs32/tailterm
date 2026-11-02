@@ -3,9 +3,11 @@ package api
 // ReviewMetadata is an explicit transition attached to a typed Board message.
 // General reviews use REVIEW/RESULT; focused verification uses REQUEST/RESULT;
 // the lead records a disposition on a NOTICE. Unstructured history is unknown.
-// On a focused check, CriterionIDs names round-two partial criteria that the
-// passing receipt settles, and TreeDiffers marks a lead-named fix: no blocker
-// ID and a tree that is not identical to the reviewed candidate.
+// On a focused check, CriterionIDs names the criteria that the passing receipt
+// settles: round-two partial criteria or, on a scope amended after round two,
+// the changed criteria round two did not judge in their current wording and
+// designation. TreeDiffers marks a lead-named fix: no blocker ID and a tree
+// that is not identical to the reviewed candidate.
 type ReviewMetadata struct {
 	LegacyReviewers    []LegacyReviewerBinding `json:"legacyReviewers,omitempty"`
 	LegacyRequests     []int64                 `json:"legacyRequests,omitempty"`

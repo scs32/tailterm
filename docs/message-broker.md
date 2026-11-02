@@ -697,7 +697,8 @@ the full matrix had not yet run, is settled by naming it in `criterionIds`:
 ```
 
 Each ID must be a distinct frozen criterion that is not verification-owned, is
-`partial` in round two, has no unresolved blocker or finding, and is not also a
+`partial` in round two (or, on a scope amended after round two, is a changed
+criterion, as below), has no unresolved blocker or finding, and is not also a
 named blocker ID. `criterionIds` may stand alone on the round-two candidate, or
 ride on a request that names `blockerIds`, an equivalence or `treeDiffers`, so
 a partial plus a rebase or fix is one request. It may also stand alone on a
@@ -711,7 +712,18 @@ and the `equivalence` or `delta` key. The round's own verdict stays `partial`;
 the focused record is the settlement and stores the `receiptGeneration` that
 settled it. A held criterion part added after round two uses the same request:
 `treeDiffers` for the commit that adds it, plus its ID in `criterionIds` when
-round two left it `partial`.
+round two left it `partial`. On a scope amended after round two, `criterionIds`
+may also name the changed criteria, the reviewer-judged ones round two did not
+judge in their current wording and designation (added, reworded, or
+re-designated from verification-owned), and a focused request must name every
+one of them. The conditions are those of
+[A scope amended after round two](two-review-round-policy.md#a-scope-amended-after-round-two):
+no criterion was removed; on a candidate other than the round-two one the
+request is a `treeDiffers` or rebase request with no `blockerIds`, whose
+`delta: pass` or equivalence also attests that the change since the reviewed
+candidate touches only tests and documentation; and the exact receipt rule
+below applies unchanged. A removed criterion, a `delta: fail` or a behaviour
+change keeps the owner route.
 
 Exact receipt rule for both routes: a request with `criterionIds`, a RESULT that
 passes them, and any accept that relies on a passed `treeDiffers` or
