@@ -164,7 +164,11 @@ const hostQueueListed = 3
 // every host wait of the project. Ahead of the wait are the project's host
 // waits set before it and every live lock run on the waiting team's hosts
 // that is not the waiting item's own: the waiting team has not joined the
-// lock, as it waits for the handler's admission first.
+// lock, as it waits for the handler's admission first. A release run counts
+// the same way: the deployer has no relay binding, so its tt saves its own
+// place in the lock as its matrixWait on each runner poll (tt deployment
+// progress, cmd/tt/matrix_wait_activity.go reportDeployerMatrixWait), and its
+// departure is seen within one poll (wi_1aef3492e5f2161a).
 type hostQueue struct {
 	setAt   time.Time
 	earlier []hostQueueWait // open host waits of the project set before this one
@@ -179,8 +183,8 @@ type hostQueueWait struct {
 }
 
 type hostQueueRun struct {
-	agent, name, status string
-	activity            *api.AgentActivity
+	agent, name, status, role string
+	activity                  *api.AgentActivity
 }
 
 // hostPlace is a host wait's place in its queue at one time.
@@ -262,11 +266,21 @@ func (p hostPlace) aheadText() string {
 			break
 		}
 		w := r.activity.MatrixWait
+		since := w.Since.UTC().Format(time.RFC3339)
+		if r.role == api.AgentRoleDeployment {
+			// A release run: the deployer's own matrix run for a job's item.
+			run := "the release run, agent " + r.name
+			if w.Item != "" {
+				run = fmt.Sprintf("the release run for item %s (agent %s)", w.Item, r.name)
+			}
+			parts = append(parts, run+", holding since "+since)
+			continue
+		}
 		run := "the host holder, agent " + r.name
 		if w.Item != "" {
 			run = fmt.Sprintf("the host holder %s (agent %s)", w.Item, r.name)
 		}
-		parts = append(parts, run+", running since "+w.Since.UTC().Format(time.RFC3339))
+		parts = append(parts, run+", running since "+since)
 	}
 	if p.waiters > 0 {
 		parts = append(parts, fmt.Sprintf("%d run(s) waiting in the host's matrix lock", p.waiters))
@@ -348,7 +362,7 @@ func readHostQueue(ctx context.Context, q queryRower, task, entry, item, setAt s
 	// wait ended after this wait was set.
 	in := strings.TrimSuffix(strings.Repeat("?,", len(hosts)), ",")
 	args := append(hosts, task, item, api.AgentClosed, api.AgentExited, floor)
-	rows, err = q.QueryContext(ctx, `SELECT a.id,a.name,a.status,t.status,COALESCE(x.payload,''),COALESCE(p.wait_ended_at,'') FROM agents a JOIN tasks t ON t.id=a.task_id
+	rows, err = q.QueryContext(ctx, `SELECT a.id,a.name,a.status,a.role,t.status,COALESCE(x.payload,''),COALESCE(p.wait_ended_at,'') FROM agents a JOIN tasks t ON t.id=a.task_id
  LEFT JOIN agent_activity x ON x.agent_id=a.id AND x.run_id=a.run_id
  LEFT JOIN stall_watch_progress p ON p.agent_id=a.id AND p.run_id=a.run_id
  WHERE a.host IN (`+in+`) AND NOT EXISTS(SELECT 1 FROM agent_work_item_bindings b WHERE b.agent_id=a.id AND b.run_id=a.run_id AND b.item_task_id=? AND b.item_id=?)
@@ -359,7 +373,7 @@ func readHostQueue(ctx context.Context, q queryRower, task, entry, item, setAt s
 	for rows.Next() {
 		var r hostQueueRun
 		var project, payload, ended string
-		if err := rows.Scan(&r.agent, &r.name, &r.status, &project, &payload, &ended); err != nil {
+		if err := rows.Scan(&r.agent, &r.name, &r.status, &r.role, &project, &payload, &ended); err != nil {
 			rows.Close()
 			return out, err
 		}

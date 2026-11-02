@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
+	"github.com/scs32/tailterm/hub/internal/server"
+	"github.com/scs32/tailterm/hub/internal/store"
 )
 
 // No test in this package reads the host's live matrix lock: without an
@@ -838,5 +840,240 @@ func TestMatrixLockDefaultAccountHome(t *testing.T) {
 	// The native account home comes from the user database, not HOME.
 	if home, err := nativeMatrixAccountHome(); err != nil || !filepath.IsAbs(home) || sameMatrixHome(home, private) {
 		t.Fatalf("native account home %q %v under HOME %s", home, err, private)
+	}
+}
+
+// wi_1aef3492e5f2161a h4: the deployer has no relay binding, so tt deployment
+// progress saves its own place in the host's matrix lock. Against a real
+// store-backed hub, a runner poll while the release run holds the host leaves
+// the deployer's saved activity carrying that run's matrix wait, a poll
+// after the run left ends it, and polls that change nothing send nothing.
+func TestMatrixWaitDeployerProgressSavesActivity(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "hub.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	var activityPosts int
+	handler := server.New(st, func(r *http.Request) (api.Caller, error) { return api.Caller{Node: "fixture", User: "owner"}, nil })
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/activity") {
+			activityPosts++
+		}
+		handler.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	c, err := api.NewClient(srv.URL, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	task, err := c.CreateTask(ctx, api.CreateTaskRequest{Name: "isolated deployer matrix wait test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deployer, err := c.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "deployer", AgentID: api.NewID("agt"), Role: api.AgentRoleDeployment, Host: "Test-Mini", Session: "deployer-fixture", Runtime: "generic"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = c.PostEvent(ctx, task.ID, api.PostEventRequest{AgentID: deployer.ID, RunID: deployer.RunID, Kind: api.EventStarted}); err != nil {
+		t.Fatal(err)
+	}
+	e := env{hub: srv.URL, task: task.ID, agent: deployer.ID, runID: deployer.RunID}
+	progress := func() {
+		t.Helper()
+		out, err := captureCLIOutput(t, func() error {
+			return cmdDeployment(e, []string{"progress", "--phase", "merged", "--job", "rel_d7cb5772f5301810", "--wait", "matrix", "--pid", "69918"})
+		})
+		if err != nil || !strings.Contains(out, `"phase": "merged"`) {
+			t.Fatalf("progress: %v %s", err, out)
+		}
+	}
+	saved := func() *api.MatrixWait {
+		t.Helper()
+		a, err := c.GetAgent(ctx, task.ID, deployer.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if a.Activity == nil {
+			return nil
+		}
+		return a.Activity.MatrixWait
+	}
+
+	// The host lock as on 2026-11-02: the release run for wi_06f3 holds it
+	// under the deployer's name, with no item binding on the deployer.
+	release, started := "wi_06f39b93792cba61", "2026-11-02T00:04:05.633Z"
+	since := time.Date(2026, 11, 2, 0, 4, 5, 633000000, time.UTC)
+	write := matrixLockFixture(t, 69918)
+	// Before the fix no relay read this; with no lock entry the poll still
+	// saves nothing.
+	write(matrixLockJSON("test-mini", ""))
+	progress()
+	if w := saved(); w != nil || activityPosts != 0 {
+		t.Fatalf("no run, no activity: %+v, %d posts", w, activityPosts)
+	}
+	write(matrixLockJSON("test-mini", matrixEntry("69918", release, "deployer", started)))
+	progress()
+	if w := saved(); w == nil || *w != (api.MatrixWait{Role: api.MatrixWaitRunning, Item: release, Since: since}) || activityPosts != 1 {
+		t.Fatalf("holding: %+v, %d posts", w, activityPosts)
+	}
+	progress()
+	if activityPosts != 1 {
+		t.Fatalf("a poll that changed nothing reported: %d posts", activityPosts)
+	}
+	// An unknown read (the file is not JSON) ends nothing and sends nothing.
+	write("{broken")
+	progress()
+	if w := saved(); w == nil || activityPosts != 1 {
+		t.Fatalf("unknown read: %+v, %d posts", w, activityPosts)
+	}
+	// The run left the lock: the next poll ends the wait.
+	write(matrixLockJSON("test-mini", ""))
+	progress()
+	if w := saved(); w != nil || activityPosts != 2 {
+		t.Fatalf("after the run left: %+v, %d posts", w, activityPosts)
+	}
+	progress()
+	if activityPosts != 2 {
+		t.Fatalf("a poll after the end reported again: %d posts", activityPosts)
+	}
+	// A withdraw is not a poll: it reads no lock and reports nothing.
+	write(matrixLockJSON("test-mini", matrixEntry("69918", release, "deployer", started)))
+	if _, err := captureCLIOutput(t, func() error { return cmdDeployment(e, []string{"progress", "--withdraw"}) }); err != nil || activityPosts != 2 {
+		t.Fatalf("withdraw: %v, %d posts", err, activityPosts)
+	}
+}
+
+// wi_1aef3492e5f2161a h4 (report shape): deployerMatrixWaitReport is due only
+// when the deployer's lock place differs from the one the hub holds.
+func TestMatrixWaitDeployerReport(t *testing.T) {
+	now := time.Date(2026, 11, 2, 0, 10, 0, 0, time.UTC)
+	release, started := "wi_06f39b93792cba61", "2026-11-02T00:04:05.633Z"
+	since := time.Date(2026, 11, 2, 0, 4, 5, 633000000, time.UTC)
+	running := &api.MatrixWait{Role: api.MatrixWaitRunning, Item: release, Since: since}
+	deployer := api.Agent{ID: "agt_11ee78b6de77e2da", RunID: "run_0123456789abcdef", Name: "deployer", Role: api.AgentRoleDeployment}
+	holding := deployer
+	holding.Activity = &api.AgentActivity{State: "working", ObservedAt: now, MatrixWait: running}
+	ended := deployer
+	ended.Activity = &api.AgentActivity{State: "working", ObservedAt: now}
+	write := matrixLockFixture(t, 69918)
+
+	write(matrixLockJSON("test-mini", matrixEntry("69918", release, "deployer", started)))
+	r := deployerMatrixWaitReport(deployer, now)
+	if r == nil || r.RunID != deployer.RunID || r.Activity.State != "working" || !r.Activity.ObservedAt.Equal(now) || r.Activity.MatrixWait == nil || *r.Activity.MatrixWait != *running || !strings.HasPrefix(r.RequestID, "activity-deployer-") {
+		t.Fatalf("holder: %+v", r)
+	}
+	if again := deployerMatrixWaitReport(deployer, now.Add(time.Second)); again == nil || again.RequestID == r.RequestID {
+		t.Fatalf("a later due report reuses a request id: %+v", again)
+	}
+	if r := deployerMatrixWaitReport(holding, now); r != nil {
+		t.Fatalf("the held wait was reported again: %+v", r)
+	}
+	write(matrixLockV2JSON("test-mini", []string{matrixEntry("11", "wi_fedcba9876543210", "lead-b", started)}, matrixEntry("69918", release, "deployer", started)))
+	if r := deployerMatrixWaitReport(holding, now); r == nil || r.Activity.MatrixWait == nil || r.Activity.MatrixWait.Role != api.MatrixWaitWaiting {
+		t.Fatalf("holder back in the waitlist: %+v", r)
+	}
+	// The entry gone from a confirmed read ends the wait.
+	write(matrixLockJSON("test-mini", ""))
+	if r := deployerMatrixWaitReport(holding, now); r == nil || r.Activity.MatrixWait != nil {
+		t.Fatalf("entry gone: %+v", r)
+	}
+	if r := deployerMatrixWaitReport(ended, now); r != nil {
+		t.Fatalf("an ended wait was ended again: %+v", r)
+	}
+	if r := deployerMatrixWaitReport(deployer, now); r != nil {
+		t.Fatalf("no activity and no wait started a row: %+v", r)
+	}
+	// An unknown read repeats the held wait, so nothing is due.
+	write("{broken")
+	if r := deployerMatrixWaitReport(holding, now); r != nil {
+		t.Fatalf("unknown read: %+v", r)
+	}
+	// A dead release run is not the deployer's.
+	write(matrixLockJSON("test-mini", matrixEntry("70000", release, "deployer", started)))
+	if r := deployerMatrixWaitReport(holding, now); r == nil || r.Activity.MatrixWait != nil {
+		t.Fatalf("dead run: %+v", r)
+	}
+}
+
+// wi_1aef3492e5f2161a r3, r6: the deployer's report never fails or slows
+// tt deployment progress past its bound, whatever the hub does, and only the
+// exact deployment agent run reports.
+func TestMatrixWaitDeploymentProgressReportBounded(t *testing.T) {
+	task := "tsk_0123456789abcdef"
+	deployer := api.Agent{ID: "agt_11ee78b6de77e2da", RunID: "run_0123456789abcdef", TaskID: task, Name: "deployer", Role: api.AgentRoleDeployment, Status: "running"}
+	stored := api.ReleaseProgress{AgentID: deployer.ID, RunID: deployer.RunID, ReportedAt: "2026-11-02T00:10:00Z", Phase: "merged"}
+	write := matrixLockFixture(t, 69918)
+	write(matrixLockJSON("test-mini", matrixEntry("69918", "wi_06f39b93792cba61", "deployer", "2026-11-02T00:04:05.633Z")))
+	for name, c := range map[string]struct {
+		agent     func(api.Agent) api.Agent
+		activity  func(w http.ResponseWriter, r *http.Request)
+		reports   int
+		stderrHas string
+	}{
+		"saved": {agent: func(a api.Agent) api.Agent { return a }, reports: 1},
+		"hub error": {agent: func(a api.Agent) api.Agent { return a }, reports: 1, stderrHas: "matrix wait not saved",
+			activity: func(w http.ResponseWriter, r *http.Request) {
+				http.Error(w, `{"error":"boom"}`, http.StatusInternalServerError)
+			}},
+		"hung hub": {agent: func(a api.Agent) api.Agent { return a }, reports: 1, stderrHas: "matrix wait not saved",
+			activity: func(w http.ResponseWriter, r *http.Request) { <-r.Context().Done() }},
+		"another role":    {agent: func(a api.Agent) api.Agent { a.Role = ""; return a }},
+		"a restarted run": {agent: func(a api.Agent) api.Agent { a.RunID = "run_fedcba9876543210"; return a }},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var reports []api.ActivityReport
+			hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/releases/actions"):
+					_ = json.NewEncoder(w).Encode(stored)
+				case r.Method == "GET" && r.URL.Path == "/v1/tasks/"+task+"/agents/"+deployer.ID:
+					_ = json.NewEncoder(w).Encode(c.agent(deployer))
+				case r.Method == "POST" && r.URL.Path == "/v1/tasks/"+task+"/agents/"+deployer.ID+"/activity":
+					var report api.ActivityReport
+					_ = json.NewDecoder(r.Body).Decode(&report)
+					reports = append(reports, report)
+					if c.activity != nil {
+						c.activity(w, r)
+						return
+					}
+					_ = json.NewEncoder(w).Encode(report.Activity)
+				default:
+					t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+				}
+			}))
+			defer hub.Close()
+			e := env{hub: hub.URL, task: task, agent: deployer.ID, runID: deployer.RunID}
+			stderr := filepath.Join(t.TempDir(), "stderr")
+			f, err := os.Create(stderr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			old := os.Stderr
+			os.Stderr = f
+			start := time.Now()
+			out, err := captureCLIOutput(t, func() error { return cmdDeployment(e, []string{"progress", "--phase", "merged"}) })
+			took := time.Since(start)
+			os.Stderr = old
+			f.Close()
+			if err != nil || !strings.Contains(out, `"phase": "merged"`) {
+				t.Fatalf("progress failed or changed its output: %v %s", err, out)
+			}
+			if took > deployerMatrixWaitBound+2*time.Second {
+				t.Fatalf("progress took %v", took)
+			}
+			if len(reports) != c.reports {
+				t.Fatalf("%d activity reports, want %d", len(reports), c.reports)
+			}
+			if c.reports > 0 && (reports[0].RunID != deployer.RunID || reports[0].Activity.MatrixWait == nil || reports[0].Activity.MatrixWait.Item != "wi_06f39b93792cba61") {
+				t.Fatalf("report %+v", reports[0])
+			}
+			raw, _ := os.ReadFile(stderr)
+			if c.stderrHas == "" && len(raw) != 0 || c.stderrHas != "" && (!strings.Contains(string(raw), c.stderrHas) || strings.Count(string(raw), "\n") != 1) {
+				t.Fatalf("stderr %q", raw)
+			}
+		})
 	}
 }

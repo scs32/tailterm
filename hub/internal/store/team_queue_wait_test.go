@@ -2629,6 +2629,92 @@ func TestQueueWaitHostQueueBoundRestartsOnEachMove(t *testing.T) {
 	}
 }
 
+// wi_1aef3492e5f2161a h2, h3: a release run holding the host is ahead of a
+// host wait for as long as it holds it, and the wait's ahead text names it as
+// the release run with its item and agent. The deployer has no relay binding:
+// it saves its own place in the lock on each runner poll (tt deployment
+// progress), as a working report. When the run leaves the lock, the wait's
+// last move up is that departure and the gate report is due the bound after
+// it, never before.
+func TestQueueWaitHostQueueReleaseRunHolds(t *testing.T) {
+	f := newWaitFixture(t)
+	f.team(t)
+	helper := f.helper(t)
+	deployer := f.hostRun(t, "deployer", "mini")
+	f.exec(t, `UPDATE agents SET role=? WHERE id=?`, api.AgentRoleDeployment, deployer.ID)
+	report := func(w *api.MatrixWait) {
+		t.Helper()
+		activity := api.AgentActivity{State: "working", ObservedAt: f.clock, MatrixWait: w}
+		if _, err := f.s.ReportActivity(f.ctx, f.task.ID, deployer.ID, api.ActivityReport{RequestID: api.NewID("req"), RunID: deployer.RunID, Activity: activity}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The release run for another item took the host before the wait was set.
+	release := "wi_06f39b93792cba61"
+	held := f.clock
+	report(holderWait(release, held))
+	f.clock = f.clock.Add(5 * time.Second)
+	setAt := f.clock
+	f.setOn(t, api.TeamQueueWaitHostKey, "", "")
+	place := func() hostPlace {
+		t.Helper()
+		hq, err := readHostQueue(f.ctx, f.s.db, f.task.ID, f.waiting.ID, f.items[1].ID, ts(setAt))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return hq.at(f.clock)
+	}
+	want := "the release run for item " + release + " (agent deployer), holding since " + held.UTC().Format(time.RFC3339)
+	for _, after := range []time.Duration{59, 60, 61, 120} {
+		f.clock = setAt.Add(after * time.Minute)
+		p := place()
+		if !p.queued() || p.position != 2 || len(p.holders) != 1 || p.holders[0].role != api.AgentRoleDeployment || !p.movedAt.Equal(setAt) {
+			t.Fatalf("%v minutes in: %+v", after, p)
+		}
+		if got := p.aheadText(); got != want {
+			t.Fatalf("%v minutes in, ahead text %q, want %q", after, got, want)
+		}
+		if steps := f.hostSweep(t); len(steps) != 0 || len(f.hostReported(t, helper)) != 0 {
+			t.Fatalf("queued behind the release run %v minutes in: %v", after, steps)
+		}
+	}
+	// A release run the lock names no item for is still named by its agent.
+	if text := (hostPlace{holders: []hostQueueRun{{name: "deployer", role: api.AgentRoleDeployment, activity: &api.AgentActivity{MatrixWait: holderWait("", held)}}}}).aheadText(); text != "the release run, agent deployer, holding since "+held.UTC().Format(time.RFC3339) {
+		t.Fatalf("itemless release run: %q", text)
+	}
+
+	// The run leaves the lock; the deployer's next poll ends its wait.
+	f.clock = setAt.Add(130 * time.Minute)
+	departed := f.clock
+	report(nil)
+	if p := place(); p.queued() || p.position != 1 || !p.movedAt.Equal(departed) || !p.due.Equal(departed.Add(queueWaitHostBound)) {
+		t.Fatalf("after the release run left: %+v", p)
+	}
+	// A later poll with no wait sends nothing new and moves nothing.
+	f.clock = departed.Add(30 * time.Second)
+	report(nil)
+	if p := place(); !p.movedAt.Equal(departed) {
+		t.Fatalf("a repeat report moved the wait: %+v", p)
+	}
+	f.clock = departed.Add(queueWaitHostBound - time.Minute)
+	if steps := f.hostSweep(t); len(steps) != 0 || len(f.hostReported(t, helper)) != 0 {
+		t.Fatalf("a minute before the bound after the departure: %v", steps)
+	}
+	f.clock = departed.Add(queueWaitHostBound)
+	if steps := f.hostSweep(t); len(steps) != 1 || steps[0] != "wait-overdue" {
+		t.Fatalf("at the bound after the departure: %v", steps)
+	}
+	for _, to := range []api.Agent{helper, f.handler} {
+		got := f.hostReported(t, to)
+		if len(got) != 1 {
+			t.Fatalf("%d reports to %s", len(got), to.Name)
+		}
+		if text := got[0].Envelope.Body.Text; !strings.Contains(text, "last moved up the host queue at "+ts(departed)) || got[0].Envelope.Refs["movedAt"] != ts(departed) {
+			t.Fatalf("report to %s: %s %v", to.Name, text, got[0].Envelope.Refs)
+		}
+	}
+}
+
 // wi_ec424e58eb611c2b h2 (wait sweep side): a host wait past its bound while
 // host work is still ahead of it posts and writes nothing.
 func TestQueueWaitHostQueuedSendsNoGateReport(t *testing.T) {

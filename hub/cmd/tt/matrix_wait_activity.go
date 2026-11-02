@@ -1,12 +1,16 @@
 package main
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -249,4 +253,62 @@ func matrixWaitKey(w *api.MatrixWait) string {
 		key += "\x00agentless"
 	}
 	return key
+}
+
+// deployerMatrixWaitBound caps the deployer's own matrix-wait report inside
+// tt deployment progress, well within the runner's 10-second call timeout
+// (scripts/release-runner.mjs, progress), so the report never fails or slows
+// the progress call (wi_1aef3492e5f2161a).
+const deployerMatrixWaitBound = 3 * time.Second
+
+// deployerMatrixWaitReport is the activity report that saves the deployer's
+// own place in this host's matrix lock, or nil when none is due. The deployer
+// is a generic runtime with no relay binding, so no relay reads its lock
+// place (relayActivityTick); without this report a release run holding the
+// host was never ahead of a team's host wait, and its departure never moved
+// the wait (wi_1aef3492e5f2161a h1). The report is due when the wait differs
+// from the one the hub holds (matrixWaitKey). An unknown lock read gives the
+// held wait (matrixWaitFor), so it is never due; with no saved activity and
+// no wait there is no row to start. The state is "working", which posts no
+// activity alert.
+func deployerMatrixWaitReport(a api.Agent, now time.Time) *api.ActivityReport {
+	w := matrixWaitFor(a, now)
+	var held *api.MatrixWait
+	if a.Activity != nil {
+		held = a.Activity.MatrixWait
+	}
+	if matrixWaitKey(w) == matrixWaitKey(held) || (a.Activity == nil && w == nil) {
+		return nil
+	}
+	key := matrixWaitKey(w)
+	sum := sha256.Sum256([]byte(a.ID + "\x00" + a.RunID + "\x00" + key + "\x00" + strconv.FormatInt(now.UnixNano(), 10)))
+	return &api.ActivityReport{
+		RequestID: "activity-deployer-" + hex.EncodeToString(sum[:12]),
+		RunID:     a.RunID,
+		Activity:  api.AgentActivity{State: "working", ObservedAt: now.UTC(), MatrixWait: w},
+	}
+}
+
+// reportDeployerMatrixWait saves the calling deployer's own matrix wait, as a
+// relay saves a bound agent's: one lock read, then one agent read and at most
+// one activity report. An unknown lock read makes no hub call. Only the exact
+// deployment agent run reports: another role, or a run that is not the
+// agent's current one (a restarted deployer), sends nothing.
+func reportDeployerMatrixWait(ctx context.Context, c *api.Client, task, agent, runID string, now time.Time) error {
+	if task == "" || agent == "" || runID == "" || readMatrixLock() == nil {
+		return nil
+	}
+	a, err := c.GetAgent(ctx, task, agent)
+	if err != nil {
+		return err
+	}
+	if a.Role != api.AgentRoleDeployment || a.RunID != runID || a.Status == api.AgentClosed || a.Status == api.AgentExited {
+		return nil
+	}
+	report := deployerMatrixWaitReport(a, now)
+	if report == nil {
+		return nil
+	}
+	_, err = c.ReportActivity(ctx, task, a.ID, *report)
+	return err
 }

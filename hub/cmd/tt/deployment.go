@@ -222,6 +222,18 @@ func cmdDeployment(e env, args []string) error {
 		if err == nil {
 			printJSON(out)
 		}
+		if err == nil && req.Progress != nil {
+			// A runner poll also saves the deployer's own place in the
+			// host's matrix lock, which no relay reads for it, so a release
+			// run counts as ahead of a team's host wait (wi_1aef3492e5f2161a).
+			// It is bounded and never changes this command's output or exit
+			// status.
+			waitCtx, stop := context.WithTimeout(ctx, deployerMatrixWaitBound)
+			if waitErr := reportDeployerMatrixWait(waitCtx, c, e.task, e.agent, e.runID, time.Now().UTC()); waitErr != nil {
+				fmt.Fprintln(os.Stderr, "tt deployment progress: matrix wait not saved:", waitErr)
+			}
+			stop()
+		}
 		return err
 	}
 	if *key == "" || e.agent == "" || e.runID == "" {
