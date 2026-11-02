@@ -1017,27 +1017,37 @@ func (s *Store) explainTeamQueue(ctx context.Context, task string, out *api.Team
 }
 
 // queueAdmissionHold is the open wait that holds a queued entry out of
-// admission.
-type queueAdmissionHold struct{ onKind, onEntry, onItem, until string }
+// admission. orphaned marks a gated wait whose predecessor can no longer
+// meet the condition: only the handler's clear ends that hold.
+type queueAdmissionHold struct {
+	onKind, onEntry, onItem, until string
+	orphaned                       bool
+}
 
 func (h queueAdmissionHold) text(entry string) string {
 	on := h.onItem
 	if h.onKind == api.TeamQueueWaitOnRelease {
 		on = "release " + h.onEntry
 	}
+	if h.orphaned {
+		return fmt.Sprintf("Admission skips %s until the database handler clears its wait on %s, which can no longer be met (until %s)", entry, on, h.until)
+	}
 	return fmt.Sprintf("Admission skips %s while its wait on %s until %s is open", entry, on, h.until)
 }
 
 // queueAdmissionHolds reads a project's open entry and release waits and
 // returns, by waiting entry, the oldest one that holds it out of admission:
-// its predecessor has not met the condition and still can. The condition is
-// judged now, from the predecessor's rows, because the sweep never marks a
-// queued entry's wait met (it has no lead to tell yet). A met condition, an
-// orphaned wait and a host wait (a handler gate) do not hold; a gated wait
-// holds only until its condition is met, as an automatic one does. Nothing
-// is written.
+// its predecessor has not met the condition and still can, or, for a gated
+// wait (resume handler), can no longer meet it. The condition is judged now,
+// from the predecessor's rows, because the sweep never marks a queued
+// entry's wait met (it has no lead to tell yet). A gated orphaned wait, live
+// or recorded, holds until the handler clears it: the gate asks for the
+// handler's checks before the team starts, and the orphan report already
+// tells the handler. A met condition, gated or not, an automatic orphaned
+// wait and a host wait (a handler gate of its own) do not hold. Nothing is
+// written.
 func queueAdmissionHolds(ctx context.Context, q queryRower, task string) (map[string]queueAdmissionHold, error) {
-	rows, err := q.QueryContext(ctx, `SELECT w.entry_id,w.on_entry_id,w.on_item_id,w.on_kind,w.until,w.state,
+	rows, err := q.QueryContext(ctx, `SELECT w.entry_id,w.on_entry_id,w.on_item_id,w.on_kind,w.until,w.state,w.resume,
  pe.id IS NOT NULL,COALESCE(pe.state,''),COALESCE(pe.released_at,''),COALESCE(pe.acceptance_json,''),COALESCE(pe.owner_integration_json,''),
  COALESCE(pi.status,''),COALESCE(rj.state,''),COALESCE(rj.record_json,'')
  FROM team_queue_waits w
@@ -1054,22 +1064,38 @@ func queueAdmissionHolds(ctx context.Context, q queryRower, task string) (map[st
 	out := map[string]queueAdmissionHold{}
 	for rows.Next() {
 		var w queueWaitRow
-		if err := rows.Scan(&w.entry, &w.onEntry, &w.onItem, &w.onKind, &w.until, &w.state,
+		if err := rows.Scan(&w.entry, &w.onEntry, &w.onItem, &w.onKind, &w.until, &w.state, &w.resume,
 			&w.predExists, &w.predState, &w.predReleased, &w.predAcceptance, &w.predOwner, &w.itemStatus, &w.jobState, &w.jobRecord); err != nil {
 			return nil, err
 		}
-		if w.state != api.TeamQueueWaitWaiting || w.onKind == api.TeamQueueWaitOnHost {
+		if w.onKind == api.TeamQueueWaitOnHost || w.state == api.TeamQueueWaitMet {
 			continue
 		}
 		if _, held := out[w.entry]; held {
 			continue
 		}
-		if ok, _, _ := w.met(); ok || w.orphaned() != "" {
+		hold := queueAdmissionHold{onKind: w.onKind, onEntry: w.onEntry, onItem: w.onItem, until: w.until}
+		if w.state == api.TeamQueueWaitOrphaned || w.orphaned() != "" {
+			// Recorded or now orphaned: only a gated wait holds, until the
+			// handler clears it. A recorded orphan is not judged again.
+			if w.gated() && (w.state == api.TeamQueueWaitOrphaned || !queueWaitMetNow(w)) {
+				hold.orphaned = true
+				out[w.entry] = hold
+			}
 			continue
 		}
-		out[w.entry] = queueAdmissionHold{onKind: w.onKind, onEntry: w.onEntry, onItem: w.onItem, until: w.until}
+		if queueWaitMetNow(w) {
+			continue
+		}
+		out[w.entry] = hold
 	}
 	return out, rows.Err()
+}
+
+// queueWaitMetNow reports whether the wait's condition holds now.
+func queueWaitMetNow(w queueWaitRow) bool {
+	ok, _, _ := w.met()
+	return ok
 }
 
 func sharedCheckoutHint(e api.TeamQueueEntry, active string) string {

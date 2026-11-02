@@ -2839,6 +2839,43 @@ func TestTeamQueueClaimAdmitsHeadOnceWaitClears(t *testing.T) {
 	}
 }
 
+// wi_bc90399c9878907e (lead REQUEST 55905, incident 55899): a gated wait
+// whose predecessor can no longer land holds the head until the handler
+// clears it, judged at once and still after the sweep records the orphan; an
+// automatic orphaned wait does not hold.
+func TestTeamQueueClaimHoldsGatedOrphanedWaitUntilCleared(t *testing.T) {
+	for _, gated := range []bool{true, false} {
+		t.Run(fmt.Sprintf("gated=%v", gated), func(t *testing.T) {
+			f := heldWaitFixture(t)
+			if gated {
+				f.setGated(t, api.TeamQueueWaitAccepted, "", waitPath)
+			} else {
+				f.set(t, api.TeamQueueWaitAccepted)
+			}
+			f.exec(t, `UPDATE work_items SET status='dismissed' WHERE task_id=? AND id=?`, f.task.ID, f.items[0].ID)
+			if gated {
+				hold := fmt.Sprintf("Admission skips %s until the database handler clears its wait on %s, which can no longer be met (until accepted)", f.waiting.ID, f.items[0].ID)
+				requireHeldClaim(t, f, hold)
+				if steps := f.sweep(t); len(steps) != 1 || steps[0] != "wait-orphaned" {
+					t.Fatalf("sweep steps %v", steps)
+				}
+				if state := f.state(t); state != api.TeamQueueWaitOrphaned {
+					t.Fatalf("wait state %s, want orphaned", state)
+				}
+				requireHeldClaim(t, f, hold)
+				f.clear(t)
+			}
+			if listed := listedEntry(t, f.s, f.task.ID, f.waiting.ID); strings.Contains(listed.BlockReason, "Admission skips") {
+				t.Fatalf("reason still says the entry is skipped: %q", listed.BlockReason)
+			}
+			claimed, err := waitFixtureClaim(t, f, f.waiting)
+			if err != nil || claimed.State != "launching" {
+				t.Fatalf("claim once the wait no longer holds %+v %v", claimed, err)
+			}
+		})
+	}
+}
+
 // capFiller registers a plain open agent that counts toward the project agent
 // cap.
 func capFiller(t *testing.T, s *Store, task api.Task, name string) api.Agent {

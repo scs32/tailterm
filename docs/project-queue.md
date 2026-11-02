@@ -828,10 +828,21 @@ or released, or its release job departs or settles, whichever the wait names,
 or when the wait is cleared. Nothing is written; the wait stays `waiting`
 until its own notice.
 
+A gated wait (`resume=handler`) whose predecessor can no longer meet the
+condition, judged now or recorded `orphaned` by the tick, also holds its
+queued entry, until the handler clears the wait. The gate asks for the
+handler's checks before the team starts, and the tick's orphan report already
+tells the handler, so this hold can always be released. Its reason reads
+`Admission skips ENTRY until the database handler clears its wait on ITEM,
+which can no longer be met (until CONDITION)`. Provenance: handler NOTICE
+55899 (source 55882), an entry admitted two seconds after its predecessor
+finished, while its gated wait on a dismissed item was orphaned and before
+the handler could act.
+
 These do not hold admission:
 
-- a wait whose predecessor can no longer meet the condition (orphaned); the
-  tick reports it to the handler;
+- an automatic wait whose predecessor can no longer meet the condition
+  (orphaned); the tick reports it to the handler;
 - a host wait, whose gate is the handler's own;
 - a gated entry or release wait once its condition is met: the entry is
   admitted as before, and the gate's notice tells its lead to stay paused for
