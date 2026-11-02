@@ -389,6 +389,36 @@ func TestClaimCheckBounded(t *testing.T) {
 	}
 }
 
+// A check that runs out of budget is reported as skipped, never as clean or
+// as "no ledger", even when the deadline has passed before the ledger is
+// opened. The ledger's rows would match, so a clean report here would be a
+// false negative.
+func TestClaimCheckExpiredIsSkipped(t *testing.T) {
+	at := time.Now().Add(-time.Hour)
+	cmd := "go test ./cmd/tt -count=1"
+	claimLedgerDir(t, claimEvidenceRow(cmd, claimExit(0), claimCommitA, at))
+	m := claimResult(map[string]api.Evidence{"e1": {Type: "command", Value: cmd, Outcome: "ok"}}, map[string]string{"commit": claimCommitA[:8]})
+	if r, ok := claimRun(claimTestAgent, m, time.Now().Add(time.Minute)); !ok || r.skipped || len(r.findings) != 2 || r.failed() {
+		t.Fatalf("live deadline: ok %v %+v", ok, r)
+	}
+	for i := 0; i < 100; i++ {
+		r, ok := claimRun(claimTestAgent, m, time.Now().Add(-time.Second))
+		if !ok || !r.skipped || !r.failed() || len(r.findings) != 0 {
+			t.Fatalf("expired deadline, run %d: ok %v %+v", i, ok, r)
+		}
+	}
+	// Through the budget: whichever of the run and the timer claimCheck
+	// selects, a 1 ns budget is reported as skipped.
+	old := claimCheckBudget
+	claimCheckBudget = time.Nanosecond
+	t.Cleanup(func() { claimCheckBudget = old })
+	for i := 0; i < 100; i++ {
+		if r, ok := claimCheck(claimTestAgent, m); !ok || !r.skipped {
+			t.Fatalf("1 ns budget, run %d: ok %v %+v", i, ok, r)
+		}
+	}
+}
+
 func TestClaimCheckReportFormat(t *testing.T) {
 	c := func(kind claimKind, text string) citedClaim {
 		return citedClaim{kind: kind, source: "e1", text: text, outcome: "ok"}

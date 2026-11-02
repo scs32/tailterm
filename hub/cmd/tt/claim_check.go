@@ -558,15 +558,17 @@ func claimCheckReceipt(c citedClaim, rows []claimRow, single string, r *claimRep
 }
 
 // claimRun is the check without its budget. ok is false when the agent has
-// no ledger.
+// no ledger; a run past its deadline is reported skipped, never as no ledger.
 func claimRun(agent string, m api.Envelope, deadline time.Time) (claimReport, bool) {
 	var r claimReport
 	rows, ok, expired := claimLedger(agent, deadline)
-	if !ok {
-		return r, false
-	}
+	// Expired comes first: past the deadline claimLedger may stop before it
+	// opens a file, and that is a check that did not run, not "no ledger".
 	if expired {
 		return claimReport{skipped: true}, true
+	}
+	if !ok {
+		return r, false
 	}
 	claims := claimExtract(m, &r)
 	single := ""
