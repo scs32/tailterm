@@ -958,18 +958,26 @@ AND NOT EXISTS (SELECT 1 FROM agent_work_item_bindings r JOIN agents ra ON ra.id
 	if a.WorkItem != nil {
 		a.ReadUpTo = contextThrough
 	}
-	if a.Role == api.AgentRoleDatabaseHandler {
-		// A handler rotation successor reads from its launch on, as a new
-		// owner helper does: nothing is addressed to it before it registers,
-		// and the project's earlier Board history is not new input for it.
-		// Without this its cursor starts at 0 and the relay wakes it for the
-		// whole backlog before its handoff (bug wi_661eac81661da548).
+	// A rotation successor (handler or backlog steward) reads from its launch
+	// on, as a new owner helper does: nothing is addressed to it before it
+	// registers, and the project's earlier Board history is not new input for
+	// it. Without this its cursor starts at 0 and the relay wakes it for the
+	// whole backlog before its handoff (bugs wi_661eac81661da548,
+	// wi_29bc8062c2d6ab11).
+	rotations, prepared := "", ""
+	switch a.Role {
+	case api.AgentRoleDatabaseHandler:
+		rotations, prepared = "handler_rotations", api.HandlerRotationPrepared
+	case api.AgentRoleBacklogSteward:
+		rotations, prepared = "steward_rotations", api.StewardRotationPrepared
+	}
+	if rotations != "" {
 		var upTo int64
 		err = tx.QueryRowContext(ctx, `INSERT INTO read_cursors (task_id,agent_id,up_to)
 SELECT ?,?,(SELECT COALESCE(MAX(seq),0) FROM messages WHERE task_id=?)
-WHERE EXISTS (SELECT 1 FROM handler_rotations WHERE task_id=? AND successor_agent_id=? AND state=?)
+WHERE EXISTS (SELECT 1 FROM `+rotations+` WHERE task_id=? AND successor_agent_id=? AND state=?)
 ON CONFLICT(task_id,agent_id) DO UPDATE SET up_to=MAX(up_to,excluded.up_to)
-RETURNING up_to`, taskID, a.ID, taskID, taskID, a.ID, api.HandlerRotationPrepared).Scan(&upTo)
+RETURNING up_to`, taskID, a.ID, taskID, taskID, a.ID, prepared).Scan(&upTo)
 		switch {
 		case err == nil:
 			a.ReadUpTo = upTo

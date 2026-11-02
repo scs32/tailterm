@@ -340,7 +340,12 @@ tt steward policy get|set --task tsk_ID [--revision N --enabled=BOOL --max-total
    that exact ID as a pending steward. It holds no slot, does not receive
    `role:backlog_steward`, and cannot run triage. Its briefing says to read the
    summary revision and the handoff first and to take no intake until the
-   handoff notice arrives.
+   handoff notice arrives. Its read cursor starts at the newest message when it
+   registers, as a handler successor's and a new owner helper's do, so its
+   inbox holds only messages posted after its launch. Nothing it inherits is
+   addressed to it earlier: `role:backlog_steward` still goes to the old
+   steward, and commit re-issues the open obligations and sends the handoff
+   notice. Until bug `wi_29bc8062c2d6ab11` its cursor started at 0.
 3. **Commit** (keyed, one transaction). It re-checks that the old steward is
    idle and that the successor is online, pending, and on the same host, runtime
    and directory (`successor_unavailable`). It closes the old steward, then

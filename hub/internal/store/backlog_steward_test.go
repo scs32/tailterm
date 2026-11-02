@@ -855,6 +855,103 @@ func TestStewardRotationCommitMovesObligationsAndHandsOffSummary(t *testing.T) {
 	}
 }
 
+// stewardMaxSeq is the task's newest message seq.
+func stewardMaxSeq(t *testing.T, s *Store, task string) int64 {
+	t.Helper()
+	var seq int64
+	if err := s.db.QueryRow(`SELECT COALESCE(MAX(seq),0) FROM messages WHERE task_id=?`, task).Scan(&seq); err != nil {
+		t.Fatal(err)
+	}
+	return seq
+}
+
+// A steward rotation successor's read cursor starts at the newest message
+// when it registers, as a handler successor's and a new owner helper's do, so
+// the Board history before its launch is never unread input for it; what it
+// inherits (re-issued obligations, the handoff notice) is posted at commit,
+// after it registers (bug wi_29bc8062c2d6ab11).
+func TestStewardRotationSuccessorReadsFromLaunch(t *testing.T) {
+	f := newStewardRotationFixture(t, true)
+	ctx := context.Background()
+	if _, err := f.s.PostMessage(ctx, f.task.ID, api.PostMessageRequest{Text: "synthetic owner board post before the prepare"}, stewardBy); err != nil {
+		t.Fatal(err)
+	}
+	before, err := stewardRequestMessage(f.s, f.task.ID, f.worker, "Intake before the rotation")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := f.prepare("launch-cursor-prepare", api.NewID("agt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	during, err := stewardRequestMessage(f.s, f.task.ID, f.worker, "Intake while the rotation is prepared")
+	if err != nil || during.To != f.old.ID {
+		t.Fatalf("role:backlog_steward while prepared: %+v %v", during, err)
+	}
+	launchSeq := stewardMaxSeq(t, f.s, f.task.ID)
+	successor := f.admit(t, r.SuccessorAgentID, true)
+	if successor.ReadUpTo != launchSeq {
+		t.Fatalf("registered successor ReadUpTo %d, want the launch seq %d", successor.ReadUpTo, launchSeq)
+	}
+	if cursor, err := f.s.ReadCursor(ctx, f.task.ID, successor.ID); err != nil || cursor != launchSeq {
+		t.Fatalf("successor read cursor %d (%v), want %d", cursor, err, launchSeq)
+	}
+	if n, err := f.s.Unread(ctx, f.task.ID, successor.ID); err != nil || n != 0 {
+		t.Fatalf("successor unread at launch %d (%v), want 0", n, err)
+	}
+	committed, err := f.act(api.StewardRotationCommit, "launch-cursor-commit", r.ID)
+	if err != nil || committed.Receipt == nil || committed.Handoff == nil {
+		t.Fatalf("commit: %+v %v", committed, err)
+	}
+	if committed.Receipt.NoticeSeq <= launchSeq || len(committed.Handoff.Reissued) != 2 {
+		t.Fatalf("handoff: receipt %+v reissued %+v", committed.Receipt, committed.Handoff.Reissued)
+	}
+	unread := map[int64]bool{}
+	page, err := f.s.ListMessages(ctx, f.task.ID, launchSeq, successor.ID, 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range page {
+		if m.Seq <= launchSeq {
+			t.Fatalf("successor unread page holds pre-launch message #%d", m.Seq)
+		}
+		unread[m.Seq] = true
+	}
+	if !unread[committed.Receipt.NoticeSeq] {
+		t.Fatalf("successor unread page %v lacks the handoff notice #%d", unread, committed.Receipt.NoticeSeq)
+	}
+	for _, p := range committed.Handoff.Reissued {
+		if p.OldMessageSeq != before.Seq && p.OldMessageSeq != during.Seq {
+			t.Fatalf("reissued unexpected #%d", p.OldMessageSeq)
+		}
+		if p.NewMessageSeq <= launchSeq || !unread[p.NewMessageSeq] {
+			t.Fatalf("re-issued obligation #%d -> #%d is not unread after launch %d: %v", p.OldMessageSeq, p.NewMessageSeq, launchSeq, unread)
+		}
+	}
+}
+
+// A steward admitted with no prepared rotation keeps today's cursor: the
+// Board history is unread input for it.
+func TestStewardWithoutRotationKeepsCursor(t *testing.T) {
+	s, task := stewardStore(t)
+	ctx := context.Background()
+	for _, text := range []string{"synthetic owner board post one", "synthetic owner board post two"} {
+		if _, err := s.PostMessage(ctx, task.ID, api.PostMessageRequest{Text: text}, stewardBy); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a := addSteward(t, s, task.ID, "backlog-steward")
+	if a.ReadUpTo != 0 {
+		t.Fatalf("steward ReadUpTo %d, want 0", a.ReadUpTo)
+	}
+	if cursor, err := s.ReadCursor(ctx, task.ID, a.ID); err != nil || cursor != 0 {
+		t.Fatalf("steward read cursor %d (%v), want 0", cursor, err)
+	}
+	if n, err := s.Unread(ctx, task.ID, a.ID); err != nil || n < 2 {
+		t.Fatalf("steward unread %d (%v), want the earlier board posts counted", n, err)
+	}
+}
+
 func TestStewardRotationLaunchFailureAbortAndRetry(t *testing.T) {
 	f := newStewardRotationFixture(t, true)
 	ctx := context.Background()
