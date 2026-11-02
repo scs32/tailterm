@@ -4,7 +4,8 @@ Before `tt send` posts a RESULT or a lead's accept disposition, it compares the
 commits, verification commands and receipt files the message cites against the
 sender's own tool-call ledger, and prints what matched, what the ledger
 contradicts and what it does not hold (feature `wi_086dd63cab0abde0`, work
-order #52735).
+order #52735). Test counts cited in a command's outcome are compared too
+(feature `wi_512ca524b2432974`, work order #54730).
 
 **It is a warning only.** The message is posted exactly as it would have been,
 whatever the report says. Refusing to post on an unmatched claim would turn a
@@ -26,7 +27,8 @@ The ledger it reads is the one `tt hook tool` writes for Claude Code sessions,
 with the verification evidence the evidence capture page describes
 ([Verification evidence capture](claude-mods-evidence-capture.md)): on the row
 of each recognised verification command, the command text, its exit code, an
-output digest and the commit it ran at.
+output digest and the commit it ran at, and on a test command's row the pass,
+fail and skip counts read from its output.
 
 1. After the message is validated, and before any hub request, `tt send` asks
    whether the message is checked: every `result`, and a `notice` whose review
@@ -69,7 +71,7 @@ parsed.
 | commit | any `refs` value that is one hex token of 7 to 64 characters and not digits alone (a run of digits is a message or receipt number far more often than a commit); evidence entries of type `commit`; `body.candidate` and `review.candidate` when hex. Duplicates are checked once, case-insensitively. |
 | command | evidence entries of type `command`, the `"eN: CMD -> OUTCOME"` form, whose command is one isolated verification command (below). |
 | receipt | a `refs` value whose key contains `receipt`, or an attachment named like a receipt, that is an absolute path to an existing file named `receipt.json` or `targeted-receipt.json`. |
-| count | not checked (see "What is not checked"). |
+| count | in a checkable command entry's outcome: a whole number, at the start of the outcome or after a space, tab, `,` `;` `:` `(` or `[`, then a space and a count word ending there. `test`/`tests` is the total; `pass`, `passed`, `passes`, `passing`; `fail`, `failed`, `fails`, `failing`, `failure`, `failures`; `skip`, `skipped`, `skips`, `skipping`; any case. A number over nine digits is not read. See "Counts" below. |
 
 ## Matching rules
 
@@ -144,6 +146,32 @@ count of failures or errors (`0 failed`, `0 fail`, `0 failures`, `0 errors`,
 both, such as `1 passed, 3 failed`, or neither, such as `62/62`, is judged
 neither way.
 
+### Counts
+
+`62 tests`, `4 pass 0 skipped`, `62 passed, 0 failed`, `exit 0; 12 tests`,
+`(3 skipped)` and `1 pass,2 fail` cite counts. `62/62 tests`, `1.5 tests`,
+`-3 tests`, `x62 tests`, `62tests`, `62 testsuites`, `no failures` and a
+ten-digit number do not: a number joined to other text is never read, and a
+long one is never cut short. Other counts in the same outcome are still read.
+
+An outcome that cites counts gets a second line beside its command's, against
+the same run the command line uses: the latest identical isolated single
+command. The command's own line, with its exit and commit rules, is unchanged.
+
+- No such run: not checked, "counts without a recorded run".
+- The run recorded no counts (its `countSkip`, such as `truncated` or
+  `no-summary`, or a row written before counts were recorded): not checked,
+  "counts your run did not record".
+- The run recorded per-package counts only (`go test` without `-v`): not
+  checked, "counts your run recorded per package (go test without -v)".
+- Every cited count equals the run's: `matched`.
+- Any differs: `mismatched`, "you cited 62 tests; your latest run recorded
+  total 60, pass 58, fail 0, skip 2 at TIME".
+
+`tests` is compared with the run's `total`, which for node is node's own
+`tests` line and also counts `todo` and `cancelled` tests. How the counts are
+read from the output is on the evidence capture page.
+
 ### Receipt
 
 The cited file is read up to 1 MiB, the hub's limit for a verification body,
@@ -171,8 +199,9 @@ receipt's is `contradicted`; a single cited commit the receipt does not name is
 
 ## The report
 
-States: `matched`, `contradicted`, `unmatched`, `unproven` (a run exists but
-its exit was not recorded) and `not checked`.
+States: `matched`, `contradicted`, `mismatched` (a cited count differs from
+the run's), `unmatched`, `unproven` (a run exists but its exit was not
+recorded) and `not checked`.
 
 - Nothing checkable in the message: a send prints nothing.
 - Every checkable claim `matched`: one line,
@@ -183,6 +212,7 @@ its exit was not recorded) and `not checked`.
 ```
 claim check (your local tool ledger; warning only, the message is sent unchanged):
   contradicted  e1 go test ./cmd/tt -run Send -> ok: your latest run exited 1 at 2026-10-31T11:42:03Z
+  mismatched    e3 counts 62 tests (go test ./cmd/tt -v -count=1): you cited 62 tests; your latest run recorded total 60, pass 58, fail 0, skip 2 at 2026-10-31T11:40:12Z
   unproven      e2 go vet ./cmd/tt -> clean: exit not recorded
   unmatched     commit 0123abcd (ref commit): no verification run in your ledger at this commit; 4 of your runs recorded no commit (cd before the command, or outside a repository)
   matched       receipt /abs/out/receipt.json (ref receipt)
@@ -200,8 +230,8 @@ nothing. Exit status:
 
 - 0 when every checkable claim is `matched`, or there is none, or the kind is
   not checked, or the agent has no ledger;
-- 1 when any claim is `contradicted`, `unmatched` or `unproven`, or the check
-  ran out of time (nothing was proven);
+- 1 when any claim is `contradicted`, `mismatched`, `unmatched` or
+  `unproven`, or the check ran out of time (nothing was proven);
 - 2, as before, for an invalid message.
 
 `not checked` claims are counted and do not change the status. So a sender can
@@ -209,8 +239,11 @@ check, fix the message or rerun the command, and then send.
 
 ## What is not checked
 
-- **Counts.** The ledger keeps a SHA-256 of the output, never the output, so
-  "62 tests" or "4 pass 0 skipped" cannot be compared with it.
+- **Some counts.** Counts are compared only with a run that recorded them: not
+  per-package counts (`go test` without `-v`), not a run whose output was cut
+  or had no summary, and not rows written before the release that records
+  counts. Counts in free text, `N/M` forms and "no failures" are not read as
+  numbers.
 - **Free text.** Only the structured fields above.
 - **Codex and other ledger-less senders.** They have no ledger.
 - **Other agents' ledgers.** A lead's accept rests mostly on the verifier's
