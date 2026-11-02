@@ -4,6 +4,14 @@
 // disposable synthetic browser, vault and in-page hub transport state; no live
 // hub, profile, network or tmux access. Run directly for Chromium and WebKit;
 // tests/static-browser.mjs runs it once per TEST_BROWSER engine.
+//
+// Warm-first (the owner's usual first visit after a reload) takes
+// WARM_PASSES passes, each a reload plus one switch per tab, and holds each
+// tab's median over those samples to TARGET_MS. One sample per tab let a
+// single slow switch under host load fail a matrix attempt (305 ms Chromium
+// Features in matrix #52783, 45 ms on the retry), while 640 measured samples
+// never exceeded 200 ms (docs/measurements/warm-first-tab-switch-2026-10-31.md).
+// A tab that is slow on most passes still fails.
 import { chromium, webkit } from "@playwright/test";
 import { createServer } from "vite";
 import assert from "node:assert/strict";
@@ -13,6 +21,9 @@ import { viteCacheDir } from "./vite-cache.mjs";
 const TARGET_MS = 200;
 const LATENCY_MS = 80;
 const ROUNDS = 5;
+// Reload passes in the warm-first case: each tab gets one warm-first sample
+// per pass, and its median over them is held to TARGET_MS.
+const WARM_PASSES = 3;
 // Retained global events the feed replays from the start, and the interval of
 // new live events while the page is open.
 const BACKLOG_EVENTS = 30000;
@@ -688,14 +699,17 @@ async function measure(browser, origin, engine) {
       if (DATA_TABS.includes(mode) && !SHELL_FREE.has(mode) && !result.shell)
         shellFailures.push(`${mode} painted no shell on an empty cache`);
     }
-    await page.evaluate(() => window.qa.idle());
     // The owner's usual first visit: a reload, the same vault unlocked again
     // with its saved cache, and a feed that replays the backlog from the start.
-    await page.reload();
-    await ready();
-    for (const mode of TABS) {
-      record("warm-first", mode, await switchTo(mode));
-      await page.waitForTimeout(DWELL_MS);
+    // Each pass waits for saves to finish so every reload loads a whole cache.
+    for (let pass = 1; pass <= WARM_PASSES; pass++) {
+      await page.evaluate(() => window.qa.idle());
+      await page.reload();
+      await ready();
+      for (const mode of TABS) {
+        record("warm-first", mode, await switchTo(mode));
+        await page.waitForTimeout(DWELL_MS);
+      }
     }
     // wi_6fad's case: rounds through every tab while the data changes.
     for (let round = 1; round <= ROUNDS; round++) {
