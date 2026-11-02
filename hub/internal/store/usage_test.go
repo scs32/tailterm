@@ -4821,17 +4821,20 @@ func rehearseUsageBoundedBackfill(b *testing.B, size usageLiveSize) {
 		if err := live.s.Close(); err != nil {
 			b.Fatal(err)
 		}
-		source, target := filepath.Join(dir, "usage-live-size.sqlite"), filepath.Join(copyDir, "usage-live-size.sqlite")
-		for _, suffix := range []string{"", "-wal", "-shm"} {
-			raw, err := os.ReadFile(source + suffix)
-			if errors.Is(err, os.ErrNotExist) && suffix != "" {
-				continue
-			}
-			if err != nil {
-				b.Fatal(err)
-			}
-			if err := os.WriteFile(target+suffix, raw, 0o600); err != nil {
-				b.Fatal(err)
+		stagedDir := b.TempDir()
+		source, target, staged := filepath.Join(dir, "usage-live-size.sqlite"), filepath.Join(copyDir, "usage-live-size.sqlite"), filepath.Join(stagedDir, "usage-live-size.sqlite")
+		for _, to := range []string{target, staged} {
+			for _, suffix := range []string{"", "-wal", "-shm"} {
+				raw, err := os.ReadFile(source + suffix)
+				if errors.Is(err, os.ErrNotExist) && suffix != "" {
+					continue
+				}
+				if err != nil {
+					b.Fatal(err)
+				}
+				if err := os.WriteFile(to+suffix, raw, 0o600); err != nil {
+					b.Fatal(err)
+				}
 			}
 		}
 		examined := 0
@@ -4883,6 +4886,40 @@ func rehearseUsageBoundedBackfill(b *testing.B, size usageLiveSize) {
 		b.Logf("m3 second open took %s, examined %d spans, digest unchanged=%t", secondOpen.Round(time.Millisecond), examined, second == first)
 		if examined != 0 || second != first {
 			b.Fatalf("m3 re-run is not idempotent: examined %d, counts %+v, then %+v", examined, first, second)
+		}
+		// The first open's breakdown, on a second copy: the span backfill, then
+		// the share backfill with the totals recompute, each on the raw file,
+		// then the rest of Open, which finds both done.
+		raw, err := sql.Open("sqlite", staged)
+		if err != nil {
+			b.Fatal(err)
+		}
+		raw.SetMaxOpenConns(1)
+		began = time.Now()
+		if err := backfillUsageSpanInstants(raw); err != nil {
+			b.Fatal(err)
+		}
+		spanStage := time.Since(began)
+		began = time.Now()
+		if err := backfillUsageItemShares(raw); err != nil {
+			b.Fatal(err)
+		}
+		shareStage := time.Since(began)
+		if err := raw.Close(); err != nil {
+			b.Fatal(err)
+		}
+		began = time.Now()
+		rest, err := Open(staged)
+		restStage := time.Since(began)
+		if err != nil {
+			b.Fatal(err)
+		}
+		defer rest.Close()
+		stagedCounts := readUsageBoundedCounts(b, rest)
+		b.Logf("m3 first open breakdown on a second copy: span backfill %s, share backfill and totals recompute %s, rest of the open %s (sum %s); counts equal=%t",
+			spanStage.Round(time.Millisecond), shareStage.Round(time.Millisecond), restStage.Round(time.Millisecond), (spanStage + shareStage + restStage).Round(time.Millisecond), stagedCounts == first)
+		if stagedCounts != first {
+			b.Fatalf("m3 staged counts %+v, want %+v", stagedCounts, first)
 		}
 	}
 }

@@ -94,9 +94,9 @@ func usageNsBound(t time.Time, open int64) int64 {
 // its stored text and payload. The polls are the payload's segments with
 // "poll" true, each at its request instant, the set the windowed read counts
 // (usageTimeReports). Both start and end are NULL when either is.
-func writeUsageSpanInstants(ctx context.Context, tx *sql.Tx, task, agent, run, span, start, end string, payload []byte) error {
+func writeUsageSpanInstants(exec func(query string, args ...any) error, task, agent, run, span, start, end string, payload []byte) error {
 	for _, table := range []string{"usage_span_instants", "usage_span_polls"} {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM `+table+` WHERE task_id=? AND agent_id=? AND run_id=? AND span_id=?`, task, agent, run, span); err != nil {
+		if err := exec(`DELETE FROM `+table+` WHERE task_id=? AND agent_id=? AND run_id=? AND span_id=?`, task, agent, run, span); err != nil {
 			return err
 		}
 	}
@@ -104,7 +104,7 @@ func writeUsageSpanInstants(ctx context.Context, tx *sql.Tx, task, agent, run, s
 	if startNs == nil || endNs == nil {
 		startNs, endNs = nil, nil
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO usage_span_instants(task_id,agent_id,run_id,span_id,start_ns,end_ns) VALUES(?,?,?,?,?,?)`, task, agent, run, span, startNs, endNs); err != nil {
+	if err := exec(`INSERT INTO usage_span_instants(task_id,agent_id,run_id,span_id,start_ns,end_ns) VALUES(?,?,?,?,?,?)`, task, agent, run, span, startNs, endNs); err != nil {
 		return err
 	}
 	if len(payload) == 0 {
@@ -118,8 +118,7 @@ func writeUsageSpanInstants(ctx context.Context, tx *sql.Tx, task, agent, run, s
 	}
 	if err := json.Unmarshal(payload, &p); err != nil {
 		// The report cannot decode it either; one NULL poll keeps it read.
-		_, err = tx.ExecContext(ctx, `INSERT INTO usage_span_polls(task_id,agent_id,run_id,span_id,segment,at_ns) VALUES(?,?,?,?,-1,NULL)`, task, agent, run, span)
-		return err
+		return exec(`INSERT INTO usage_span_polls(task_id,agent_id,run_id,span_id,segment,at_ns) VALUES(?,?,?,?,-1,NULL)`, task, agent, run, span)
 	}
 	for i, segment := range p.Segments {
 		if !segment.Poll {
@@ -130,7 +129,7 @@ func writeUsageSpanInstants(ctx context.Context, tx *sql.Tx, task, agent, run, s
 		if json.Unmarshal(segment.At, &at) == nil {
 			ns = usageSpanNs(at)
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO usage_span_polls(task_id,agent_id,run_id,span_id,segment,at_ns) VALUES(?,?,?,?,?,?)`, task, agent, run, span, i, ns); err != nil {
+		if err := exec(`INSERT INTO usage_span_polls(task_id,agent_id,run_id,span_id,segment,at_ns) VALUES(?,?,?,?,?,?)`, task, agent, run, span, i, ns); err != nil {
 			return err
 		}
 	}
@@ -151,7 +150,23 @@ var usageSpanInstantChecked func(examined int) error
 // interrupted open resumes. Only a span with a poll has its payload copied.
 func backfillUsageSpanInstants(db *sql.DB) error {
 	ctx := context.Background()
-	tx, err := db.BeginTx(ctx, nil)
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	// A first fill writes every span's rows: a larger page cache on this one
+	// connection keeps the side tables' pages in memory while it runs, and the
+	// connection's own size is restored before it returns to the pool.
+	var cacheSize int64
+	if err = conn.QueryRowContext(ctx, `PRAGMA cache_size`).Scan(&cacheSize); err != nil {
+		return err
+	}
+	if _, err = conn.ExecContext(ctx, `PRAGMA cache_size=-65536`); err != nil {
+		return err
+	}
+	defer conn.ExecContext(ctx, `PRAGMA cache_size=`+strconv.FormatInt(cacheSize, 10))
+	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
@@ -178,13 +193,13 @@ func backfillUsageSpanInstants(db *sql.DB) error {
 		payload                          sql.NullString
 	}
 	for {
-		tx, err := db.BeginTx(ctx, nil)
+		tx, err := conn.BeginTx(ctx, nil)
 		if err != nil {
 			return err
 		}
 		var examined int
 		var last sql.NullInt64
-		if err = tx.QueryRowContext(ctx, `SELECT count(*),max(span_rowid) FROM (SELECT span_rowid FROM usage_span_instant_checks ORDER BY span_rowid LIMIT 500)`).Scan(&examined, &last); err != nil {
+		if err = tx.QueryRowContext(ctx, `SELECT count(*),max(span_rowid) FROM (SELECT span_rowid FROM usage_span_instant_checks ORDER BY span_rowid LIMIT 5000)`).Scan(&examined, &last); err != nil {
 			tx.Rollback()
 			return err
 		}
@@ -213,11 +228,31 @@ func backfillUsageSpanInstants(db *sql.DB) error {
 			tx.Rollback()
 			return err
 		}
-		for _, x := range batch {
-			if err = writeUsageSpanInstants(ctx, tx, x.task, x.agent, x.run, x.id, x.start, x.end, []byte(x.payload.String)); err != nil {
-				tx.Rollback()
-				return err
+		// The batch reuses one prepared statement per query.
+		prepared := map[string]*sql.Stmt{}
+		exec := func(query string, args ...any) error {
+			statement := prepared[query]
+			if statement == nil {
+				var err error
+				if statement, err = tx.PrepareContext(ctx, query); err != nil {
+					return err
+				}
+				prepared[query] = statement
 			}
+			_, err := statement.ExecContext(ctx, args...)
+			return err
+		}
+		for _, x := range batch {
+			if err = writeUsageSpanInstants(exec, x.task, x.agent, x.run, x.id, x.start, x.end, []byte(x.payload.String)); err != nil {
+				break
+			}
+		}
+		for _, statement := range prepared {
+			statement.Close()
+		}
+		if err != nil {
+			tx.Rollback()
+			return err
 		}
 		if _, err = tx.ExecContext(ctx, `DELETE FROM usage_span_instant_checks WHERE span_rowid<=?`, last.Int64); err != nil {
 			tx.Rollback()
@@ -340,7 +375,11 @@ func storeUsageSpans(ctx context.Context, tx *sql.Tx, task, agent, run string, s
 		if err != nil {
 			return err
 		}
-		if err = writeUsageSpanInstants(ctx, tx, task, agent, run, span.ID, ts(span.Start), ts(span.End), payload); err != nil {
+		exec := func(query string, args ...any) error {
+			_, err := tx.ExecContext(ctx, query, args...)
+			return err
+		}
+		if err = writeUsageSpanInstants(exec, task, agent, run, span.ID, ts(span.Start), ts(span.End), payload); err != nil {
 			return err
 		}
 		if _, err = tx.ExecContext(ctx, `DELETE FROM usage_span_instant_checks WHERE span_rowid=?`, rowid); err != nil {
