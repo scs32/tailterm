@@ -47,6 +47,22 @@ failed rebuild, or one that changes the checkout, refuses the run before any
 check starts with `Stale WASM prerequisites (<cause>): <why>`, the rebuild log
 kept in the output directory as `wasm-prerequisite-rebuild.log`. A plan with
 `wasm-test-build` builds the WASM itself and reads no record.
+`dist-static` is not a prerequisite: the plan's `00-static-build` check builds
+it from each candidate before any browser check, so readiness and provisioning
+do not look for it. A browser suite run outside the matrix (a measurement, a
+host-lock `exec`, a direct `node tests/<suite>`) needs `npm run build:static`
+in that checkout first. `tests/static-browser.mjs`,
+`tests/inactivity-browser.mjs`, `tests/speech-browser.mjs` and
+`tests/appearance-switching-browser.mjs` now say so: through
+`tests/dist-static-check.mjs` they exit 1 at start with one line,
+`dist-static is missing: ... Run npm run build:static in this checkout first`,
+instead of timing out on 404 pages. They print one warning line and continue
+when `dist-static/release.json` names a commit other than HEAD, or none. That
+commit comparison is a proxy: uncommitted edits after the build go unnoticed,
+a later commit that changed no client file still warns, and without git it is
+skipped; the byte-exact check is `npm run verify:release`
+(`wi_6e2dbfea3fbe54f3`, order #55913). `tests/browser.mjs` builds its own
+bundle and is unaffected.
 Six formerly Chromium-only entrypoints accept `TEST_BROWSER=chromium|webkit`.
 The WebKit microphone fixtures return a real oscillator-backed MediaStream;
 application recording and AudioWorklet processing remain real. Their prototype

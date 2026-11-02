@@ -4,6 +4,8 @@ import { readFile } from "node:fs/promises";
 import { once } from "node:events";
 import assert from "node:assert/strict";
 import { mockSpeechWorker } from "./voice-dictation-browser.mjs";
+import { requireDistStatic } from "./dist-static-check.mjs";
+requireDistStatic();
 const server = createServer(async (req, res) => {
   try {
     const name = new URL(req.url, "http://localhost").pathname;

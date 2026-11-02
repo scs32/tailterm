@@ -3,6 +3,8 @@ import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { chromium, webkit } from "@playwright/test";
 import { createStaticPreviewServer } from "../scripts/preview-static.mjs";
+import { requireDistStatic } from "./dist-static-check.mjs";
+requireDistStatic();
 // The suite serves dist-static itself on a port the system picks, and checks a
 // per-run token so it never drives a server it did not start.
 const token = randomUUID();

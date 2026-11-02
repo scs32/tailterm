@@ -13,6 +13,8 @@ import {
   exerciseForgetDevice,
 } from "./workspace-actions-browser.mjs";
 import { chromium, webkit } from "@playwright/test";
+import { requireDistStatic } from "./dist-static-check.mjs";
+requireDistStatic();
 const engine = process.env.TEST_BROWSER || "chromium";
 if (!["chromium", "webkit"].includes(engine))
   throw new Error("Unknown TEST_BROWSER");
