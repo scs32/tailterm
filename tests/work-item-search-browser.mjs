@@ -69,7 +69,9 @@ const client={base:'isolated://search',token:'fixture',cacheStatus:()=>({label:'
  async listNarrativeArtifactVersions(){return {versions:[{version:1}]}},
  async getNarrativeArtifactVersion(){return {title:'Submitted artifact',content:'Captured eta artifact body'}},
 };
-if(cursorMode)client.listWorkItemChanges=async({taskId='',since})=>{
+// changes=0: a client without changes reads (the plain hub client) over a
+// hub whose pages carry a cursor.
+if(cursorMode&&params.get('changes')!=='0')client.listWorkItemChanges=async({taskId='',since})=>{
  changeReads.push(since);
  if(failChanges)throw new Error('synthetic changes read failure');
  if(resetNext){resetNext=false;savedPages.clear();return {items:[],next:0,cursor:changeSeq+'.0',reset:true}}
@@ -422,7 +424,9 @@ async function cursorCases(browser, engine, kind) {
     // blockers b1 and b2): no reload, no retry until the next notice.
     const newest = await titles(page);
     assert.ok(
-      newest.some(([id, title]) => id === "wi_history" && title.includes("Hidden change")),
+      newest.some(
+        ([id, title]) => id === "wi_history" && title.includes("Hidden change"),
+      ),
       `${label}: the row is newer than its saved page`,
     );
     await page.evaluate(() => window.qa.failChanges(true));
@@ -458,7 +462,11 @@ async function cursorCases(browser, engine, kind) {
     await changesAfter(page, before.changes.length);
     await page.waitForTimeout(200);
     assert.deepEqual(await titles(page), newest, `${label}: recovered rows`);
-    assert.equal((await reads(page)).pages, before.pages, `${label}: recovery needs no page`);
+    assert.equal(
+      (await reads(page)).pages,
+      before.pages,
+      `${label}: recovery needs no page`,
+    );
     await page.evaluate(() => {
       window.qa.change("wi_current", { title: "Recovered alpha" });
       window.qa.event("work_item_updated");
@@ -486,6 +494,49 @@ async function cursorCases(browser, engine, kind) {
       before.pages,
     );
     assert.deepEqual((await reads(page)).changes, [], `${label}: no cursor`);
+    await page.close();
+  }
+  // Pages with a cursor, a client without changes reads (matrix finding
+  // #55383): the view reads each page once per show and once per notice, and
+  // its rows stay put long enough to click.
+  {
+    const page = await browser.newPage();
+    const errors = [];
+    page.on("pageerror", (error) => errors.push(error.message));
+    await page.goto(
+      `${origin}/work-item-search-test?kind=${kind}&cursor=1&changes=0`,
+    );
+    await page.waitForFunction(() => Boolean(window.qa));
+    await page.waitForFunction(
+      () => document.querySelectorAll("[data-work-item]").length === 3,
+    );
+    await page.waitForTimeout(300);
+    const settled = await reads(page);
+    assert.equal(
+      settled.pages,
+      2,
+      `${label} no changes reads: one complete read`,
+    );
+    await page.evaluate(() => window.qa.event("work_item_updated"));
+    await page.waitForFunction(
+      (n) => window.qa.reads().pages >= n,
+      settled.pages + 2,
+    );
+    await page.waitForTimeout(300);
+    assert.equal(
+      (await reads(page)).pages,
+      settled.pages + 2,
+      `${label} no changes reads: one reload per notice`,
+    );
+    await page
+      .locator('[data-item-edit="wi_current"]')
+      .click({ timeout: 5000 });
+    assert.equal(
+      await page.locator("#work-item-title").inputValue(),
+      "Visible alpha",
+      `${label} no changes reads: editor opens`,
+    );
+    assert.deepEqual(errors, [], `${label} no changes reads: page errors`);
     await page.close();
   }
 }

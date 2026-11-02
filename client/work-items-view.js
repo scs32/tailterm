@@ -260,8 +260,12 @@ export function createWorkItemsView({
       completeKey = key;
       listCursor = cursor || null;
       // Cached pages may be older than the hub: a changes read brings them
-      // current, unless this reload is itself the fallback of one.
-      followNext = !afterFallback && Boolean(listCursor);
+      // current, unless this reload is itself the fallback of one. A client
+      // without changes reads reads pages from the hub and follows nothing.
+      followNext =
+        !afterFallback &&
+        Boolean(listCursor) &&
+        typeof client()?.listWorkItemChanges === "function";
       if (shownGeneration === token) {
         showPage(token, key, nextTasks, next, false);
         return;
@@ -316,8 +320,12 @@ export function createWorkItemsView({
       !listCursor ||
       completeKey !== key ||
       itemsKey !== key
-    )
+    ) {
+      // The reload this falls back to never follows on its own, so a client
+      // without changes reads cannot alternate the two.
+      if (!c?.listWorkItemChanges) fallbackReload = true;
       return reload();
+    }
     loading = true;
     followAgain = false;
     const token = ++generation;
