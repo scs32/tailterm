@@ -1376,3 +1376,355 @@ test("a catch-up ends once when the feed fails after a probe sees more events", 
     view.dispose();
   }
 });
+
+// A hub whose answer depends on the request: route(url) returns the body,
+// or {status, body} for an error.
+function routedFixture(route) {
+  let disk;
+  const requests = [];
+  const live = createHubClient({
+    baseURL: "http://fixture",
+    token: "routed",
+    fetchImpl: async (url, init) => {
+      const parsed = new URL(url);
+      requests.push(parsed.pathname + parsed.search);
+      const answer = route(parsed, init);
+      const status = answer?.status && answer.body ? answer.status : 200;
+      const body = answer?.status && answer.body ? answer.body : answer;
+      return { status, text: async () => JSON.stringify(body) };
+    },
+  });
+  const cache = createHubReadCache({
+    load: async () => disk,
+    save: async (value) => {
+      disk = structuredClone(value);
+    },
+  });
+  return {
+    live,
+    requests,
+    since(count) {
+      return requests.slice(count);
+    },
+    make: (client = live, options = {}) =>
+      createCachedHubClient({ client, cache, online: () => true, ...options }),
+  };
+}
+
+function hubRoutes(url) {
+  const path = url.pathname;
+  if (path === "/v1/tasks") return { tasks: [] };
+  if (/^\/v1\/tasks\/[^/]+$/.test(path))
+    return url.searchParams.get("agents") === "none"
+      ? { task: { id: path.split("/")[3] }, latestSeq: 7, agentsOmitted: true }
+      : { task: { id: path.split("/")[3] }, latestSeq: 7, agents: [] };
+  if (path.endsWith("/agents"))
+    return url.searchParams.has("since")
+      ? { agents: [], cursor: "e.1", changes: true }
+      : { agents: [{ id: "agt_lead" }], cursor: "e.1" };
+  if (path.endsWith("/messages")) return { messages: [] };
+  if (path.endsWith("/queue")) return { entries: [] };
+  if (path === "/v1/work-items") return { items: [], next: 0, cursor: "1.0" };
+  return { id: path };
+}
+
+async function deliverEvents(feed, task, events) {
+  for (const f of feed.feeds.filter((f) => f.task === task && !f.stopped)) {
+    const page = events.map((event) => ({ seq: ++f.cursor, ...event }));
+    await f.onEvents(page, f.cursor);
+  }
+}
+
+// Which reads one feed page sends back to the hub.
+async function refreshedBy(events) {
+  const f = routedFixture(hubRoutes),
+    feed = feedClient(f.live),
+    view = f.make(feed.client, { now: () => 0 });
+  const readAll = async () => {
+    await view.listTasks();
+    await view.getTask("tsk_a");
+    await view.listAgents("tsk_b");
+    await view.listMessages("tsk_a", { limit: 50 });
+    await view.listWorkItems({ kind: "bug" });
+    await view.getWorkItem("tsk_a", "wi_1");
+    await view.listQueue("tsk_a");
+  };
+  try {
+    await readAll();
+    await settle();
+    view.subscribe("", () => {});
+    const before = f.requests.length;
+    await deliverEvents(feed, "", events);
+    await readAll();
+    await settle();
+    return new Set(f.since(before).map((path) => path.split("?")[0]));
+  } finally {
+    view.dispose();
+  }
+}
+
+test("a message marks only its own project's reads stale", async () => {
+  const refreshed = await refreshedBy([{ kind: "message", taskId: "tsk_a" }]);
+  assert.deepEqual([...refreshed].sort(), [
+    "/v1/tasks/tsk_a",
+    "/v1/tasks/tsk_a/agents",
+    "/v1/tasks/tsk_a/messages",
+    "/v1/tasks/tsk_a/queue",
+    "/v1/tasks/tsk_a/work-items/wi_1",
+  ]);
+});
+
+test("a work-item change marks work-item and queue reads, not the detail or roster", async () => {
+  const refreshed = await refreshedBy([
+    {
+      kind: "work_item_updated",
+      taskId: "tsk_a",
+      data: { itemId: "wi_1", revision: 2 },
+    },
+  ]);
+  assert.deepEqual([...refreshed].sort(), [
+    "/v1/tasks/tsk_a/queue",
+    "/v1/tasks/tsk_a/work-items/wi_1",
+    "/v1/work-items",
+  ]);
+});
+
+test("a dispatch also marks the target project's reads", async () => {
+  const refreshed = await refreshedBy([
+    {
+      kind: "work_item_dispatched",
+      taskId: "tsk_c",
+      data: { targetTaskId: "tsk_b" },
+    },
+  ]);
+  assert.deepEqual([...refreshed].sort(), [
+    "/v1/tasks/tsk_b/agents",
+    "/v1/work-items",
+  ]);
+});
+
+for (const kind of ["running", "agent_added", "task_paused"])
+  test(`a ${kind} event marks the projects list and its own project's reads`, async () => {
+    const refreshed = await refreshedBy([{ kind, taskId: "tsk_a" }]);
+    assert.deepEqual([...refreshed].sort(), [
+      "/v1/tasks",
+      "/v1/tasks/tsk_a",
+      "/v1/tasks/tsk_a/agents",
+      "/v1/tasks/tsk_a/messages",
+      "/v1/tasks/tsk_a/queue",
+      "/v1/tasks/tsk_a/work-items/wi_1",
+    ]);
+  });
+
+for (const event of [
+  { kind: "something_new", taskId: "tsk_a" },
+  { kind: "message" },
+])
+  test(`${event.taskId ? "an unknown kind" : "an event without a project"} marks every read stale`, async () => {
+    const refreshed = await refreshedBy([event]);
+    assert.equal(refreshed.size, 8, [...refreshed].join(" "));
+  });
+
+test("a heartbeat marks no read stale", async () => {
+  const refreshed = await refreshedBy([{ kind: "heartbeat", taskId: "tsk_a" }]);
+  assert.equal(refreshed.size, 0);
+});
+
+test("the project detail comes from a detail without agents and the agents read", async () => {
+  const f = routedFixture(hubRoutes),
+    view = f.make();
+  try {
+    const detail = await view.getTask("tsk_a");
+    assert.deepEqual(detail, {
+      task: { id: "tsk_a" },
+      latestSeq: 7,
+      agents: [{ id: "agt_lead" }],
+    });
+    assert.deepEqual(f.requests, [
+      "/v1/tasks/tsk_a?agents=none",
+      "/v1/tasks/tsk_a/agents",
+    ]);
+  } finally {
+    view.dispose();
+  }
+});
+
+test("an older hub's detail with its roster passes through in one read", async () => {
+  const old = {
+    task: { id: "tsk_a" },
+    latestSeq: 3,
+    agents: [{ id: "agt_old" }],
+  };
+  const f = routedFixture(() => old),
+    view = f.make();
+  try {
+    assert.deepEqual(await view.getTask("tsk_a"), old);
+    assert.deepEqual(f.requests, ["/v1/tasks/tsk_a?agents=none"]);
+  } finally {
+    view.dispose();
+  }
+});
+
+test("an agents refresh asks for changes since its cursor and merges them", async () => {
+  let answer = {
+    agents: [{ id: "a1" }, { id: "a2", unread: 0 }, { id: "a3" }],
+    cursor: "e.1",
+  };
+  const f = routedFixture(() => answer),
+    feed = feedClient(f.live),
+    view = f.make(feed.client, { now: () => 0 });
+  try {
+    await view.listAgents("tsk_a");
+    view.subscribe("", () => {});
+    answer = {
+      agents: [{ id: "a2", unread: 1 }, { id: "a4" }],
+      removed: ["a3"],
+      cursor: "e.2",
+      changes: true,
+    };
+    const before = f.requests.length;
+    await deliverEvents(feed, "", [{ kind: "message", taskId: "tsk_a" }]);
+    await view.listAgents("tsk_a");
+    await settle(() => f.requests.length > before);
+    assert.deepEqual(f.since(before), ["/v1/tasks/tsk_a/agents?since=e.1"]);
+    assert.deepEqual(await view.listAgents("tsk_a"), [
+      { id: "a1" },
+      { id: "a2", unread: 1 },
+      { id: "a4" },
+    ]);
+    // An empty answer keeps the roster and its cursor without a save.
+    answer = { agents: [], cursor: "e.2", changes: true };
+    await deliverEvents(feed, "", [{ kind: "message", taskId: "tsk_a" }]);
+    await view.listAgents("tsk_a");
+    await settle(() => f.requests.length > before + 1);
+    assert.deepEqual(f.since(before + 1), ["/v1/tasks/tsk_a/agents?since=e.2"]);
+    assert.equal((await view.listAgents("tsk_a")).length, 3);
+  } finally {
+    view.dispose();
+  }
+});
+
+test("a reset or a roster without a cursor replaces the whole roster", async () => {
+  let answer = { agents: [{ id: "a1" }, { id: "a2" }], cursor: "e.4" };
+  const f = routedFixture(() => answer),
+    feed = feedClient(f.live),
+    view = f.make(feed.client, { now: () => 0 });
+  const refreshAgents = async () => {
+    const before = f.requests.length;
+    await deliverEvents(feed, "", [{ kind: "message", taskId: "tsk_a" }]);
+    await view.listAgents("tsk_a");
+    await settle(() => f.requests.length > before);
+    return f.since(before);
+  };
+  try {
+    await view.listAgents("tsk_a");
+    view.subscribe("", () => {});
+    answer = { agents: [{ id: "b1" }], cursor: "f.1", reset: true };
+    assert.deepEqual(await refreshAgents(), [
+      "/v1/tasks/tsk_a/agents?since=e.4",
+    ]);
+    assert.deepEqual(await view.listAgents("tsk_a"), [{ id: "b1" }]);
+    // An older hub ignores since and sends the roster with no cursor.
+    answer = { agents: [{ id: "c1" }] };
+    assert.deepEqual(await refreshAgents(), [
+      "/v1/tasks/tsk_a/agents?since=f.1",
+    ]);
+    assert.deepEqual(await view.listAgents("tsk_a"), [{ id: "c1" }]);
+    // With no saved cursor the next refresh is a whole read again.
+    answer = { agents: [{ id: "c1" }, { id: "c2" }] };
+    assert.deepEqual(await refreshAgents(), ["/v1/tasks/tsk_a/agents"]);
+    assert.equal((await view.listAgents("tsk_a")).length, 2);
+  } finally {
+    view.dispose();
+  }
+});
+
+test("a followed page with a cursor is left to its caller; one without is refreshed", async () => {
+  let clock = 0;
+  const f = routedFixture((url) =>
+    url.searchParams.get("kind") === "bug"
+      ? { items: [{ id: "wi_bug" }], next: 0, cursor: "1.0" }
+      : { items: [{ id: "wi_feature" }], next: 0 },
+  );
+  const feed = feedClient(f.live),
+    view = f.make(feed.client, { now: () => clock, refreshMs: 30 });
+  try {
+    await view.listWorkItems({ kind: "bug" }, { followed: true });
+    await view.listWorkItems({ kind: "feature" }, { followed: true });
+    view.subscribe("", () => {});
+    let before = f.requests.length;
+    await deliverEvents(feed, "", [{ kind: "something_new" }]);
+    await view.listWorkItems({ kind: "bug" }, { followed: true });
+    await view.listWorkItems({ kind: "feature" }, { followed: true });
+    await settle(() => f.requests.length > before);
+    assert.deepEqual(
+      f.since(before),
+      ["/v1/work-items?kind=feature"],
+      "feed event",
+    );
+    before = f.requests.length;
+    clock = 40;
+    await view.listWorkItems({ kind: "bug" }, { followed: true });
+    await view.listWorkItems({ kind: "feature" }, { followed: true });
+    await tick(100);
+    assert.ok(
+      f.since(before).length >= 1,
+      "the timer refreshes the page without a cursor",
+    );
+    assert.ok(
+      f.since(before).every((path) => path === "/v1/work-items?kind=feature"),
+      `the timer and age leave the followed page alone: ${f.since(before)}`,
+    );
+    before = f.requests.length;
+    await view.refreshConnection();
+    assert.ok(
+      f.since(before).every((path) => path === "/v1/work-items?kind=feature"),
+    );
+  } finally {
+    view.dispose();
+  }
+});
+
+test("a changes read that resets makes the next work-items read wait for the hub", async () => {
+  let page = {
+    items: [{ id: "wi_1", title: "Before" }],
+    next: 0,
+    cursor: "1.0",
+  };
+  let changes = { items: [], next: 0, cursor: "1.0", changes: true };
+  const f = routedFixture((url) =>
+      url.searchParams.has("since") ? changes : page,
+    ),
+    view = f.make(f.live, { now: () => 0 });
+  try {
+    await view.listWorkItems({ kind: "bug" }, { followed: true });
+    await settle();
+    let before = f.requests.length;
+    assert.deepEqual(
+      await view.listWorkItemChanges({ kind: "bug", since: "1.0" }),
+      changes,
+    );
+    page = { items: [{ id: "wi_1", title: "After" }], next: 0, cursor: "9.0" };
+    assert.equal(
+      (await view.listWorkItems({ kind: "bug" }, { followed: true })).items[0]
+        .title,
+      "Before",
+      "an ordinary changes read leaves the page saved",
+    );
+    assert.deepEqual(f.since(before), ["/v1/work-items?kind=bug&since=1.0"]);
+    changes = { items: [], next: 0, cursor: "9.0", reset: true };
+    before = f.requests.length;
+    await view.listWorkItemChanges({ kind: "bug", since: "1.0" });
+    const reloaded = await view.listWorkItems(
+      { kind: "bug" },
+      { followed: true },
+    );
+    assert.equal(reloaded.items[0].title, "After");
+    assert.deepEqual(f.since(before), [
+      "/v1/work-items?kind=bug&since=1.0",
+      "/v1/work-items?kind=bug",
+    ]);
+  } finally {
+    view.dispose();
+  }
+});

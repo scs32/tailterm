@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -1111,4 +1112,115 @@ func (s *Store) DispatchWorkItem(ctx context.Context, taskID, itemID string, req
 	}
 	item.LastDispatch = &dispatch
 	return api.WorkItemDispatchResult{Item: item, Dispatch: dispatch, Queue: &queueReceipt}, nil
+}
+
+// WorkItemCursor marks a point in the work-item change log: the last
+// work_item_changes seq and the last work_item_dispatches seq. Every item
+// create or update writes a change row and every dispatch a dispatch row, in
+// the write's own transaction and under writeMu, so both seqs grow in commit
+// order. An estimate save writes neither: it changes only the budget, which a
+// list row does not render.
+type WorkItemCursor struct {
+	Change, Dispatch int64
+}
+
+func (c WorkItemCursor) String() string {
+	return strconv.FormatInt(c.Change, 10) + "." + strconv.FormatInt(c.Dispatch, 10)
+}
+
+// ParseWorkItemCursor reads the "CHANGE.DISPATCH" form String writes.
+func ParseWorkItemCursor(value string) (WorkItemCursor, bool) {
+	change, dispatch, ok := strings.Cut(value, ".")
+	if !ok {
+		return WorkItemCursor{}, false
+	}
+	c, err1 := strconv.ParseInt(change, 10, 64)
+	d, err2 := strconv.ParseInt(dispatch, 10, 64)
+	if err1 != nil || err2 != nil || c < 0 || d < 0 || strconv.FormatInt(c, 10) != change || strconv.FormatInt(d, 10) != dispatch {
+		return WorkItemCursor{}, false
+	}
+	return WorkItemCursor{Change: c, Dispatch: d}, true
+}
+
+// CurrentWorkItemCursor returns the cursor of the newest committed change.
+// A list read takes it before its rows, so a change committed during the read
+// is at most sent again by the next changes read, never missed.
+func (s *Store) CurrentWorkItemCursor(ctx context.Context) (WorkItemCursor, error) {
+	var c WorkItemCursor
+	err := s.db.QueryRowContext(ctx, `SELECT (SELECT COALESCE(MAX(seq),0) FROM work_item_changes),(SELECT COALESCE(MAX(seq),0) FROM work_item_dispatches)`).Scan(&c.Change, &c.Dispatch)
+	return c, err
+}
+
+// WorkItemChanges answers a changes-since read. Reset means the caller must
+// reload the whole list instead: its cursor is ahead of this hub, or more
+// items changed than one page holds.
+type WorkItemChanges struct {
+	Items  []api.WorkItem
+	Cursor WorkItemCursor
+	Reset  bool
+}
+
+// ListWorkItemChanges returns the current state of every item of the given
+// task and kind that was created, updated or dispatched after since, of any
+// status, so a caller filtering by status also learns which rows left its
+// filter. Items come in item seq order with their last dispatch and budget,
+// as ListWorkItems loads them.
+func (s *Store) ListWorkItemChanges(ctx context.Context, taskID, kind string, since WorkItemCursor) (WorkItemChanges, error) {
+	if since.Change < 0 || since.Dispatch < 0 || (taskID != "" && !api.ValidID(taskID, "tsk")) || (kind != "" && !validWorkItemKind(kind)) {
+		return WorkItemChanges{}, api.ErrInvalid
+	}
+	if taskID != "" {
+		if _, err := s.GetTask(ctx, taskID); err != nil {
+			return WorkItemChanges{}, err
+		}
+	}
+	current, err := s.CurrentWorkItemCursor(ctx)
+	if err != nil {
+		return WorkItemChanges{}, err
+	}
+	if since.Change > current.Change || since.Dispatch > current.Dispatch {
+		return WorkItemChanges{Items: []api.WorkItem{}, Cursor: current, Reset: true}, nil
+	}
+	query := `SELECT ` + workItemCols + ` FROM work_items WHERE id IN (SELECT item_id FROM work_item_changes WHERE seq>? AND seq<=? UNION SELECT item_id FROM work_item_dispatches WHERE seq>? AND seq<=?)`
+	args := []any{since.Change, current.Change, since.Dispatch, current.Dispatch}
+	if taskID != "" {
+		query += ` AND task_id=?`
+		args = append(args, taskID)
+	}
+	if kind != "" {
+		query += ` AND kind=?`
+		args = append(args, kind)
+	}
+	query += ` ORDER BY seq LIMIT ?`
+	args = append(args, api.MaxLimit+1)
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return WorkItemChanges{}, err
+	}
+	items := []api.WorkItem{}
+	for rows.Next() {
+		item, err := scanWorkItem(rows)
+		if err != nil {
+			rows.Close()
+			return WorkItemChanges{}, err
+		}
+		items = append(items, item)
+	}
+	if err = rows.Err(); err != nil {
+		rows.Close()
+		return WorkItemChanges{}, err
+	}
+	rows.Close()
+	if len(items) > api.MaxLimit {
+		return WorkItemChanges{Items: []api.WorkItem{}, Cursor: current, Reset: true}, nil
+	}
+	for i := range items {
+		if err = loadLastDispatch(s.db, ctx, &items[i]); err != nil {
+			return WorkItemChanges{}, err
+		}
+		if items[i].Budget, err = loadTokenBudget(ctx, s.db, items[i].TaskID, items[i].ID); err != nil {
+			return WorkItemChanges{}, err
+		}
+	}
+	return WorkItemChanges{Items: items, Cursor: current}, nil
 }

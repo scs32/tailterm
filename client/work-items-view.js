@@ -40,6 +40,34 @@ const priorities = {
 };
 // The hub's page limit (api.MaxLimit).
 const PAGE_LIMIT = 200;
+// Feed events that cannot change a work-item row. Every other event, and a
+// cache notice, asks the hub for the items changed since the list's cursor.
+const ROW_NEUTRAL_EVENTS = new Set([
+  "heartbeat",
+  "message",
+  "agent_added",
+  "started",
+  "running",
+  "done",
+  "needs_input",
+  "closed",
+  "exited",
+  "retired",
+  "resumed",
+  "agent_cleanup",
+]);
+// The componentwise minimum of two "CHANGE.DISPATCH" cursors: the oldest
+// point every page of a read is current from. null when either is missing.
+const parseCursor = (cursor) => {
+  const match = /^(\d+)\.(\d+)$/.exec(cursor ?? "");
+  return match ? [Number(match[1]), Number(match[2])] : null;
+};
+export function minCursor(a, b) {
+  const x = parseCursor(a),
+    y = parseCursor(b);
+  if (!x || !y) return null;
+  return `${Math.min(x[0], y[0])}.${Math.min(x[1], y[1])}`;
+}
 const options = (values, selected) =>
   Object.entries(values)
     .map(
@@ -85,6 +113,13 @@ export function createWorkItemsView({
     // never rendered.
     itemsKey = "",
     shownGeneration = 0,
+    // The change cursor of the complete list on screen, and whether a
+    // changes read is waiting behind a read in flight.
+    listCursor = null,
+    followAgain = false,
+    // A reload that a reset asked for is not followed by another changes
+    // read at once, so a hub that keeps resetting cannot loop.
+    resetReload = false,
     listScheduled = false,
     narrativeGeneration = 0,
     searchGeneration = 0,
@@ -116,6 +151,8 @@ export function createWorkItemsView({
     morePages = false;
     completeKey = "";
     renderedKey = "";
+    listCursor = null;
+    followAgain = false;
     subscription?.stop();
     subscription = null;
     itemScroll.interrupt();
@@ -132,9 +169,17 @@ export function createWorkItemsView({
     if (client() && root && !root.firstElementChild) paintShell();
     await reload();
     if (visible && client() && !subscription)
-      subscription = client().subscribe("", () => reload(), {
-        onError: () => {},
-      });
+      subscription = client().subscribe(
+        "",
+        (events) => {
+          if (
+            !events?.length ||
+            events.some((event) => !ROW_NEUTRAL_EVENTS.has(event?.kind))
+          )
+            void follow();
+        },
+        { onError: () => {} },
+      );
   }
   function paintShell() {
     const noun = plural.toLowerCase();
@@ -155,8 +200,12 @@ export function createWorkItemsView({
     }
     loading = true;
     again = false;
+    followAgain = false;
     const token = ++generation;
     const filter = { taskId: scope, status: state };
+    const afterReset = resetReload;
+    resetReload = false;
+    let followNext = false;
     try {
       const nextTasks = await client().listTasks(),
         next = [];
@@ -166,16 +215,25 @@ export function createWorkItemsView({
       // tab revisit or a filter change) each page is shown as it arrives.
       const progressive = completeKey !== key;
       let after = 0,
-        fullPage = 0;
+        fullPage = 0,
+        cursor;
       for (;;) {
-        const page = await client().listWorkItems({
-          kind,
-          ...filter,
-          after,
-          limit: PAGE_LIMIT,
-        });
+        // Followed: this view keeps its pages current by changes reads.
+        const page = await client().listWorkItems(
+          {
+            kind,
+            ...filter,
+            after,
+            limit: PAGE_LIMIT,
+          },
+          { followed: true },
+        );
         if (!visible || token !== generation) return;
         next.push(...page.items);
+        cursor =
+          cursor === undefined
+            ? parseCursor(page.cursor) && page.cursor
+            : minCursor(cursor, page.cursor);
         // The hub names a next cursor on every non-empty page, so the list
         // ends at an empty page, or at a page shorter than an earlier one of
         // this read: a hub that pages below PAGE_LIMIT still reads every page.
@@ -198,6 +256,10 @@ export function createWorkItemsView({
         return;
       }
       completeKey = key;
+      listCursor = cursor || null;
+      // Cached pages may be older than the hub: a changes read brings them
+      // current, unless this reload itself answered a reset.
+      followNext = !afterReset && Boolean(listCursor);
       if (shownGeneration === token) {
         showPage(token, key, nextTasks, next, false);
         return;
@@ -218,6 +280,7 @@ export function createWorkItemsView({
       morePages = false;
       completeKey = "";
       renderedKey = "";
+      listCursor = null;
       itemScroll.interrupt();
       presentation.interrupt();
       root.innerHTML = `<div class="mode-empty"><span class="eyebrow">${plural.toUpperCase()}</span><h2>Hub unavailable.</h2><p class="launcher-intro" role="alert">${esc(error.message)}</p><button data-items-retry>Retry</button></div>`;
@@ -226,6 +289,91 @@ export function createWorkItemsView({
       if (token === generation) {
         loading = false;
         if (again) void reload();
+        else {
+          itemScroll.flush();
+          if (followNext || followAgain) void follow();
+        }
+      }
+    }
+  }
+  // Brings the complete list on screen current with one changes read: an
+  // item still matching the status filter replaces its row or is inserted by
+  // seq, and one that no longer matches leaves. Without a cursor (an older
+  // hub), on a reset or on a failed read, the whole list is reloaded.
+  async function follow() {
+    if (!visible || !root) return;
+    if (loading) {
+      followAgain = true;
+      return;
+    }
+    const c = client();
+    const key = filterKey();
+    if (
+      !c?.listWorkItemChanges ||
+      !listCursor ||
+      completeKey !== key ||
+      itemsKey !== key
+    )
+      return reload();
+    loading = true;
+    followAgain = false;
+    const token = ++generation;
+    const filter = { taskId: scope, status: state };
+    let fallback = false;
+    try {
+      const [nextTasks, changes] = await Promise.all([
+        c.listTasks(),
+        c.listWorkItemChanges({
+          kind,
+          taskId: filter.taskId,
+          since: listCursor,
+        }),
+      ]);
+      if (!visible || token !== generation) return;
+      if (
+        filterKey() !== key ||
+        !changes?.changes ||
+        changes.reset ||
+        !parseCursor(changes.cursor) ||
+        !Array.isArray(changes.items)
+      ) {
+        fallback = true;
+        resetReload = Boolean(changes?.reset);
+        return;
+      }
+      listCursor = changes.cursor;
+      const tasksChanged = JSON.stringify(nextTasks) !== JSON.stringify(tasks);
+      tasks = nextTasks;
+      let next = items;
+      for (const item of changes.items) {
+        if (item.kind && item.kind !== kind) continue;
+        if (next === items) next = items.slice();
+        const at = next.findIndex((entry) => entry.id === item.id);
+        const keep = !filter.status || item.status === filter.status;
+        if (at >= 0) {
+          if (keep) next[at] = item;
+          else next.splice(at, 1);
+        } else if (keep) {
+          const before = next.findIndex((entry) => entry.seq > item.seq);
+          next.splice(before < 0 ? next.length : before, 0, item);
+        }
+        // Only a changed item's search text can be out of date.
+        searchHistory.delete(item.id);
+      }
+      const itemsChanged = next !== items;
+      items = next;
+      loading = false;
+      if (tasksChanged) render();
+      else if (itemsChanged) updateList();
+      if (itemsChanged && query.trim()) void enrichSearchHistory();
+    } catch {
+      if (!visible || token !== generation) return;
+      fallback = true;
+    } finally {
+      if (token === generation) {
+        loading = false;
+        if (fallback || again) void reload();
+        else if (followAgain) void follow();
         else itemScroll.flush();
       }
     }

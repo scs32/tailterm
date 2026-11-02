@@ -119,13 +119,50 @@ func (s *Server) listAllWorkItems(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid task id")
 		return
 	}
+	s.writeWorkItemList(w, r, task)
+}
+
+// workItemListPage is a list page with the change cursor taken before its
+// rows. A caller keeps the cursor and later asks for changes since it.
+type workItemListPage struct {
+	api.WorkItemList
+	Cursor  string `json:"cursor"`
+	Changes bool   `json:"changes,omitempty"`
+	Reset   bool   `json:"reset,omitempty"`
+}
+
+// writeWorkItemList answers both list routes. A page read carries the cursor.
+// since=CURSOR returns every item of the task and kind changed after it, of
+// any status, so a caller learns which rows left its status filter; reset asks
+// it to reload the whole list instead.
+func (s *Server) writeWorkItemList(w http.ResponseWriter, r *http.Request, task string) {
 	kind, status, after, limit := workItemFilters(r)
+	q := r.URL.Query()
+	if q.Has("since") {
+		since, ok := store.ParseWorkItemCursor(q.Get("since"))
+		if !ok || q.Has("after") || status != "" {
+			writeError(w, http.StatusBadRequest, "since needs a cursor from a list page and no after or status")
+			return
+		}
+		changes, err := s.store.ListWorkItemChanges(r.Context(), task, kind, since)
+		if err != nil {
+			fail(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, workItemListPage{WorkItemList: api.WorkItemList{Items: changes.Items}, Cursor: changes.Cursor.String(), Changes: !changes.Reset, Reset: changes.Reset})
+		return
+	}
+	cursor, err := s.store.CurrentWorkItemCursor(r.Context())
+	if err != nil {
+		fail(w, err)
+		return
+	}
 	items, err := s.store.ListWorkItems(r.Context(), task, kind, status, after, limit)
 	if err != nil {
 		fail(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, items)
+	writeJSON(w, http.StatusOK, workItemListPage{WorkItemList: items, Cursor: cursor.String()})
 }
 
 func (s *Server) listTaskWorkItems(w http.ResponseWriter, r *http.Request) {
@@ -136,13 +173,7 @@ func (s *Server) listTaskWorkItems(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	kind, status, after, limit := workItemFilters(r)
-	items, err := s.store.ListWorkItems(r.Context(), task, kind, status, after, limit)
-	if err != nil {
-		fail(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, items)
+	s.writeWorkItemList(w, r, task)
 }
 
 func (s *Server) createWorkItem(w http.ResponseWriter, r *http.Request) {

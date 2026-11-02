@@ -343,13 +343,25 @@ async function fixturePage({
   let liveTimer = null;
   const changed = { workItem: 0, message: 0, agent: 0 };
   const changedBytes = { workItem: 0, message: 0, agent: 0 };
-  // One live event: one work item changes, one message is posted and one
-  // agent changes activity, so each view has one changed record to show.
+  // The hub's change cursors (bug wi_c83e8ef138265cf9): a work-item change
+  // log behind "CHANGE.DISPATCH" page cursors and since reads, and per-project
+  // agent versions behind "EPOCH.N" agents cursors.
+  let changeSeq = 0;
+  const changeLog = [];
+  const rosterVersion = new Map(tasks.map((task) => [task.id, 0]));
+  const agentVersion = new Map();
+  const ROSTER_EPOCH = "e0";
+  const eventLog = new Map();
+  let ticks = 0;
+  // One live tick: one work item changes, one message is posted and one
+  // agent changes activity, so each view has one changed record to show. The
+  // feed carries a work_item_updated event and a message event.
   const liveEvent = () => {
-    const n = eventSeq - backlog;
+    const n = ticks++;
     const item = items[(n * 37) % items.length];
     item.revision++;
     item.updatedAt = new Date().toISOString();
+    changeLog.push([++changeSeq, item.id]);
     changed.workItem++;
     changedBytes.workItem += JSON.stringify(item).length;
     const task = tasks[0];
@@ -361,21 +373,34 @@ async function fixturePage({
     const a = roster[roster.length - 1 - (n % 6)];
     a.activity = a.activity === "working" ? "idle" : "working";
     a.lastEventAt = new Date().toISOString();
+    rosterVersion.set(task.id, rosterVersion.get(task.id) + 1);
+    agentVersion.set(a.id, rosterVersion.get(task.id));
     changed.agent++;
     changedBytes.agent += JSON.stringify(a).length;
+    eventLog.set(++eventSeq, {
+      seq: eventSeq,
+      taskId: item.taskId,
+      kind: "work_item_updated",
+      agentId: "",
+      text: item.title,
+      data: { itemId: item.id, kind: item.kind, revision: item.revision },
+      by: { node: "workspace", user: "fixture" },
+      createdAt: "2026-10-30T10:00:00Z",
+    });
     eventSeq++;
     for (const wake of waiters) wake();
     waiters.clear();
   };
-  const eventAt = (seq) => ({
-    seq,
-    taskId: tasks[0].id,
-    kind: "message",
-    agentId: "",
-    text: "synthetic event " + seq,
-    by: { node: "workspace", user: "fixture" },
-    createdAt: "2026-10-30T10:00:00Z",
-  });
+  const eventAt = (seq) =>
+    eventLog.get(seq) || {
+      seq,
+      taskId: tasks[0].id,
+      kind: "message",
+      agentId: "",
+      text: "synthetic event " + seq,
+      by: { node: "workspace", user: "fixture" },
+      createdAt: "2026-10-30T10:00:00Z",
+    };
   const eventsAfter = (task, after, limit) => {
     const out = [];
     for (let seq = after + 1; seq <= eventSeq && out.length < limit; seq++) {
@@ -389,10 +414,20 @@ async function fixturePage({
     const p = u.pathname;
     if (p === "/v1/events" || /\/events$/.test(p)) return "events";
     if (p === "/v1/work-items")
-      return "work-items" + (u.searchParams.get("kind") ? "" : " (no kind)");
+      return (
+        "work-items" +
+        (u.searchParams.has("since") ? " changes" : "") +
+        (u.searchParams.get("kind") ? "" : " (no kind)")
+      );
     if (p === "/v1/tasks") return "tasks list";
-    if (/^\/v1\/tasks\/[^/]+$/.test(p)) return "task detail (with agents)";
-    if (/\/agents$/.test(p)) return "agents list";
+    if (/^\/v1\/tasks\/[^/]+$/.test(p))
+      return u.searchParams.get("agents") === "none"
+        ? "task detail (no agents)"
+        : "task detail (with agents)";
+    if (/\/agents$/.test(p))
+      return u.searchParams.has("since")
+        ? "agents since cursor"
+        : "agents list";
     if (/\/messages$/.test(p))
       return u.searchParams.get("after")
         ? "messages after cursor"
@@ -478,6 +513,25 @@ async function fixturePage({
     if (p === "/v1/whoami")
       return respond({ node: "workspace", user: "fixture" });
     if (p === "/v1/tasks") return respond({ tasks });
+    if (p === "/v1/work-items" && u.searchParams.has("since")) {
+      const q = (name) => u.searchParams.get(name);
+      const cursor = `${changeSeq}.0`;
+      const since = Number(String(q("since")).split(".")[0]);
+      if (!(since <= changeSeq))
+        return respond({ items: [], next: 0, cursor, reset: true });
+      const ids = new Set(
+        changeLog.filter(([seq]) => seq > since).map(([, id]) => id),
+      );
+      const list = items.filter(
+        (x) =>
+          ids.has(x.id) &&
+          (!q("taskId") || x.taskId === q("taskId")) &&
+          (!q("kind") || x.kind === q("kind")),
+      );
+      if (list.length > 200)
+        return respond({ items: [], next: 0, cursor, reset: true });
+      return respond({ items: list, next: 0, cursor, changes: true });
+    }
     if (p === "/v1/work-items") {
       const q = (name) => u.searchParams.get(name);
       const after = Number(q("after") || 0);
@@ -493,7 +547,11 @@ async function fixturePage({
         .slice(0, limit);
       // Hub semantics (hub/internal/store/work_items.go ListWorkItems):
       // next is the last seq of every non-empty page.
-      return respond({ items: page, next: page.length ? page.at(-1).seq : 0 });
+      return respond({
+        items: page,
+        next: page.length ? page.at(-1).seq : 0,
+        cursor: `${changeSeq}.0`,
+      });
     }
     const match = p.match(/^\/v1\/tasks\/([^/]+)(.*)$/);
     const task = match && tasks.find((t) => t.id === match[1]);
@@ -503,13 +561,29 @@ async function fixturePage({
     }
     const tail = match[2];
     if (!tail)
+      return respond(
+        u.searchParams.get("agents") === "none"
+          ? { task, latestSeq: messageSeq, agentsOmitted: true }
+          : { task, agents: agentsByTask.get(task.id), latestSeq: messageSeq },
+      );
+    if (tail === "/agents") {
+      const version = rosterVersion.get(task.id);
+      const cursor = `${ROSTER_EPOCH}.${version}`;
+      const roster = agentsByTask.get(task.id);
+      const since = u.searchParams.get("since");
+      const [epoch, n] = String(since || "").split(".");
+      if (!since || epoch !== ROSTER_EPOCH || !(Number(n) <= version))
+        return respond({
+          agents: roster,
+          cursor,
+          ...(since ? { reset: true } : {}),
+        });
       return respond({
-        task,
-        agents: agentsByTask.get(task.id),
-        latestSeq: messageSeq,
+        agents: roster.filter((x) => (agentVersion.get(x.id) || 0) > Number(n)),
+        cursor,
+        changes: true,
       });
-    if (tail === "/agents")
-      return respond({ agents: agentsByTask.get(task.id) });
+    }
     if (tail === "/messages") {
       const after = Number(u.searchParams.get("after") || 0);
       const limit = Math.min(1000, Number(u.searchParams.get("limit") || 50));
@@ -557,7 +631,7 @@ async function fixturePage({
   // Every listWorkItems call the view makes, network-served or cache-served.
   const reads = [];
   const listWorkItems = client.listWorkItems;
-  client.listWorkItems = async (params) => {
+  client.listWorkItems = async (params, options) => {
     const read = {
       start: performance.now(),
       end: 0,
@@ -567,7 +641,7 @@ async function fixturePage({
     reads.push(read);
     const before = log.length;
     try {
-      return await listWorkItems(params);
+      return await listWorkItems(params, options);
     } finally {
       read.end = performance.now();
       read.network = log

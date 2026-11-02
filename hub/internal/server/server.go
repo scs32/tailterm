@@ -36,10 +36,13 @@ type Server struct {
 	// bridgeReports is the Discord bridge's last settings report, in memory
 	// only (bridge_settings.go).
 	bridgeReports bridgeReports
+	// rosters versions each project's agents for the agents route's since
+	// cursor (agent_changes.go).
+	rosters *rosterTracker
 }
 
 func New(st *store.Store, identity Identity) *Server {
-	s := &Server{store: st, identity: identity, mux: http.NewServeMux(), limiter: newLimiter(20, 40), logf: log.Printf, gate: newAdmission()}
+	s := &Server{store: st, identity: identity, mux: http.NewServeMux(), limiter: newLimiter(20, 40), logf: log.Printf, gate: newAdmission(), rosters: newRosterTracker()}
 	s.singleReads = newLimiter(singleReadsPerSecond, singleReadBurst)
 	s.singleReads.maxKeys = singleReadMaxKeys
 	s.profileRoutes()
@@ -611,22 +614,42 @@ func (s *Server) getTask(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// agents=none leaves the roster to the agents route, which a client can
+	// read by changes since a cursor instead of whole on every refresh.
+	omit := r.URL.Query().Has("agents")
+	if omit && r.URL.Query().Get("agents") != "none" {
+		writeError(w, http.StatusBadRequest, "agents accepts only none")
+		return
+	}
 	t, err := s.store.GetTask(r.Context(), id)
 	if err != nil {
 		fail(w, err)
 		return
 	}
-	agents, err := s.store.ListAgents(r.Context(), id)
-	if err != nil {
-		fail(w, err)
-		return
+	var agents []api.Agent
+	if !omit {
+		if agents, err = s.store.ListAgents(r.Context(), id); err != nil {
+			fail(w, err)
+			return
+		}
 	}
 	latest, err := s.store.LatestSeq(r.Context(), id)
 	if err != nil {
 		fail(w, err)
 		return
 	}
+	if omit {
+		writeJSON(w, 200, taskDetailWithoutAgents{Task: t, LatestSeq: latest, AgentsOmitted: true})
+		return
+	}
 	writeJSON(w, 200, api.TaskDetail{Task: t, Agents: agents, LatestSeq: latest})
+}
+
+// taskDetailWithoutAgents is the project detail read with agents=none.
+type taskDetailWithoutAgents struct {
+	Task          api.Task `json:"task"`
+	LatestSeq     int64    `json:"latestSeq"`
+	AgentsOmitted bool     `json:"agentsOmitted"`
 }
 
 func (s *Server) updateTask(w http.ResponseWriter, r *http.Request) {
@@ -828,26 +851,6 @@ func (s *Server) getAllocationIntent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, in)
-}
-
-func (s *Server) listAgents(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.caller(w, r); !ok {
-		return
-	}
-	id, ok := taskID(w, r)
-	if !ok {
-		return
-	}
-	if _, err := s.store.GetTask(r.Context(), id); err != nil {
-		fail(w, err)
-		return
-	}
-	agents, err := s.store.ListAgents(r.Context(), id)
-	if err != nil {
-		fail(w, err)
-		return
-	}
-	writeJSON(w, 200, api.AgentList{Agents: agents})
 }
 
 func (s *Server) agentInTask(w http.ResponseWriter, r *http.Request) (api.Agent, bool) {

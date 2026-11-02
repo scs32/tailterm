@@ -35,7 +35,29 @@ ends at an empty page, or at a page shorter than an earlier one, so a hub that
 pages below 200 still lists every item (bug `wi_782e0ea7627f9fca`; measurements
 in [measurements/work-items-fetch-2026-11-01.md](measurements/work-items-fetch-2026-11-01.md)).
 
+Once a list is complete, Bugs and Features refresh by changes, not pages
+(bug `wi_c83e8ef138265cf9`). Each list page names the hub's change cursor, and
+the view keeps the oldest cursor of its pages. After a complete read, and on
+each feed event that can change a row or each cache notice, it asks the hub once
+for the items created, updated or sent since that cursor
+(`GET /v1/work-items?kind=...&taskId=...&since=CURSOR`, of any status). An item
+that still matches the status filter replaces its row or is inserted by its
+place in the list; one that no longer matches leaves. Messages, agent lifecycle
+events and heartbeats alone change no row and read nothing. The view reloads
+every page instead when the hub names no cursor (an older hub), answers
+`reset` (its cursor is ahead of the hub, or more than 200 items changed) or the
+changes read fails, and after its own edits and sends. A tab revisit serves the
+saved pages and then one changes read brings them current. Only a changed
+item's search history is refetched, so a narrative or message write that does
+not change an item's revision can leave its search text stale until the next
+full reload. An estimate save changes no list row and is not sent.
+
 Board refreshes normally fetch only messages newer than the saved conversation.
+The project detail on Board and Projects reads the project without its roster
+(`GET /v1/tasks/{id}?agents=none`) and the roster from the agents read, which
+after its first answer asks only for the agents changed since its cursor and
+the ids that left (`GET /v1/tasks/{id}/agents?since=CURSOR`). A reset or an
+older hub sends the whole roster again.
 Terminal reconciliation, launches and cleanup still require authoritative hub
 reads. Changes and dispatches require a confirmed hub response: failures retain
 the form draft and are never queued or replayed automatically. Teams already

@@ -234,7 +234,12 @@ their columns; project titles and subtitles occupy separate lines. Selection
 uses fill, hover uses outline, and the history checkbox stays beside its label.
 
 Previously visited hub views use an encrypted local read cache and refresh in
-the background, including small incremental Board message reads. The cache is
+the background, including small incremental Board message reads. A feed event
+marks stale only the reads it can affect: a message its own project's reads, a
+work-item change the work-item and queue reads, and an unknown event every read.
+Bugs and Features refresh by work items changed since a cursor, and the project
+detail reads its roster by agents changed since a cursor, each with a full
+reload as the fallback (bug `wi_c83e8ef138265cf9`). The cache is
 bounded to 100 entries/8 MiB/seven days and isolated by hub credential. Saved data
 remains readable while the hub is offline; hub mutations are never queued.
 When the hub answers, a read after a confirmed write returns post-write data,

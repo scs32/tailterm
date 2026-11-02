@@ -10,6 +10,85 @@ const CATCH_UP_QUIET_MS = 250;
 // eviction order current without a full encrypted save on every refresh.
 const RESAVE_MS = 10 * 60 * 1000;
 
+// Feed event kinds that change work items. They can affect the cross-project
+// work-item lists and the project's own work-item and queue reads, never its
+// detail or roster.
+const WORK_ITEM_EVENTS = new Set([
+  "work_item_created",
+  "work_item_updated",
+  "work_item_dispatched",
+  "review_follow_up_fixed",
+  "review_follow_up_closed",
+  "review_finding_folded",
+  "fold_candidates_skipped",
+]);
+// Agent lifecycle kinds. With task_* kinds they can affect the projects list
+// and every read of their own project.
+const AGENT_EVENTS = new Set([
+  "agent_added",
+  "started",
+  "running",
+  "done",
+  "needs_input",
+  "closed",
+  "exited",
+  "retired",
+  "resumed",
+  "agent_cleanup",
+]);
+
+// staleScope returns which read paths (by URL pathname) one feed event can
+// affect. An unknown kind or an event without a project marks every path.
+export function staleScope(event) {
+  const kind = event?.kind;
+  if (kind === "heartbeat") return () => false;
+  const task = event?.taskId;
+  if (!task || typeof task !== "string") return () => true;
+  const inTask = (id) => (pathname) =>
+    pathname === `/v1/tasks/${id}` || pathname.startsWith(`/v1/tasks/${id}/`);
+  const own = inTask(task);
+  if (WORK_ITEM_EVENTS.has(kind)) {
+    const target = event.data?.targetTaskId;
+    const targetPaths =
+      kind === "work_item_dispatched" && typeof target === "string" && target
+        ? inTask(target)
+        : () => false;
+    return (pathname) =>
+      pathname === "/v1/work-items" ||
+      pathname.startsWith("/v1/work-items/") ||
+      pathname === `/v1/tasks/${task}/work-items` ||
+      pathname.startsWith(`/v1/tasks/${task}/work-items/`) ||
+      pathname === `/v1/tasks/${task}/queue` ||
+      pathname.startsWith(`/v1/tasks/${task}/queue/`) ||
+      targetPaths(pathname);
+  }
+  if (kind === "message") return own;
+  if (
+    AGENT_EVENTS.has(kind) ||
+    (typeof kind === "string" && kind.startsWith("task_"))
+  )
+    return (pathname) => pathname === "/v1/tasks" || own(pathname);
+  return () => true;
+}
+
+// mergeAgents applies an agents changes read to a saved roster: changed agents
+// replace theirs in place, new ones append in response order, removed ids go.
+export function mergeAgents(previous, changed = [], removed = []) {
+  const gone = new Set(removed);
+  const byId = new Map(changed.map((agent) => [agent.id, agent]));
+  const merged = [];
+  for (const agent of previous) {
+    if (gone.has(agent.id)) continue;
+    if (byId.has(agent.id)) {
+      merged.push(byId.get(agent.id));
+      byId.delete(agent.id);
+    } else merged.push(agent);
+  }
+  for (const agent of changed)
+    if (byId.has(agent.id) && !gone.has(agent.id)) merged.push(agent);
+  return merged;
+}
+
 // Cache only presentation reads. The underlying client remains authoritative
 // for terminal reconciliation, launches, cleanup and every mutation.
 export function createCachedHubClient({
@@ -59,6 +138,18 @@ export function createCachedHubClient({
     touched = new Map(),
     stops = new Set(),
     feeds = new Map();
+  // A followed read is kept current by its caller through changes-since
+  // reads. While its saved data carries a cursor, feed events, the refresh
+  // timer and connection refreshes leave it alone; without a cursor (an older
+  // hub) it refreshes as any other read.
+  const followed = new Set(),
+    cursorPaths = new Set();
+  const selfFollowed = (path) => followed.has(path) && cursorPaths.has(path);
+  const noteCursor = (path, data) => {
+    if (data && typeof data.cursor === "string" && data.cursor)
+      cursorPaths.add(path);
+    else cursorPaths.delete(path);
+  };
   let staleGeneration = 0;
   const deferred = new Set();
   let capabilityMemo = null,
@@ -178,8 +269,46 @@ export function createCachedHubClient({
           1,
           Math.min(1000, Number(url.searchParams.get("limit")) || 50),
         );
-        let data;
-        if (incremental) {
+        // A saved roster with a cursor asks for the agents changed since it.
+        const previousRoster = old?.value.data;
+        const rosterCursor =
+          /^\/v1\/tasks\/[^/]+\/agents$/.test(url.pathname) &&
+          !url.search &&
+          Array.isArray(previousRoster?.agents) &&
+          typeof previousRoster.cursor === "string" &&
+          previousRoster.cursor;
+        let data, rosterChanged;
+        if (rosterCursor) {
+          url.searchParams.set("since", rosterCursor);
+          const delta = await client.request(url.pathname + url.search, {
+            timeoutMs: 15000,
+          });
+          if (
+            delta?.changes &&
+            typeof delta.cursor === "string" &&
+            Array.isArray(delta.agents)
+          ) {
+            const removed = delta.removed || [];
+            rosterChanged =
+              delta.agents.length > 0 ||
+              removed.length > 0 ||
+              delta.cursor !== rosterCursor;
+            data = rosterChanged
+              ? {
+                  agents: mergeAgents(
+                    previousRoster.agents,
+                    delta.agents,
+                    removed,
+                  ),
+                  cursor: delta.cursor,
+                }
+              : previousRoster;
+          } else {
+            // A reset, or a hub that ignored since, sends the whole roster.
+            data = { agents: delta.agents, cursor: delta.cursor };
+            if (typeof data.cursor !== "string") delete data.cursor;
+          }
+        } else if (incremental) {
           url.searchParams.delete("latest");
           url.searchParams.set("after", previousMessages.at(-1).seq);
           data = await client.request(url.pathname + url.search, {
@@ -208,7 +337,9 @@ export function createCachedHubClient({
           return data;
         }
         const changed =
+          rosterChanged ??
           JSON.stringify(old?.value.data) !== JSON.stringify(data);
+        noteCursor(path, data);
         // The caller gets the data without waiting for the encrypted save.
         // The cache takes the entry into memory before put returns, and
         // refuses it once the vault locks or this client is disposed.
@@ -307,6 +438,7 @@ export function createCachedHubClient({
       now() - (checked.get(path) || 0) < refreshMs
     )
       throw optionalFailures.get(path);
+    if (entry && !entry.value.error) noteCursor(path, entry.value.data);
     if (
       entry &&
       (!dirty.has(path) ||
@@ -317,10 +449,13 @@ export function createCachedHubClient({
     ) {
       saved = true;
       if (!listeners.size) unlistened.add(path);
+      // A followed read refreshes once per client session; its caller
+      // keeps it current after that.
       if (
-        (stale.has(path) && !failed) ||
         !checked.has(path) ||
-        now() - checked.get(path) >= refreshMs
+        (!selfFollowed(path) &&
+          ((stale.has(path) && !failed) ||
+            now() - checked.get(path) >= refreshMs))
       )
         refreshAfterPaint(path);
       notify();
@@ -353,11 +488,17 @@ export function createCachedHubClient({
     }
     notify(true);
   }
-  function markStale() {
+  // A feed page marks stale only the reads its events can affect.
+  function markStale(events) {
     staleGeneration++;
     for (const task of new Set([...auditEpochs.keys(), ...auditMemory.keys()]))
       auditEpochs.set(task, (auditEpochs.get(task) || 0) + 1);
-    for (const path of paths) stale.add(path);
+    const scopes = events.map(staleScope);
+    for (const path of paths) {
+      if (selfFollowed(path)) continue;
+      const pathname = new URL(path, client.base).pathname;
+      if (scopes.some((affects) => affects(pathname))) stale.add(path);
+    }
   }
   // One hub feed per project for the life of this client. Views attach and
   // detach; a later view resumes from the kept cursor instead of replaying
@@ -369,7 +510,7 @@ export function createCachedHubClient({
   function sharedFeed(task, after = 0) {
     if (feeds.has(task)) return feeds.get(task);
     const shared = { views: new Set(), quiet: null };
-    let changes = false,
+    let changes = [],
       caughtUp = false,
       last = null;
     const flush = () => {
@@ -377,8 +518,8 @@ export function createCachedHubClient({
       shared.quiet = null;
       caughtUp = true;
       if (disposed) return;
-      if (changes) markStale();
-      changes = false;
+      if (changes.length) markStale(changes);
+      changes = [];
       const [events, cursor] = last;
       for (const view of shared.views)
         Promise.resolve()
@@ -404,7 +545,9 @@ export function createCachedHubClient({
     shared.feed = client.subscribe(
       task,
       (events, cursor) => {
-        changes ||= events.some((event) => event.kind !== "heartbeat");
+        // Kept until the catch-up ends, so its stale marks cover every page.
+        for (const event of events)
+          if (event?.kind !== "heartbeat") changes.push(event);
         last = [events, cursor];
         clearTimeout(shared.quiet);
         if (!caughtUp && events.length >= FEED_PAGE)
@@ -684,7 +827,15 @@ export function createCachedHubClient({
       return result;
     },
     listTasks: async () => (await read("/v1/tasks")).tasks,
-    getTask: (id) => read(`/v1/tasks/${id}`),
+    // The detail leaves its roster to the agents read, which refreshes by
+    // changes since a cursor. An older hub ignores agents=none and its detail
+    // still carries the roster, which passes through.
+    getTask: async (id) => {
+      const detail = await read(`/v1/tasks/${id}?agents=none`);
+      if (!detail?.agentsOmitted) return detail;
+      const { agentsOmitted: _omitted, ...rest } = detail;
+      return { ...rest, agents: (await read(`/v1/tasks/${id}/agents`)).agents };
+    },
     listAgents: async (id) => (await read(`/v1/tasks/${id}/agents`)).agents,
     getAgent: (task, id) => read(`/v1/tasks/${task}/agents/${id}`),
     listMessages: async (task, params) =>
@@ -703,7 +854,30 @@ export function createCachedHubClient({
     listInterventions: (task, params) =>
       read(`/v1/tasks/${task}/interventions` + query(params)),
     handlerABReport: (task) => read(`/v1/tasks/${task}/handler-ab/report`),
-    listWorkItems: (params) => read("/v1/work-items" + query(params)),
+    // {followed: true} says the caller keeps this page current by
+    // listWorkItemChanges, so feed events and timers leave it alone.
+    listWorkItems: (params, { followed: follow = false } = {}) => {
+      const path = "/v1/work-items" + query(params);
+      if (follow) followed.add(path);
+      return read(path);
+    },
+    // An uncached changes-since read. A reset marks every work-items read
+    // dirty, so the caller's full reload waits for the network.
+    listWorkItemChanges: async (params) => {
+      if (disposed) throw new Error("Workspace is locked.");
+      const data = await client.request("/v1/work-items" + query(params), {
+        timeoutMs: 15000,
+      });
+      if (data?.reset) {
+        revision++;
+        for (const path of paths)
+          if (new URL(path, client.base).pathname === "/v1/work-items") {
+            dirty.add(path);
+            checked.delete(path);
+          }
+      }
+      return data;
+    },
     getWorkItem: (task, id) => read(`/v1/tasks/${task}/work-items/${id}`),
     listWorkItemRevisions: (task, id, params) =>
       read(`/v1/tasks/${task}/work-items/${id}/revisions` + query(params)),
@@ -769,7 +943,7 @@ export function createCachedHubClient({
       const work = [];
       if (online())
         for (const path of paths)
-          if (now() - touched.get(path) < refreshMs * 2)
+          if (now() - touched.get(path) < refreshMs * 2 && !selfFollowed(path))
             work.push(refresh(path));
       notify();
       return Promise.allSettled(work);
@@ -794,6 +968,7 @@ export function createCachedHubClient({
           for (const path of paths)
             if (
               now() - touched.get(path) < refreshMs * 2 &&
+              !selfFollowed(path) &&
               (!checked.has(path) || now() - checked.get(path) >= refreshMs)
             )
               void refresh(path).catch(() => {});

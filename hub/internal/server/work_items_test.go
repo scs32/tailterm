@@ -414,3 +414,119 @@ func TestHandlerWriteRefusalHTTPRecording(t *testing.T) {
 		t.Fatalf("refusals %v", got)
 	}
 }
+
+// workItemPage is a list page as a client sees it, with the cursor fields.
+type workItemPage struct {
+	Items   []api.WorkItem `json:"items"`
+	Next    int64          `json:"next"`
+	Cursor  string         `json:"cursor"`
+	Changes bool           `json:"changes"`
+	Reset   bool           `json:"reset"`
+}
+
+func pageIDs(page workItemPage) []string {
+	ids := []string{}
+	for _, item := range page.Items {
+		ids = append(ids, item.ID)
+	}
+	return ids
+}
+
+// Both list routes carry the change cursor on every page, including an empty
+// last page, and the cursor moves with each write.
+func TestWorkItemListCursorOnEveryPage(t *testing.T) {
+	c := newClient(t)
+	task := c.task("cursor-pages")
+	ids := []string{}
+	for i := 0; i < 3; i++ {
+		var item api.WorkItem
+		if code := c.do("POST", "/v1/tasks/"+task.ID+"/work-items", api.CreateWorkItemRequest{Kind: "bug", Title: fmt.Sprintf("Bug %d", i), RequestID: fmt.Sprintf("cursor-page-%d", i)}, &item); code != 201 {
+			t.Fatalf("create %d = %d", i, code)
+		}
+		ids = append(ids, item.ID)
+	}
+	for _, base := range []string{"/v1/work-items?taskId=" + task.ID + "&kind=bug&", "/v1/tasks/" + task.ID + "/work-items?kind=bug&"} {
+		var after int64
+		seen := []string{}
+		for pages := 0; ; pages++ {
+			var page workItemPage
+			if code := c.do("GET", fmt.Sprintf("%slimit=2&after=%d", base, after), nil, &page); code != 200 {
+				t.Fatalf("%s page %d = %d", base, pages, code)
+			}
+			if page.Cursor != "3.0" || page.Changes || page.Reset {
+				t.Fatalf("%s page %d cursor fields: %+v", base, pages, page)
+			}
+			seen = append(seen, pageIDs(page)...)
+			if len(page.Items) == 0 {
+				break
+			}
+			after = page.Next
+		}
+		if !reflect.DeepEqual(seen, ids) {
+			t.Fatalf("%s pages %v, want %v", base, seen, ids)
+		}
+	}
+}
+
+// since returns the items changed after the cursor, of any status, with the
+// next cursor; an ahead cursor resets; malformed input is refused.
+func TestWorkItemsSinceReturnsChangesAndRefusesBadInput(t *testing.T) {
+	c := newClient(t)
+	task := c.task("cursor-since")
+	c.agent(task, "lead")
+	orchestrator := "lead"
+	if code := c.do("PATCH", "/v1/tasks/"+task.ID, api.UpdateTaskRequest{Orchestrator: &orchestrator}, nil); code != 200 {
+		t.Fatalf("set orchestrator = %d", code)
+	}
+	items := []api.WorkItem{}
+	for i := 0; i < 3; i++ {
+		var item api.WorkItem
+		if code := c.do("POST", "/v1/tasks/"+task.ID+"/work-items", api.CreateWorkItemRequest{Kind: "bug", Title: fmt.Sprintf("Bug %d", i), RequestID: fmt.Sprintf("since-%d", i)}, &item); code != 201 {
+			t.Fatalf("create %d = %d", i, code)
+		}
+		items = append(items, item)
+	}
+	var start workItemPage
+	if code := c.do("GET", "/v1/work-items?taskId="+task.ID+"&kind=bug&status=open", nil, &start); code != 200 || len(start.Items) != 3 {
+		t.Fatalf("first page = %d %+v", code, start)
+	}
+	done := "done"
+	if code := c.do("PATCH", "/v1/tasks/"+task.ID+"/work-items/"+items[0].ID, api.UpdateWorkItemRequest{Revision: 1, Status: &done}, nil); code != 200 {
+		t.Fatalf("close = %d", code)
+	}
+	if code := c.do("POST", "/v1/tasks/"+task.ID+"/work-items/"+items[2].ID+"/dispatch", api.DispatchWorkItemRequest{Revision: 1, RequestID: "since-dispatch"}, nil); code != 201 {
+		t.Fatalf("dispatch = %d", code)
+	}
+	for _, base := range []string{"/v1/work-items?taskId=" + task.ID + "&kind=bug&since=", "/v1/tasks/" + task.ID + "/work-items?kind=bug&since="} {
+		var changes workItemPage
+		if code := c.do("GET", base+start.Cursor, nil, &changes); code != 200 || !changes.Changes || changes.Reset || changes.Next != 0 {
+			t.Fatalf("%s changes = %d %+v", base, code, changes)
+		}
+		if got := pageIDs(changes); !reflect.DeepEqual(got, []string{items[0].ID, items[2].ID}) {
+			t.Fatalf("%s changed ids %v", base, got)
+		}
+		if changes.Items[0].Status != "done" || changes.Items[1].LastDispatch == nil || changes.Cursor != "4.1" {
+			t.Fatalf("%s changed rows: %+v cursor %s", base, changes.Items, changes.Cursor)
+		}
+		var none workItemPage
+		if code := c.do("GET", base+changes.Cursor, nil, &none); code != 200 || !none.Changes || len(none.Items) != 0 || none.Cursor != changes.Cursor {
+			t.Fatalf("%s no changes = %d %+v", base, code, none)
+		}
+		var reset workItemPage
+		if code := c.do("GET", base+"99.0", nil, &reset); code != 200 || !reset.Reset || reset.Changes || len(reset.Items) != 0 || reset.Cursor != "4.1" {
+			t.Fatalf("%s ahead = %d %+v", base, code, reset)
+		}
+		var raw json.RawMessage
+		if code := c.do("GET", base+start.Cursor, nil, &raw); code != 200 || !strings.Contains(string(raw), `"items":[`) {
+			t.Fatalf("%s changes body = %d %s", base, code, raw)
+		}
+	}
+	for _, bad := range []string{"since=", "since=1", "since=a.b", "since=-1.0", "since=1.0&after=1", "since=1.0&status=open"} {
+		if code := c.do("GET", "/v1/work-items?taskId="+task.ID+"&"+bad, nil, nil); code != 400 {
+			t.Fatalf("%s = %d, want 400", bad, code)
+		}
+		if code := c.do("GET", "/v1/tasks/"+task.ID+"/work-items?"+bad, nil, nil); code != 400 {
+			t.Fatalf("nested %s = %d, want 400", bad, code)
+		}
+	}
+}

@@ -30,6 +30,13 @@ const items=[
 const extra=paged?Array.from({length:448},(_,i)=>({id:'wi_page'+String(i).padStart(4,'0'),taskId:i%2?task.id:other.id,kind,title:i===447?'Later omega record':'Paged record '+i,description:'Synthetic paged text',status:i%3?'done':'open',priority:'normal',revision:1})):[];
 const all=[...items,...extra].map((item,i)=>({...item,seq:i+1}));
 const requests=[];
+// cursor=1: pages carry a change cursor and are served as a saved cache
+// serves a followed page (the first answer per filter, until a reset), and
+// listWorkItemChanges answers from a change log.
+const cursorMode=params.get('cursor')==='1';
+const live=[...items,{id:'wi_closed',taskId:task.id,kind,title:'Closed record',description:'Done text',status:'done',priority:'low',revision:1}].map((item,i)=>({...item,seq:i+1}));
+const savedPages=new Map(), changeLog=[], changeReads=[];
+let changeSeq=0, resetNext=false, listCalls=0;
 // Each held page waits on its own release, oldest first.
 const held=[];
 let holding=params.get('hold')==='1';
@@ -37,6 +44,15 @@ let notify=()=>{}, messageText='Board epsilon evidence', reportText='Durable zet
 const client={base:'isolated://search',token:'fixture',cacheStatus:()=>({label:'Fixture current'}),subscribe:(_scope,callback)=>{notify=callback;return {stop(){}}},
  async listTasks(){return paged?[task,other]:[task]},
  async listWorkItems({taskId='',status='',after=0,limit=200}={}){
+  listCalls++;
+  if(cursorMode){
+   const key=JSON.stringify([taskId,status,after]);
+   if(!savedPages.has(key)){
+    const page=live.filter(item=>item.seq>after&&(!status||item.status===status)&&(!taskId||item.taskId===taskId)).slice(0,limit);
+    savedPages.set(key,{items:page.map(item=>({...item})),next:page.length?page.at(-1).seq:0,cursor:changeSeq+'.0'});
+   }
+   return structuredClone(savedPages.get(key));
+  }
   if(!paged)return {items:items.map(item=>({...item})),next:0};
   requests.push({taskId,status,after});
   if(after>0&&!taskId&&!status&&holding)await new Promise(resolve=>held.push(resolve));
@@ -53,11 +69,22 @@ const client={base:'isolated://search',token:'fixture',cacheStatus:()=>({label:'
  async listNarrativeArtifactVersions(){return {versions:[{version:1}]}},
  async getNarrativeArtifactVersion(){return {title:'Submitted artifact',content:'Captured eta artifact body'}},
 };
+if(cursorMode)client.listWorkItemChanges=async({taskId='',since})=>{
+ changeReads.push(since);
+ if(resetNext){resetNext=false;savedPages.clear();return {items:[],next:0,cursor:changeSeq+'.0',reset:true}}
+ const after=Number(String(since).split('.')[0]);
+ const ids=new Set(changeLog.filter(entry=>entry.seq>after).map(entry=>entry.id));
+ return {items:live.filter(item=>ids.has(item.id)&&(!taskId||item.taskId===taskId)).map(item=>({...item})),next:0,cursor:changeSeq+'.0',changes:true};
+};
 const dialogNode=document.querySelector('#dialog');
 const closeDialog=()=>{dialogNode.close();dialogNode.replaceChildren()};
 const dialog=(title,body)=>{dialogNode.innerHTML='<h2>'+title+'</h2>'+body;dialogNode.showModal()};
 const view=createWorkItemsView({kind,client:()=>client,dialog,closeDialog,notice(){},configure(){},openBoard(){}});
-view.mount(document.querySelector('#mode-view'));const shown=view.show();if(!paged)await shown;window.qa={view,refresh(){notify()},requests(){return requests.map(r=>({...r}))},release(){holding=false;held.splice(0).forEach(resolve=>resolve())},releaseNext(){held.shift()?.()},held(){return held.length},
+view.mount(document.querySelector('#mode-view'));const shown=view.show();if(!paged)await shown;window.qa={view,refresh(){notify()},
+ event(kind){notify([{seq:Date.now(),kind,taskId:task.id,data:{}}],0)},
+ change(id,patch){const item=live.find(entry=>entry.id===id);Object.assign(item,patch,{revision:item.revision+1});changeLog.push({seq:++changeSeq,id})},
+ resetNext(){resetNext=true},
+ reads(){return {pages:listCalls,changes:changeReads.slice()}},requests(){return requests.map(r=>({...r}))},release(){holding=false;held.splice(0).forEach(resolve=>resolve())},releaseNext(){held.shift()?.()},held(){return held.length},
  count(status,taskId){return all.filter(item=>(!status||item.status===status)&&(!taskId||item.taskId===taskId)).length},setMessage(text){messageText=text},setReport(text){reportText=text},setReportFailure(value){failReport=value},reportFetches(){return reportFetches}};
 </script></body></html>`;
 
@@ -272,6 +299,144 @@ async function pagedCases(browser, engine, kind) {
     await page.close();
   }
 }
+// Changes-since refresh (bug wi_c83e8ef138265cf9, order #54541): with a hub
+// that names a cursor, a change notice after a complete read makes one
+// changes read and no page reads; without one, the view reloads every page.
+async function cursorCases(browser, engine, kind) {
+  const label = `${engine} ${kind} cursor`;
+  const reads = (page) => page.evaluate(() => window.qa.reads());
+  const titles = (page) =>
+    page.evaluate(() =>
+      [...document.querySelectorAll("[data-work-item]")].map((row) => [
+        row.dataset.workItem,
+        row.querySelector(".work-item-title").textContent,
+      ]),
+    );
+  const changesAfter = (page, count) =>
+    page.waitForFunction((n) => window.qa.reads().changes.length > n, count);
+  {
+    const page = await browser.newPage();
+    const errors = [];
+    page.on("pageerror", (error) => errors.push(error.message));
+    await page.goto(`${origin}/work-item-search-test?kind=${kind}&cursor=1`);
+    await page.waitForFunction(() => Boolean(window.qa));
+    await page.waitForFunction(
+      () => document.querySelectorAll("[data-work-item]").length === 3,
+    );
+    // The complete read is followed by one changes read from its cursor.
+    await page.waitForFunction(() => window.qa.reads().changes.length === 1);
+    let before = await reads(page);
+    assert.deepEqual(before.changes, ["0.0"], `${label}: first changes read`);
+    // The page reads of one complete read: the list, then its empty end.
+    const perReload = before.pages;
+    assert.equal(perReload, 2, `${label}: one complete read`);
+    // A message alone changes no row: no read at all.
+    await page.evaluate(() => window.qa.event("message"));
+    await page.waitForTimeout(150);
+    assert.deepEqual(await reads(page), before, `${label}: message event`);
+    // A work-item change: one changes read, no page read, the row updates.
+    await page.evaluate(() => {
+      window.qa.change("wi_current", { title: "Renamed alpha" });
+      window.qa.event("work_item_updated");
+    });
+    await page.waitForFunction(() =>
+      document
+        .querySelector('[data-item-edit="wi_current"]')
+        ?.textContent.includes("Renamed alpha"),
+    );
+    let after = await reads(page);
+    assert.equal(after.pages, before.pages, `${label}: no page reads`);
+    assert.deepEqual(after.changes, ["0.0", "0.0"], `${label}: changes read`);
+    assert.deepEqual(
+      (await titles(page)).map(([id]) => id),
+      ["wi_current", "wi_history", "wi_closed"],
+      `${label}: row order kept`,
+    );
+    // An item leaving the status filter disappears.
+    await page.locator("[data-items-status]").selectOption("open");
+    await page.waitForFunction(
+      () => document.querySelectorAll("[data-work-item]").length === 2,
+    );
+    await changesAfter(page, after.changes.length);
+    before = await reads(page);
+    await page.evaluate(() => {
+      window.qa.change("wi_history", { status: "done" });
+      window.qa.event("work_item_updated");
+    });
+    await page.waitForFunction(
+      () => !document.querySelector('[data-work-item="wi_history"]'),
+    );
+    after = await reads(page);
+    assert.equal(after.pages, before.pages, `${label}: leaving needs no page`);
+    assert.equal(after.changes.length, before.changes.length + 1);
+    assert.equal(await page.locator(".count-badge").textContent(), "1");
+    await page.locator("[data-items-status]").selectOption("");
+    await page.waitForFunction(
+      () => document.querySelectorAll("[data-work-item]").length === 3,
+    );
+    // A reset makes one full reload: one page read, then no changes read.
+    await page.waitForTimeout(150);
+    before = await reads(page);
+    await page.evaluate(() => {
+      window.qa.resetNext();
+      window.qa.change("wi_closed", { title: "Reset record" });
+      window.qa.event("work_item_updated");
+    });
+    await page.waitForFunction(() =>
+      document
+        .querySelector('[data-item-edit="wi_closed"]')
+        ?.textContent.includes("Reset record"),
+    );
+    await page.waitForTimeout(150);
+    after = await reads(page);
+    assert.equal(
+      after.pages,
+      before.pages + perReload,
+      `${label}: one full reload`,
+    );
+    assert.equal(after.changes.length, before.changes.length + 1);
+    // A change while the tab is hidden shows after show(), through one
+    // changes read from the saved page's cursor.
+    await page.evaluate(() => window.qa.view.hide());
+    await page.evaluate(() =>
+      window.qa.change("wi_history", { title: "Hidden change" }),
+    );
+    before = await reads(page);
+    await page.evaluate(() => window.qa.view.show());
+    await page.waitForFunction(() =>
+      document
+        .querySelector('[data-item-edit="wi_history"]')
+        ?.textContent.includes("Hidden change"),
+    );
+    after = await reads(page);
+    assert.equal(
+      after.pages,
+      before.pages + perReload,
+      `${label}: saved pages reread`,
+    );
+    assert.equal(after.changes.length, before.changes.length + 1);
+    assert.deepEqual(errors, [], `${label}: page errors`);
+    await page.close();
+  }
+  // A hub without a cursor: a change notice rereads every page.
+  {
+    const page = await browser.newPage();
+    await page.goto(`${origin}/work-item-search-test?kind=${kind}`);
+    await page.waitForFunction(() => Boolean(window.qa));
+    await page.waitForFunction(
+      () => document.querySelectorAll("[data-work-item]").length === 2,
+    );
+    const before = await reads(page);
+    await page.evaluate(() => window.qa.event("work_item_updated"));
+    await page.waitForFunction(
+      (n) => window.qa.reads().pages > n,
+      before.pages,
+    );
+    assert.deepEqual((await reads(page)).changes, [], `${label}: no cursor`);
+    await page.close();
+  }
+}
+
 const origin = `http://127.0.0.1:${server.httpServer.address().port}`;
 try {
   for (const engine of [chromium, webkit]) {
@@ -418,6 +583,7 @@ try {
         assert.deepEqual(errors, [], `${engine.name()} ${kind} page errors`);
         await page.close();
         await pagedCases(browser, engine.name(), kind);
+        await cursorCases(browser, engine.name(), kind);
       }
     } finally {
       await browser.close();

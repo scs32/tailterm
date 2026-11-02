@@ -1794,3 +1794,149 @@ func TestWorkItemNoteUntriggeredUnchanged(t *testing.T) {
 		t.Fatalf("the uncited payload hash changed: %s", got)
 	}
 }
+
+func changeIDs(t *testing.T, changes WorkItemChanges) []string {
+	t.Helper()
+	ids := []string{}
+	for _, item := range changes.Items {
+		ids = append(ids, item.ID)
+	}
+	return ids
+}
+
+// The cursor names the newest change and dispatch, round-trips through its
+// string form, and refuses anything else.
+func TestWorkItemChangeCursorParsesAndTracksWrites(t *testing.T) {
+	s, ctx, by := workItemStore(t)
+	empty, err := s.CurrentWorkItemCursor(ctx)
+	if err != nil || empty != (WorkItemCursor{}) || empty.String() != "0.0" {
+		t.Fatalf("empty cursor: %+v %v", empty, err)
+	}
+	project, _ := workItemProject(t, s, ctx, by, "Source", "lead")
+	createWorkItem(t, s, ctx, by, project, "cursor-1")
+	after, err := s.CurrentWorkItemCursor(ctx)
+	if err != nil || after.Change != 1 || after.Dispatch != 0 {
+		t.Fatalf("cursor after create: %+v %v", after, err)
+	}
+	for _, good := range []string{"0.0", "12.3"} {
+		c, ok := ParseWorkItemCursor(good)
+		if !ok || c.String() != good {
+			t.Fatalf("parse %q: %+v %v", good, c, ok)
+		}
+	}
+	for _, bad := range []string{"", "1", "1.", ".1", "-1.0", "1.-2", "01.2", "1.2.3", "a.b", "1 .2", "+1.2"} {
+		if _, ok := ParseWorkItemCursor(bad); ok {
+			t.Fatalf("parsed malformed cursor %q", bad)
+		}
+	}
+}
+
+// A changes read returns exactly the items of its task and kind created,
+// updated or dispatched after the cursor, of any status, with the new cursor.
+func TestListWorkItemChangesReturnsCreatesUpdatesAndDispatches(t *testing.T) {
+	s, ctx, by := workItemStore(t)
+	source, _ := workItemProject(t, s, ctx, by, "Source", "lead")
+	target, _ := workItemProject(t, s, ctx, by, "Target", "targetlead")
+	first := createWorkItem(t, s, ctx, by, source, "changes-1")
+	second := createWorkItem(t, s, ctx, by, source, "changes-2")
+	untouched := createWorkItem(t, s, ctx, by, source, "changes-3")
+	feature, err := s.CreateWorkItem(ctx, source.ID, api.CreateWorkItemRequest{Kind: "feature", Title: "A feature", Description: "Feature.", RequestID: "changes-feature"}, by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	elsewhere := createWorkItem(t, s, ctx, by, target, "changes-target")
+	start, err := s.CurrentWorkItemCursor(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	none, err := s.ListWorkItemChanges(ctx, source.ID, "bug", start)
+	if err != nil || none.Reset || len(none.Items) != 0 || none.Cursor != start {
+		t.Fatalf("no changes: %+v %v", none, err)
+	}
+	done := "done"
+	if _, err := s.UpdateWorkItem(ctx, source.ID, first.ID, api.UpdateWorkItemRequest{Revision: first.Revision, Status: &done}, by); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DispatchWorkItem(ctx, source.ID, second.ID, api.DispatchWorkItemRequest{Revision: second.Revision, TargetTaskID: target.ID, RequestID: "changes-dispatch"}, by); err != nil {
+		t.Fatal(err)
+	}
+	title := "Feature renamed"
+	if _, err := s.UpdateWorkItem(ctx, source.ID, feature.ID, api.UpdateWorkItemRequest{Revision: feature.Revision, Title: &title}, by); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpdateWorkItem(ctx, target.ID, elsewhere.ID, api.UpdateWorkItemRequest{Revision: elsewhere.Revision, Title: &title}, by); err != nil {
+		t.Fatal(err)
+	}
+	created := createWorkItem(t, s, ctx, by, source, "changes-4")
+	changes, err := s.ListWorkItemChanges(ctx, source.ID, "bug", start)
+	if err != nil || changes.Reset {
+		t.Fatalf("changes: %+v %v", changes, err)
+	}
+	if got, want := changeIDs(t, changes), []string{first.ID, second.ID, created.ID}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("changed bugs %v, want %v (untouched %s)", got, want, untouched.ID)
+	}
+	if changes.Items[0].Status != "done" || changes.Items[1].LastDispatch == nil || changes.Items[1].Revision != second.Revision {
+		t.Fatalf("changed rows not current: %+v", changes.Items)
+	}
+	current, _ := s.CurrentWorkItemCursor(ctx)
+	if changes.Cursor != current || current.Change <= start.Change || current.Dispatch != start.Dispatch+1 {
+		t.Fatalf("new cursor %+v, current %+v, start %+v", changes.Cursor, current, start)
+	}
+	all, err := s.ListWorkItemChanges(ctx, "", "", start)
+	if err != nil || !reflect.DeepEqual(changeIDs(t, all), []string{first.ID, second.ID, feature.ID, elsewhere.ID, created.ID}) {
+		t.Fatalf("unfiltered changes: %v %v", changeIDs(t, all), err)
+	}
+	features, err := s.ListWorkItemChanges(ctx, source.ID, "feature", start)
+	if err != nil || !reflect.DeepEqual(changeIDs(t, features), []string{feature.ID}) {
+		t.Fatalf("feature changes: %v %v", changeIDs(t, features), err)
+	}
+	again, err := s.ListWorkItemChanges(ctx, source.ID, "bug", changes.Cursor)
+	if err != nil || again.Reset || len(again.Items) != 0 {
+		t.Fatalf("changes after the new cursor: %+v %v", again, err)
+	}
+	// A dispatch alone, with no change row, still reaches the next read.
+	dispatchOnly, err := s.ListWorkItemChanges(ctx, source.ID, "bug", WorkItemCursor{Change: current.Change, Dispatch: start.Dispatch})
+	if err != nil || !reflect.DeepEqual(changeIDs(t, dispatchOnly), []string{second.ID}) {
+		t.Fatalf("dispatch-only change: %v %v", changeIDs(t, dispatchOnly), err)
+	}
+}
+
+// A cursor ahead of the hub, or more changed items than one page, asks the
+// caller to reload; bad input is refused.
+func TestListWorkItemChangesResetsAndRefuses(t *testing.T) {
+	s, ctx, by := workItemStore(t)
+	project, _ := workItemProject(t, s, ctx, by, "Source", "lead")
+	start, _ := s.CurrentWorkItemCursor(ctx)
+	createWorkItem(t, s, ctx, by, project, "reset-0")
+	current, _ := s.CurrentWorkItemCursor(ctx)
+	for _, ahead := range []WorkItemCursor{{Change: current.Change + 1}, {Change: current.Change, Dispatch: 1}} {
+		reset, err := s.ListWorkItemChanges(ctx, project.ID, "bug", ahead)
+		if err != nil || !reset.Reset || len(reset.Items) != 0 || reset.Cursor != current {
+			t.Fatalf("ahead %+v: %+v %v", ahead, reset, err)
+		}
+	}
+	for i := 1; i < api.MaxLimit; i++ {
+		createWorkItem(t, s, ctx, by, project, fmt.Sprintf("reset-%d", i))
+	}
+	full, err := s.ListWorkItemChanges(ctx, project.ID, "bug", start)
+	if err != nil || full.Reset || len(full.Items) != api.MaxLimit {
+		t.Fatalf("exactly one page of changes: reset=%v len=%d %v", full.Reset, len(full.Items), err)
+	}
+	createWorkItem(t, s, ctx, by, project, "reset-over")
+	over, err := s.ListWorkItemChanges(ctx, project.ID, "bug", start)
+	if err != nil || !over.Reset || len(over.Items) != 0 {
+		t.Fatalf("over one page of changes: reset=%v len=%d %v", over.Reset, len(over.Items), err)
+	}
+	if _, err := s.ListWorkItemChanges(ctx, project.ID, "story", start); !errors.Is(err, api.ErrInvalid) {
+		t.Fatalf("bad kind: %v", err)
+	}
+	if _, err := s.ListWorkItemChanges(ctx, "nope", "", start); !errors.Is(err, api.ErrInvalid) {
+		t.Fatalf("bad task: %v", err)
+	}
+	if _, err := s.ListWorkItemChanges(ctx, "", "", WorkItemCursor{Change: -1}); !errors.Is(err, api.ErrInvalid) {
+		t.Fatalf("negative cursor: %v", err)
+	}
+	if _, err := s.ListWorkItemChanges(ctx, api.NewID("tsk"), "", start); !errors.Is(err, api.ErrNotFound) {
+		t.Fatalf("missing task: %v", err)
+	}
+}

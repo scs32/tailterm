@@ -19,6 +19,9 @@ html,body{height:100%;margin:0} body{padding:20px;box-sizing:border-box}
 <p id="notice"></p><script type="module">
 import {createWorkItemsView} from '/client/work-items-view.js';
 const kind=new URLSearchParams(location.search).get('kind')||'bug';
+// cursor=1: pages carry a change cursor and listWorkItemChanges answers from
+// a change log (bug wi_c83e8ef138265cf9).
+const cursorMode=new URLSearchParams(location.search).get('cursor')==='1';
 const tasks=[
   {id:'tsk_alpha',name:'Alpha project',goal:'Primary scroll fixture',status:'open',orchestrator:'lead'},
   {id:'tsk_beta',name:'Beta project',goal:'Secondary scroll fixture',status:'open',orchestrator:'lead'},
@@ -29,19 +32,25 @@ const item=(index,status='open',prefix='Current')=>({
   title:prefix+' '+kind+' '+index+' '+'reading anchor '.repeat((index%3)+1),
   description:'Isolated fixture record',status,priority:index%4===0?'high':'normal',revision:2,
 });
-const state={items:[...Array.from({length:52},(_,index)=>item(index+1)),...Array.from({length:8},(_,index)=>item(index+101,'done'))],listCalls:[]};
+const state={items:[...Array.from({length:52},(_,index)=>item(index+1)),...Array.from({length:8},(_,index)=>item(index+101,'done'))].map((entry,index)=>({...entry,seq:index+1})),listCalls:[],changeCalls:[],changeSeq:0,changeLog:[]};
+let notify=()=>{};
 const client={
   async listTasks(){return tasks.map(task=>({...task}))},
   async listWorkItems(query){
     state.listCalls.push({...query});
     const filtered=state.items.filter(entry=>entry.kind===query.kind&&(!query.taskId||entry.taskId===query.taskId)&&(!query.status||entry.status===query.status));
     const start=Number(query.after)||0,end=Math.min(start+14,filtered.length);
-    return {items:filtered.slice(start,end).map(entry=>({...entry})),next:end<filtered.length?end:0};
+    return {items:filtered.slice(start,end).map(entry=>({...entry})),next:end<filtered.length?end:0,...(cursorMode?{cursor:state.changeSeq+'.0'}:{})};
   },
+  ...(cursorMode?{async listWorkItemChanges({since}){
+    state.changeCalls.push(since);
+    const after=Number(String(since).split('.')[0]),ids=new Set(state.changeLog.filter(entry=>entry.seq>after).map(entry=>entry.id));
+    return {items:state.items.filter(entry=>ids.has(entry.id)).map(entry=>({...entry})),next:0,cursor:state.changeSeq+'.0',changes:true};
+  }}:{}),
   async listWorkItemRevisions(_taskId,itemId){const entry=state.items.find(candidate=>candidate.id===itemId);return {revisions:[{...entry,changeKind:'created',updatedAt:'2026-09-09T12:00:00Z',provenance:'native'}],nextAfter:0}},
   async listWorkItemHistoryGaps(){return {gaps:[],nextAfter:0}},
   async listWorkItemMessages(){return {links:[],nextAfter:0}},
-  subscribe(){return {stop(){}}},cacheStatus(){return {label:'Fixture current'}},
+  subscribe(_scope,callback){notify=callback;return {stop(){}}},cacheStatus(){return {label:'Fixture current'}},
 };
 const dialogNode=document.querySelector('#dialog');
 const closeDialog=()=>{dialogNode.close();dialogNode.replaceChildren()};
@@ -63,6 +72,8 @@ window.qa={state,view,viewport,place,watchScroll,scrollWatch,
   smoothScroll(distance=560){const watched=watchScroll();watchedMain.scrollBy({top:distance,behavior:'smooth'});return watched},
   moveWatched(distance=120){watchedMain.scrollTop+=distance;return viewport()},
   resetCalls(){state.listCalls=[]},
+  // Lengthens the title of a row above the reading anchor and announces it.
+  changeAbove(id){const entry=state.items.find(candidate=>candidate.id===id);entry.title='Changed above the anchor with a much longer title '+'that wraps onto more lines '.repeat(4);entry.revision++;state.changeLog.push({seq:++state.changeSeq,id});notify([{kind:'work_item_updated',taskId:entry.taskId,data:{itemId:id,revision:entry.revision}}],0)},
 };
 </script></body></html>`;
 
@@ -192,6 +203,35 @@ try {
         assert.equal(await page.locator('#work-item-target').inputValue(),'tsk_alpha');
         assert.deepEqual(errors,[],`${label}: browser errors`);
         console.log(`${label}: filter pagination, stable anchors, synthetic touch lifecycle, history, and dispatch remain wired`);
+
+        if(expectReplacementBaseline)continue;
+        // A changes read during a held scroll keeps the DOM, needs no page
+        // read, and repaints at idle with the anchored row in place.
+        await page.goto(`${origin}/work-items-scroll-test?kind=${kind}&cursor=1`);
+        await page.waitForFunction(()=>Boolean(window.qa));
+        await page.locator('[data-items-status]').selectOption('open');
+        await page.waitForFunction(()=>qa.viewport().rowCount===qa.viewport().stateCount);
+        await page.waitForFunction(()=>qa.state.changeCalls.length>=1);
+        await page.evaluate(id=>qa.place(id),`wi_${kind}_025`);
+        await page.waitForTimeout(180);
+        const cursorWatch=await page.evaluate(()=>qa.watchScroll());
+        const cursorBox=await page.locator('.work-items-main').boundingBox();
+        await page.mouse.move(cursorBox.x+cursorBox.width/2,cursorBox.y+cursorBox.height/2);
+        await page.mouse.wheel(0,180);
+        await page.waitForFunction(scrollTop=>qa.scrollWatch().watchedScrollTop>scrollTop,cursorWatch.watchedScrollTop);
+        const pageCalls=await page.evaluate(()=>qa.state.listCalls.length);
+        const changeCalls=await page.evaluate(()=>qa.state.changeCalls.length);
+        await page.evaluate(id=>qa.changeAbove(id),`wi_${kind}_003`);
+        await page.waitForFunction(count=>qa.state.changeCalls.length>count,changeCalls);
+        const duringHeldChanges=await page.evaluate(()=>qa.scrollWatch());
+        assert.equal(duringHeldChanges.sameMain,true,`${label}: a held changes read replaced the scrolling element`);
+        const beforeChangesIdle=await page.evaluate(()=>qa.viewport());
+        await page.waitForFunction(id=>document.querySelector('[data-item-edit="'+id+'"]')?.textContent.includes('Changed above'),`wi_${kind}_003`);
+        const afterChangesIdle=await page.evaluate(()=>qa.viewport());
+        sameAnchor(beforeChangesIdle,afterChangesIdle,`${label} held changes read`);
+        assert.equal(await page.evaluate(()=>qa.state.listCalls.length),pageCalls,`${label}: a changes read made page reads`);
+        assert.deepEqual(errors,[],`${label}: browser errors after the changes read`);
+        console.log(`${label}: a changes read during a held scroll kept the anchor without page reads`);
       }
     } finally {
       await context.close();

@@ -16,6 +16,7 @@ Everything ran on isolated synthetic state. The hub binary ran on 127.0.0.1 with
 
   WebKit cold at RTT 0 (402 ms, tail 27%) does not qualify. There, rendering all 1,089 rows is the larger share (270 ms). Every warm case is under 200 ms (88-136 ms): the saved cache serves all 7 pages, and the network refresh starts after paint. So the full read is the slow part of a cold load, and the owner's impression holds for an empty or evicted cache.
 - **m2 after the fix:** the first row now waits for `/v1/tasks` and one page. Cold Bugs at RTT 80 drops from 1,091 to 216 ms in Chromium and from 1,056 to 209 ms in WebKit (see "After" below).
+- **m5 after bug `wi_c83e8ef138265cf9`:** every former COST row is under 1 MiB/min and under 10x its changed bytes: Bugs 170 KiB/min (from about 219 MiB/min), Board and Tasks project detail about 60 KiB/min with the agents read (from about 90 MiB/min). Windowing is not built. See "After: partial refresh" below.
 - **m5:** COST for the Bugs list and for the project detail with its full agents list (Board, Tasks). REPORT-ONLY for Board messages, which are already incremental, and for the Agents tab, which makes no hub reads (see P4). The COST verdicts are reported, not built.
 
 ## Fixture (counts only)
@@ -230,3 +231,87 @@ What drives the rate:
 So the per-minute cost scales with the live hub's rate of non-heartbeat events, which this measurement did not read. The quiet run gives the floor: 5.4 MiB/min for an open Bugs tab and 1.5 MiB/min for an open Board.
 
 As the order requires, the COST verdicts are reported, not built. A changes-since read for work items and agents (with a full reload kept as the fallback) needs a hub list parameter, which is outside this order's owned paths. It goes to the handler as an amendment or a new item.
+
+## After: partial refresh (bug `wi_c83e8ef138265cf9`)
+
+Bug `wi_c83e8ef138265cf9` revision 3, work order #54541, builder ASSIGN #54600. Measured with the P4 harness and cases above at `acc473b9` (tasks-hub `ab429d9d` plus this change), on Stephens-Mini, in two exclusive holds that the database handler admitted (#54748, #54771):
+
+| Lock | Seq | Engine | Acquired | Released | Outcome |
+|---|---|---|---|---|---|
+| 236435c2 | 2101 | Chromium, live events for 4 tabs plus the quiet Bugs and Board runs | 01:21:55Z | 01:28:20Z | released, wrapper and harness exit 0, alone |
+| e5442e93 | 2102 | WebKit, live events for 4 tabs | 01:30:06Z | 01:34:27Z | released, wrapper and harness exit 0, alone |
+
+```sh
+node scripts/verify-matrix-host-lock.mjs exec --item wi_c83e8ef138265cf9 --agent builder-38265cf9 \
+  --priority normal --timeout-minutes 10 --record DIR --exclusive -- \
+  env TEST_BROWSER=chromium MEASURE_PHASES=refresh MEASURE_PAGE_MS=13 MEASURE_REFRESH_SECONDS=60 \
+  MEASURE_OUT=FILE node tests/measure/work-items-fetch.mjs
+# then the same with TEST_BROWSER=webkit
+```
+
+The harness now models the hub this change adds. Every work-items page carries a change cursor, and `since=CURSOR` answers with the items changed after it. `GET /v1/tasks/{id}?agents=none` leaves out the roster, and the agents route answers `since=CURSOR` with the changed agents. Each live tick changes one work item, posts one message and changes one agent's activity, as before. The feed now carries a `work_item_updated` event (with `itemId` and `revision`) and a `message` event for each tick. There were no page errors, unknown routes or writes in any run.
+
+| Engine | Tab | Live events | Route | Requests/min | KiB/min |
+|---|---|---|---|---|---|
+| chromium | bugs | 1 per 1000 ms | work-items changes | 59 | 170 |
+| chromium | bugs | 1 per 1000 ms | tasks list | 3 | 22 |
+| chromium | board | 1 per 1000 ms | work-items (no kind) | 128 | 5 |
+| chromium | board | 1 per 1000 ms | other | 177 | 4 |
+| chromium | board | 1 per 1000 ms | task detail (no agents) | 59 | 28 |
+| chromium | board | 1 per 1000 ms | messages after cursor | 59 | 70 |
+| chromium | board | 1 per 1000 ms | agents since cursor | 59 | 31 |
+| chromium | board | 1 per 1000 ms | tasks list | 3 | 22 |
+| chromium | agents | 1 per 1000 ms | (no hub reads) | 0 | 0 |
+| chromium | tasks | 1 per 1000 ms | other | 188 | 3 |
+| chromium | tasks | 1 per 1000 ms | task detail (no agents) | 62 | 30 |
+| chromium | tasks | 1 per 1000 ms | agents since cursor | 62 | 31 |
+| chromium | tasks | 1 per 1000 ms | tasks list | 3 | 22 |
+| chromium | bugs | none | tasks list | 1 | 7 |
+| chromium | board | none | tasks list | 1 | 7 |
+| chromium | board | none | other | 3 | 0 |
+| chromium | board | none | task detail (no agents) | 1 | 0 |
+| chromium | board | none | messages after cursor | 1 | 0 |
+| chromium | board | none | agents since cursor | 1 | 0 |
+| webkit | bugs | 1 per 1000 ms | work-items changes | 59 | 170 |
+| webkit | bugs | 1 per 1000 ms | tasks list | 3 | 22 |
+| webkit | board | 1 per 1000 ms | work-items (no kind) | 119 | 4 |
+| webkit | board | 1 per 1000 ms | other | 177 | 4 |
+| webkit | board | 1 per 1000 ms | task detail (no agents) | 59 | 28 |
+| webkit | board | 1 per 1000 ms | messages after cursor | 59 | 70 |
+| webkit | board | 1 per 1000 ms | agents since cursor | 59 | 31 |
+| webkit | board | 1 per 1000 ms | tasks list | 3 | 22 |
+| webkit | agents | 1 per 1000 ms | (no hub reads) | 0 | 0 |
+| webkit | tasks | 1 per 1000 ms | other | 140 | 2 |
+| webkit | tasks | 1 per 1000 ms | task detail (no agents) | 63 | 30 |
+| webkit | tasks | 1 per 1000 ms | agents since cursor | 63 | 32 |
+| webkit | tasks | 1 per 1000 ms | tasks list | 4 | 29 |
+
+Changed records per minute, both engines: 60 work items (about 209 KiB/min), 60 messages (about 71 KiB/min) and 60 agents (about 29 KiB/min).
+
+Verdicts by the P4 rule (COST at 1 MiB/min or more, or at 10x or more the changed bytes):
+
+| Former COST row | Before | After | Verdict |
+|---|---|---|---|
+| Bugs: work-item reads | 354 page reads, about 219 MiB/min, 1,070x the changed items | 59 changes reads, 170 KiB/min, 0.8x the changed items | under both thresholds |
+| Board: project detail, with agents | about 89 MiB/min, 3,100x the changed agents | detail 28 KiB/min plus agents since cursor 31 KiB/min: 59 KiB/min, 2x the changed agents | under both thresholds |
+| Tasks: project detail, with agents | about 90 MiB/min | detail 30 KiB/min plus agents since cursor 31-32 KiB/min: about 62 KiB/min, 2.1x the changed agents | under both thresholds |
+
+Each detail answer still carries the project record and its `latestSeq` (about 0.5 KiB). The agents-since answer carries the agent that changed in the tick, so these rows track the change rate, not the roster size.
+
+The quiet floor fell as well. An open Bugs tab with no events now reads only the projects list from the 20 s timer (7 KiB/min, against 5.4 MiB/min of work-item pages before): its followed pages wait for a change. A quiet Board reads under 1 KiB/min of detail, agents and messages (1.5 MiB/min before).
+
+Board messages were already incremental and are unchanged at 70 KiB/min.
+
+What drives the new rate:
+
+- A feed event marks stale only the reads it can affect (`staleScope` in `client/cached-hub-client.js`). A message marks its own project's reads, a work-item change marks the work-item and queue reads, and an agent lifecycle or `task_*` event marks the projects list and its own project's reads. Unknown kinds still mark every read.
+- The Bugs view makes one changes read per relevant notice. Messages, agent lifecycle events and heartbeats alone read nothing; a cache notice (another read changed) also asks once.
+- The `tasks list` rows (3-4 requests/min) are the projects list refreshed by the 20 s timer and by its own cache notices.
+
+### d4: windowing is not built
+
+The P6 numbers above show the first row no longer waits for the full list. After `wi_782e`, WebKit renders the first page in about 27 ms of a 209 ms cold first row at RTT 80, and warm first rows take 34-35 ms. So the 1,089-row render does not delay first paint.
+
+The 123-270 ms render of the full list remains. It used to run on every feed event, a message included. It now runs only on a complete read or on a changes read that changed the list, so messages and agent events no longer trigger it. This measurement did not time interaction; windowing is not built because first paint is not delayed and the render no longer repeats on every event.
+
+The residual is one WebKit long task when a work item changes while the Bugs tab is open. If the owner reports jank, the follow-up is row patching with a long-task measurement, filed through the steward.
