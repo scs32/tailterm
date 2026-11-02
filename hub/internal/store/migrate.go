@@ -494,6 +494,11 @@ CREATE INDEX IF NOT EXISTS agent_allocation_intents_item ON agent_allocation_int
 	if err := migrateOwnerHelperWakes(db); err != nil {
 		return err
 	}
+	// The owner status call's daily baselines (wi_475a3df9b345e13e): one
+	// additive table, ignored by an older hub.
+	if _, err := db.Exec(ownerStatusSchema); err != nil {
+		return err
+	}
 	// Last, after every additive step: rewrite rows stored before the
 	// single-copy forms. A finished cleanup is not entered again.
 	if err := runRetentionCleanup(db, retentionRun{}); err != nil {

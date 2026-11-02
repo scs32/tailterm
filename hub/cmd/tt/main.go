@@ -70,7 +70,7 @@ Commands
   owner extend|answer|cancel OBLIGATION_ID ...  the owner's controls over an obligation
   owner intervene --task ID --kind K --item ID [--product-item ID] --text T [--actor owner|helper]  record an owner intervention
   owner interventions --task ID [--tz ZONE]  owner interventions per day and kind
-  owner report hourly|morning|evening [--task ID] [--tz ZONE] [--host H] [--now T] [--since T]  the owner's progress report from one fixed template (docs/owner-report.md)
+  owner report hourly|morning|evening [--task ID] [--tz ZONE] [--host H] [--now T] [--since T] [--post]  the owner's progress report from one fixed template (docs/owner-report.md)
   operational-record get       read a legacy operational record (writes retired in phase 3)
   current-assignment [--item ID --action-key KEY] [--json]  read a legacy directive
   delivery coverage [--json]   read legacy directive coverage (writes retired in phase 3)

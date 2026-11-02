@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -183,4 +184,131 @@ func TestQueueFirstAckStampsDeliveryAtAck(t *testing.T) {
 			t.Fatalf("#%d: created %v delivered %v acked %v", seq, o.CreatedAt, o.DeliveredAt, o.AckedAt)
 		}
 	}
+}
+
+// reportWakeFixture fires one hourly-update and one queue-check wake to the
+// owner helper, then gives the helper an unacknowledged REQUEST past the
+// grace (wi_475a3df9b345e13e g1/g2). Isolated store and fake clock only.
+type reportWakeFixture struct {
+	*wakeFixture
+	lead, other        api.Agent
+	hourly, queueCheck int64 // notice seqs
+	request            api.Message
+}
+
+func newReportWakeFixture(t *testing.T) reportWakeFixture {
+	t.Helper()
+	f := wakeStore(t, true)
+	ctx := context.Background()
+	add := func(name string) api.Agent {
+		a, err := f.s.AddAgent(ctx, f.task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: name, Host: "h", Session: name, Runtime: "codex"}, wakeBy)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return a
+	}
+	r := reportWakeFixture{wakeFixture: f, lead: add("lead"), other: add("other")}
+	hourly := f.create("report-hourly", "hourly-update", "0 * * * *")
+	queue := f.create("report-queue", "queue-check", "0 * * * *")
+	f.sweep(pst(2, 7, 0, 30))
+	for _, c := range []struct {
+		wake string
+		seq  *int64
+	}{{hourly.ID, &r.hourly}, {queue.ID, &r.queueCheck}} {
+		got := f.firings(c.wake)
+		if len(got) != 1 || got[0].NoticeSeq == 0 || got[0].RecipientID != f.helper.ID {
+			t.Fatalf("wake %s firings %+v", c.wake, got)
+		}
+		*c.seq = got[0].NoticeSeq
+	}
+	ask := func(to api.Agent, key string) api.Message {
+		m, err := f.s.PostMessage(ctx, f.task.ID, api.PostMessageRequest{AgentID: r.lead.ID, RunID: r.lead.RunID, To: to.ID, RequestID: key,
+			Envelope: &api.Envelope{Kind: api.EnvelopeKindRequest, To: to.Name, Subject: "Send the overnight count", Body: api.EnvelopeBody{Ask: "count it"}}}, wakeBy)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	r.request = ask(f.helper, "ask-helper")
+	ask(r.other, "ask-other")
+	f.now = pst(2, 7, 0, 30).Add(api.ObligationAckGrace + time.Minute)
+	return r
+}
+
+func (r reportWakeFixture) report(agent api.Agent, run string, replyTo int64, key string) (api.Message, error) {
+	return r.s.PostMessage(context.Background(), r.task.ID, api.PostMessageRequest{AgentID: agent.ID, RunID: run, ReplyTo: replyTo, RequestID: key,
+		Text: "**Owner report: Hourly** 2026-11-02 06:00–07:00 PST"}, wakeBy)
+}
+
+// a7 (g2): with an unacknowledged REQUEST open past the grace, the helper's
+// scheduled report still posts as the reply to its hourly wake notice, and
+// that reply closes the notice's delivery obligation. The REQUEST stays
+// unacknowledged and keeps gating everything else.
+func TestAckGateLetsTheReportReplyToItsWake(t *testing.T) {
+	r := newReportWakeFixture(t)
+	var unacked *api.UnacknowledgedError
+	if _, err := r.report(r.helper, r.helper.RunID, 0, "plain-first"); !errors.As(err, &unacked) || unacked.Items[0].Seq != r.request.Seq {
+		t.Fatalf("the helper was not gated before the report: %v", err)
+	}
+	m, err := r.report(r.helper, r.helper.RunID, r.hourly, "owner-report-hourly-x")
+	if err != nil {
+		t.Fatalf("the scheduled report was lost to the ack gate: %v", err)
+	}
+	if m.ReplyTo != r.hourly {
+		t.Fatalf("the report is not the reply to its wake: %+v", m)
+	}
+	all, err := r.s.ListObligations(context.Background(), r.task.ID, ObligationFilter{}, r.now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var notice, request *api.Obligation
+	for i := range all {
+		switch all[i].MessageSeq {
+		case r.hourly:
+			notice = &all[i]
+		case r.request.Seq:
+			request = &all[i]
+		}
+	}
+	if notice == nil || notice.State != api.ObligationClosed || notice.ClosedAt == nil {
+		t.Fatalf("the report did not close its wake notice: %+v", notice)
+	}
+	if request == nil || (request.State != api.ObligationQueued && request.State != api.ObligationDelivered) {
+		t.Fatalf("the report acknowledged the unrelated request: %+v", request)
+	}
+	if _, err := r.report(r.helper, r.helper.RunID, 0, "plain-after"); !errors.As(err, &unacked) {
+		t.Fatalf("after the report the helper is no longer gated: %v", err)
+	}
+}
+
+// a6 (g1): the rule is narrow. A plain post, a reply to a queue-check wake,
+// another agent's reply to the helper's report wake, a stale or missing run,
+// a second reply to the same report wake and a work-item write all stay
+// refused while the REQUEST is unacknowledged.
+func TestAckGateWakeReplyStaysNarrow(t *testing.T) {
+	r := newReportWakeFixture(t)
+	var unacked *api.UnacknowledgedError
+	refused := func(what string, err error) {
+		t.Helper()
+		if !errors.As(err, &unacked) {
+			t.Fatalf("%s bypassed the gate: %v", what, err)
+		}
+	}
+	_, err := r.report(r.helper, r.helper.RunID, 0, "n-plain")
+	refused("a plain post", err)
+	_, err = r.report(r.helper, r.helper.RunID, r.queueCheck, "n-queue")
+	refused("a reply to a queue-check wake", err)
+	_, err = r.report(r.other, r.other.RunID, r.hourly, "n-other")
+	refused("another agent's reply to the helper's wake", err)
+	_, err = r.report(r.helper, "run_0000000000000000", r.hourly, "n-stale")
+	refused("a stale run's reply", err)
+	_, err = r.report(r.helper, "", r.hourly, "n-norun")
+	refused("a reply without a run", err)
+	_, err = r.s.CreateWorkItem(context.Background(), r.task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Filed by the gated helper", AgentID: r.helper.ID, RequestID: "n-wi"}, wakeBy)
+	refused("a work-item write", err)
+	if _, err = r.report(r.helper, r.helper.RunID, r.hourly, "n-first"); err != nil {
+		t.Fatalf("the first report reply was refused: %v", err)
+	}
+	_, err = r.report(r.helper, r.helper.RunID, r.hourly, "n-second")
+	refused("a second reply to the same report wake", err)
 }

@@ -64,8 +64,9 @@ type ReleaseJob struct {
 	RetryOf *ReleaseRetry `json:"retryOf,omitempty"`
 	// SettledAt orders released and superseded jobs for target baselines:
 	// the hub time of the final receipt, or the hand release's record time.
-	// A job the handler's reconcile refused carries that reconcile's hub
-	// time, which only the quiet-window ledger reads.
+	// A refused job carries the hub time of its refusal, by the deployer or
+	// by the handler's reconcile, except a job refused before
+	// wi_bd0310b7bbcd4a52, which has none.
 	SettledAt string `json:"settledAt,omitempty"`
 	// Hold is set only while the job is in state held (an owner hold);
 	// HoldHistory keeps every hold and release of the job and is never rewritten.

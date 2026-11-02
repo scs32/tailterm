@@ -116,6 +116,7 @@ func New(st *store.Store, identity Identity) *Server {
 	m.HandleFunc("GET /v1/tasks/{id}/team-queue", s.listTeamQueue)
 	m.HandleFunc("GET /v1/tasks/{id}/team-queue/{entry}", s.getTeamQueueEntry)
 	m.HandleFunc("POST /v1/tasks/{id}/team-queue/actions", s.teamQueueAction)
+	m.HandleFunc("GET /v1/tasks/{id}/owner-status", s.ownerStatus)
 	m.HandleFunc("POST /v1/tasks/{id}/agents/{aid}/cleanup", s.agentCleanup)
 	m.HandleFunc("POST /v1/tasks/{id}/messages", s.postMessage)
 	m.HandleFunc("GET /v1/tasks/{id}/messages", s.listMessages)

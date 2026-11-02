@@ -15,7 +15,9 @@ import (
 // ackGate refuses a write from agentID while it holds an ack_outcome or
 // answer obligation still queued or delivered after the grace period. A
 // reply to one of those messages is the way out and is refused only when it
-// names a stale run.
+// names a stale run. The one other post it lets through is a scheduled owner
+// report sent as the first reply to its own wake notice, from the current
+// run (ownerReportWakeReply).
 func ackGate(ctx context.Context, q queryRower, agentID, runID string, replyTo int64, now time.Time) error {
 	if agentID == "" {
 		return nil // people and the hub are never gated
@@ -74,9 +76,34 @@ WHERE o.agent_id=? AND o.state IN (?,?) AND o.needs IN (?,?) AND o.created_at<=?
 				}
 			}
 		}
+		if runID != "" && runID == current {
+			ok, err := ownerReportWakeReply(ctx, q, agentID, replyTo)
+			if err != nil || ok {
+				return err
+			}
+		}
 	}
 	return &api.UnacknowledgedError{Items: items}
 }
+
+// ownerReportWakeReply reports whether a post replying to replyTo is the one
+// scheduled owner report that closes its wake notice (wi_475a3df9b345e13e g1;
+// docs/owner-report.md, "Sending on the hub schedule"). It holds only when
+// replyTo is the notice of a firing of an hourly-update, morning-summary or
+// evening-summary wake, delivered to agentID, and agentID has not replied to
+// that notice yet. The hub checks its own firing record, so no kind, text or
+// request ID can claim it; every other post, reply and write stays gated.
+func ownerReportWakeReply(ctx context.Context, q queryRower, agentID string, replyTo int64) (bool, error) {
+	var n int
+	err := q.QueryRowContext(ctx, `SELECT count(*) FROM owner_helper_wake_firings f JOIN owner_helper_wakes w ON w.id=f.wake_id AND w.task_id=f.task_id
+WHERE f.notice_seq=? AND f.recipient_id=? AND w.kind IN (?,?,?)
+AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.task_id=f.task_id AND m.reply_to=f.notice_seq AND m.from_agent=?)`,
+		replyTo, agentID, ownerReportWakeKinds[0], ownerReportWakeKinds[1], ownerReportWakeKinds[2], agentID).Scan(&n)
+	return n > 0, err
+}
+
+// ownerReportWakeKinds are the wakes whose step is a scheduled owner report.
+var ownerReportWakeKinds = [3]string{"hourly-update", "morning-summary", "evening-summary"}
 
 // acknowledgeByReply records a reply from the recipient's current run as the
 // acknowledgement of the obligation it answers (in the reply's transaction).

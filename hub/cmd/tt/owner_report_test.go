@@ -32,7 +32,11 @@ type ownerReportFixture struct {
 	usage         api.ProviderUsage
 	tokens        map[string]string
 	needs         []api.Obligation
-	fail          map[string]bool // route name -> answer 500
+	// status is the owner status call's answer; nil serves the zero status
+	// of a project with nothing recorded.
+	status *api.OwnerStatus
+	wakes  api.OwnerHelperWakeList
+	fail   map[string]bool // route name -> answer 500
 
 	mu    sync.Mutex
 	calls map[string]int
@@ -187,6 +191,16 @@ func (f *ownerReportFixture) route(t *testing.T, r *http.Request) (string, any) 
 			t.Errorf("project usage read without a window: %s", r.URL.RawQuery)
 		}
 		return "usage", api.UsageReport{Version: 1, ProjectID: ownerReportTestTask, Summary: api.UsageSummary{State: "complete", Tokens: f.tokens}}
+	case path == prefix+"/owner-status":
+		if q.Get("from") == "" || q.Get("to") == "" || q.Get("tz") == "" {
+			t.Errorf("owner status read without a window or zone: %s", r.URL.RawQuery)
+		}
+		if f.status == nil {
+			return "owner-status", api.OwnerStatus{TaskID: ownerReportTestTask, Zone: q.Get("tz"), Teams: api.OwnerStatusTeams{Stalled: []api.OwnerStatusStall{}}}
+		}
+		return "owner-status", *f.status
+	case path == prefix+"/owner-helper/wakes":
+		return "wakes", f.wakes
 	case path == prefix+"/obligations":
 		if q.Get("owner") != "1" || q.Get("open") != "1" {
 			t.Errorf("owner obligations query = %s", r.URL.RawQuery)
@@ -330,6 +344,23 @@ func fullOwnerReportFixture(now time.Time) *ownerReportFixture {
 			{ID: "obl_0000000000000002", MessageSeq: 910, SourceKind: "question", Subject: "Approve the  bridge\nrestart", Needs: "answer", DueAt: now.Add(15 * time.Minute)},
 			{ID: "obl_0000000000000001", MessageSeq: 880, SourceKind: "request", Needs: "result", DueAt: now.Add(-40 * time.Minute), Overdue: "outcome"},
 		},
+		status: ownerReportStatus(now),
+	}
+}
+
+// ownerReportStatus is a full owner status: a stored baseline at 21:00 UTC
+// on Oct 30, a host census read four minutes before now and one stalled
+// entry. The fake hub serves it for every window.
+func ownerReportStatus(now time.Time) *api.OwnerStatus {
+	five, free, pressure, waiters := 5, int64(15360), 64, 0
+	return &api.OwnerStatus{TaskID: ownerReportTestTask, Zone: "UTC",
+		Releases: api.OwnerStatusReleases{ReleasedSinceBaseline: &five},
+		Items: api.OwnerStatusItems{Opened: api.OwnerStatusCounts{Bugs: 2, Features: 1}, Closed: api.OwnerStatusCounts{Bugs: 3},
+			OpenNow: api.OwnerStatusCounts{Bugs: 40, Features: 12}, NetSinceBaseline: &api.OwnerStatusCounts{Bugs: -1, Features: 1}},
+		Baseline: &api.OwnerStatusBaseline{Day: "2026-10-30", At: time.Date(2026, 10, 30, 21, 0, 0, 0, time.UTC), Zone: "UTC", ReleasedTotal: 300, Open: api.OwnerStatusCounts{Bugs: 41, Features: 11}},
+		Host: &api.OwnerStatusHost{Host: "mini", ObservedAt: now.Add(-4 * time.Minute).Format(time.RFC3339), FreeDiskMiB: &free, DiskReserveMiB: 8192,
+			MemoryPressure: &pressure, StrainPressure: 70, MatrixWaiters: &waiters},
+		Teams: api.OwnerStatusTeams{Running: 2, Limit: 4, Stalled: []api.OwnerStatusStall{{EntryID: "tqe_3", ItemID: "wi_ffffffffffffffff", Cause: "idle-entry"}}},
 	}
 }
 
@@ -355,10 +386,11 @@ func assertGolden(t *testing.T, got, want string) {
 
 const ownerReportGoldenHourly = `**Owner report: Hourly** 2026-10-31 13:00–14:00 UTC
 **Shipped** (2)
-- wi_aaaaaaaaaaaaaaaa Owner report template: The product renders the owner report from one fixed template. Limits: Host health waits for its data.
-- wi_cccccccccccccccc Retire the old relay flag: no saved completion report
+- Owner report template: The product renders the owner report from one fixed template. Limits: Host health waits for its data.
+- Retire the old relay flag: no saved completion report
 **Releases**
 - released 1, rolled back 0, refused 0, superseded 1 in this window; in line now: 2
+- since the Oct 30 21:00 baseline: released 5
 **Running teams** (2 of 4)
 - wi_eeeeeeeeeeeeeeee Host health figures (small, launching)
 - wi_dddddddddddddddd Queue shows up next (planned, running)
@@ -368,14 +400,17 @@ const ownerReportGoldenHourly = `**Owner report: Hourly** 2026-10-31 13:00–14:
 **What went wrong** (1)
 - intervention #900 unblock on wi_dddddddddddddddd by helper
 **Opened vs closed**
-- not yet available (waits for wi_475a)
+- opened 2 bugs, 1 features; closed 3 bugs, 0 features in this window
+- open now: 40 bugs, 12 features (since the Oct 30 21:00 baseline: -1 bugs, +1 features)
 **Usage**
 - claude five_hour: 42% used, resets Sat 16:00 (reading 7m old)
 - claude seven_day: 61.5% used, resets Tue 17:00 (reading 7m old)
 - codex seven_day: missing
 - project tokens in window: cached 91000/2, input 34000, output 1200
 **Host health**
-- not yet available (waits for wi_475a)
+- mini: 15.0 GiB free (reserve 8.0 GiB), memory pressure 64, matrix waiters 0 (reading 4m old)
+- queue: admitting
+- stalled: wi_ffffffffffffffff idle-entry
 **Needs you** (2)
 - #880 request: result (due 13:20, overdue outcome)
 - #910 question: Approve the bridge restart (due 14:15)
@@ -397,11 +432,12 @@ func TestOwnerReportGoldenHourly(t *testing.T) {
 
 const ownerReportGoldenMorning = `**Owner report: Morning** 2026-10-30 21:00–2026-10-31 07:00 UTC
 **Shipped** (3)
-- wi_bbbbbbbbbbbbbbbb Board pages load faster: Board pages open in half the time. Limits: none recorded
-- wi_aaaaaaaaaaaaaaaa Owner report template: The product renders the owner report from one fixed template. Limits: Host health waits for its data.
-- wi_cccccccccccccccc Retire the old relay flag: no saved completion report
+- Board pages load faster: Board pages open in half the time. Limits: none recorded
+- Owner report template: The product renders the owner report from one fixed template. Limits: Host health waits for its data.
+- Retire the old relay flag: no saved completion report
 **Releases**
 - released 2, rolled back 0, refused 0, superseded 1 in this window; in line now: 2
+- since the Oct 30 21:00 baseline: released 5
 **Running teams** (2 of 4)
 - wi_eeeeeeeeeeeeeeee Host health figures (small, launching)
 - wi_dddddddddddddddd Queue shows up next (planned, running)
@@ -411,14 +447,17 @@ const ownerReportGoldenMorning = `**Owner report: Morning** 2026-10-30 21:00–2
 **What went wrong** (1)
 - intervention #900 unblock on wi_dddddddddddddddd by helper
 **Opened vs closed**
-- not yet available (waits for wi_475a)
+- opened 2 bugs, 1 features; closed 3 bugs, 0 features in this window
+- open now: 40 bugs, 12 features (since the Oct 30 21:00 baseline: -1 bugs, +1 features)
 **Usage**
 - claude five_hour: 42% used, resets Sat 09:00 (reading 7m old)
 - claude seven_day: 61.5% used, resets Tue 10:00 (reading 7m old)
 - codex seven_day: missing
 - project tokens in window: cached 91000/2, input 34000, output 1200
 **Host health**
-- not yet available (waits for wi_475a)
+- mini: 15.0 GiB free (reserve 8.0 GiB), memory pressure 64, matrix waiters 0 (reading 4m old)
+- queue: admitting
+- stalled: wi_ffffffffffffffff idle-entry
 **Needs you** (2)
 - #880 request: result (due 06:20, overdue outcome)
 - #910 question: Approve the bridge restart (due 07:15)
@@ -436,11 +475,12 @@ func TestOwnerReportGoldenMorning(t *testing.T) {
 
 const ownerReportGoldenEvening = `**Owner report: Evening** 2026-10-31 07:00–21:00 UTC
 **Shipped** (3)
-- wi_bbbbbbbbbbbbbbbb Board pages load faster: Board pages open in half the time. Limits: none recorded
-- wi_aaaaaaaaaaaaaaaa Owner report template: The product renders the owner report from one fixed template. Limits: Host health waits for its data.
-- wi_cccccccccccccccc Retire the old relay flag: no saved completion report
+- Board pages load faster: Board pages open in half the time. Limits: none recorded
+- Owner report template: The product renders the owner report from one fixed template. Limits: Host health waits for its data.
+- Retire the old relay flag: no saved completion report
 **Releases**
 - released 2, rolled back 0, refused 0, superseded 1 in this window; in line now: 2
+- since the Oct 30 21:00 baseline: released 5
 **Running teams** (2 of 4)
 - wi_eeeeeeeeeeeeeeee Host health figures (small, launching)
 - wi_dddddddddddddddd Queue shows up next (planned, running)
@@ -450,14 +490,17 @@ const ownerReportGoldenEvening = `**Owner report: Evening** 2026-10-31 07:00–2
 **What went wrong** (1)
 - intervention #900 unblock on wi_dddddddddddddddd by helper
 **Opened vs closed**
-- not yet available (waits for wi_475a)
+- opened 2 bugs, 1 features; closed 3 bugs, 0 features in this window
+- open now: 40 bugs, 12 features (since the Oct 30 21:00 baseline: -1 bugs, +1 features)
 **Usage**
 - claude five_hour: 42% used, resets Sat 23:00 (reading 7m old)
 - claude seven_day: 61.5% used, resets Wed 00:00 (reading 7m old)
 - codex seven_day: missing
 - project tokens in window: cached 91000/2, input 34000, output 1200
 **Host health**
-- not yet available (waits for wi_475a)
+- mini: 15.0 GiB free (reserve 8.0 GiB), memory pressure 64, matrix waiters 0 (reading 4m old)
+- queue: admitting
+- stalled: wi_ffffffffffffffff idle-entry
 **Needs you** (2)
 - #880 request: result (due 20:20, overdue outcome)
 - #910 question: Approve the bridge restart (due 21:15)
@@ -491,13 +534,13 @@ func assertOwnerReportHeaders(t *testing.T, out string) {
 func TestOwnerReportGoldensKeepEverySectionAndFixedLines(t *testing.T) {
 	for name, golden := range map[string]string{"hourly": ownerReportGoldenHourly, "morning": ownerReportGoldenMorning, "evening": ownerReportGoldenEvening} {
 		assertOwnerReportHeaders(t, golden)
-		for _, h := range []string{"**Opened vs closed**", "**Host health**"} {
-			if !strings.Contains(golden, h+"\n"+ownerReportNotYet+"\n") {
-				t.Fatalf("%s golden: %s does not read exactly %q", name, h, ownerReportNotYet)
-			}
+		// Opened vs closed and Host health render the hub's figures; the
+		// old placeholder is gone (wi_475a3df9b345e13e f4).
+		if strings.Contains(golden, "not yet available") || !strings.Contains(golden, "**Opened vs closed**\n- opened ") || !strings.Contains(golden, "**Host health**\n- mini: ") {
+			t.Fatalf("%s golden: Opened vs closed and Host health must show hub figures", name)
 		}
-		if strings.Count(golden, ownerReportNotYet) != 2 || !strings.Contains(golden, "**Up next** (2)\n- 1. ") {
-			t.Fatalf("%s golden: Up next must list the queue, not a not-yet line", name)
+		if !strings.Contains(golden, "**Up next** (2)\n- 1. ") {
+			t.Fatalf("%s golden: Up next must list the queue", name)
 		}
 	}
 }
@@ -514,12 +557,14 @@ const ownerReportGoldenEmpty = `**Owner report: Hourly** 2026-10-31 13:00–14:0
 **What went wrong** (0)
 - none recorded (sources: refused or rolled-back releases, owner interventions)
 **Opened vs closed**
-- not yet available (waits for wi_475a)
+- opened 0 bugs, 0 features; closed 0 bugs, 0 features in this window
+- open now: 0 bugs, 0 features (no 21:00 baseline yet)
 **Usage**
 - no provider reading for host test-host
 - project tokens in window: none recorded
 **Host health**
-- not yet available (waits for wi_475a)
+- no host reading
+- queue: admitting
 **Needs you** (0)
 - nothing waiting on you
 `
@@ -562,7 +607,7 @@ func TestOwnerReportNoShippedItems(t *testing.T) {
 		if err != nil {
 			t.Fatalf("report: %v\n%s", err, out)
 		}
-		if !strings.Contains(out, "**Shipped** (1)\n- wi_cccccccccccccccc Retire the old relay flag: no saved completion report\n") {
+		if !strings.Contains(out, "**Shipped** (1)\n- Retire the old relay flag: no saved completion report\n") {
 			t.Fatalf("missing the no-completion-report line:\n%s", out)
 		}
 		if f.calledTimes("report") != 0 {
@@ -721,7 +766,7 @@ func TestOwnerReportDispatch(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "tt owner is for the owner") {
 		t.Fatalf("agent extend must still be refused, got %v", err)
 	}
-	synopsis := "  owner report hourly|morning|evening [--task ID] [--tz ZONE] [--host H] [--now T] [--since T]  the owner's progress report from one fixed template (docs/owner-report.md)\n"
+	synopsis := "  owner report hourly|morning|evening [--task ID] [--tz ZONE] [--host H] [--now T] [--since T] [--post]  the owner's progress report from one fixed template (docs/owner-report.md)\n"
 	if !strings.Contains(usage, synopsis) {
 		t.Fatalf("tt usage lacks the owner report synopsis line")
 	}
@@ -813,7 +858,7 @@ func TestOwnerReportSettledPaging(t *testing.T) {
 	if got := f.calledTimes("releases-settled"); got != 3 {
 		t.Fatalf("settled pages read = %d, want 3", got)
 	}
-	if !strings.Contains(out, "**Shipped** (1)\n- wi_aaaaaaaaaaaaaaaa Owner report template:") || !strings.Contains(out, "- released 2, rolled back 0") {
+	if !strings.Contains(out, "**Shipped** (1)\n- Owner report template:") || !strings.Contains(out, "- released 2, rolled back 0") {
 		t.Fatalf("paged report:\n%s", out)
 	}
 	t.Logf("600 settled rows over 3 pages rendered in %s against the fake hub", time.Since(started).Round(time.Millisecond))
@@ -835,7 +880,9 @@ func TestOwnerReportDocMatchesTemplate(t *testing.T) {
 	assertOwnerReportHeaders(t, template)
 	for _, want := range []string{
 		"tt owner report hourly|morning|evening [--task ID] [--tz ZONE] [--host H] [--now T] [--since T] [--post]",
-		ownerReportNotYet, ownerReportNothingQueued, ownerReportNoShipped, ownerReportNoRunning, ownerReportNothingWrong, ownerReportNothingWaiting,
+		ownerReportNothingQueued, ownerReportNoHostReading, ownerReportNoBaseline, ownerReportSeeReport, ownerSourceOwnerStatus,
+		"- opened <n> bugs, <n> features; closed <n> bugs, <n> features in this window", "- queue: admitting", "- queue: held: <hold>", "- stalled: <item id> <cause>",
+		"- since the <Mon D> 21:00 baseline: released <n>", "GET /v1/tasks/{id}/owner-status", "## Owner status call", ownerReportNoShipped, ownerReportNoRunning, ownerReportNothingWrong, ownerReportNothingWaiting,
 		ownerReportNoCompletion, "`" + ownerReportNoneRecorded + "`", "- no provider reading for host <host>",
 		"- project tokens in window: none recorded", "- unavailable: could not read <source>",
 		ownerSourceReleases, ownerSourceTeamQueue, ownerSourceInterventions, ownerSourceProvider,
@@ -915,7 +962,7 @@ func TestOwnerReportShippedSummary(t *testing.T) {
 	}
 	delivered := strings.TrimRight(string([]rune(strings.Repeat("The renderer ", 20))[:ownerReportDeliveredLimit]), " ") + "…"
 	limits := strings.TrimRight(string([]rune(strings.Repeat("A limit ", 30))[:ownerReportLimitsLimit]), " ") + "…"
-	want := "- wi_aaaaaaaaaaaaaaaa Owner report template: " + delivered + ". Limits: " + limits + "\n"
+	want := "- Owner report template: " + delivered + ". Limits: " + limits + "\n"
 	if !strings.Contains(out, want) {
 		t.Fatalf("shipped summary line missing\nwant: %s\nreport:\n%s", want, out)
 	}
@@ -1063,5 +1110,174 @@ func TestOwnerReportPostSourceFailure(t *testing.T) {
 	_, err = runOwnerReport(t, ownerReportEnv(f2.serve(t)), append(ownerReportArgs("morning", slot), "--post")...)
 	if err == nil || !strings.Contains(err.Error(), "the report was not posted") {
 		t.Fatalf("a refused post must fail, got %v", err)
+	}
+}
+
+// TestOwnerReportHubFigures renders the owner status call's figures under
+// Opened vs closed, Host health and Releases (wi_475a3df9b345e13e f4): no
+// baseline yet, unobserved readings, a strained host, a lane hold and
+// several stalled entries.
+func TestOwnerReportHubFigures(t *testing.T) {
+	now := time.Date(2026, 10, 31, 14, 0, 0, 0, time.UTC)
+	f := fullOwnerReportFixture(now)
+	f.status = ownerReportStatus(now)
+	f.status.Baseline, f.status.Releases.ReleasedSinceBaseline, f.status.Items.NetSinceBaseline = nil, nil, nil
+	f.status.Items = api.OwnerStatusItems{Opened: api.OwnerStatusCounts{Features: 4}, Closed: api.OwnerStatusCounts{Bugs: 1, Features: 2}, OpenNow: api.OwnerStatusCounts{Bugs: 7}}
+	pressure := 83
+	f.status.Host = &api.OwnerStatusHost{Host: "mini", DiskReserveMiB: 10240, MemoryPressure: &pressure, StrainPressure: 70, Strained: true}
+	f.status.Teams.Hold = "a matrix run waits for the verification host"
+	f.status.Teams.Stalled = append(f.status.Teams.Stalled, api.OwnerStatusStall{EntryID: "tqe_9", ItemID: "wi_9999999999999999", Cause: "failed-entry"})
+	out, err := runOwnerReport(t, ownerReportEnv(f.serve(t)), ownerReportArgs("hourly", now)...)
+	if err != nil {
+		t.Fatalf("report: %v\n%s", err, out)
+	}
+	if got, want := ownerReportSection(t, out, "**Opened vs closed**", "**Usage**"),
+		"- opened 0 bugs, 4 features; closed 1 bugs, 2 features in this window\n- open now: 7 bugs, 0 features (no 21:00 baseline yet)\n"; got != want {
+		t.Fatalf("opened vs closed:\n%s\nwant:\n%s", got, want)
+	}
+	if got, want := ownerReportSection(t, out, "**Host health**", "**Needs you**"),
+		"- mini: free disk not observed (reserve 10.0 GiB), memory pressure 83 (strained, over 70), matrix waiters not observed\n"+
+			"- queue: held: a matrix run waits for the verification host\n- stalled: wi_ffffffffffffffff idle-entry\n- stalled: wi_9999999999999999 failed-entry\n"; got != want {
+		t.Fatalf("host health:\n%s\nwant:\n%s", got, want)
+	}
+	if strings.Contains(out, "since the") {
+		t.Fatalf("a baseline line without a baseline:\n%s", out)
+	}
+	if got := f.calledTimes("owner-status"); got != 1 {
+		t.Fatalf("owner status reads = %d, want one call", got)
+	}
+}
+
+// TestOwnerReportStatusUnavailable: a failed owner status read shows the
+// unavailable line under Opened vs closed and Host health, omits the
+// baseline line and exits 1; every other section prints as usual.
+func TestOwnerReportStatusUnavailable(t *testing.T) {
+	now := time.Date(2026, 10, 31, 14, 0, 0, 0, time.UTC)
+	f := fullOwnerReportFixture(now)
+	f.fail = map[string]bool{"owner-status": true}
+	out, err := runOwnerReport(t, ownerReportEnv(f.serve(t)), ownerReportArgs("hourly", now)...)
+	if err == nil || !strings.Contains(err.Error(), "could not be read") {
+		t.Fatalf("a failed owner status read must exit 1, got %v", err)
+	}
+	want := ownerReportGoldenHourly
+	for old, repl := range map[string]string{
+		"- since the Oct 30 21:00 baseline: released 5\n": "",
+		"**Opened vs closed**\n- opened 2 bugs, 1 features; closed 3 bugs, 0 features in this window\n- open now: 40 bugs, 12 features (since the Oct 30 21:00 baseline: -1 bugs, +1 features)\n": "**Opened vs closed**\n- unavailable: could not read the owner status\n",
+		"**Host health**\n- mini: 15.0 GiB free (reserve 8.0 GiB), memory pressure 64, matrix waiters 0 (reading 4m old)\n- queue: admitting\n- stalled: wi_ffffffffffffffff idle-entry\n":        "**Host health**\n- unavailable: could not read the owner status\n",
+	} {
+		if !strings.Contains(want, old) {
+			t.Fatalf("test setup: %q is not in the hourly golden", old)
+		}
+		want = strings.Replace(want, old, repl, 1)
+	}
+	assertGolden(t, out, want)
+}
+
+// TestOwnerReportPlainShipped: the Shipped line is the title and the first
+// plain sentence of the delivered work; provenance (message numbers, commit
+// SHAs, branch names, worktree paths) never prints (wi_475a3df9b345e13e f8).
+func TestOwnerReportPlainShipped(t *testing.T) {
+	for _, tc := range []struct {
+		text  string
+		plain bool
+	}{
+		{"Owners see the report in one place.", true},
+		{"Edits owner_report.go and v1.2 docs in 2026.", true},
+		{"Added three decades of deadbeef caches.", true},
+		{"Follows order #55055.", false},
+		{"Saved under REQUEST54571.", false},
+		{"Landed 05f1a040 today.", false},
+		{"Landed05f1a040 today.", false},
+		{"Merged 298f54d0cedabf6be328c462107faa1ac8693b01.", false},
+		{"Built in queue-475a3df9.", false},
+		{"Item wi_475a3df9b345e13e.", false},
+		{"Pushed to origin/main.", false},
+		{"Rebased on Tasks-Hub.", false},
+		{"From /Users/x/.build/worktrees/q.", false},
+	} {
+		if got := reportPlain(tc.text); got != tc.plain {
+			t.Fatalf("reportPlain(%q) = %v, want %v", tc.text, got, tc.plain)
+		}
+	}
+
+	now := time.Date(2026, 10, 31, 14, 0, 0, 0, time.UTC)
+	f := fullOwnerReportFixture(now)
+	f.reports["nar_aaaaaaaaaaaaaaaa/2"] = api.NarrativeReportVersion{ReportID: "nar_aaaaaaaaaaaaaaaa", Version: 2, Sections: api.NarrativeReportSections{
+		DeliveredWork: "Landed 05f1a040 on tasks-hub under order #55055 from /Users/x/.build/worktrees/queue-475a3df9. The owner report now shows open and closed counts. Verified by REQUEST54571.",
+		Limitations:   "Receipt rel_ab12cd34ef56 is pending. Swap and load are not shown yet.",
+	}}
+	f.overviews["wi_cccccccccccccccc"] = ownerReportOverview("wi_cccccccccccccccc", "Retire the old relay flag", "nar_cccccccccccccccc", 1)
+	f.reports["nar_cccccccccccccccc/1"] = api.NarrativeReportVersion{ReportID: "nar_cccccccccccccccc", Version: 1, Sections: api.NarrativeReportSections{
+		DeliveredWork: "Merged 298f54d0 from branch wi_cccc-relay. See #54000.",
+		Limitations:   "Reverted in 7310f81c.",
+	}}
+	out, err := runOwnerReport(t, ownerReportEnv(f.serve(t)), ownerReportArgs("hourly", now)...)
+	if err != nil {
+		t.Fatalf("report: %v\n%s", err, out)
+	}
+	want := "**Shipped** (2)\n" +
+		"- Owner report template: The owner report now shows open and closed counts. Limits: Swap and load are not shown yet.\n" +
+		"- Retire the old relay flag. Limits: see the completion report\n"
+	if !strings.Contains(out, want) {
+		t.Fatalf("shipped lines\nwant:\n%s\nreport:\n%s", want, out)
+	}
+	shipped := ownerReportSection(t, out, "**Shipped** (2)", "**Releases**")
+	for _, banned := range []string{"#", "05f1a040", "298f54d0", "tasks-hub", "/", "queue-475a3df9", "wi_", "REQUEST"} {
+		if strings.Contains(shipped, banned) {
+			t.Fatalf("shipped section prints %q:\n%s", banned, shipped)
+		}
+	}
+}
+
+// TestOwnerReportPostRepliesToWake: an agent's --post replies to its own
+// wake notice for the slot, which the hub's ack gate lets through; another
+// kind's wake, another agent's firing, another slot and the owner post
+// without a reply (wi_475a3df9b345e13e g1/g2).
+func TestOwnerReportPostRepliesToWake(t *testing.T) {
+	slot := time.Date(2026, 10, 31, 14, 0, 0, 0, time.UTC)
+	const helper = "agt_0000000000000001"
+	firing := func(due time.Time, notice int64, to string) api.OwnerHelperWakeFiring {
+		return api.OwnerHelperWakeFiring{DueAt: due, Outcome: api.OwnerHelperWakePosted, NoticeSeq: notice, RecipientID: to}
+	}
+	wakes := api.OwnerHelperWakeList{TaskID: ownerReportTestTask, Wakes: []api.OwnerHelperWake{
+		{ID: "ohw_0000000000000001", Kind: "hourly-update", Firings: []api.OwnerHelperWakeFiring{
+			firing(slot.Add(time.Hour), 7300, helper), firing(slot, 7200, helper), firing(slot.Add(-time.Hour), 7100, helper)}},
+		{ID: "ohw_0000000000000002", Kind: "queue-check", Firings: []api.OwnerHelperWakeFiring{firing(slot, 7250, helper)}},
+		{ID: "ohw_0000000000000003", Kind: "morning-summary", Firings: []api.OwnerHelperWakeFiring{firing(slot, 7260, "agt_0000000000000009")}},
+	}}
+	run := func(t *testing.T, agent string, kind string, now time.Time, w api.OwnerHelperWakeList) api.PostMessageRequest {
+		t.Helper()
+		f := fullOwnerReportFixture(slot)
+		f.wakes = w
+		e := ownerReportEnv(f.serve(t))
+		if agent != "" {
+			e.agent, e.agentName, e.runID = agent, "owner-helper", "run_0000000000000001"
+		}
+		out, err := runOwnerReport(t, e, append(ownerReportArgs(kind, now), "--post")...)
+		if err != nil || f.postCount() != 1 {
+			t.Fatalf("post: %v (%d posts)\n%s", err, f.postCount(), out)
+		}
+		if agent == "" && f.calledTimes("wakes") != 0 {
+			t.Fatal("the owner's post read the wakes")
+		}
+		return f.posts[0]
+	}
+	if p := run(t, helper, "hourly", slot.Add(25*time.Minute), wakes); p.ReplyTo != 7200 || p.Text != ownerReportGoldenHourly {
+		t.Fatalf("the slot's report did not reply to its wake notice: reply %d", p.ReplyTo)
+	}
+	if p := run(t, helper, "hourly", slot.Add(-35*time.Minute), wakes); p.ReplyTo != 7100 {
+		t.Fatalf("the earlier slot replied to %d, want 7100", p.ReplyTo)
+	}
+	if p := run(t, "agt_0000000000000002", "hourly", slot.Add(5*time.Minute), wakes); p.ReplyTo != 0 {
+		t.Fatalf("another agent replied to the helper's wake: %d", p.ReplyTo)
+	}
+	if p := run(t, helper, "morning", time.Date(2026, 10, 31, 7, 10, 0, 0, time.UTC), wakes); p.ReplyTo != 0 {
+		t.Fatalf("a slot with no own firing replied to %d", p.ReplyTo)
+	}
+	if p := run(t, "", "hourly", slot.Add(5*time.Minute), wakes); p.ReplyTo != 0 {
+		t.Fatalf("the owner's post replied to %d", p.ReplyTo)
+	}
+	if p := run(t, helper, "hourly", slot.Add(5*time.Minute), api.OwnerHelperWakeList{}); p.ReplyTo != 0 {
+		t.Fatalf("no wakes: replied to %d", p.ReplyTo)
 	}
 }

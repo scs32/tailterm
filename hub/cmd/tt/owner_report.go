@@ -31,7 +31,6 @@ const ownerReportUsage = "usage: tt owner report hourly|morning|evening [--task 
 
 // Fixed lines. Each is printed verbatim; docs/owner-report.md quotes them.
 const (
-	ownerReportNotYet         = "- not yet available (waits for wi_475a)"
 	ownerReportNoShipped      = "- none in this window"
 	ownerReportNothingQueued  = "- nothing queued"
 	ownerReportNoRunning      = "- none running"
@@ -39,6 +38,9 @@ const (
 	ownerReportNothingWaiting = "- nothing waiting on you"
 	ownerReportNoCompletion   = "no saved completion report"
 	ownerReportNoneRecorded   = "none recorded"
+	ownerReportNoHostReading  = "- no host reading"
+	ownerReportNoBaseline     = "no 21:00 baseline yet"
+	ownerReportSeeReport      = "see the completion report"
 	ownerReportTextLimit      = 280
 	// The Shipped line is a summary: the first sentence of each field,
 	// cut at these rune limits (wi_546279658420371a f1c).
@@ -57,6 +59,7 @@ const (
 	ownerSourceProjectUsage  = "project usage"
 	ownerSourceObligations   = "owner obligations"
 	ownerSourceNarrative     = "the work item narrative"
+	ownerSourceOwnerStatus   = "the owner status"
 )
 
 var ownerReportKinds = map[string]string{"hourly": "Hourly", "morning": "Morning", "evening": "Evening"}
@@ -115,6 +118,11 @@ type ownerReportData struct {
 
 	needs            []api.Obligation
 	needsUnavailable bool
+
+	// status is the hub's owner status call for the window: Opened vs
+	// closed, Host health and the Releases baseline line.
+	status            api.OwnerStatus
+	statusUnavailable bool
 }
 
 // renderOwnerReport prints the fixed template. It reads no clock, no
@@ -148,9 +156,11 @@ func renderOwnerReport(d ownerReportData) string {
 		line(ownerReportNoShipped)
 	}
 	for _, s := range d.shipped {
-		head := s.item
-		if s.title != "" {
-			head += " " + s.title
+		// The Shipped line is plain words (wi_475a3df9b345e13e f8): the
+		// title, else the item ID when the title could not be read.
+		head := s.title
+		if head == "" {
+			head = s.item
 		}
 		switch {
 		case s.unavailable:
@@ -158,8 +168,15 @@ func renderOwnerReport(d ownerReportData) string {
 		case s.noReport:
 			line("- %s: %s", head, ownerReportNoCompletion)
 		default:
-			delivered := strings.TrimRight(orNone(reportSummary(s.delivered, ownerReportDeliveredLimit)), ".")
-			line("- %s: %s. Limits: %s", head, delivered, orNone(reportSummary(s.limitations, ownerReportLimitsLimit)))
+			limits := ownerReportNoneRecorded
+			if reportText(s.limitations) != "" {
+				limits = orPlain(plainSentence(s.limitations, ownerReportLimitsLimit), ownerReportSeeReport)
+			}
+			if what := strings.TrimRight(plainSentence(s.delivered, ownerReportDeliveredLimit), "."); what != "" {
+				line("- %s: %s. Limits: %s", head, what, limits)
+			} else {
+				line("- %s. Limits: %s", strings.TrimRight(head, "."), limits)
+			}
 		}
 	}
 
@@ -168,6 +185,9 @@ func renderOwnerReport(d ownerReportData) string {
 		unavailable(ownerSourceReleases)
 	} else {
 		line("- released %d, rolled back %d, refused %d, superseded %d in this window; in line now: %d", d.released, d.rolledBack, d.refused, d.superseded, d.inLine)
+	}
+	if b := d.status.Baseline; !d.statusUnavailable && b != nil && d.status.Releases.ReleasedSinceBaseline != nil {
+		line("- since the %s baseline: released %d", reportBaselineLabel(*b, d.zone), *d.status.Releases.ReleasedSinceBaseline)
 	}
 
 	if d.runningUnavailable {
@@ -216,7 +236,17 @@ func renderOwnerReport(d ownerReportData) string {
 	}
 
 	line("**Opened vs closed**")
-	line(ownerReportNotYet)
+	if d.statusUnavailable {
+		unavailable(ownerSourceOwnerStatus)
+	} else {
+		it := d.status.Items
+		line("- opened %d bugs, %d features; closed %d bugs, %d features in this window", it.Opened.Bugs, it.Opened.Features, it.Closed.Bugs, it.Closed.Features)
+		since := ownerReportNoBaseline
+		if b := d.status.Baseline; b != nil && it.NetSinceBaseline != nil {
+			since = fmt.Sprintf("since the %s baseline: %+d bugs, %+d features", reportBaselineLabel(*b, d.zone), it.NetSinceBaseline.Bugs, it.NetSinceBaseline.Features)
+		}
+		line("- open now: %d bugs, %d features (%s)", it.OpenNow.Bugs, it.OpenNow.Features, since)
+	}
 
 	line("**Usage**")
 	switch {
@@ -262,7 +292,35 @@ func renderOwnerReport(d ownerReportData) string {
 	}
 
 	line("**Host health**")
-	line(ownerReportNotYet)
+	if d.statusUnavailable {
+		unavailable(ownerSourceOwnerStatus)
+	} else {
+		if h := d.status.Host; h == nil {
+			line(ownerReportNoHostReading)
+		} else {
+			free := "free disk not observed"
+			if h.FreeDiskMiB != nil {
+				free = reportGiB(h.FreeDiskMiB) + " free"
+			}
+			text := fmt.Sprintf("- %s: %s (reserve %s), memory pressure %s", h.Host, free, reportGiB(&h.DiskReserveMiB), reportInt(h.MemoryPressure))
+			if h.Strained {
+				text += fmt.Sprintf(" (strained, over %d)", h.StrainPressure)
+			}
+			text += ", matrix waiters " + reportInt(h.MatrixWaiters)
+			if t, ok := parseReportTime(h.ObservedAt); ok {
+				text += " (reading " + reportAge(d.end.Sub(t)) + " old)"
+			}
+			line("%s", text)
+		}
+		if hold := d.status.Teams.Hold; hold != "" {
+			line("- queue: held: %s", reportText(hold))
+		} else {
+			line("- queue: admitting")
+		}
+		for _, st := range d.status.Teams.Stalled {
+			line("- stalled: %s %s", st.ItemID, st.Cause)
+		}
+	}
 
 	line("**Needs you**%s", count(len(d.needs), d.needsUnavailable))
 	switch {
@@ -287,6 +345,101 @@ func renderOwnerReport(d ownerReportData) string {
 		line("- #%d %s: %s (due %s)", o.MessageSeq, o.SourceKind, reportText(what), dueText)
 	}
 	return b.String()
+}
+
+// reportBaselineLabel names a stored baseline as "Oct 30 21:00".
+func reportBaselineLabel(b api.OwnerStatusBaseline, zone *time.Location) string {
+	return b.At.In(zone).Format("Jan 2 15:04")
+}
+
+// reportGiB prints MiB as GiB with one decimal.
+func reportGiB(mib *int64) string {
+	return fmt.Sprintf("%.1f GiB", float64(*mib)/1024)
+}
+
+func reportInt(n *int) string {
+	if n == nil {
+		return "not observed"
+	}
+	return fmt.Sprintf("%d", *n)
+}
+
+func orPlain(s, fallback string) string {
+	if s == "" {
+		return fallback
+	}
+	return s
+}
+
+// reportSentences splits saved free text, whitespace collapsed, into
+// sentences by the reportSummary rule: a sentence ends at ".", "!" or "?"
+// followed by a space or the end of the text.
+func reportSentences(s string) []string {
+	s = strings.Join(strings.Fields(s), " ")
+	var out []string
+	start := 0
+	for i := 0; i < len(s); i++ {
+		if (s[i] == '.' || s[i] == '!' || s[i] == '?') && (i+1 == len(s) || s[i+1] == ' ') {
+			out = append(out, strings.TrimSpace(s[start:i+1]))
+			start = i + 1
+		}
+	}
+	if rest := strings.TrimSpace(s[start:]); rest != "" {
+		out = append(out, rest)
+	}
+	return out
+}
+
+// plainSentence is the first plain sentence of saved free text, cut at limit
+// runes and then ending in "…", or "" when no sentence is plain.
+func plainSentence(s string, limit int) string {
+	for _, sentence := range reportSentences(s) {
+		if reportPlain(sentence) {
+			return reportSummary(sentence, limit)
+		}
+	}
+	return ""
+}
+
+// reportPlain reports whether text is plain words the owner can read
+// (wi_475a3df9b345e13e f8; docs/owner-report.md, "The Shipped summary"): no
+// message number ("#" and a digit, or five or more digits in a row), no
+// commit SHA or hex ID (a run of 7 to 40 hex characters with a digit and a
+// letter), no path or remote branch (any "/") and no "tasks-hub".
+func reportPlain(s string) bool {
+	if strings.Contains(s, "/") || strings.Contains(strings.ToLower(s), "tasks-hub") {
+		return false
+	}
+	isDigit := func(c byte) bool { return c >= '0' && c <= '9' }
+	isHexLetter := func(c byte) bool { return c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F' }
+	for i := 0; i+1 < len(s); i++ {
+		if s[i] == '#' && isDigit(s[i+1]) {
+			return false
+		}
+	}
+	for i := 0; i < len(s); {
+		if !isDigit(s[i]) && !isHexLetter(s[i]) {
+			i++
+			continue
+		}
+		j, digits, letters, run := i, 0, 0, 0
+		for ; j < len(s) && (isDigit(s[j]) || isHexLetter(s[j])); j++ {
+			if isDigit(s[j]) {
+				digits++
+				if run++; run >= 5 {
+					return false
+				}
+			} else {
+				letters++
+				run = 0
+			}
+		}
+		if n := j - i; n >= 7 && n <= 40 && digits > 0 && letters > 0 {
+			return false
+		}
+		i = j
+	}
+	return true
 }
 
 func orNone(s string) string {
@@ -463,8 +616,12 @@ func cmdOwnerReport(e env, args []string) error {
 	fmt.Print(report)
 	if *post {
 		// A report with unavailable sections is still posted: the owner sees
-		// what could not be read, and the command still exits 1 below.
-		seq, already, err := postOwnerReport(c, e, *task, ownerReportRequestID(*task, kind, start, now), report)
+		// what could not be read, and the command still exits 1 below. An
+		// agent posts it as the reply to its own wake notice for this slot,
+		// which the ack gate lets through (docs/owner-report.md, "Sending on
+		// the hub schedule").
+		replyTo := ownerReportWakeNotice(c, e, *task, kind, now, zone)
+		seq, already, err := postOwnerReport(c, e, *task, ownerReportRequestID(*task, kind, start, now), report, replyTo)
 		if err != nil {
 			return fmt.Errorf("the report was not posted: %w", err)
 		}
@@ -483,11 +640,44 @@ func cmdOwnerReport(e env, args []string) error {
 	return nil
 }
 
+// ownerReportWakeKinds maps a report kind to the hub wake that schedules it.
+var ownerReportWakeKinds = map[string]string{"hourly": "hourly-update", "morning": "morning-summary", "evening": "evening-summary"}
+
+// ownerReportWakeNotice is the notice of the caller's own wake firing for
+// this slot: a firing of the kind's wake delivered to the calling agent
+// whose due time falls in the slot that ends at slot. 0 for the owner, when
+// no firing matches or when the wakes cannot be read; the post then goes
+// out without a reply.
+func ownerReportWakeNotice(c *api.Client, e env, task, kind string, slot time.Time, zone *time.Location) int64 {
+	if e.agent == "" {
+		return 0
+	}
+	ctx, cancel := ctxTimeout(ownerReportCallTimeout)
+	defer cancel()
+	list, err := c.ListOwnerHelperWakes(ctx, task, 50)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "tt owner report: could not read the owner-helper wakes (%v); posting without a wake reply\n", err)
+		return 0
+	}
+	var notice int64
+	for _, w := range list.Wakes {
+		if w.Kind != ownerReportWakeKinds[kind] {
+			continue
+		}
+		for _, f := range w.Firings {
+			if f.NoticeSeq > notice && f.RecipientID == e.agent && ownerReportSlot(kind, f.DueAt, zone).Equal(slot) {
+				notice = f.NoticeSeq
+			}
+		}
+	}
+	return notice
+}
+
 // postOwnerReport posts the report as one plain undirected Board message
-// under requestID. A slot that was already posted (even with other bytes,
+// under requestID, as the reply to replyTo when it is not 0. A slot that was already posted (even with other bytes,
 // because the data has moved since) is found by its receipt and not posted
 // again; already reports that case.
-func postOwnerReport(c *api.Client, e env, task, requestID, report string) (seq int64, already bool, err error) {
+func postOwnerReport(c *api.Client, e env, task, requestID, report string, replyTo int64) (seq int64, already bool, err error) {
 	found := func() (int64, bool) {
 		ctx, cancel := ctxTimeout(ownerReportCallTimeout)
 		defer cancel()
@@ -502,7 +692,7 @@ func postOwnerReport(c *api.Client, e env, task, requestID, report string) (seq 
 	}
 	ctx, cancel := ctxTimeout(ownerReportCallTimeout)
 	defer cancel()
-	m, err := c.PostMessage(ctx, task, api.PostMessageRequest{Text: report, AgentID: e.agent, RunID: e.runID, RequestID: requestID})
+	m, err := c.PostMessage(ctx, task, api.PostMessageRequest{Text: report, AgentID: e.agent, RunID: e.runID, RequestID: requestID, ReplyTo: replyTo})
 	if err != nil {
 		// A concurrent run may have posted the slot first.
 		if seq, ok := found(); ok {
@@ -777,6 +967,14 @@ func fetchOwnerReport(c *api.Client, task, kind string, start, end time.Time, zo
 		d.tokensUnavailable = true
 	} else {
 		d.tokens = project.Summary.Tokens
+	}
+
+	if err := call(func(ctx context.Context) (err error) {
+		d.status, err = c.OwnerStatus(ctx, task, api.OwnerStatusQuery{From: start, To: end, Zone: zone.String()})
+		return err
+	}); err != nil {
+		fail(ownerSourceOwnerStatus, err)
+		d.statusUnavailable = true
 	}
 
 	var needs []api.Obligation

@@ -357,3 +357,50 @@ func TestMigrateRunsStorageCleanupLastAndOnce(t *testing.T) {
 		t.Fatal("no ledger rows")
 	}
 }
+
+// wi_475a3df9b345e13e a2: the owner status baselines table is additive. A
+// store from before it (the table dropped) gains it empty on open, and a
+// recorded baseline survives a reopen unchanged.
+func TestMigrateAddsOwnerStatusBaselines(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "baselines.sqlite")
+	now := time.Date(2026, 11, 3, 6, 0, 0, 0, time.UTC)
+	open := func() *Store {
+		t.Helper()
+		s, err := Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.now = func() time.Time { return now }
+		return s
+	}
+	ctx := context.Background()
+	s := open()
+	task, err := s.CreateTask(ctx, api.CreateTaskRequest{Name: "Baseline migration"}, api.Caller{Node: "fixture", User: "owner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`DROP TABLE owner_status_baselines`); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	s = open()
+	var n int
+	if err := s.db.QueryRow(`SELECT count(*) FROM owner_status_baselines`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("the table was not created empty on a store without it: %d %v", n, err)
+	}
+	q := api.OwnerStatusQuery{From: now.Add(-time.Hour), To: now, Zone: "UTC"}
+	first, err := s.OwnerStatus(ctx, task.ID, q)
+	if err != nil || first.Baseline == nil {
+		t.Fatalf("record: %+v %v", first.Baseline, err)
+	}
+	s.Close()
+	s = open()
+	defer s.Close()
+	again, err := s.OwnerStatus(ctx, task.ID, q)
+	if err != nil || again.Baseline == nil || *again.Baseline != *first.Baseline {
+		t.Fatalf("after reopen %+v %v, first %+v", again.Baseline, err, first.Baseline)
+	}
+	if err := s.db.QueryRow(`SELECT count(*) FROM owner_status_baselines`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("rows %d %v", n, err)
+	}
+}
