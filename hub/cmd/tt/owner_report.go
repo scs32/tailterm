@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -401,13 +402,21 @@ func plainSentence(s string, limit int) string {
 	return ""
 }
 
+// reportNotPlainRE matches the word forms of provenance: an item reference
+// or branch name starting "wi_" (wi_475a, wi_475a-owner-status, also inside
+// fix-wi_8237-wait), and a message number named by its word, such as
+// "order 4335", "request #812" or "seq 2131".
+var reportNotPlainRE = regexp.MustCompile(`(?i)(^|[^a-z0-9])wi_|(^|[^a-z])(order|request|message|msg|seq)s?\s*#?\s*[0-9]{3,}`)
+
 // reportPlain reports whether text is plain words the owner can read
 // (wi_475a3df9b345e13e f8; docs/owner-report.md, "The Shipped summary"): no
-// message number ("#" and a digit, or five or more digits in a row), no
-// commit SHA or hex ID (a run of 7 to 40 hex characters with a digit and a
-// letter), no path or remote branch (any "/") and no "tasks-hub".
+// message number ("#" and a digit, five or more digits in a row, or order,
+// request, message, msg or seq followed by three or more digits), no commit
+// SHA or hex ID (a run of 7 to 40 hex characters with a digit and a letter),
+// no item reference or branch name starting "wi_", no path or remote branch
+// (any "/") and no "tasks-hub".
 func reportPlain(s string) bool {
-	if strings.Contains(s, "/") || strings.Contains(strings.ToLower(s), "tasks-hub") {
+	if strings.Contains(s, "/") || strings.Contains(strings.ToLower(s), "tasks-hub") || reportNotPlainRE.MatchString(s) {
 		return false
 	}
 	isDigit := func(c byte) bool { return c >= '0' && c <= '9' }

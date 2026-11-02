@@ -15,10 +15,17 @@ import (
 // ackGate refuses a write from agentID while it holds an ack_outcome or
 // answer obligation still queued or delivered after the grace period. A
 // reply to one of those messages is the way out and is refused only when it
-// names a stale run. The one other post it lets through is a scheduled owner
-// report sent as the first reply to its own wake notice, from the current
-// run (ownerReportWakeReply).
+// names a stale run. Every write but a Board post uses it.
 func ackGate(ctx context.Context, q queryRower, agentID, runID string, replyTo int64, now time.Time) error {
+	return ackGatePost(ctx, q, agentID, runID, replyTo, false, now)
+}
+
+// ackGatePost is ackGate for a Board post. reportShape says the post has the
+// shape tt owner report --post sends: plain text, no envelope, no recipient
+// and no work-item links. Only such a post can be the one scheduled owner
+// report the gate also lets through: the first reply to its own latest wake
+// notice, from the current run (ownerReportWakeReply).
+func ackGatePost(ctx context.Context, q queryRower, agentID, runID string, replyTo int64, reportShape bool, now time.Time) error {
 	if agentID == "" {
 		return nil // people and the hub are never gated
 	}
@@ -76,7 +83,7 @@ WHERE o.agent_id=? AND o.state IN (?,?) AND o.needs IN (?,?) AND o.created_at<=?
 				}
 			}
 		}
-		if runID != "" && runID == current {
+		if reportShape && runID != "" && runID == current {
 			ok, err := ownerReportWakeReply(ctx, q, agentID, replyTo)
 			if err != nil || ok {
 				return err
@@ -89,14 +96,16 @@ WHERE o.agent_id=? AND o.state IN (?,?) AND o.needs IN (?,?) AND o.created_at<=?
 // ownerReportWakeReply reports whether a post replying to replyTo is the one
 // scheduled owner report that closes its wake notice (wi_475a3df9b345e13e g1;
 // docs/owner-report.md, "Sending on the hub schedule"). It holds only when
-// replyTo is the notice of a firing of an hourly-update, morning-summary or
-// evening-summary wake, delivered to agentID, and agentID has not replied to
-// that notice yet. The hub checks its own firing record, so no kind, text or
-// request ID can claim it; every other post, reply and write stays gated.
+// replyTo is the notice of the latest firing of an hourly-update,
+// morning-summary or evening-summary wake, delivered to agentID, and agentID
+// has not replied to that notice yet. The hub checks its own firing record,
+// so no kind, text or request ID can claim it; an older slot's notice, and
+// every other post, reply and write, stays gated.
 func ownerReportWakeReply(ctx context.Context, q queryRower, agentID string, replyTo int64) (bool, error) {
 	var n int
 	err := q.QueryRowContext(ctx, `SELECT count(*) FROM owner_helper_wake_firings f JOIN owner_helper_wakes w ON w.id=f.wake_id AND w.task_id=f.task_id
 WHERE f.notice_seq=? AND f.recipient_id=? AND w.kind IN (?,?,?)
+AND NOT EXISTS (SELECT 1 FROM owner_helper_wake_firings later WHERE later.wake_id=f.wake_id AND later.due_at>f.due_at)
 AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.task_id=f.task_id AND m.reply_to=f.notice_seq AND m.from_agent=?)`,
 		replyTo, agentID, ownerReportWakeKinds[0], ownerReportWakeKinds[1], ownerReportWakeKinds[2], agentID).Scan(&n)
 	return n > 0, err

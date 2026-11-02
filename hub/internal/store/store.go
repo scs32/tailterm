@@ -1335,8 +1335,10 @@ func (s *Store) PostMessage(ctx context.Context, taskID string, req api.PostMess
 	if t.Status != api.TaskOpen {
 		return api.Message{}, api.ErrClosed
 	}
-	// Broker phase 3.1: an agent holding unacknowledged work may only reply to it.
-	if err := ackGate(ctx, tx, req.AgentID, req.RunID, req.ReplyTo, s.now()); err != nil {
+	// Broker phase 3.1: an agent holding unacknowledged work may only reply to
+	// it, or send its scheduled owner report in the report's own shape.
+	reportShape := req.Envelope == nil && req.To == "" && len(req.WorkItems) == 0
+	if err := ackGatePost(ctx, tx, req.AgentID, req.RunID, req.ReplyTo, reportShape, s.now()); err != nil {
 		return api.Message{}, err
 	}
 	if req.AgentID != "" && req.Envelope != nil && req.Envelope.Kind == api.EnvelopeKindAssign {

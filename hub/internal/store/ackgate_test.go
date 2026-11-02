@@ -282,9 +282,10 @@ func TestAckGateLetsTheReportReplyToItsWake(t *testing.T) {
 }
 
 // a6 (g1): the rule is narrow. A plain post, a reply to a queue-check wake,
-// another agent's reply to the helper's report wake, a stale or missing run,
-// a second reply to the same report wake and a work-item write all stay
-// refused while the REQUEST is unacknowledged.
+// a directed or enveloped reply to the report wake, another agent's reply to
+// the helper's report wake, a stale or missing run, a work-item write, a
+// reply to an older firing's notice and a second reply to the same report
+// wake all stay refused while the REQUEST is unacknowledged.
 func TestAckGateWakeReplyStaysNarrow(t *testing.T) {
 	r := newReportWakeFixture(t)
 	var unacked *api.UnacknowledgedError
@@ -298,6 +299,18 @@ func TestAckGateWakeReplyStaysNarrow(t *testing.T) {
 	refused("a plain post", err)
 	_, err = r.report(r.helper, r.helper.RunID, r.queueCheck, "n-queue")
 	refused("a reply to a queue-check wake", err)
+	// Only the report's own shape passes (review b1): a directed reply or an
+	// enveloped one to the report wake stays gated.
+	ctx := context.Background()
+	_, err = r.s.PostMessage(ctx, r.task.ID, api.PostMessageRequest{AgentID: r.helper.ID, RunID: r.helper.RunID, ReplyTo: r.hourly, To: r.other.ID, RequestID: "n-directed",
+		Text: "**Owner report: Hourly** directed"}, wakeBy)
+	refused("a directed reply to the report wake", err)
+	_, err = r.s.PostMessage(ctx, r.task.ID, api.PostMessageRequest{AgentID: r.helper.ID, RunID: r.helper.RunID, ReplyTo: r.hourly, RequestID: "n-envelope",
+		Envelope: &api.Envelope{Kind: api.EnvelopeKindNotice, Subject: "Status of something unrelated", Body: api.EnvelopeBody{Text: "unrelated"}}}, wakeBy)
+	refused("an enveloped reply to the report wake", err)
+	_, err = r.s.PostMessage(ctx, r.task.ID, api.PostMessageRequest{AgentID: r.helper.ID, RunID: r.helper.RunID, ReplyTo: r.hourly, To: r.other.ID, RequestID: "n-request",
+		Envelope: &api.Envelope{Kind: api.EnvelopeKindRequest, To: r.other.Name, Subject: "Do something unrelated", Body: api.EnvelopeBody{Ask: "do it"}}}, wakeBy)
+	refused("a directed request replying to the report wake", err)
 	_, err = r.report(r.other, r.other.RunID, r.hourly, "n-other")
 	refused("another agent's reply to the helper's wake", err)
 	_, err = r.report(r.helper, "run_0000000000000000", r.hourly, "n-stale")
@@ -306,9 +319,18 @@ func TestAckGateWakeReplyStaysNarrow(t *testing.T) {
 	refused("a reply without a run", err)
 	_, err = r.s.CreateWorkItem(context.Background(), r.task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Filed by the gated helper", AgentID: r.helper.ID, RequestID: "n-wi"}, wakeBy)
 	refused("a work-item write", err)
-	if _, err = r.report(r.helper, r.helper.RunID, r.hourly, "n-first"); err != nil {
-		t.Fatalf("the first report reply was refused: %v", err)
+	// The next slot fires: the 07:00 notice, never replied to, is now an
+	// older firing's and no longer opens the gate (review b1).
+	r.sweep(pst(2, 8, 0, 30))
+	var latest int64
+	if err := r.s.db.QueryRow(`SELECT f.notice_seq FROM owner_helper_wake_firings f JOIN owner_helper_wakes w ON w.id=f.wake_id WHERE w.request_id='report-hourly' ORDER BY f.due_at DESC LIMIT 1`).Scan(&latest); err != nil || latest == 0 || latest == r.hourly {
+		t.Fatalf("the 08:00 slot did not fire a new notice: %d %v", latest, err)
 	}
-	_, err = r.report(r.helper, r.helper.RunID, r.hourly, "n-second")
+	_, err = r.report(r.helper, r.helper.RunID, r.hourly, "n-older")
+	refused("a reply to an older firing's notice", err)
+	if _, err = r.report(r.helper, r.helper.RunID, latest, "n-first"); err != nil {
+		t.Fatalf("the first report reply to the latest wake was refused: %v", err)
+	}
+	_, err = r.report(r.helper, r.helper.RunID, latest, "n-second")
 	refused("a second reply to the same report wake", err)
 }

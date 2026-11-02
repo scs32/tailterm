@@ -146,15 +146,20 @@ full stop on the what-changed sentence is dropped before `. Limits:`.
 
 A sentence is plain when it contains none of these:
 
-- `#` followed by a digit, or a run of five or more digits (message numbers
-  such as `#55055` or `REQUEST54571`);
+- `#` followed by a digit, a run of five or more digits, or `order`,
+  `request`, `message`, `msg` or `seq` (any case, optionally plural)
+  followed by three or more digits (message numbers such as `#55055`,
+  `REQUEST54571` or `order 4335`);
+- a word starting `wi_` (item references and branch names such as
+  `wi_475a-owner-status`, also inside `fix-wi_8237-pathless-wait`);
 - a run of 7 to 40 hexadecimal characters with at least one digit and one
   letter (commit SHAs, also inside a word such as `landed05f1a040`, and the
   hex in IDs such as `wi_475a3df9b345e13e` or `queue-475a3df9`);
 - a `/` (paths and branches such as `origin/main`);
 - the branch name `tasks-hub`, in any case.
 
-So `owner_report.go`, `v1.2` and a year stay plain. The source is the
+So `owner_report.go`, `v1.2`, a year and a count such as `1245 tests` stay
+plain. The source is the
 completion report's delivered work and limitations; when bug
 `wi_977caae754fc263e` adds a one-line result for bug done saves, that line
 can become the source instead.
@@ -286,15 +291,18 @@ assignment, request, review or question) past its grace period
 (`docs/broker-phase-3.1.md`), and a scheduled report must not be lost to
 that. The rule: an agent's post passes the gate when it is the first reply,
 from the agent's current run, to the notice of its own firing of an
-`hourly-update`, `morning-summary` or `evening-summary` wake. The hub checks
+`hourly-update`, `morning-summary` or `evening-summary` wake, that firing
+is the wake's latest, and the post has the report's own shape: plain text,
+with no envelope, no recipient and no work-item links, as `--post` sends it. The hub checks
 its own firing record (the notice, the recipient and the wake's kind), so no
 message kind, text or request ID can claim the rule. The reply closes the
 notice's delivery obligation, so the report is the reply that closes the
-wake notice. The gate is not weakened for anything else: a plain post, a
-reply to any other wake (such as `queue-check`) or notice, a second reply
-to the same wake, another agent's reply, a stale or missing run and every
-work-item, verification, release or decision write stay refused until the
-work is acknowledged or answered. The unacknowledged work itself stays open.
+wake notice. The gate is not weakened for anything else: a plain post, a directed or
+enveloped (typed) reply even to the report's wake, a reply to any other wake
+(such as `queue-check`) or notice, a reply to an older firing's notice once
+the next slot has fired, a second reply to the same wake, another agent's
+reply, a stale or missing run and every work-item, verification, release or
+decision write stay refused until the work is acknowledged or answered. The unacknowledged work itself stays open.
 
 `--post` from an agent reads the project's wakes and replies to the notice
 of the caller's own firing of the kind's wake whose due time falls in the
@@ -306,7 +314,9 @@ report was not posted" with the hub's list of unacknowledged work, and
 exits 1. Acknowledge or answer each listed message (`tt ack SEQ`, or reply
 to it), then run the same command again. For an earlier slot, add
 `--now <that slot's end>`: with `--post` the window snaps to the slot at or
-before `--now`, and the slot's request ID posts it once.
+before `--now`, and the slot's request ID posts it once. Once a later slot
+has fired, an earlier slot's report no longer passes the gate by its wake,
+so acknowledge the listed work first.
 
 What `--post` does:
 
@@ -358,5 +368,8 @@ or `--since` not before `--now`) exit 1 before any hub read.
 - Up next uses the queue's up-next numbers (`wi_35e9`).
 - The hub refuses a Board message over 8 KiB, so a report that long (a very
   long queue or many open owner obligations) is printed but not posted.
+- The ack-gate rule checks the report's shape, not its text: a gated agent
+  can still send one plain, undirected message of any text as the first
+  reply to its own latest report wake notice.
 - Post receipts are per caller: the same slot posted once by the owner
   helper and once from the owner terminal gives two posts.

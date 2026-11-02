@@ -1194,6 +1194,11 @@ func TestOwnerReportPlainShipped(t *testing.T) {
 		{"Pushed to origin/main.", false},
 		{"Rebased on Tasks-Hub.", false},
 		{"From /Users/x/.build/worktrees/q.", false},
+		{"Committed on branch wi_475a-owner-status.", false},
+		{"Built on fix-wi_8237-pathless-wait.", false},
+		{"Built under order 4335.", false},
+		{"Answers request #812 and seq 2131.", false},
+		{"Added 1245 tests in 2026 for 30 orders.", true},
 	} {
 		if got := reportPlain(tc.text); got != tc.plain {
 			t.Fatalf("reportPlain(%q) = %v, want %v", tc.text, got, tc.plain)
