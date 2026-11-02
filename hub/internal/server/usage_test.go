@@ -3,7 +3,9 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"github.com/scs32/tailterm/hub/internal/api"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -367,5 +369,89 @@ func TestUsageHoldStopByFailHTTP(t *testing.T) {
 	}
 	if _, err := f.hub.TeamQueueAction(ctx, f.task.ID, api.TeamQueueRequest{RequestID: api.NewID("req"), Operation: "budget_continue", EntryID: entry.ID, ExpectedRevision: failed.Revision}); httpStatus(err) != 409 {
 		t.Fatalf("continue of a stopped hold: %v", err)
+	}
+}
+
+// A 1h usage read over HTTP returns only the window's requests and time
+// while history lies outside it, keeps lifetime budgets, and the unwindowed
+// read still counts everything (wi_f8f4f32d4555aec5). Synthetic data only.
+func TestUsageHTTPWindowedReadIgnoresHistory(t *testing.T) {
+	f := newClient(t)
+	ctx := context.Background()
+	task, err := f.st.CreateTask(ctx, api.CreateTaskRequest{Name: "Usage window HTTP synthetic", Swarm: true}, f.who)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := f.st.AddAgent(ctx, task.ID, api.AddAgentRequest{Name: "metered", AgentID: api.NewID("agt"), Role: api.AgentRoleDatabaseHandler, Host: "fixture", Session: "synthetic", Runtime: "codex"}, f.who)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, err := f.st.CreateWorkItem(ctx, task.ID, api.CreateWorkItemRequest{Kind: "bug", Title: "Synthetic window item", RequestID: "window-item"}, f.who)
+	if err != nil {
+		t.Fatal(err)
+	}
+	order, err := f.st.PostMessage(ctx, task.ID, api.PostMessageRequest{To: a.ID, RequestID: "window-order", WorkItems: []api.MessageWorkItem{{ItemTaskID: task.ID, ItemID: item.ID, ItemRevision: item.Revision, Relationship: "primary"}}, Envelope: &api.Envelope{Kind: "request", To: a.ID, Subject: "Record the synthetic window", Body: api.EnvelopeBody{Ask: "Record synthetic data"}}}, f.who)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := api.NewClient(f.srv.URL, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	end := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	from := end.Add(-time.Hour)
+	// 300 requests and chunks over the 30 days before the window, 3 inside it.
+	var history []time.Time
+	for i := 0; i < 300; i++ {
+		history = append(history, from.Add(-time.Duration(i+1)*2*time.Hour-time.Minute))
+	}
+	inside := []time.Time{from, from.Add(30 * time.Minute), end.Add(-time.Minute)}
+	serial := 0
+	upload := func(at []time.Time) {
+		for len(at) > 0 {
+			n := min(len(at), 32)
+			b := api.UsageBatch{Version: 1, RequestID: fmt.Sprintf("window-batch-%d", serial), RunID: a.RunID, Session: "synthetic", StartedAt: end.Add(-40 * 24 * time.Hour)}
+			for _, x := range at[:n] {
+				serial++
+				id := fmt.Sprintf("window-%d", serial)
+				handled := []api.UsageEvidence{{TaskID: task.ID, Seq: order.Seq, Operation: "ack", At: x}}
+				b.Turns = append(b.Turns, api.UsageTurn{ID: id, Revision: 1, Runtime: "codex", Session: "synthetic", Model: "fixture-model", At: x, Handled: handled, Tokens: map[string]int64{"input": 21, "cached": 80, "cacheWrite": 0, "output": 7, "reasoning": 2}, Raw: map[string]int64{"input_tokens": 101, "cached_input_tokens": 80, "cache_write_input_tokens": 0, "output_tokens": 9, "reasoning_output_tokens": 2}, SourceDigest: strings.Repeat("a", 64), Complete: true})
+				b.Spans = append(b.Spans, api.UsageSpan{ID: id + "#0", Turn: id, Last: true, Start: x, End: x.Add(40 * time.Second), Handled: handled, Segments: []api.UsageSpanSegment{{From: x, To: x.Add(40 * time.Second), At: x}}, SourceDigest: strings.Repeat("c", 64)})
+			}
+			if _, err := c.ReportUsage(ctx, task.ID, a.ID, b); err != nil {
+				t.Fatal(err)
+			}
+			at = at[n:]
+		}
+	}
+	upload(history)
+	upload(inside)
+	windowed, err := c.Usage(ctx, task.ID, api.UsageQuery{From: from, To: end})
+	if err != nil {
+		t.Fatal(err)
+	}
+	all, err := c.Usage(ctx, task.ID, api.UsageQuery{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if windowed.Summary.Requests != 3 || all.Summary.Requests != 303 {
+		t.Fatalf("requests: windowed %d, all %d", windowed.Summary.Requests, all.Summary.Requests)
+	}
+	if len(windowed.Items) != 1 || len(all.Items) != 1 || windowed.Items[0].ItemID != item.ID {
+		t.Fatalf("items: windowed %+v, all %+v", windowed.Items, all.Items)
+	}
+	w, l := windowed.Items[0], all.Items[0]
+	if w.Summary.Requests != 3 || l.Summary.Requests != 303 {
+		t.Fatalf("item requests: windowed %d, all %d", w.Summary.Requests, l.Summary.Requests)
+	}
+	// Three 40 s chunks inside the window; the lifetime budget ignores it.
+	if w.Time == nil || w.Time.ModelMs != "120000" || !w.Time.From.Equal(from) || !w.Time.To.Equal(end.Add(-time.Minute+40*time.Second)) {
+		t.Fatalf("windowed time: %+v", w.Time)
+	}
+	if l.Time == nil || l.Time.ModelMs != "12120000" {
+		t.Fatalf("unwindowed time: %+v", l.Time)
+	}
+	if !reflect.DeepEqual(w.Budget, l.Budget) || w.Budget == nil || w.Budget.ActualTokens != "33330" {
+		t.Fatalf("budgets: windowed %+v, all %+v", w.Budget, l.Budget)
 	}
 }
