@@ -3723,7 +3723,7 @@ func seedUsageLiveSize(tb testing.TB, dir string, size usageLiveSize) *usageLive
 		handled, refs, _ := evidence(i)
 		turn := fmt.Sprintf("live-turn-%07d", i)
 		span := api.UsageSpan{ID: turn + "#0", Turn: turn, Last: true, Start: start, End: end, SourceDigest: digest, Handled: handled,
-			Tool: [][2]time.Time{{start.Add(12 * time.Second), start.Add(20 * time.Second)}},
+			Tool:     [][2]time.Time{{start.Add(12 * time.Second), start.Add(20 * time.Second)}},
 			Segments: []api.UsageSpanSegment{{From: start, To: start.Add(10 * time.Second), At: start}, {From: start.Add(10 * time.Second), To: start.Add(25 * time.Second), At: start.Add(10 * time.Second), Poll: i%10 < 3}, {From: start.Add(25 * time.Second), To: end, At: start.Add(25 * time.Second)}}}
 		if i%4 == 0 {
 			span.Wait = [][2]time.Time{{start.Add(30 * time.Second), start.Add(35 * time.Second)}}
@@ -3972,5 +3972,73 @@ func TestUsageWindowedSpansStraddleAndPollInstant(t *testing.T) {
 	all := f.item(f.report(time.Time{}, time.Time{}), 0).Time
 	if all == nil || all.Polls != 1 || all.PollMs != "40000" {
 		t.Fatalf("unwindowed time: %+v", all)
+	}
+}
+
+// A windowed read's decoded turns do not grow with history outside the
+// window.
+func TestUsageWindowedReadCostBounded(t *testing.T) {
+	f := newUsageWindowFixture(t)
+	from, to := timeAt("10:00:00"), timeAt("11:00:00")
+	f.turns(0, timeAt("10:10:00"), timeAt("10:20:00"))
+	f.turns(1, timeAt("10:40:00"))
+	f.spans(0, testSpan("in-1", "10:10:00", "10:10:40"), testSpan("in-2", "10:20:00", "10:20:40"))
+	history := func(n int) {
+		for i := 0; i < n; i++ {
+			at := timeAt("09:00:00").Add(-time.Duration(f.serial) * time.Minute)
+			f.turns(i%2, at)
+			late := timeAt("12:00:00").Add(time.Duration(f.serial) * time.Minute)
+			f.spans(i%2, testSpan(fmt.Sprintf("out-%d", f.serial), ts(at)[11:19], ts(at.Add(30 * time.Second))[11:19]), testSpan(fmt.Sprintf("late-%d", f.serial), ts(late)[11:19], ts(late.Add(30 * time.Second))[11:19]))
+		}
+	}
+	read := func() *usageReadStats {
+		t.Helper()
+		cache := newUsagePhaseCache()
+		began := time.Now()
+		report, err := f.s.usageReport(context.Background(), f.task.ID, api.UsageQuery{From: from, To: to}, cache)
+		if err != nil || report.Summary.Requests != 3 {
+			t.Fatal(report.Summary, err)
+		}
+		if took := time.Since(began); took > time.Second && !raceBuilt() {
+			t.Fatalf("windowed read took %s", took)
+		}
+		return cache.stats
+	}
+	history(10)
+	f.reopen()
+	small := read()
+	history(30)
+	large := read() // history x4; the new turns are still listed for a check
+	if small.rows[usageStageTurns] != 3 || large.rows[usageStageTurns] != 3 {
+		t.Fatalf("turn rows decoded: %d, then %d with four times the history", small.rows[usageStageTurns], large.rows[usageStageTurns])
+	}
+}
+
+// The windowed turn read searches usage_turn_totals by its window index with
+// an at_ns range, not the whole project.
+func TestUsageWindowedTurnsQueryUsesTotalsIndex(t *testing.T) {
+	s, task, _, _, _ := usageFixture(t)
+	rows, err := s.db.QueryContext(context.Background(), "EXPLAIN QUERY PLAN "+fmt.Sprintf(usageWindowTurnsQuery, "?,?"), task.ID, "claude", "codex", int64(1), int64(2), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	ranged, scanned := false, false
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatal(err)
+		}
+		t.Log(detail)
+		ranged = ranged || (strings.Contains(detail, "usage_turn_totals_window") && strings.Contains(detail, "at_ns>? AND at_ns<?"))
+		// Neither branch may walk the project's turns.
+		scanned = scanned || strings.HasPrefix(detail, "SCAN x") || strings.HasPrefix(detail, "SCAN t") || strings.HasSuffix(detail, "(task_id=?)")
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !ranged || scanned {
+		t.Fatal("windowed turn read does not search the totals index by instant")
 	}
 }

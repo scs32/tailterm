@@ -5,9 +5,12 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"math"
 	"math/big"
 	"regexp"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/scs32/tailterm/hub/internal/api"
@@ -321,6 +324,67 @@ func (c usageCountingQuerier) QueryContext(ctx context.Context, query string, ar
 
 const usageReportTurnsQuery = `SELECT projection FROM usage_turns WHERE task_id=? ORDER BY task_id,agent_id,run_id,request_id`
 
+// usageTurnRuntimesQuery lists the project's runtimes by skipping along
+// usage_turn_totals_window, one index probe per runtime.
+const usageTurnRuntimesQuery = `WITH RECURSIVE r(runtime) AS (
+ SELECT min(runtime) FROM usage_turn_totals WHERE task_id=?1
+ UNION ALL SELECT (SELECT min(runtime) FROM usage_turn_totals WHERE task_id=?1 AND runtime>r.runtime) FROM r WHERE r.runtime IS NOT NULL)
+ SELECT runtime FROM r WHERE runtime IS NOT NULL`
+
+// usageWindowTurnsQuery reads the turns whose totals row at their current
+// revision puts them in [from,to), by usage_turn_totals_window (task,
+// runtime, at_ns range), plus every turn of the project listed for a totals
+// check that has no totals row at its current revision: only such a row can
+// be stale (a turn's instant never changes between revisions, and ingest
+// writes the row with the turn). Instants are Unix nanoseconds, so the range
+// is exact; the stored text instants are never compared. The %s is one
+// placeholder per runtime. CROSS JOIN keeps the check list, not the
+// project's turns, as the outer loop.
+const usageWindowTurnsQuery = `SELECT t.rowid,t.agent_id,t.run_id,t.request_id,t.projection FROM usage_turn_totals x
+ JOIN usage_turns t ON t.task_id=x.task_id AND t.agent_id=x.agent_id AND t.run_id=x.run_id AND t.request_id=x.request_id AND t.revision=x.turn_revision
+ WHERE x.task_id=? AND x.runtime IN (%s) AND x.at_ns>=? AND x.at_ns<?
+ UNION SELECT t.rowid,t.agent_id,t.run_id,t.request_id,t.projection FROM usage_turn_total_checks c CROSS JOIN usage_turns t ON t.rowid=c.turn_rowid
+ WHERE t.task_id=? AND NOT EXISTS (SELECT 1 FROM usage_turn_totals s WHERE s.task_id=t.task_id AND s.agent_id=t.agent_id AND s.run_id=t.run_id AND s.request_id=t.request_id AND s.turn_revision=t.revision)
+ ORDER BY 2,3,4`
+
+// usageWindowTurns returns the projections a windowed report must decode, in
+// the order of usageReportTurnsQuery. A turn missing from the result has a
+// current totals row outside the window, so the report's own Turn.At filter
+// would drop it too.
+func usageWindowTurns(ctx context.Context, q queryRower, task string, from, to time.Time) (*sql.Rows, error) {
+	rows, err := q.QueryContext(ctx, usageTurnRuntimesQuery, task)
+	if err != nil {
+		return nil, err
+	}
+	var runtimes []any
+	for rows.Next() {
+		var runtime string
+		if err = rows.Scan(&runtime); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		runtimes = append(runtimes, runtime)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return nil, err
+	}
+	low, high := int64(math.MinInt64), int64(math.MaxInt64)
+	if !from.IsZero() {
+		low = from.UnixNano()
+	}
+	if !to.IsZero() {
+		high = to.UnixNano()
+	}
+	marks := "NULL"
+	if len(runtimes) > 0 {
+		marks = strings.TrimSuffix(strings.Repeat("?,", len(runtimes)), ",")
+	}
+	args := append(append([]any{task}, runtimes...), low, high, task)
+	return q.QueryContext(ctx, fmt.Sprintf(usageWindowTurnsQuery, marks), args...)
+}
+
 func (s *Store) usageReport(ctx context.Context, task string, q api.UsageQuery, cache *usagePhaseCache) (api.UsageReport, error) {
 	out := api.UsageReport{Version: api.UsageVersion, ProjectID: task, Items: []api.UsageItemReport{}}
 	if !api.ValidID(task, "tsk") || (q.Item != "" && !api.ValidID(q.Item, "wi")) || (!q.From.IsZero() && !q.To.IsZero() && !q.From.Before(q.To)) {
@@ -390,14 +454,27 @@ func (s *Store) usageReport(ctx context.Context, task string, q api.UsageQuery, 
 	stats.queries[usageStagePrices] += 3
 	done()
 	done = stats.stage(usageStageTurns)
-	stats.queries[usageStageTurns]++
-	rows, err = tx.QueryContext(ctx, usageReportTurnsQuery, task)
+	windowed := !q.From.IsZero() || !q.To.IsZero()
+	if windowed {
+		stats.queries[usageStageTurns] += 2
+		rows, err = usageWindowTurns(ctx, tx, task, q.From, q.To)
+	} else {
+		stats.queries[usageStageTurns]++
+		rows, err = tx.QueryContext(ctx, usageReportTurnsQuery, task)
+	}
 	if err != nil {
 		return out, err
 	}
 	for rows.Next() {
 		var raw string
-		if err = rows.Scan(&raw); err != nil {
+		if windowed {
+			var rowid int64
+			var agent, run, request string
+			err = rows.Scan(&rowid, &agent, &run, &request, &raw)
+		} else {
+			err = rows.Scan(&raw)
+		}
+		if err != nil {
 			break
 		}
 		stats.rows[usageStageTurns]++
