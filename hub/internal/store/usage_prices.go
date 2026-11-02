@@ -291,11 +291,13 @@ var usageStageNames = [usageStageCount]string{"S0 prices/items", "S1 turns", "S2
 
 // usageReadStats is what one report read cost, per stage: the time it took,
 // the rows its queries returned, the rows that went on past the window and
-// item filters, and the queries it ran. Counts only; tests and the live-size
+// item filters, and the queries it ran. scanned counts span keys a windowed
+// read examined without decoding them. Counts only; tests and the live-size
 // benchmark read it.
 type usageReadStats struct {
 	elapsed [usageStageCount]time.Duration
 	rows    [usageStageCount]int
+	scanned [usageStageCount]int
 	kept    [usageStageCount]int
 	queries [usageStageCount]int
 }

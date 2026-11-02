@@ -3811,7 +3811,7 @@ func BenchmarkUsageReportLiveSize(parent *testing.B) {
 				if walls[median] > 0 {
 					share = 100 * float64(st.elapsed[n]) / float64(walls[median])
 				}
-				line = append(line, fmt.Sprintf("%s: %s (%.1f%%) rows=%d kept=%d queries=%d", usageStageNames[n], st.elapsed[n].Round(time.Millisecond), share, st.rows[n], st.kept[n], st.queries[n]))
+				line = append(line, fmt.Sprintf("%s: %s (%.1f%%) rows=%d scanned=%d kept=%d queries=%d", usageStageNames[n], st.elapsed[n].Round(time.Millisecond), share, st.rows[n], st.scanned[n], st.kept[n], st.queries[n]))
 			}
 			b.Log(strings.Join(line, "\n  "))
 		})
@@ -3975,8 +3975,8 @@ func TestUsageWindowedSpansStraddleAndPollInstant(t *testing.T) {
 	}
 }
 
-// A windowed read's decoded turns do not grow with history outside the
-// window.
+// A windowed read's decoded turns and spans do not grow with history
+// outside the window.
 func TestUsageWindowedReadCostBounded(t *testing.T) {
 	f := newUsageWindowFixture(t)
 	from, to := timeAt("10:00:00"), timeAt("11:00:00")
@@ -4011,6 +4011,9 @@ func TestUsageWindowedReadCostBounded(t *testing.T) {
 	large := read() // history x4; the new turns are still listed for a check
 	if small.rows[usageStageTurns] != 3 || large.rows[usageStageTurns] != 3 {
 		t.Fatalf("turn rows decoded: %d, then %d with four times the history", small.rows[usageStageTurns], large.rows[usageStageTurns])
+	}
+	if small.rows[usageStageSpans] != 2 || large.rows[usageStageSpans] != 2 || large.scanned[usageStageSpans] != 2+2*40 {
+		t.Fatalf("span rows decoded: %d, then %d; keys scanned %d", small.rows[usageStageSpans], large.rows[usageStageSpans], large.scanned[usageStageSpans])
 	}
 }
 

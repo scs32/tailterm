@@ -488,6 +488,62 @@ func (s *waitSweep) cause(from time.Time) (string, *waitCandidate) {
 	return "unknown", nil
 }
 
+// usageWindowSpansQuery reads, in report order, each span's bounds and, for
+// a span with a poll, its poll requests' instants, without copying its
+// payload or projection. json.Marshal writes "poll":true only for a poll.
+const usageWindowSpansQuery = `SELECT rowid,start_at,end_at,CASE WHEN instr(payload,'"poll":true')>0 THEN
+ (SELECT group_concat(json_extract(s.value,'$.at'),' ') FROM json_each(payload,'$.segments') s WHERE json_extract(s.value,'$.poll')=1) END
+ FROM usage_spans WHERE task_id=? ORDER BY start_at`
+
+// usageWindowSpans lists, in report order, the spans a windowed report must
+// read: those whose time meets [from,to) and those with a poll whose request
+// instant is in it, which counts even when the chunk lies outside
+// (usageTimeReports). Every other span adds nothing to the window, so it is
+// neither decoded nor classified. Instants are compared as times: the stored
+// text drops trailing zeros and does not sort.
+func usageWindowSpans(ctx context.Context, tx *sql.Tx, task string, from, to time.Time, stats *usageReadStats) ([]int64, error) {
+	stats.queries[usageStageSpans] += 2
+	rows, err := tx.QueryContext(ctx, usageWindowSpansQuery, task)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	inside := func(at time.Time) bool {
+		return (from.IsZero() || !at.Before(from)) && (to.IsZero() || at.Before(to))
+	}
+	var keep []int64
+	for rows.Next() {
+		var rowid int64
+		var start, end string
+		var polls sql.NullString
+		if err := rows.Scan(&rowid, &start, &end, &polls); err != nil {
+			return nil, err
+		}
+		stats.scanned[usageStageSpans]++
+		s, e := parseTS(start), parseTS(end)
+		// A zero-length span has no time to clip; its polls still count.
+		meets := (to.IsZero() || s.Before(to)) && (from.IsZero() || e.After(from))
+		for _, at := range strings.Fields(polls.String) {
+			if meets {
+				break
+			}
+			if t, err := time.Parse(time.RFC3339Nano, at); err != nil || inside(t) {
+				meets = true // an unreadable instant is read in full, as before
+			}
+		}
+		if meets || s.IsZero() || e.IsZero() {
+			keep = append(keep, rowid)
+		}
+	}
+	return keep, rows.Err()
+}
+
+// usageSpansByRowid reads the listed spans in the listed order.
+func usageSpansByRowid(ctx context.Context, tx *sql.Tx, keep []int64) (*sql.Rows, error) {
+	list, _ := json.Marshal(keep)
+	return tx.QueryContext(ctx, `SELECT s.agent_id,s.run_id,s.payload,s.projection FROM json_each(?) k JOIN usage_spans s ON s.rowid=k.value ORDER BY k.key`, string(list))
+}
+
 // usageTimeReports assembles, per item id ("" is project overhead), where
 // its wall time went. Everything is read from durable tables, so the report
 // is the same after close and restart and costs no agent turn.
@@ -513,9 +569,19 @@ func usageTimeReports(ctx context.Context, tx *sql.Tx, task string, q api.UsageQ
 	}
 	cache, legacy := newUsagePhaseCache(), map[string][]api.MessageReference{}
 	done := stats.stage(usageStageSpans)
-	stats.queries[usageStageSpans]++
-	// Only this project's spans, by the (task_id,start_at) index.
-	rows, err := tx.QueryContext(ctx, `SELECT agent_id,run_id,payload,projection FROM usage_spans WHERE task_id=? ORDER BY start_at`, task)
+	var rows *sql.Rows
+	var err error
+	if q.From.IsZero() && q.To.IsZero() {
+		stats.queries[usageStageSpans]++
+		// Only this project's spans, by the (task_id,start_at) index.
+		rows, err = tx.QueryContext(ctx, `SELECT agent_id,run_id,payload,projection FROM usage_spans WHERE task_id=? ORDER BY start_at`, task)
+	} else {
+		var keep []int64
+		if keep, err = usageWindowSpans(ctx, tx, task, q.From, q.To, stats); err != nil {
+			return nil, err
+		}
+		rows, err = usageSpansByRowid(ctx, tx, keep)
+	}
 	if err != nil {
 		return nil, err
 	}
