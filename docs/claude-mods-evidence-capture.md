@@ -3,7 +3,9 @@
 When a Claude Code session runs a recognised verification command through
 Bash, the tool-call ledger records, on that call's own row, the exact command,
 its exit code, a SHA-256 of its output and the git commit it ran at (feature
-`wi_95d33b4e3248bac5`, work order #51365).
+`wi_95d33b4e3248bac5`, work order #51365). For a test command it also records
+the run's pass, fail and skip counts, read from the output (feature
+`wi_512ca524b2432974`, work order #54730; see "Test counts" below).
 
 **This is local evidence only. AIV bindings and integration remain deferred.**
 Nothing is sent to the hub, the Board or AIV. The fields sit in the agent's
@@ -83,6 +85,9 @@ What does not count:
 | `commit` | 40 or 64 lower-case hex characters; absent outside a repository |
 | `commitSource` | `pre` (read when the call started) or `post` (read at the post) |
 | `commitSkip` | `changed-directory` when the command may run elsewhere than `cwd` (below); then there is no `commit` |
+| `counts` | only on a test row: `{"total": T, "pass": P, "fail": F, "skip": S}`, four whole numbers, 0 included |
+| `countSource` | with `counts`: `go-test-v`, `go-test-packages` or `node-summary` (below) |
+| `countSkip` | only on a test row with no `counts`: `background`, `unreadable`, `timeout`, `no-summary`, `truncated` or `mixed` |
 
 The digests:
 
@@ -99,6 +104,79 @@ The digests:
 
 The digest is of what Claude Code handed the hook, before any secret
 redaction rewrites the output the model sees.
+
+## Test counts
+
+A **test row** is one whose `kinds` hold `go-test`, `node-test` or `npm-test`.
+Every test row has either `counts` with `countSource`, or `countSkip`. Any
+other row, `go-vet` and `verify-matrix` alone included, has neither and is
+written byte for byte as before.
+
+The counts are read from the same decoded text the digest is taken over:
+`stdout` then `stderr` for a `PostToolUse`, the `error` text for a
+`PostToolUseFailure`. Each line is read on its own, a trailing carriage
+return and ANSI colour codes dropped first; the text is never kept.
+
+`countSkip` when there is nothing to count:
+
+- `background`, `unreadable` or `timeout`: the same as `outputSkip`, so no
+  output was read;
+- `timeout` also when reading passes the 120 ms output budget (checked every
+  4096 lines; 4 MiB of output reads in about 13 ms on the Mini);
+- `no-summary`: the text holds no summary at all, for example `go test
+  -json` output, a failure text that is only `Exit code 1`, or empty output;
+- `truncated`: some part the reader can see is unfinished (below);
+- `mixed`: both a go summary and a node summary were found (a compound
+  command), so which count belongs to which is not guessed.
+
+**Counts are taken only when every part is finished.** Any unfinished part,
+anywhere in the output, gives `countSkip: "truncated"` and no counts at all,
+even when other parts completed. Counts are never taken from part of a run.
+
+**go** (`go-test`). A package result line starts at column 0 with `ok`, `FAIL`
+or `?` and has at least one more field (`ok  \tpkg\t0.1s`, `ok  \tpkg\t(cached)`,
+`FAIL\tpkg [build failed]`, `?   \tpkg\t[no test files]`); a bare `FAIL` line
+is not one. Go prints each package's output together and its result line
+last, so these lines cut the output into package segments.
+
+- Under `-v`, seen as any `=== RUN` line, the counts are the top-level
+  `--- PASS:`, `--- FAIL:` and `--- SKIP:` lines at column 0, summed over all
+  packages (`countSource: "go-test-v"`). Subtests (a name with `/`, printed
+  indented) are not counted. `total` is pass + fail + skip.
+- Otherwise each package line counts once: `ok` as pass, `FAIL` as fail, `?`
+  as skip (`countSource: "go-test-packages"`). Go prints `--- FAIL:` lines
+  without `-v` too, so those alone do not select `-v`.
+- Unfinished: go output (a run, pause, continue or per-test line, a bare
+  `PASS`, `exit status N` or `panic:`) after the last package line, other than
+  go's own closing bare `FAIL`; go output with no package line at all; and
+  under `-v` a package whose top-level `=== RUN` lines and results differ in
+  number. A test timeout under `-v` leaves the running tests started and
+  unfinished, so that run is `truncated` too.
+- Under `-v` a package that fails to build has no test lines and adds nothing
+  to the counts; without `-v` it counts as one failed package.
+
+**node** (`node-test`, `npm-test`). The footer is a block of lines at column
+0, `# key value` (TAP reporter) or `ℹ key value` (spec reporter, the default
+and the one `npm test` prints here), from its `tests` line to its
+`duration_ms` line. A block is complete when it holds `tests`, `pass`, `fail`,
+`cancelled`, `skipped` and `todo` once each, each value 1 to 9 digits.
+`total` is node's `tests` value, which also counts `todo` and `cancelled`
+tests and subtests; pass, fail and skip are `pass`, `fail` and `skipped`.
+Several complete blocks are summed (`countSource: "node-summary"`).
+
+- Unfinished: a block with no `duration_ms` line; a block missing a key,
+  repeating one or with a bad value; a footer line outside any block; and,
+  after the last block, a line that starts a new run (`TAP version`, a TAP
+  `ok N` or `not ok N` at column 0, or a spec line starting `✔`, `▶` or `﹣`).
+  The spec reporter's own `✖ failing tests:` recap after its footer is
+  allowed.
+- No footer line at all is `no-summary`.
+
+**Known limit.** A cut that removes whole parts cleanly, for example one that
+drops whole packages from the middle and leaves no partial line, cannot be
+seen in the text and gives counts that are too low. Whether Claude Code cuts a
+long output before the hook sees it has not been observed; no live payload was
+read for this feature.
 
 ## Where the commit comes from (D3)
 
@@ -160,7 +238,8 @@ no `exitCode`, that is the first thing to check (`jq 'select(.evidence and
 
 ## What is stored and what is never stored
 
-Stored: the fields above. The one exception to the ledger's rule that tool
+Stored: the fields above. The counts are whole numbers, and their source and
+skip reason come from fixed lists; no text of the output is stored. The one exception to the ledger's rule that tool
 input is never stored is `command`: the words of the command, literal paths
 included, are stored as written. Every span the existing secret scan finds is
 replaced by `[redacted]` first: values this host holds (group A, the hub token
@@ -187,7 +266,8 @@ jq -c 'select(.evidence)' ~/.local/state/tailterm/tool-ledger/<agent>/ledger.jso
 Each line is one verification call: `toolUseId`, `time`, `outcome`, and its
 `evidence`. To check a claim such as "go test passed at abc123", find the row
 whose `evidence.command` is the command quoted, whose `evidence.exitCode` is 0
-and whose `evidence.commit` is the commit named. The digest lets two people
+and whose `evidence.commit` is the commit named. A cited test count is checked
+against `evidence.counts` the same way. The digest lets two people
 compare an output they both hold without the ledger keeping it.
 
 ## When it is live (D5)
@@ -229,6 +309,22 @@ git repositories and no live session:
 - `TestToolLedgerEvidenceCommitStalls`: with a `HEAD` whose read blocks (a
   FIFO), the pre and the post return inside the deadline and leave the row,
   with a measured duration and no commit.
+
+For the test counts (`go test ./cmd/tt -run 'Evidence' -count=1`), with
+synthetic outputs shaped as go 1.26 and node 26 print them:
+
+- `TestToolLedgerEvidenceCounts`: the reader over complete go `-v`, go
+  without `-v`, package-only, build-failure, node TAP, node spec (plain and in
+  colour), `npm test` and summed outputs; go and node outputs that complete and
+  are then cut (`truncated`); summary-less outputs (`no-summary`); `mixed`;
+  and a passed deadline (`timeout`).
+- `TestToolLedgerEvidenceCountsRow`: the whole `evidence` object through the
+  hook for a go-test, a node-test failure, an npm-test row and each skip
+  reason.
+- `TestToolLedgerEvidenceCountsOnlyTestRows`: `go-vet`, `verify-matrix` and
+  `go vet && verify-matrix` rows are byte for byte their old form.
+- `TestToolLedgerEvidenceWithinBound` now also expects counts, or
+  `countSkip: "timeout"`, for its 4 MiB output.
 
 Not checked: a live Claude Code session's hook payload (see exit codes above),
 and Codex sessions, which this does not cover.
