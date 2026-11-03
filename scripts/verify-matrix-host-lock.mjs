@@ -3,7 +3,10 @@
 // run, and supplemental runs started through `exec` below, hold it while they
 // run. The lock and waitlist are one JSON file other tools can read. Waiting
 // reads that file only: nothing here lists processes. See
-// docs/objective-verification.md, "Host lock and waitlist".
+// docs/objective-verification.md, "Host lock and waitlist". Before joining,
+// a non-release run in a project session reads the project's host schedule
+// from the hub and waits for a host turn while one is active
+// (docs/project-queue.md, "Host schedule"; wi_57c903a832b38b70).
 import {
   readFileSync,
   writeFileSync,
@@ -246,6 +249,104 @@ export function releaseRun(environment = process.env) {
   if (raw === undefined || raw === "") return false;
   if (raw !== "1") throw new Error("TAILTERM_MATRIX_RELEASE must be 1 or unset");
   return true;
+}
+// The project's host schedule (docs/project-queue.md, "Host schedule"). While
+// one is active, a run whose item holds no grant waits before it joins the
+// waitlist, re-reading the schedule every SCHEDULE_POLL_MS.
+export const SCHEDULE_POLL_MS = 60000;
+export const HOST_SCHEDULE_LOOKUP_MS = 15000;
+// The schedule as `tt team queue schedule --json` reports it: { state,
+// schedule }. Throws with the reason on a failed, timed-out or unreadable
+// lookup.
+export function lookupHostSchedule(environment = process.env, timeoutMs = HOST_SCHEDULE_LOOKUP_MS) {
+  const result = spawnSync("tt", ["team", "queue", "schedule", "--json", "--task", environment.TAILTERM_TASK], {
+    env: environment,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: timeoutMs,
+    killSignal: "SIGKILL",
+  });
+  if (result.error)
+    throw new Error(
+      result.error.code === "ETIMEDOUT"
+        ? `the lookup timed out after ${timeoutMs} ms`
+        : "the lookup could not run: " + result.error.message,
+    );
+  if (result.status !== 0)
+    throw new Error(
+      "the lookup failed: " +
+        ((result.stderr || "").trim().split("\n").pop() ||
+          (result.signal ? "signal " + result.signal : "exit " + result.status)),
+    );
+  let found;
+  try {
+    found = JSON.parse(result.stdout);
+  } catch {
+    throw new Error("the lookup returned no JSON");
+  }
+  if (typeof found?.state !== "string") throw new Error("the lookup returned no schedule state");
+  return found;
+}
+// The wait line while the schedule holds item's run, or null when it may
+// start: no active schedule, a grant for the item, or a release run.
+export function hostScheduleHold(view, { item, release = false } = {}) {
+  if (release || view?.state !== "active" || !view.schedule) return null;
+  const schedule = view.schedule;
+  if ((schedule.grants || []).some((grant) => grant?.itemId === item)) return null;
+  const named = typeof item === "string" && item && item !== "unknown" ? item : "ITEM";
+  return (
+    `matrix host: waiting for a host turn: host schedule ${JSON.stringify(schedule.reason ?? "")}` +
+    ` (set by ${schedule.setBy} at ${schedule.setAt}, until ${schedule.expiresAt});` +
+    ` a run starts only on a database handler grant for ${named} (tt team queue schedule grant --item ${named})`
+  );
+}
+// The gate acquireHostLock calls before it joins, or undefined when there is
+// none: outside a project session (TAILTERM_TASK unset) no tt call is made,
+// a release run never waits for a turn, and a command started inside a hold
+// (EXEC_HOLDER_ENV) meets the lock's own refusal instead. The gate resolves
+// { hold } (null to start) or { unknown: reason } when the schedule could not
+// be read.
+export function hostScheduleGate(item, environment = process.env, lookup = lookupHostSchedule) {
+  if (!environment.TAILTERM_TASK || environment[EXEC_HOLDER_ENV] || releaseRun(environment)) return undefined;
+  return async () => {
+    try {
+      return { hold: hostScheduleHold(lookup(environment), { item }) };
+    } catch (error) {
+      return { unknown: String(error?.message || error) };
+    }
+  };
+}
+// Waits while the gate holds, printing the wait line once and when it
+// changes. Returns the milliseconds waited. A schedule that cannot be read
+// lets the run start under native admission (fail open).
+async function waitForHostTurn(gate, { maxWaitMs, pollMs, signal, say, now }) {
+  const started = now();
+  let shown = "";
+  for (;;) {
+    const result = await gate();
+    if (result?.unknown !== undefined) {
+      say(`matrix host: host schedule unknown (${result.unknown}); starting under native admission`);
+      return now() - started;
+    }
+    if (!result?.hold) {
+      if (shown) say("matrix host: host turn given; joining the host lock");
+      return now() - started;
+    }
+    if (result.hold !== shown) {
+      shown = result.hold;
+      say(shown);
+    }
+    const waited = now() - started;
+    if (waited >= maxWaitMs)
+      throw new HostLockError(
+        "wait-expired",
+        `Host lock wait expired after ${maxWaitMs} ms waiting for a host turn under the host schedule`,
+        EXIT_WAIT_EXPIRED,
+      );
+    await sleep(Math.min(pollMs, maxWaitMs - waited), signal);
+    if (signal?.aborted)
+      throw new HostLockError("withdrawn", "Verification interrupted by " + signal.reason + " while waiting for a host turn");
+  }
 }
 export const MEMORY_PROBE_MS = 1000;
 // The reading: the percentage of memory the kernel does not count as
@@ -735,8 +836,9 @@ function hookExit() {
 // print, now, extra (copied into the sidecar), environment (holder, fairness
 // and memory-pressure limits), release (the deployer's run, granted first),
 // memoryPressure (a function returning the reading; tests inject one),
-// exclusive (hold the host alone; see exclusiveCapMs) and staleWaiterMs
-// (WAITER_STALE_MS unless a test sets a shorter bound).
+// exclusive (hold the host alone; see exclusiveCapMs), staleWaiterMs
+// (WAITER_STALE_MS unless a test sets a shorter bound), scheduleGate (see
+// hostScheduleGate; never called for a release run) and schedulePollMs.
 // The requester clamps its own run timeout to the holder cap, so the deadline
 // it records in the file is the one it stops itself at. A waiter never
 // shortens the deadline another holder recorded.
@@ -777,6 +879,18 @@ export async function acquireHostLock(options = {}) {
   if (exclusive && releaseMarked) throw new Error("A release run cannot be exclusive");
   const capMs = exclusive ? exclusiveCapMs(options.environment ?? process.env) : undefined;
   const paths = lockPaths(options.path ?? lockPath());
+  // The host schedule's turn comes before the waitlist; its wait counts
+  // toward maxWaitMs.
+  let scheduleWaitMs = 0;
+  if (typeof options.scheduleGate === "function" && !releaseMarked)
+    scheduleWaitMs = await waitForHostTurn(options.scheduleGate, {
+      maxWaitMs,
+      pollMs: options.schedulePollMs ?? SCHEDULE_POLL_MS,
+      signal,
+      say: print,
+      now,
+    });
+  const lockWaitMs = Math.max(1, maxWaitMs - scheduleWaitMs);
   const requestedMs = now();
   const entry = {
     id: randomUUID(),
@@ -831,6 +945,7 @@ export async function acquireHostLock(options = {}) {
     ...(exclusive ? { exclusive: true, exclusiveCapMs: capMs, overlapsAfterCap: [], alone: null } : {}),
     memoryPressureMax: pressureMax ?? "off",
     memoryHeldMs: 0,
+    ...(scheduleWaitMs > 0 ? { scheduleWaitMs } : {}),
     ...(options.extra || {}),
   };
 
@@ -1185,7 +1300,7 @@ export async function acquireHostLock(options = {}) {
       if (!first) leave("withdrawn", { reason: String(signal.reason) });
       throw new HostLockError("withdrawn", "Verification interrupted by " + signal.reason + " while waiting for the host lock");
     }
-    if (now() - requestedMs >= maxWaitMs) {
+    if (now() - requestedMs >= lockWaitMs) {
       if (!first) leave("wait-expired", last ? { position: last.position, of: last.length } : {});
       throw new HostLockError(
         "wait-expired",
@@ -1515,6 +1630,7 @@ async function main(args) {
   return execWithHostLock(argv, {
     ...resolvePriority(given["--priority"]),
     item: given["--item"],
+    scheduleGate: hostScheduleGate(given["--item"]),
     agent: given["--agent"] || process.env.TAILTERM_AGENT_NAME || "unknown",
     runTimeoutMs: minutesFlag("--timeout-minutes", given["--timeout-minutes"], 1440),
     maxWaitMs: given["--host-wait-minutes"] === undefined ? DEFAULT_HOST_WAIT_MS : minutesFlag("--host-wait-minutes", given["--host-wait-minutes"], 1440),

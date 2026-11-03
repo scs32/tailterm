@@ -79,9 +79,18 @@ process.env.PATH = fakeTTDirectory + ":" + process.env.PATH;
 delete process.env.FAKE_TT_MODE;
 delete process.env.FAKE_TT_PRIORITY;
 delete process.env.FAKE_TT_CONTEXT;
+// The calls this file's tests assert, in order. A run with a project
+// (agentIdentity) also reads the host schedule before it joins the lock
+// (wi_57c903a832b38b70); the stand-in fails that lookup, the run starts under
+// native admission, and tests/host-schedule.test.js asserts those lookups, so
+// they are left out here.
 export const fakeTTLookups = () =>
   existsSync(fakeTTCalls)
-    ? readFileSync(fakeTTCalls, "utf8").trim().split("\n").map((line) => JSON.parse(line))
+    ? readFileSync(fakeTTCalls, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line))
+        .filter((call) => !(call[0] === "team" && call[1] === "queue" && call[2] === "schedule"))
     : [];
 process.on("exit", () => {
   rmSync(hostLockDirectory, { recursive: true, force: true });

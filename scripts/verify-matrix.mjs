@@ -36,6 +36,7 @@ import { fileHash } from "../tests/test-binaries.mjs";
 import {
   acquireHostLock,
   releaseRun,
+  hostScheduleGate,
   resolveRunPriority,
   resolvePriority,
   receiptKeys,
@@ -4082,6 +4083,9 @@ if (invokedDirectly && process.argv[2] === "go-race") {
             maxWaitMs,
             // The item the priority above was looked up for.
             item: input?.itemId || item,
+            // A non-release run waits for a host turn while the project's
+            // host schedule is active (docs/project-queue.md, "Host schedule").
+            scheduleGate: hostScheduleGate(input?.itemId || item),
             print: (line) => console.log(line),
           },
         },

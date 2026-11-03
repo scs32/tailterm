@@ -867,3 +867,29 @@ test("owner helper template and its doc copy carry no live identifiers, paths, m
   const guide = readFileSync(new URL("../docs/owner-helper.md", import.meta.url), "utf8");
   assert.ok(guide.includes("## Its procedure") && guide.includes("PROJECT_ROLE_TEMPLATES.owner_helper"), "owner-helper.md does not say where the procedure lives");
 });
+
+// wi_57c903a832b38b70 a5: one generated line tells the planned lead, the
+// planned verifier and the small-lane lead to check the project's host
+// schedule before a matrix start; no other seat carries it, and the doc
+// mirrors and the generated launch plan hold it exactly.
+test("the leads and the verifier check the host schedule before a matrix start", () => {
+  const rule =
+    "Check the host schedule first (tt team queue schedule): while one is active, a matrix run or host-lock exec waits for a database handler grant for this item; ask the handler for a turn and never work around it.";
+  const carriers = { planned: ["lead", "verifier"], small: ["lead"] };
+  for (const id of ["planned", "small"])
+    for (const member of exampleTeam(id).members) {
+      const wanted = carriers[id].includes(member.name) ? 1 : 0;
+      assert.equal(member.prompt.split(rule).length - 1, wanted, `${id}/${member.name}`);
+      assert.equal(member.prompt.split("tt team queue schedule").length - 1, wanted, `${id}/${member.name}`);
+      assert.ok(Buffer.byteLength(`Role: ${member.role}\n\n${member.prompt}`) <= MAX_AGENT_PROMPT_BYTES, `${id}/${member.name} is ${Buffer.byteLength(member.prompt)} bytes`);
+    }
+  const smallLead = exampleTeam("small").members.find((member) => member.name === "lead").prompt;
+  assert.ok(smallLead.includes(`${rule} Verify it yourself:`), "the small-lane lead checks before it starts its own run");
+  const verifier = exampleTeam("planned").members.find((member) => member.name === "verifier").prompt;
+  assert.ok(verifier.includes(`${rule} Start each run at once;`), "the verifier checks before it starts");
+  const read = (file) => readFileSync(new URL(file, import.meta.url), "utf8");
+  assert.equal(read("../docs/team-examples.md").split(rule).length - 1, 2, "docs/team-examples.md mirrors the planned lead and verifier");
+  assert.equal(read("../docs/team-launch.md").split(rule).length - 1, 1, "docs/team-launch.md mirrors the small-lane lead");
+  assert.ok(read("../hub/internal/teamplan/plan.mjs").includes(rule), "the generated plan.mjs lacks the host schedule line");
+  assert.ok(read("../docs/project-queue.md").includes("\n### Host schedule\n"), "the queue doc lacks the Host schedule section");
+});

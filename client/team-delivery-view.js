@@ -21,6 +21,22 @@ function lanesText(lanes) {
   return `<span class="fine" data-testid="team-delivery-lanes" title="${esc(lanes.hold || "")}">Lanes ${esc(lanes.lanes)} · ${esc(lanes.window)}${lanes.strained ? " · strained" : ""}${held}</span>`;
 }
 
+// The project's host schedule (wi_57c903a832b38b70): while active, team matrix
+// starts wait for a database handler grant. Who set or cleared it, and when,
+// is in the title. Absent without a schedule.
+function scheduleText(lanes) {
+  const schedule = lanes?.policy?.hostSchedule;
+  if (!schedule || !lanes.scheduleState) return "";
+  const set = `set by ${schedule.setBy} at ${schedule.setAt}`;
+  if (lanes.scheduleState === "cleared")
+    return `<span class="fine" data-testid="team-delivery-host-schedule" title="${esc(`${set}; cleared at ${schedule.clearedAt}: ${schedule.clearReason || ""}`)}">Host schedule cleared by ${esc(schedule.clearedBy)}</span>`;
+  if (lanes.scheduleState === "expired")
+    return `<span class="fine" data-testid="team-delivery-host-schedule" title="${esc(`${set}; ${schedule.reason}`)}">Host schedule expired</span>`;
+  const grants = schedule.grants?.length || 0;
+  const names = grants ? `; grants ${schedule.grants.map((grant) => grant.itemId).join(", ")}` : "";
+  return `<span class="fine" data-testid="team-delivery-host-schedule" title="${esc(set + names)}">Host schedule · ${esc(schedule.reason)} · until ${esc(schedule.expiresAt)} · grants ${esc(grants)}</span>`;
+}
+
 export function renderTeamDelivery(queue, agents = [], ownerRequests = [], taskId = "") {
   if (!queue || !Array.isArray(queue.entries) || queue.entries.length === 0) return "";
   const byId = new Map(agents.map((agent) => [agent.id, agent]));
@@ -64,5 +80,5 @@ export function renderTeamDelivery(queue, agents = [], ownerRequests = [], taskI
   // The hub lists the newest page of finished entries; say when older ones exist.
   const shown = queue.entries.filter((entry) => entry.summary).length;
   const history = queue.history?.nextAfter ? `<span class="fine" data-testid="team-delivery-history">Showing ${esc(shown)} of ${esc(queue.history.total)} finished</span>` : "";
-  return `<article class="task-card task-detail-card team-delivery-panel" data-testid="team-delivery-panel"><header><h3>Delivery</h3><span class="fine">${queue.concurrencyLimit === 0 ? "No fixed limit" : `Limit ${esc(queue.concurrencyLimit ?? 1)}`}</span>${lanesText(queue.lanes)}${history}</header><div class="team-delivery-rows">${rows}</div></article>`;
+  return `<article class="task-card task-detail-card team-delivery-panel" data-testid="team-delivery-panel"><header><h3>Delivery</h3><span class="fine">${queue.concurrencyLimit === 0 ? "No fixed limit" : `Limit ${esc(queue.concurrencyLimit ?? 1)}`}</span>${lanesText(queue.lanes)}${scheduleText(queue.lanes)}${history}</header><div class="team-delivery-rows">${rows}</div></article>`;
 }

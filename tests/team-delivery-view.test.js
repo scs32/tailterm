@@ -139,3 +139,23 @@ test("queued rows are numbered up next and the header shows the lanes", () => {
   const escaped = renderTeamDelivery({ entries, lanes: { window: "<b>", lanes: "<i>", hold: '"><img src=x>' } });
   assert.ok(!escaped.includes("<b>") && !escaped.includes("<i>") && !escaped.includes("<img"));
 });
+
+// wi_57c903a832b38b70 a4: the header shows the project's host schedule as it
+// applies now, with who set or cleared it in the title; nothing without one.
+test("the header shows the host schedule while active, expired or cleared", () => {
+  const entries = [{ itemId: "wi_running", state: "running" }];
+  const schedule = { reason: "release turns: team matrices start only on a handler grant", setBy: "agt_handler", setAt: "2026-11-03T08:00:00Z", expiresAt: "2026-11-03T12:00:00Z" };
+  const render = (state, fields = {}) => renderTeamDelivery({ entries, lanes: { policy: { day: 3, night: 2, hostSchedule: { ...schedule, ...fields } }, window: "day", lanes: 3, active: 1, scheduleState: state } });
+  const span = (html) => html.match(/<span class="fine" data-testid="team-delivery-host-schedule" title="([^"]*)">([^<]*)</);
+  const active = span(render("active", { grants: [{ itemId: "wi_a", by: "agt_handler", at: "2026-11-03T08:05:00Z" }] }));
+  assert.equal(active[2], "Host schedule · release turns: team matrices start only on a handler grant · until 2026-11-03T12:00:00Z · grants 1");
+  assert.equal(active[1], "set by agt_handler at 2026-11-03T08:00:00Z; grants wi_a");
+  assert.equal(span(render("active"))[2].endsWith("grants 0"), true);
+  assert.equal(span(render("expired"))[2], "Host schedule expired");
+  const cleared = span(render("cleared", { clearedBy: "owner", clearedAt: "2026-11-03T09:00:00Z", clearReason: "releases done" }));
+  assert.equal(cleared[2], "Host schedule cleared by owner");
+  assert.equal(cleared[1], "set by agt_handler at 2026-11-03T08:00:00Z; cleared at 2026-11-03T09:00:00Z: releases done");
+  assert.ok(!renderTeamDelivery({ entries, lanes: { policy: { day: 3, night: 2 }, window: "day", lanes: 3 } }).includes("team-delivery-host-schedule"));
+  const escaped = render("active", { reason: "<img src=x>", setBy: '"><b>' });
+  assert.ok(!escaped.includes("<img") && !escaped.includes("<b>"));
+});

@@ -482,6 +482,79 @@ type TeamQueueLanePolicy struct {
 	// verification host, or while the host's lock is not observed.
 	HoldWhileMatrixWaits bool   `json:"holdWhileMatrixWaits"`
 	UpdatedAt            string `json:"updatedAt,omitempty"`
+	// HostSchedule is the project's host schedule, kept in the same stored
+	// policy (docs/project-queue.md, "Host schedule"); nil when none was
+	// ever set. A lanes save keeps it; schedule_* operations change it.
+	HostSchedule *TeamHostSchedule `json:"hostSchedule,omitempty"`
+}
+
+// TeamHostSchedule is a project-level host schedule: while it is active (set,
+// not cleared and not past ExpiresAt), a team's matrix start (verify-matrix
+// run or targeted, host-lock exec) waits unless the item holds a grant. It
+// does not change queue admission, and release runs never consult it. SetBy
+// and ClearedBy are a database handler's or the owner helper's agent ID, or
+// "owner".
+type TeamHostSchedule struct {
+	Reason      string              `json:"reason"`
+	SetBy       string              `json:"setBy"`
+	SetAt       string              `json:"setAt"`
+	ExpiresAt   string              `json:"expiresAt"`
+	Grants      []TeamHostTurnGrant `json:"grants,omitempty"`
+	ClearedBy   string              `json:"clearedBy,omitempty"`
+	ClearedAt   string              `json:"clearedAt,omitempty"`
+	ClearReason string              `json:"clearReason,omitempty"`
+}
+
+// TeamHostTurnGrant lets one item's matrix runs start while the schedule is
+// active, until the grant is revoked or the schedule is set again or cleared.
+type TeamHostTurnGrant struct {
+	ItemID string `json:"itemId"`
+	By     string `json:"by"`
+	At     string `json:"at"`
+	Reason string `json:"reason,omitempty"`
+}
+
+// Host schedule states, computed on read by the hub's clock.
+const (
+	HostScheduleActive  = "active"
+	HostScheduleExpired = "expired"
+	HostScheduleCleared = "cleared"
+)
+
+// HostScheduleMaxTTLMinutes bounds a schedule's lifetime; HostScheduleMaxReason
+// bounds its one-line reason and a grant's reason.
+const (
+	HostScheduleMaxTTLMinutes = 1440
+	HostScheduleMaxReason     = 500
+)
+
+// Grant returns the item's grant, or nil.
+func (s *TeamHostSchedule) Grant(item string) *TeamHostTurnGrant {
+	if s == nil {
+		return nil
+	}
+	for i := range s.Grants {
+		if s.Grants[i].ItemID == item {
+			return &s.Grants[i]
+		}
+	}
+	return nil
+}
+
+// Equal compares two schedules, nil included.
+func (s *TeamHostSchedule) Equal(o *TeamHostSchedule) bool {
+	if s == nil || o == nil {
+		return s == o
+	}
+	if s.Reason != o.Reason || s.SetBy != o.SetBy || s.SetAt != o.SetAt || s.ExpiresAt != o.ExpiresAt || s.ClearedBy != o.ClearedBy || s.ClearedAt != o.ClearedAt || s.ClearReason != o.ClearReason || len(s.Grants) != len(o.Grants) {
+		return false
+	}
+	for i := range s.Grants {
+		if s.Grants[i] != o.Grants[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // Lane policy defaults the CLI fills in; the strain threshold is the matrix
@@ -511,6 +584,9 @@ type TeamQueueLanes struct {
 	MatrixWaiters  *int `json:"matrixWaiters,omitempty"`
 	// Hold says why nothing is admitted now, empty when lanes admit.
 	Hold string `json:"hold,omitempty"`
+	// ScheduleState is the policy's host schedule as it applies now:
+	// active, expired or cleared; empty when there is no schedule.
+	ScheduleState string `json:"scheduleState,omitempty"`
 }
 
 // TeamQueueHistoryPage is one newest-first page of finished and released
@@ -669,6 +745,16 @@ type TeamQueueRequest struct {
 	// exactly one of the two is given.
 	LanePolicy      *TeamQueueLanePolicy `json:"lanePolicy,omitempty"`
 	ClearLanePolicy bool                 `json:"clearLanePolicy,omitempty"`
+	// schedule_set, schedule_grant, schedule_revoke and schedule_clear
+	// change the lane policy's host schedule. ScheduleReason is set's and
+	// clear's required reason and a grant's or revoke's optional one;
+	// ScheduleTTLMinutes is set's lifetime, from which the hub computes the
+	// expiry; ScheduleItem is the wi_ID a grant or revoke names. A database
+	// handler names its exact run (HandlerAgentID, HandlerRunID) and the
+	// owner helper its agent (AgentID); the owner gives neither.
+	ScheduleReason     string `json:"scheduleReason,omitempty"`
+	ScheduleTTLMinutes int    `json:"scheduleTtlMinutes,omitempty"`
+	ScheduleItem       string `json:"scheduleItem,omitempty"`
 	// The runner's saved handler launch spec for provision_handler: runtime,
 	// model, reasoning and the prompt's template digest, all empty when the
 	// host has no saved spec. HandlerAgentID is the preallocated handler.
@@ -693,8 +779,9 @@ type TeamQueueRequest struct {
 	WaitUntil     string   `json:"waitUntil,omitempty"`
 	WaitReason    string   `json:"waitReason,omitempty"`
 	WaitResume    string   `json:"waitResume,omitempty"`
-	// AgentID is the agent a budget_continue caller names itself as; the hub
-	// accepts only the project's owner helper. No other operation reads it.
+	// AgentID is the agent a budget_continue or schedule_* caller names
+	// itself as; the hub accepts only the project's owner helper. No other
+	// operation reads it.
 	AgentID string `json:"agentId,omitempty"`
 	// Caller is the authenticated caller, set by the hub's HTTP layer and
 	// never read from the wire. A rebind records it as the approver.

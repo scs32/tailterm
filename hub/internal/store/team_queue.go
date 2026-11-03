@@ -1662,6 +1662,13 @@ func (s *Store) teamQueueAction(ctx context.Context, task string, req api.TeamQu
 			return zero, err
 		}
 		e = api.TeamQueueEntry{TaskID: task, State: "settings"}
+	case "schedule_set", "schedule_grant", "schedule_revoke", "schedule_clear":
+		// The host schedule is a field of the stored lane policy
+		// (team_host_capacity.go); no entry is touched.
+		if err := teamHostScheduleAction(ctx, tx, task, req, parseTS(now)); err != nil {
+			return zero, err
+		}
+		e = api.TeamQueueEntry{TaskID: task, State: "settings"}
 	case "set_lanes":
 		// Exactly one of a policy to save and the clear.
 		if (req.LanePolicy == nil) != req.ClearLanePolicy {
@@ -1682,7 +1689,11 @@ func (s *Store) teamQueueAction(ctx context.Context, task string, req api.TeamQu
 			if _, err := validQueueLanePolicy(policy, limit); err != nil {
 				return zero, err
 			}
+			// A lanes save carries the saved host schedule, if any: only
+			// the schedule operations change it.
+			policy.HostSchedule = nil
 			if saved != nil {
+				policy.HostSchedule = saved.HostSchedule
 				unchanged := *saved
 				unchanged.UpdatedAt = ""
 				if unchanged == policy {
@@ -1700,6 +1711,8 @@ func (s *Store) teamQueueAction(ctx context.Context, task string, req api.TeamQu
 		} else if saved == nil {
 			e = api.TeamQueueEntry{TaskID: task, State: "settings"}
 			break
+		} else if hostScheduleState(saved.HostSchedule, s.now()) == api.HostScheduleActive {
+			return zero, fmt.Errorf("%w: a host schedule is active and lives in the lane policy; clear it first: tt team queue schedule clear --task %s --reason TEXT", api.ErrConflict, task)
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO team_queue_settings(task_id,lane_policy_json) VALUES(?,?) ON CONFLICT(task_id) DO UPDATE SET lane_policy_json=excluded.lane_policy_json`, task, stored); err != nil {
 			return zero, err

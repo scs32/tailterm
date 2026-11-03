@@ -3353,3 +3353,146 @@ func TestTeamQueueHostCensusLaneSignals(t *testing.T) {
 		t.Fatalf("an unchanged census was rewritten: %d %d", *got.MemoryPressure, *got.MatrixWaiters)
 	}
 }
+
+// wi_57c903a832b38b70 a4 (CLI): tt team queue schedule reads the host
+// schedule (off, active, cleared), its set, grant, revoke and clear record
+// who and why and read back in --json, the lanes line carries it, agents
+// other than a handler or the owner helper are refused, and the usage is
+// checked before any hub call.
+func TestTeamQueueScheduleCommand(t *testing.T) {
+	f := newTeamFixture(t, true)
+	first, _ := lanesCLIQueue(t, f)
+	ctx := context.Background()
+	run := func(e env, args ...string) (string, error) {
+		return captureCLIOutput(t, func() error { return cmdTeamQueue(e, append([]string{"schedule"}, args...)) })
+	}
+	if out, err := run(f.e); err != nil || out != "host schedule=off\n" {
+		t.Fatalf("schedule without lanes %q %v", out, err)
+	}
+	if _, err := run(f.e, "set", "--reason", "release turns", "--expires-minutes", "30"); err == nil || !strings.Contains(err.Error(), "a host schedule needs a lane policy") {
+		t.Fatalf("set without lanes: %v", err)
+	}
+	if _, err := captureCLIOutput(t, func() error {
+		return cmdTeamQueue(f.e, []string{"lanes", "--day", "3", "--night", "3", "--zone", "UTC", "--night-start", "00:00", "--night-end", "23:59"})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for name, args := range map[string][]string{
+		"unknown verb":        {"pause"},
+		"set no reason":       {"set", "--expires-minutes", "30"},
+		"set no expiry":       {"set", "--reason", "turns"},
+		"set expiry too long": {"set", "--reason", "turns", "--expires-minutes", "1441"},
+		"set with item":       {"set", "--reason", "turns", "--expires-minutes", "30", "--item", first.ID},
+		"grant no item":       {"grant"},
+		"grant bad item":      {"grant", "--item", "tqe_x"},
+		"grant with expiry":   {"grant", "--item", first.ID, "--expires-minutes", "5"},
+		"clear no reason":     {"clear"},
+		"read with reason":    {"--reason", "x"},
+		"foreign flag":        {"set", "--reason", "turns", "--expires-minutes", "30", "--entry", "tqe_x"},
+	} {
+		if _, err := run(f.e, args...); err == nil || !strings.Contains(err.Error(), "usage: tt team queue schedule") {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	if _, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"list", "--expires-minutes", "5"}) }); err == nil || !strings.Contains(err.Error(), "--expires-minutes applies only to tt team queue schedule set") {
+		t.Fatalf("expires-minutes on list: %v", err)
+	}
+
+	handlerEnv := f.e
+	handlerEnv.agent, handlerEnv.runID = f.handler.ID, f.handler.RunID
+	out, err := run(handlerEnv, "set", "--reason", "release turns: team matrices start only on a handler grant", "--expires-minutes", "120")
+	if err != nil || !strings.HasPrefix(out, `host schedule=active reason="release turns: team matrices start only on a handler grant" by=`+f.handler.ID+" at=") || !strings.HasSuffix(out, " grants=none\n") {
+		t.Fatalf("handler set %q %v", out, err)
+	}
+	if out, err = run(handlerEnv, "grant", "--item", first.ID, "--reason", "first turn"); err != nil || !strings.HasSuffix(out, " grants="+first.ID+"\n") {
+		t.Fatalf("handler grant %q %v", out, err)
+	}
+	out, err = run(f.e, "--json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var view hostScheduleView
+	if err := json.Unmarshal([]byte(out), &view); err != nil {
+		t.Fatalf("schedule --json %q: %v", out, err)
+	}
+	h := view.Schedule
+	if view.State != api.HostScheduleActive || h == nil || h.SetBy != f.handler.ID || h.Reason != "release turns: team matrices start only on a handler grant" || len(h.Grants) != 1 || h.Grants[0].ItemID != first.ID || h.Grants[0].By != f.handler.ID || h.Grants[0].Reason != "first turn" {
+		t.Fatalf("schedule --json %+v %+v", view, h)
+	}
+	setAt, _ := time.Parse(time.RFC3339Nano, h.SetAt)
+	expires, _ := time.Parse(time.RFC3339Nano, h.ExpiresAt)
+	if expires.Sub(setAt) != 120*time.Minute {
+		t.Fatalf("expiry %s after %s", h.ExpiresAt, h.SetAt)
+	}
+	list, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"list"}) })
+	if err != nil || !strings.Contains(list, " host-schedule=active until="+h.ExpiresAt+" grants=1") {
+		t.Fatalf("lanes line lacks the schedule:\n%s %v", list, err)
+	}
+
+	// The owner helper revokes and clears in its own name.
+	reg, err := f.c.RegisterOwnerHelper(ctx, f.task.ID, api.RegisterOwnerHelperRequest{Host: spawn.Host(), Session: "owner", Runtime: "claude", Cwd: t.TempDir(), RequestID: "schedule-helper"})
+	if err != nil || reg.Agent == nil {
+		t.Fatalf("register helper %+v %v", reg, err)
+	}
+	helperEnv := f.e
+	helperEnv.agent, helperEnv.runID = reg.Agent.ID, reg.Agent.RunID
+	if out, err = run(helperEnv, "revoke", "--item", first.ID); err != nil || !strings.HasSuffix(out, " grants=none\n") {
+		t.Fatalf("helper revoke %q %v", out, err)
+	}
+	if out, err = run(helperEnv, "clear", "--reason", "releases done", "--json"); err != nil {
+		t.Fatal(err)
+	}
+	view = hostScheduleView{}
+	if err := json.Unmarshal([]byte(out), &view); err != nil || view.State != api.HostScheduleCleared || view.Schedule.ClearedBy != reg.Agent.ID || view.Schedule.ClearReason != "releases done" || view.Schedule.SetBy != f.handler.ID {
+		t.Fatalf("helper clear --json %q %+v %v", out, view.Schedule, err)
+	}
+	if out, err = run(f.e); err != nil || !strings.Contains(out, "host schedule=cleared ") || !strings.HasSuffix(out, fmt.Sprintf(" cleared-by=%s cleared-at=%s why=%q\n", reg.Agent.ID, view.Schedule.ClearedAt, "releases done")) {
+		t.Fatalf("cleared read %q %v", out, err)
+	}
+	if list, err = captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"list"}) }); err != nil || !strings.Contains(list, " host-schedule=cleared") {
+		t.Fatalf("lanes line after clear:\n%s %v", list, err)
+	}
+
+	// Any other agent is refused before the hub, and the owner may set it.
+	lead, err := f.st.AddAgent(ctx, f.task.ID, api.AddAgentRequest{Name: "lead-schedule", AgentID: api.NewID("agt"), Host: "mini", Session: "lead-schedule"}, api.Caller{Node: "fixture", User: "owner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	leadEnv := f.e
+	leadEnv.agent, leadEnv.runID = lead.ID, lead.RunID
+	if _, err := run(leadEnv, "set", "--reason", "lead turns", "--expires-minutes", "30"); err == nil || !strings.Contains(err.Error(), "ask the database handler for a host turn") {
+		t.Fatalf("lead set: %v", err)
+	}
+	if out, err := run(leadEnv); err != nil || !strings.HasPrefix(out, "host schedule=cleared ") {
+		t.Fatalf("a lead reads the schedule: %q %v", out, err)
+	}
+	if out, err = run(f.e, "set", "--reason", "owner turns", "--expires-minutes", "15"); err != nil || !strings.Contains(out, `reason="owner turns" by=owner `) {
+		t.Fatalf("owner set %q %v", out, err)
+	}
+	if _, err := captureCLIOutput(t, func() error { return cmdTeamQueue(f.e, []string{"lanes", "--off"}) }); err == nil || !strings.Contains(err.Error(), "tt team queue schedule clear --task "+f.task.ID) {
+		t.Fatalf("lanes --off under a schedule: %v", err)
+	}
+	if !strings.Contains(teamQueueUsage, "|schedule|") {
+		t.Fatalf("team queue usage lacks schedule: %s", teamQueueUsage)
+	}
+}
+
+func TestTeamQueueScheduleLanesSuffix(t *testing.T) {
+	if got := queueScheduleLanesText(nil); got != "" {
+		t.Fatalf("no lanes %q", got)
+	}
+	l := &api.TeamQueueLanes{Policy: api.TeamQueueLanePolicy{HostSchedule: &api.TeamHostSchedule{Reason: "r", ExpiresAt: "2026-11-03T12:00:00Z", Grants: []api.TeamHostTurnGrant{{ItemID: "wi_a"}}}}, ScheduleState: api.HostScheduleActive}
+	if got := queueScheduleLanesText(l); got != " host-schedule=active until=2026-11-03T12:00:00Z grants=1" {
+		t.Fatalf("active %q", got)
+	}
+	l.ScheduleState = api.HostScheduleExpired
+	if got := queueScheduleLanesText(l); got != " host-schedule=expired" {
+		t.Fatalf("expired %q", got)
+	}
+	if got := hostScheduleOf(l).Text(); got != `host schedule=expired reason="r" by= at= until=2026-11-03T12:00:00Z` {
+		t.Fatalf("expired text %q", got)
+	}
+	if got := queueScheduleLanesText(&api.TeamQueueLanes{}); got != "" {
+		t.Fatalf("no schedule %q", got)
+	}
+}

@@ -1442,6 +1442,117 @@ sends no readings: pressure is then not strain, and a policy with
 the hub and the Mini relay together. An older tt or TailOS ignores `upNext`
 and `lanes`.
 
+### Host schedule
+
+Bug `wi_57c903a832b38b70`, work order #56142; source FINDING #56128 on morning
+order #56037; owner principle #51832: a release-first host schedule must be
+hub state, not a handler request.
+
+**What existed, and why none of it carried the schedule.** Order #56037 asked
+the database handler to release six jobs one at a time on a quiet host, with
+team matrices taking turns between them. That sequence lived only in the
+request:
+
+1. The lane policy's `HoldWhileMatrixWaits` (`--matrix-waits hold`) refuses
+   queue *admission* while a matrix run waits or the lock is not observed. It
+   never gates a matrix *start*. The team on `wi_6e2dbfea3fbe54f3` was
+   already admitted, and the host had no waiter, so nothing held.
+2. A structured host wait (`tt team queue wait set --entry tqe_ID --on host
+   --resume handler`, [Host admission waits](#host-admission-waits)) is a
+   per-entry record the handler sets on each team. It pauses a lead by notice
+   and holds nothing physical, and the host lock reads no hub state. No host
+   wait was set on that entry, so the verifier's run saw only the lock file.
+3. Release holds, `TAILTERM_MATRIX_RELEASE=1` and release waits (`--on
+   rel_JOB`), put a release run ahead of every lock waiter and pause named
+   entries. Neither reserves an empty host for a release that has not yet
+   joined the lock, so an empty host admits the first requester.
+4. The team prompts said to start each run at once. Nothing told a team that
+   a project-wide turn order existed.
+
+Native admission (no holder, no waiter: grant) was correct for its own rule
+and is unchanged.
+
+**The schedule.** A project's host schedule is a field of its lane policy
+(`hostSchedule` in `team_queue_settings.lane_policy_json`; no schema change),
+so it needs a saved policy. It has a one-line reason (at most 500 bytes), who
+set it and when, an expiry the hub computes from a lifetime of 1 to 1440
+minutes, and per-item grants:
+
+```
+tt team queue schedule [--json]
+tt team queue schedule set --reason TEXT --expires-minutes N
+tt team queue schedule grant --item wi_ID [--reason TEXT]
+tt team queue schedule revoke --item wi_ID [--reason TEXT]
+tt team queue schedule clear --reason TEXT
+```
+
+The owner, the owner helper and a live database handler run (its exact run,
+checked as for waits) may change it. The hub records the handler's or
+helper's agent ID, or `owner`, with each set, grant and clear. An item lead,
+a closed, exited or retired handler and any other agent are refused. `set`
+replaces any earlier schedule and its grants. `grant` and `revoke` need an
+active schedule and an item of the project; a repeated grant replaces the
+item's earlier one. `clear` keeps the record with who cleared it, when and
+why, and drops the grants; an expired schedule may still be cleared. The
+state is computed on read by the hub clock: `active` until the expiry,
+`expired` from it, `cleared` once cleared.
+
+A lanes save keeps the saved schedule; only these commands change it, and a
+schedule sent inside a lanes policy is ignored. `tt team queue lanes --off`
+is refused while the schedule is active and names `tt team queue schedule
+clear`.
+
+**What it shows.** `tt team queue schedule` prints one line:
+
+```
+host schedule=active reason="release turns" by=agt_HANDLER at=T until=U grants=wi_A,wi_B
+host schedule=cleared reason="release turns" by=agt_HANDLER at=T until=U cleared-by=owner cleared-at=C why="releases done"
+```
+
+or `host schedule=off`; `--json` prints `{state, schedule}`. The lanes line
+ends with ` host-schedule=active until=U grants=N` (or `expired`, `cleared`).
+TailOS Delivery shows `Host schedule · REASON · until U · grants N` in the
+header, with who set it and the granted items in its title, and `Host
+schedule expired` or `Host schedule cleared by WHO` afterwards.
+
+**The gate.** Before a `verify-matrix run` or `targeted` run, or a
+`verify-matrix-host-lock.mjs exec`, joins the host lock, it reads the
+schedule with `tt team queue schedule --json --task $TAILTERM_TASK` (15 s
+timeout). While the schedule is active and the run's item holds no grant, it
+prints, once and whenever it changes,
+
+```
+matrix host: waiting for a host turn: host schedule "REASON" (set by BY at AT, until UNTIL); a run starts only on a database handler grant for ITEM (tt team queue schedule grant --item ITEM)
+```
+
+and reads again every 60 seconds. A grant for the item, a clear or the
+expiry lets it join the lock as before. The wait counts toward the run's
+host wait bound (`--host-wait-minutes`, default 240): past it the run exits
+75 naming the schedule, and an interrupt withdraws it with no receipt.
+
+A grant is a turn: the handler grants the item whose run goes next and
+revokes the grant after that run. Releases are unaffected: a release run
+(`TAILTERM_MATRIX_RELEASE=1`) never reads the schedule. Without
+`TAILTERM_TASK` (outside a project session) no lookup is made, and a command
+started inside a hold meets the lock's own refusal instead. A lookup that
+fails, times out or returns no state prints `matrix host: host schedule
+unknown (REASON); starting under native admission` and the run proceeds
+(fail open: the deployer and receipts need the hub anyway).
+
+**Limits.** A run the schedule holds is outside the lock's waitlist, so it is
+not a matrix waiter for the lanes or for host-wait positions. The schedule
+changes no queue admission. The lead and verifier prompts carry one line to
+check the schedule; running threads keep the prompts they started with.
+Setting a live schedule is a separate step after release.
+
+**Compatibility and rollback.** The field is optional JSON: without a
+schedule the stored policy and the listing are byte-identical to before,
+and rollback is a binary swap. An older hub refuses the `schedule_*`
+operations as invalid and drops the field when it saves a changed lane
+policy. An older tt has
+no `schedule` command, so the gate's lookup fails and the run starts under
+native admission. Release the hub with the Mini and Air tt.
+
 ## Small-change lane
 
 Feature `wi_f8d48780626165cc` (order #16786) adds a queue-only team template,

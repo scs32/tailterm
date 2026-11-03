@@ -30,12 +30,69 @@ func validTeamQueueEntryID(id string) bool {
 	return err == nil
 }
 
-const teamQueueUsage = "usage: tt team queue add|list|policy|limit|lanes|provision|scope|wait|rebind|requeue|fail|accept|integrated|replace-lead|remove|reorder|release|abandon"
+const teamQueueUsage = "usage: tt team queue add|list|policy|limit|lanes|schedule|provision|scope|wait|rebind|requeue|fail|accept|integrated|replace-lead|remove|reorder|release|abandon"
 
 // teamQueueWaitUsage is the shared-path wait command (docs/project-queue.md,
 // "Team queue shared-path waits"), with the release-job and host-admission
 // waits (docs/stall-watch.md, "Handler gate").
 const teamQueueWaitUsage = "usage: tt team queue wait set --entry tqe_WAITING --on tqe_PREDECESSOR --owns PATH [--owns PATH...] --until accepted|done|released [--resume handler]\n       tt team queue wait set --entry tqe_WAITING --on tqe_PREDECESSOR --reason TEXT --until accepted|done|released [--resume handler]\n       tt team queue wait set --entry tqe_WAITING --on rel_JOB --reason TEXT --until departed|settled [--resume handler]\n       tt team queue wait set --entry tqe_WAITING --on host --reason TEXT [--until handler] [--resume handler]\n       tt team queue wait clear --entry tqe_WAITING --on tqe_PREDECESSOR|rel_JOB|host [--reason TEXT]"
+
+// teamQueueScheduleUsage is the host schedule command (docs/project-queue.md,
+// "Host schedule").
+const teamQueueScheduleUsage = "usage: tt team queue schedule [--json]\n       tt team queue schedule set --reason TEXT --expires-minutes N\n       tt team queue schedule grant --item wi_ID [--reason TEXT]\n       tt team queue schedule revoke --item wi_ID [--reason TEXT]\n       tt team queue schedule clear --reason TEXT"
+
+// hostScheduleView is tt team queue schedule --json: the schedule's state
+// now (off, active, expired or cleared) by the hub's clock, and the saved
+// record, absent when off.
+type hostScheduleView struct {
+	State    string                `json:"state"`
+	Schedule *api.TeamHostSchedule `json:"schedule,omitempty"`
+}
+
+// hostScheduleOf reads the schedule from a listing's lanes.
+func hostScheduleOf(l *api.TeamQueueLanes) hostScheduleView {
+	if l == nil || l.Policy.HostSchedule == nil || l.ScheduleState == "" {
+		return hostScheduleView{State: "off"}
+	}
+	return hostScheduleView{State: l.ScheduleState, Schedule: l.Policy.HostSchedule}
+}
+
+// Text is the schedule on one line: state, reason, who set it and when,
+// its expiry and grants, or who cleared it, when and why.
+func (v hostScheduleView) Text() string {
+	h := v.Schedule
+	if h == nil {
+		return "host schedule=off"
+	}
+	text := fmt.Sprintf("host schedule=%s reason=%q by=%s at=%s until=%s", v.State, h.Reason, h.SetBy, h.SetAt, h.ExpiresAt)
+	switch v.State {
+	case api.HostScheduleActive:
+		grants := make([]string, 0, len(h.Grants))
+		for _, g := range h.Grants {
+			grants = append(grants, g.ItemID)
+		}
+		if len(grants) == 0 {
+			grants = append(grants, "none")
+		}
+		text += " grants=" + strings.Join(grants, ",")
+	case api.HostScheduleCleared:
+		text += fmt.Sprintf(" cleared-by=%s cleared-at=%s why=%q", h.ClearedBy, h.ClearedAt, h.ClearReason)
+	}
+	return text
+}
+
+// queueScheduleLanesText is the lanes line's host schedule suffix, empty
+// without one.
+func queueScheduleLanesText(l *api.TeamQueueLanes) string {
+	v := hostScheduleOf(l)
+	switch v.State {
+	case api.HostScheduleActive:
+		return fmt.Sprintf(" host-schedule=active until=%s grants=%d", v.Schedule.ExpiresAt, len(v.Schedule.Grants))
+	case api.HostScheduleExpired, api.HostScheduleCleared:
+		return " host-schedule=" + v.State
+	}
+	return ""
+}
 
 // parseQueueLimit reads --limit: none (no fixed cap, stored as 0) or N >= 1.
 func parseQueueLimit(raw string) (int, bool) {
@@ -231,6 +288,17 @@ func cmdTeamQueue(e env, args []string) error {
 		}
 		waitVerb, rest = rest[0], rest[1:]
 	}
+	// schedule takes an optional verb: set, grant, revoke or clear; none
+	// reads the schedule.
+	scheduleVerb := ""
+	if sub == "schedule" && len(rest) > 0 && !strings.HasPrefix(rest[0], "-") {
+		switch rest[0] {
+		case "set", "grant", "revoke", "clear":
+			scheduleVerb, rest = rest[0], rest[1:]
+		default:
+			return errors.New(teamQueueScheduleUsage)
+		}
+	}
 	fs := flag.NewFlagSet("team queue "+sub, flag.ContinueOnError)
 	task := fs.String("task", e.task, "project ID")
 	hub := fs.String("hub", e.hub, "hub URL")
@@ -281,6 +349,7 @@ func cmdTeamQueue(e env, args []string) error {
 	laneStrainLanes := fs.Int("strain-lanes", api.DefaultLaneStrainLanes, "lanes: lanes taken away while the host is strained, never below one")
 	laneMatrixWaits := fs.String("matrix-waits", "hold", "lanes: hold (admit nothing while a matrix run waits) or ignore")
 	laneOff := fs.Bool("off", false, "lanes: clear the lane policy; the limit alone admits")
+	scheduleMinutes := fs.Int("expires-minutes", 0, "schedule set: minutes until the host schedule expires, 1 to 1440")
 	jsonOut := fs.Bool("json", false, "print JSON")
 	if err := fs.Parse(rest); err != nil {
 		return err
@@ -330,6 +399,32 @@ func cmdTeamQueue(e env, args []string) error {
 		if !ok {
 			return errors.New(teamQueueWaitUsage)
 		}
+	}
+	if sub == "schedule" {
+		// Checked before any hub call; the hub checks the reason's length.
+		given := map[string]bool{}
+		fs.Visit(func(f *flag.Flag) { given[f.Name] = true })
+		for name := range given {
+			if name != "task" && name != "hub" && name != "json" && name != "reason" && name != "item" && name != "expires-minutes" {
+				return errors.New(teamQueueScheduleUsage)
+			}
+		}
+		ok := true
+		switch scheduleVerb {
+		case "":
+			ok = !given["reason"] && !given["item"] && !given["expires-minutes"]
+		case "set":
+			ok = strings.TrimSpace(*reason) != "" && *scheduleMinutes >= 1 && *scheduleMinutes <= api.HostScheduleMaxTTLMinutes && !given["item"]
+		case "grant", "revoke":
+			ok = api.ValidID(*item, "wi") && !given["expires-minutes"]
+		case "clear":
+			ok = strings.TrimSpace(*reason) != "" && !given["item"] && !given["expires-minutes"]
+		}
+		if !ok {
+			return errors.New(teamQueueScheduleUsage)
+		}
+	} else if *scheduleMinutes != 0 {
+		return errors.New("--expires-minutes applies only to tt team queue schedule set")
 	}
 	if sub != "add" && *plannedReason != "" {
 		return errors.New("--planned-reason applies only to tt team queue add")
@@ -447,7 +542,22 @@ func cmdTeamQueue(e env, args []string) error {
 		}
 		return nil
 	}
-	if e.agent != "" && sub != "accept" && sub != "scope" && sub != "rebind" && sub != "requeue" && sub != "wait" {
+	if sub == "schedule" && scheduleVerb == "" {
+		// Any session may read the schedule; the matrix host lock's gate
+		// reads it with --json.
+		list, err := c.ListTeamQueuePage(ctx, *task, api.TeamQueueListOptions{View: api.TeamQueueViewActive})
+		if err != nil {
+			return err
+		}
+		view := hostScheduleOf(list.Lanes)
+		if *jsonOut {
+			printJSON(view)
+			return nil
+		}
+		fmt.Println(view.Text())
+		return nil
+	}
+	if e.agent != "" && sub != "accept" && sub != "scope" && sub != "rebind" && sub != "requeue" && sub != "wait" && sub != "schedule" {
 		return errors.New("owner-side team queue changes require an unbound CLI session")
 	}
 	req := api.TeamQueueRequest{RequestID: api.NewID("tqr"), Operation: sub}
@@ -654,6 +764,36 @@ func cmdTeamQueue(e env, args []string) error {
 				return errors.New("only the owner or a database handler may set or clear a shared-path wait; ask the database handler")
 			}
 			req.HandlerAgentID, req.HandlerRunID = e.agent, e.runID
+		}
+	case "schedule":
+		// The host schedule lives in the lane policy; the hub records who
+		// changes it and why (docs/project-queue.md, "Host schedule").
+		req.Operation, req.ScheduleReason = "schedule_"+scheduleVerb, *reason
+		if scheduleVerb == "set" {
+			req.ScheduleTTLMinutes = *scheduleMinutes
+		}
+		if scheduleVerb == "grant" || scheduleVerb == "revoke" {
+			req.ScheduleItem = *item
+		}
+		if e.agent != "" {
+			// A database handler names its exact run and the owner helper
+			// its agent; the hub checks both. Any other agent asks the
+			// handler.
+			self, selfErr := c.GetAgent(ctx, *task, e.agent)
+			if selfErr != nil {
+				return selfErr
+			}
+			switch self.Role {
+			case api.AgentRoleDatabaseHandler:
+				if e.runID == "" {
+					return errors.New("schedule from a database handler session needs its exact run")
+				}
+				req.HandlerAgentID, req.HandlerRunID = e.agent, e.runID
+			case api.AgentRoleOwnerHelper:
+				req.AgentID = e.agent
+			default:
+				return errors.New("only the owner, the owner helper or a database handler may change the host schedule; ask the database handler for a host turn")
+			}
 		}
 	case "remove", "reorder", "release", "replace-lead", "accept", "scope", "fail", "integrated", "rebind", "requeue":
 		if !validTeamQueueEntryID(*entry) {
@@ -1083,6 +1223,20 @@ func cmdTeamQueue(e env, args []string) error {
 			}
 		}
 	}
+	if sub == "schedule" {
+		// The read back is the saved schedule as it applies now.
+		list, listErr := c.ListTeamQueuePage(ctx, *task, api.TeamQueueListOptions{View: api.TeamQueueViewActive})
+		if listErr != nil {
+			return fmt.Errorf("schedule %s saved, but the read back failed: %w", scheduleVerb, listErr)
+		}
+		view := hostScheduleOf(list.Lanes)
+		if *jsonOut {
+			printJSON(view)
+		} else {
+			fmt.Println(view.Text())
+		}
+		return nil
+	}
 	if *jsonOut {
 		printJSON(result)
 	} else {
@@ -1175,6 +1329,7 @@ func queueLanesText(l *api.TeamQueueLanes) string {
 		return strconv.Itoa(*v)
 	}
 	text := fmt.Sprintf("lanes=%d window=%s active=%d strained=%s memory-pressure=%s matrix-waiters=%s", l.Lanes, l.Window, l.Active, strained, reading(l.MemoryPressure), reading(l.MatrixWaiters))
+	text += queueScheduleLanesText(l)
 	if l.Hold != "" {
 		text += " held: " + l.Hold
 	}

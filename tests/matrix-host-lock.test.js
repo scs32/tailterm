@@ -70,6 +70,9 @@ delete process.env.TAILTERM_MATRIX_OVERTAKE_LIMIT;
 // records any probe that still gets through, child processes included (M12).
 process.env.TAILTERM_MATRIX_MEMORY_PRESSURE_MAX = "off";
 delete process.env.TAILTERM_MATRIX_RELEASE;
+// No test here may read the live project's host schedule: without a project
+// the host lock makes no tt call (wi_57c903a832b38b70).
+delete process.env.TAILTERM_TASK;
 const probeMarker = join(isolated, "sysctl-ran");
 mkdirSync(join(isolated, "bin"));
 writeFileSync(join(isolated, "bin", "sysctl"), `#!/bin/sh\n: >> '${probeMarker}'\necho 50\n`, { mode: 0o755 });

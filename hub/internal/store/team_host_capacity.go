@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/scs32/tailterm/hub/internal/api"
 )
@@ -447,6 +448,7 @@ func queueLanes(limit int, p api.TeamQueueLanePolicy, u *api.TeamHostUsage, now 
 	if limit > 0 {
 		out.Lanes = min(out.Lanes, limit)
 	}
+	out.ScheduleState = hostScheduleState(p.HostSchedule, now)
 	if p.HoldWhileMatrixWaits {
 		switch {
 		case out.MatrixWaiters == nil:
@@ -489,4 +491,158 @@ func queueLaneReason(l api.TeamQueueLanes, active int) string {
 		return fmt.Sprintf("Lanes full: %d of %d (%s)", active, l.Lanes, queueLanesWhy(l))
 	}
 	return ""
+}
+
+// hostScheduleState is a host schedule as it applies at now: cleared once
+// cleared, expired from its expiry on, else active; empty without one.
+func hostScheduleState(h *api.TeamHostSchedule, now time.Time) string {
+	switch {
+	case h == nil:
+		return ""
+	case h.ClearedAt != "":
+		return api.HostScheduleCleared
+	}
+	until, err := time.Parse(time.RFC3339Nano, h.ExpiresAt)
+	if err != nil || !now.Before(until) {
+		return api.HostScheduleExpired
+	}
+	return api.HostScheduleActive
+}
+
+// hostScheduleAuthority admits the owner (no agent fields), a live database
+// handler run of the project, or the project's current owner helper, and
+// returns who acts: the handler's or helper's agent ID, or "owner". An item
+// lead is refused, as is a handler that is closed, exited or retired.
+func hostScheduleAuthority(ctx context.Context, tx *sql.Tx, task string, req api.TeamQueueRequest) (string, error) {
+	refused := fmt.Errorf("%w: only the owner, the owner helper or a database handler may change the host schedule; ask the database handler", api.ErrConflict)
+	if req.LeadAgentID != "" || req.LeadRunID != "" {
+		return "", refused
+	}
+	handler := req.HandlerAgentID != "" || req.HandlerRunID != ""
+	if handler && req.AgentID != "" {
+		return "", refused
+	}
+	if req.AgentID != "" {
+		helper, ok, err := currentOwnerHelper(ctx, tx, task)
+		if err != nil {
+			return "", err
+		}
+		if !ok || helper.ID != req.AgentID || helper.Status == api.AgentExited || helper.Status == api.AgentRetired {
+			return "", refused
+		}
+		return req.AgentID, nil
+	}
+	if !handler {
+		return "owner", nil
+	}
+	return queueWaitAuthority(ctx, tx, task, req)
+}
+
+// validHostScheduleReason checks a one-line reason of at most
+// api.HostScheduleMaxReason bytes; required says whether it may be empty.
+func validHostScheduleReason(reason string, required bool) error {
+	if len(reason) > api.HostScheduleMaxReason || strings.ContainsFunc(reason, unicode.IsControl) {
+		return fmt.Errorf("%w: a host schedule reason is one line of at most %d bytes", api.ErrInvalid, api.HostScheduleMaxReason)
+	}
+	if required && strings.TrimSpace(reason) == "" {
+		return fmt.Errorf("%w: a host schedule needs --reason TEXT saying why matrix starts take turns", api.ErrInvalid)
+	}
+	return nil
+}
+
+// teamHostScheduleAction runs schedule_set, schedule_grant, schedule_revoke
+// and schedule_clear inside the queue action's transaction. The schedule is
+// a field of the stored lane policy, so it needs one: a lanes save keeps it
+// and lanes --off is refused while it is active. set replaces any earlier
+// schedule and drops its grants; clear keeps the record with who cleared it,
+// when and why, and drops the grants. Grants and revokes need an active
+// schedule. Each change refreshes the policy's UpdatedAt.
+func teamHostScheduleAction(ctx context.Context, tx *sql.Tx, task string, req api.TeamQueueRequest, now time.Time) error {
+	policy, err := loadQueueLanePolicy(ctx, tx, task)
+	if err != nil {
+		return err
+	}
+	if policy == nil {
+		return fmt.Errorf("%w: a host schedule needs a lane policy; set one first: tt team queue lanes --task %s --day N --night N --zone ZONE --night-start HH:MM --night-end HH:MM", api.ErrConflict, task)
+	}
+	by, err := hostScheduleAuthority(ctx, tx, task, req)
+	if err != nil {
+		return err
+	}
+	at := ts(now)
+	reason := strings.TrimSpace(req.ScheduleReason)
+	state := hostScheduleState(policy.HostSchedule, now)
+	switch req.Operation {
+	case "schedule_set":
+		if req.ScheduleItem != "" {
+			return fmt.Errorf("%w: schedule set takes no item", api.ErrInvalid)
+		}
+		if err := validHostScheduleReason(req.ScheduleReason, true); err != nil {
+			return err
+		}
+		if req.ScheduleTTLMinutes < 1 || req.ScheduleTTLMinutes > api.HostScheduleMaxTTLMinutes {
+			return fmt.Errorf("%w: a host schedule expires in 1 to %d minutes", api.ErrInvalid, api.HostScheduleMaxTTLMinutes)
+		}
+		policy.HostSchedule = &api.TeamHostSchedule{Reason: reason, SetBy: by, SetAt: at, ExpiresAt: ts(now.Add(time.Duration(req.ScheduleTTLMinutes) * time.Minute))}
+	case "schedule_grant", "schedule_revoke":
+		if !api.ValidID(req.ScheduleItem, "wi") || req.ScheduleTTLMinutes != 0 {
+			return fmt.Errorf("%w: a host turn grant or revoke names one item, --item wi_ID, and no expiry", api.ErrInvalid)
+		}
+		if err := validHostScheduleReason(req.ScheduleReason, false); err != nil {
+			return err
+		}
+		if state != api.HostScheduleActive {
+			return fmt.Errorf("%w: no host schedule is active, so matrix runs need no grant", api.ErrConflict)
+		}
+		h := *policy.HostSchedule
+		grants := make([]api.TeamHostTurnGrant, 0, len(h.Grants)+1)
+		found := false
+		for _, g := range h.Grants {
+			if g.ItemID == req.ScheduleItem {
+				found = true
+				continue
+			}
+			grants = append(grants, g)
+		}
+		if req.Operation == "schedule_revoke" {
+			if !found {
+				return fmt.Errorf("%w: %s holds no host turn grant", api.ErrNotFound, req.ScheduleItem)
+			}
+		} else {
+			var kind string
+			if err := tx.QueryRowContext(ctx, `SELECT kind FROM work_items WHERE task_id=? AND id=?`, task, req.ScheduleItem).Scan(&kind); errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("%w: work item %s is not in this project", api.ErrNotFound, req.ScheduleItem)
+			} else if err != nil {
+				return err
+			}
+			grants = append(grants, api.TeamHostTurnGrant{ItemID: req.ScheduleItem, By: by, At: at, Reason: reason})
+		}
+		if len(grants) == 0 {
+			grants = nil
+		}
+		h.Grants = grants
+		policy.HostSchedule = &h
+	case "schedule_clear":
+		if req.ScheduleItem != "" || req.ScheduleTTLMinutes != 0 {
+			return fmt.Errorf("%w: schedule clear takes only --reason", api.ErrInvalid)
+		}
+		if err := validHostScheduleReason(req.ScheduleReason, true); err != nil {
+			return err
+		}
+		if state != api.HostScheduleActive && state != api.HostScheduleExpired {
+			return fmt.Errorf("%w: no host schedule is set to clear", api.ErrNotFound)
+		}
+		h := *policy.HostSchedule
+		h.Grants, h.ClearedBy, h.ClearedAt, h.ClearReason = nil, by, at, reason
+		policy.HostSchedule = &h
+	default:
+		return api.ErrInvalid
+	}
+	policy.UpdatedAt = at
+	b, err := json.Marshal(policy)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE team_queue_settings SET lane_policy_json=? WHERE task_id=?`, string(b), task)
+	return err
 }
