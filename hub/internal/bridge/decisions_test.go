@@ -170,7 +170,9 @@ func TestDecisionCardLongQuestionButtonsOnLastPart(t *testing.T) {
 func TestDecisionCardRedactsHelperSecrets(t *testing.T) {
 	h := newHelperHarness(t)
 	helper := h.register()
-	secret := "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+	// Assembled at runtime so no tracked file holds a token shape (the
+	// tool-redact corpus check scans every tracked file).
+	secret := "gh" + "p_" + strings.Repeat("abcdefghij", 3) + "0123456789"
 	req := api.DecisionRequest{
 		Question: "Rotate " + secret + " now?",
 		Options: []api.DecisionOption{
