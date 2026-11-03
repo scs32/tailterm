@@ -53,6 +53,11 @@ var BridgeRoutes = map[string]bool{
 	"GET /v1/tasks/{id}/delegation-windows":              true,
 	"POST /v1/tasks/{id}/delegation-windows":             true,
 	"POST /v1/tasks/{id}/delegation-windows/{wid}/close": true,
+	// Read and answer only: the owner answers a tt ask decision from its
+	// Discord card or /answer (wi_be6e41aed949f387); the bridge can never
+	// ask one.
+	"GET /v1/tasks/{id}/decisions":               true,
+	"POST /v1/tasks/{id}/decisions/{seq}/answer": true,
 	// Create only: /bug and /feature file an owner item; the bridge can
 	// never update, dispatch or queue one.
 	"POST /v1/tasks/{id}/work-items": true,

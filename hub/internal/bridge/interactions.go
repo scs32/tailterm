@@ -166,6 +166,17 @@ func (b *Bridge) act(ctx context.Context, taskID string, in discord.Interaction)
 			return ephemeral("No approval saved.")
 		}
 		return ephemeral("Approved with the exact requested text; answer #%d saved.", out.Message.Seq)
+	case strings.HasPrefix(id, "decide:"):
+		seqText, optionID, ok := strings.Cut(strings.TrimPrefix(id, "decide:"), ":")
+		seq, err := strconv.ParseInt(seqText, 10, 64)
+		if !ok || err != nil || seq < 1 || optionID == "" {
+			return ephemeral("That control is no longer supported.")
+		}
+		d, err := b.decision(ctx, taskID, seq)
+		if err != nil {
+			return decisionLookupReply(seq, err)
+		}
+		return b.answerDecision(ctx, taskID, d, api.AnswerDecisionRequest{OptionID: optionID}, in.ID)
 	case id == "stalled":
 		return b.stalledReply(ctx, taskID)
 	case strings.HasPrefix(id, "nudge:"):
@@ -472,6 +483,21 @@ func (b *Bridge) extend(ctx context.Context, taskID, ref, duration, reason, inte
 
 func (b *Bridge) answer(ctx context.Context, taskID, ref, text, interactionID string) reply {
 	o, err := b.obligation(ctx, taskID, ref)
+	if errors.Is(err, errNotOpen) {
+		// No open obligation: the number may be a tt ask decision.
+		if seq, seqErr := strconv.ParseInt(strings.TrimPrefix(strings.TrimSpace(ref), "#"), 10, 64); seqErr == nil && seq > 0 {
+			d, dErr := b.decision(ctx, taskID, seq)
+			switch {
+			case dErr == nil:
+				if strings.TrimSpace(text) == "" {
+					return ephemeral("Say what the answer is: a letter, an option or your own words.")
+				}
+				return b.answerDecision(ctx, taskID, d, decisionChoice(d.Request.DecisionRequest, text), interactionID)
+			case !errors.Is(dErr, errNotOpen):
+				return decisionLookupReply(seq, dErr)
+			}
+		}
+	}
 	if err != nil {
 		return lookupReply(err)
 	}
@@ -487,6 +513,71 @@ func (b *Bridge) answer(ctx context.Context, taskID, ref, text, interactionID st
 		seq = out.Message.Seq
 	}
 	return reply{Public: true, Content: truncate(fmt.Sprintf("**owner** answered #%d on the recipient's behalf:\n%s", o.MessageSeq, text), contentLimit-40) + "\n" + marker(seq, 1, 1, "")}
+}
+
+// decision finds the tt ask decision a message number names; errNotOpen
+// means the hub has no decision with that number.
+func (b *Bridge) decision(ctx context.Context, taskID string, seq int64) (api.DecisionRecord, error) {
+	list, err := b.cfg.Hub.ListDecisions(ctx, taskID, seq-1, 1)
+	if err != nil {
+		return api.DecisionRecord{}, err
+	}
+	if len(list.Decisions) == 0 || list.Decisions[0].Request.Seq != seq || list.Decisions[0].Request.DecisionRequest == nil {
+		return api.DecisionRecord{}, fmt.Errorf("%w: no decision #%d", errNotOpen, seq)
+	}
+	return list.Decisions[0], nil
+}
+
+func decisionLookupReply(seq int64, err error) reply {
+	if errors.Is(err, errNotOpen) {
+		return ephemeral("⚠️ There is no decision #%d in this project.", seq)
+	}
+	return ephemeral("⚠️ %s.", hubMessage(err))
+}
+
+// decisionChoice maps /answer text onto a decision: a single letter A–E
+// (an optional trailing "." or ")") within the option count picks the
+// option shown with that letter, else an exact option ID picks that option,
+// else the text is the owner's own answer.
+func decisionChoice(req *api.DecisionRequest, text string) api.AnswerDecisionRequest {
+	text = strings.TrimSpace(text)
+	letter := strings.TrimRight(text, ".)")
+	if len(letter) == 1 && len(text)-len(letter) <= 1 {
+		if i := int(unicode.ToUpper(rune(letter[0])) - 'A'); i >= 0 && i < len(req.Options) {
+			return api.AnswerDecisionRequest{OptionID: req.Options[i].ID}
+		}
+	}
+	for _, o := range req.Options {
+		if o.ID == text {
+			return api.AnswerDecisionRequest{OptionID: o.ID}
+		}
+	}
+	return api.AnswerDecisionRequest{Text: text}
+}
+
+// answerDecision stores the owner's answer to a decision. The interaction ID
+// is the retry key, so a resumed interaction returns the same answer; a
+// decision answered before gets "Already answered" and nothing is stored.
+func (b *Bridge) answerDecision(ctx context.Context, taskID string, d api.DecisionRecord, choice api.AnswerDecisionRequest, interactionID string) reply {
+	seq, req := d.Request.Seq, d.Request.DecisionRequest
+	choice.RequestID = "discord-interaction-" + interactionID
+	out, err := b.cfg.Hub.AnswerDecision(ctx, taskID, seq, choice)
+	if err != nil {
+		var h *api.HTTPError
+		if errors.As(err, &h) && h.Status == http.StatusConflict && strings.Contains(h.Msg, "already answered") {
+			return ephemeral("✔️ Already answered: decision #%d.", seq)
+		}
+		return ephemeral("⚠️ %s.", hubMessage(err))
+	}
+	what := choice.Text
+	for i, o := range req.Options {
+		if choice.OptionID != "" && o.ID == choice.OptionID {
+			what = decisionLetter(i) + " · " + clean(redactSecrets(o.Label))
+			break
+		}
+	}
+	mk := marker(out.Seq, 1, 1, "")
+	return reply{Public: true, Content: truncate(fmt.Sprintf("**owner** answered decision #%d: %s", seq, what), contentLimit-len(mk)-1) + "\n" + mk}
 }
 
 func (b *Bridge) cancel(ctx context.Context, taskID, ref, reason, interactionID string) reply {

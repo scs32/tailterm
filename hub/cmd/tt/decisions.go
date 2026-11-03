@@ -69,7 +69,7 @@ func cmdAsk(e env, args []string) error {
 		fmt.Fprintln(fs.Output(), "Usage: tt ask --request-id KEY --file PATH [--task ID] [--json]")
 		fmt.Fprintln(fs.Output(), "       tt ask answer SEQ (--option ID | --text T) --rationale R   (a delegation window's delegate)")
 		fmt.Fprintln(fs.Output(), "Use --file - for stdin. JSON fields: question, options [{id,label,description}], recommendedOptionId, recommendationReason; optional workItems and workOrderMessage.")
-		fmt.Fprintln(fs.Output(), "Reuse the same key and file after an uncertain response. Identity comes from this agent session. An owner answers on the Board; recommendations never submit consent.")
+		fmt.Fprintln(fs.Output(), "Reuse the same key and file after an uncertain response. Identity comes from this agent session. The owner answers on the Board or in Discord (a button on the decision card, or /answer #SEQ); recommendations never submit consent.")
 		fs.PrintDefaults()
 	}
 	key := fs.String("request-id", "", "stable retry key (required)")
@@ -149,7 +149,7 @@ func cmdAsk(e env, args []string) error {
 	if *asJSON {
 		printJSON(message)
 	} else {
-		fmt.Printf("Decision requested #%d. The owner can answer on the Board.\n", message.Seq)
+		fmt.Printf("Decision requested #%d. The owner can answer on the Board or in Discord.\n", message.Seq)
 	}
 	return nil
 }

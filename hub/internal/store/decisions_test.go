@@ -6,6 +6,7 @@ import (
 	"errors"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 
@@ -458,5 +459,37 @@ func TestDecisionMigrationPreservesA1ReceiptAndHistory(t *testing.T) {
 	var violations int
 	if err = s.db.QueryRow(`SELECT count(*) FROM pragma_foreign_key_check`).Scan(&violations); err != nil || violations != 0 {
 		t.Fatalf("foreign-key integrity = %d, %v", violations, err)
+	}
+}
+
+// wi_be6e step 1: the Discord bridge answers a decision as the owner on its
+// own node with an interaction-derived key. The answer closes the decision,
+// an exact replay returns the same message and a different answer conflicts.
+func TestDecisionAnswerFromDiscordBridgeClosesAndReplays(t *testing.T) {
+	s, ctx, by, task, author := decisionFixture(t)
+	created, err := s.CreateDecision(ctx, task.ID, decisionRequest(author, "bridge-decision"), by)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bridge := api.Caller{Node: "discord-bridge", User: by.User}
+	req := api.AnswerDecisionRequest{RequestID: "discord-interaction-1234567890", OptionID: "all"}
+	answer, err := s.AnswerDecision(ctx, task.ID, created.Seq, req, bridge)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if answer.DecisionAnswer == nil || answer.DecisionAnswer.OptionID != "all" || answer.ReplyTo != created.Seq || answer.To != author.ID || answer.From.Node != "discord-bridge" {
+		t.Fatalf("bridge answer = %+v", answer)
+	}
+	list, err := s.ListDecisions(ctx, task.ID, created.Seq-1, 1)
+	if err != nil || len(list.Decisions) != 1 || list.Decisions[0].Request.Seq != created.Seq || list.Decisions[0].Answer == nil || list.Decisions[0].Answer.Seq != answer.Seq {
+		t.Fatalf("decision not closed by the bridge answer: %+v %v", list, err)
+	}
+	replayed, err := s.AnswerDecision(ctx, task.ID, created.Seq, req, bridge)
+	if err != nil || replayed.Seq != answer.Seq {
+		t.Fatalf("bridge replay = %+v %v, want #%d", replayed, err, answer.Seq)
+	}
+	_, err = s.AnswerDecision(ctx, task.ID, created.Seq, api.AnswerDecisionRequest{RequestID: "discord-interaction-1234567891", OptionID: "staged"}, bridge)
+	if !errors.Is(err, api.ErrConflict) || !strings.Contains(err.Error(), "already answered") {
+		t.Fatalf("second bridge answer err = %v, want already answered conflict", err)
 	}
 }

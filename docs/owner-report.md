@@ -98,6 +98,7 @@ printed, even when the section is empty or could not be read.
 - stalled: <item id> <cause>
 **Needs you** (<n>)
 - #<seq> <source kind>: <subject or needs> (due <HH:MM>[, overdue <overdue>])
+- #<seq> decision: <question> (asked <HH:MM>)
 ```
 
 When the window's start and end fall on different local days, the header
@@ -115,7 +116,7 @@ shows the end's date too (`2026-10-30 21:00–2026-10-31 07:00 UTC`).
 | Opened vs closed | the owner status call (`GET /v1/tasks/{id}/owner-status`) | Bugs and features opened and closed in the window, those open at the window's end, and the change since the latest 21:00 baseline, or `no 21:00 baseline yet` (see "Owner status call"). |
 | Usage | `GET /v1/provider-usage?host=H` and `GET /v1/tasks/{id}/usage?from=&to=` | Each stored provider reading for the host, ordered by runtime and then window. A reading that is not `ok` prints its state. Then the project's token classes in the window, sorted by class, exactly as the hub reports them. |
 | Host health | the same owner status call | The host census the team queue stores: free disk and its reserve, memory pressure (with the strain threshold when it is over it) and matrix waiters, each shown as not observed when the runner did not read it, and the reading's age. Then whether the queue's lanes admit or hold (with the hold reason), and one line per stalled queue entry with its cause. |
-| Needs you | `GET /v1/tasks/{id}/obligations?owner=1&open=1` | Every open owner obligation, ordered by due time and then message number. The subject is shown, or what the obligation needs when it has no subject. A due time on another day than the window's end shows its date (`Oct 30 15:04`). |
+| Needs you | `GET /v1/tasks/{id}/obligations?owner=1&open=1`; `GET /v1/tasks/{id}/decisions` (every page) and the task roster (`GET /v1/tasks/{id}`) | Every open owner obligation, ordered by due time and then message number. The subject is shown, or what the obligation needs when it has no subject. A due time on another day than the window's end shows its date (`Oct 30 15:04`). Then every unanswered `tt ask` decision whose asking agent is neither closed nor exited (the rule TailOS uses), ordered by message number, with its question and when it was asked (`Oct 30 15:04` on another day). The count covers both. A decision leaves the list once it is answered, on the Board or in Discord (wi_be6e41aed949f387). |
 
 The narrative is read once per item, even when an item appears in more than
 one of Shipped, Running teams and Up next.
@@ -183,19 +184,21 @@ These lines are printed exactly as shown.
 | Nothing went wrong in the window | `- none recorded (sources: refused or rolled-back releases, owner interventions)` |
 | No provider reading for the host | `- no provider reading for host <host>` |
 | No project tokens recorded in the window | `- project tokens in window: none recorded` |
-| No open owner obligation | `- nothing waiting on you` |
+| No open owner obligation and no unanswered decision | `- nothing waiting on you` |
 | A read failed | `- unavailable: could not read <source>` |
 
 The sources a failed read names are `the release ledger`, `the team queue`,
 `owner interventions`, `provider usage`, `project usage`,
-`owner obligations`, `the owner status` and, for a single shipped item,
+`owner obligations`, `decision requests` (the decisions or the roster
+read), `the owner status` and, for a single shipped item,
 `the work item narrative` (as `- <item id>: unavailable: could not read the
 work item narrative`; a Shipped line shows the item ID only when its title
 could not be read). A section that could not be read prints its header
 without a count. A failed team queue read shows the unavailable line under
 both Running teams and Up next. A failed owner status read shows it under
 both Opened vs closed and Host health, and leaves out the Releases baseline
-line.
+line. When one of the two Needs you reads fails, Needs you prints its
+unavailable line, drops the count, and still lists what the other read found.
 A running team whose narrative cannot be read is listed without its title,
 and the read counts as a failure (see Exit status).
 

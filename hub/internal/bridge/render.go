@@ -142,6 +142,9 @@ func (b *Bridge) renderMessage(task api.Task, r roster, m api.Message) []OutboxR
 		}
 		return rows
 	}
+	if m.DecisionRequest != nil && m.From.AgentID != "" {
+		return b.renderDecision(r, m, row)
+	}
 	header := fmt.Sprintf("**%s** → **%s**", clean(r.sender(m)), clean(r.recipient(m)))
 	if m.ReplyTo > 0 {
 		header += fmt.Sprintf(" · re #%d", m.ReplyTo)
@@ -168,6 +171,69 @@ func (b *Bridge) renderMessage(task api.Task, r roster, m api.Message) []OutboxR
 			content = header + "\n" + content
 		}
 		rows = append(rows, row("msg", kindLine, i+1, outboxPayload{Message: discord.MessageSend{Content: content}, Marker: mk}))
+	}
+	return rows
+}
+
+// Discord's button limits: a label of at most 80 characters and a custom ID
+// of at most 100. A decision has at most five options, one action row.
+const buttonLabelLimit = 80
+
+// decisionLetter is the letter the card shows for the option at position i.
+func decisionLetter(i int) string { return string(rune('A' + i)) }
+
+// decisionCustomID is the button's custom ID: the request and the stored
+// option ID (at most 32 characters, so the ID stays within Discord's 100).
+func decisionCustomID(seq int64, optionID string) string {
+	return fmt.Sprintf("decide:%d:%s", seq, optionID)
+}
+
+// renderDecision draws a tt ask decision as a card the owner answers in
+// Discord (wi_be6e41aed949f387): the question, its options lettered A–E in
+// their stored order, the recommendation and how to answer. The last part
+// carries one button per option. An owner helper's decision is redacted in
+// every field, as its text is.
+func (b *Bridge) renderDecision(r roster, m api.Message, row func(key, kind string, part int, p outboxPayload) OutboxRow) []OutboxRow {
+	req := *m.DecisionRequest
+	redact := func(s string) string { return s }
+	if a, ok := r[m.From.AgentID]; ok && a.Role == api.AgentRoleOwnerHelper {
+		redact = redactField
+	}
+	var text strings.Builder
+	text.WriteString(redact(req.Question))
+	buttons := make([]discord.Component, 0, len(req.Options))
+	for i, o := range req.Options {
+		label := clean(redact(o.Label))
+		line := "**" + decisionLetter(i) + "** · " + label
+		style := discord.ButtonSecondary
+		if o.ID == req.RecommendedOptionID {
+			line += " (Recommended)"
+			style = discord.ButtonPrimary
+		}
+		text.WriteString("\n\n" + line + "\n" + redact(o.Description))
+		buttons = append(buttons, discord.Component{Type: discord.ComponentButton, Style: style,
+			Label: truncate(decisionLetter(i)+" · "+label, buttonLabelLimit), CustomID: decisionCustomID(m.Seq, o.ID)})
+	}
+	text.WriteString("\n\nRecommendation: " + redact(req.RecommendationReason))
+	if req.Category != "" && req.Category != api.RequestCategoryDecision {
+		text.WriteString("\nCategory: " + req.Category)
+	}
+	text.WriteString(fmt.Sprintf("\n\nAnswer with a button, or /answer #%d with a letter or your own words. A plain reply does not answer.", m.Seq))
+	parts := chunk(text.String(), embedBudget)
+	link := b.tailosLink(m)
+	head := "**Decision for owner** from **" + clean(r.sender(m)) + "**"
+	rows := make([]OutboxRow, 0, len(parts))
+	for i, part := range parts {
+		mk := marker(m.Seq, i+1, len(parts), "decision")
+		embed := discord.Embed{Description: part, Color: kindColors[api.EnvelopeKindQuestion], URL: link}
+		if link != "" {
+			embed.Title = "Open in TailOS"
+		}
+		send := discord.MessageSend{Content: truncate(head, contentLimit-len(mk)-1) + "\n" + mk, Embeds: []discord.Embed{embed}}
+		if i == len(parts)-1 {
+			send.Components = []discord.Component{{Type: discord.ComponentActionRow, Components: buttons}}
+		}
+		rows = append(rows, row("decision", kindLine, i+1, outboxPayload{Message: send, Marker: mk}))
 	}
 	return rows
 }

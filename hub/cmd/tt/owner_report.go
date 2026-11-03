@@ -59,6 +59,7 @@ const (
 	ownerSourceProvider      = "provider usage"
 	ownerSourceProjectUsage  = "project usage"
 	ownerSourceObligations   = "owner obligations"
+	ownerSourceDecisions     = "decision requests"
 	ownerSourceNarrative     = "the work item narrative"
 	ownerSourceOwnerStatus   = "the owner status"
 )
@@ -80,6 +81,12 @@ type ownerReportRunning struct {
 type ownerReportUpNext struct {
 	n                     int
 	item, title, template string
+}
+
+type ownerReportDecision struct {
+	seq      int64
+	question string
+	asked    time.Time
 }
 
 type ownerReportWrong struct {
@@ -119,6 +126,11 @@ type ownerReportData struct {
 
 	needs            []api.Obligation
 	needsUnavailable bool
+
+	// decisions are unanswered tt ask decisions from live agents, in request
+	// order; they wait for the owner beside the owner obligations.
+	decisions            []ownerReportDecision
+	decisionsUnavailable bool
 
 	// status is the hub's owner status call for the window: Opened vs
 	// closed, Host health and the Releases baseline line.
@@ -323,11 +335,14 @@ func renderOwnerReport(d ownerReportData) string {
 		}
 	}
 
-	line("**Needs you**%s", count(len(d.needs), d.needsUnavailable))
-	switch {
-	case d.needsUnavailable:
+	line("**Needs you**%s", count(len(d.needs)+len(d.decisions), d.needsUnavailable || d.decisionsUnavailable))
+	if d.needsUnavailable {
 		unavailable(ownerSourceObligations)
-	case len(d.needs) == 0:
+	}
+	if d.decisionsUnavailable {
+		unavailable(ownerSourceDecisions)
+	}
+	if !d.needsUnavailable && !d.decisionsUnavailable && len(d.needs)+len(d.decisions) == 0 {
 		line(ownerReportNothingWaiting)
 	}
 	for _, o := range d.needs {
@@ -344,6 +359,14 @@ func renderOwnerReport(d ownerReportData) string {
 			dueText += ", overdue " + o.Overdue
 		}
 		line("- #%d %s: %s (due %s)", o.MessageSeq, o.SourceKind, reportText(what), dueText)
+	}
+	for _, q := range d.decisions {
+		asked := q.asked.In(d.zone)
+		askedText := asked.Format("15:04")
+		if asked.Format("2006-01-02") != end.Format("2006-01-02") {
+			askedText = asked.Format("Jan 2 15:04")
+		}
+		line("- #%d decision: %s (asked %s)", q.seq, reportText(q.question), askedText)
 	}
 	return b.String()
 }
@@ -1001,6 +1024,48 @@ func fetchOwnerReport(c *api.Client, task, kind string, start, end time.Time, zo
 			}
 			return d.needs[i].MessageSeq < d.needs[j].MessageSeq
 		})
+	}
+
+	// Unanswered decisions wait for the owner too, read in full; one whose
+	// asking agent closed or exited no longer waits (the TailOS rule).
+	if err := func() error {
+		var detail api.TaskDetail
+		if err := call(func(ctx context.Context) (err error) {
+			detail, err = c.GetTask(ctx, task)
+			return err
+		}); err != nil {
+			return err
+		}
+		live := map[string]bool{}
+		for _, a := range detail.Agents {
+			live[a.ID] = a.Status != api.AgentClosed && a.Status != api.AgentExited
+		}
+		var open []ownerReportDecision
+		for after := int64(0); ; {
+			var page api.DecisionList
+			if err := call(func(ctx context.Context) (err error) {
+				page, err = c.ListDecisions(ctx, task, after, api.MaxDecisionPage)
+				return err
+			}); err != nil {
+				return err
+			}
+			for _, r := range page.Decisions {
+				if r.Answer != nil || r.Request.DecisionRequest == nil || !live[r.Request.From.AgentID] {
+					continue
+				}
+				open = append(open, ownerReportDecision{seq: r.Request.Seq, question: r.Request.DecisionRequest.Question, asked: r.Request.CreatedAt})
+			}
+			if page.NextAfter == 0 || page.NextAfter <= after {
+				break
+			}
+			after = page.NextAfter
+		}
+		sort.SliceStable(open, func(i, j int) bool { return open[i].seq < open[j].seq })
+		d.decisions = open
+		return nil
+	}(); err != nil {
+		fail(ownerSourceDecisions, err)
+		d.decisionsUnavailable = true
 	}
 	return d, failures
 }

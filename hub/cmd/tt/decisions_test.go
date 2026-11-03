@@ -196,3 +196,32 @@ func TestAskAmbiguousFailureRetainsRecoveryKey(t *testing.T) {
 		t.Fatalf("uncertain response lost retry identity or reposted: calls=%d err=%v", calls.Load(), err)
 	}
 }
+
+// wi_be6e a2: tt ask tells its caller the owner answers on the Board or in
+// Discord, in its help and its success line.
+func TestAskHelpAndSuccessNameBoardAndDiscord(t *testing.T) {
+	const where = "on the Board or in Discord"
+	var help strings.Builder
+	restore := captureStderr(t, &help)
+	err := cmdAsk(env{task: "tsk_0000000000000001", agent: "agt_0000000000000001"}, []string{"--help"})
+	restore()
+	if err != nil || !strings.Contains(help.String(), where) || !strings.Contains(help.String(), "/answer #SEQ") {
+		t.Fatalf("tt ask --help = %v\n%s", err, help.String())
+	}
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var input api.CreateDecisionRequest
+		_ = json.NewDecoder(r.Body).Decode(&input)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(201)
+		_ = json.NewEncoder(w).Encode(api.Message{Seq: 41, DecisionRequest: &input.DecisionRequest})
+	}))
+	defer s.Close()
+	t.Setenv("TAILTERM_WORK_ITEM", "")
+	e := env{hub: s.URL, task: "tsk_0000000000000001", agent: "agt_0000000000000001"}
+	out, err := captureCLIOutput(t, func() error {
+		return cmdAsk(e, []string{"--request-id", "where-1", "--file", askFixtureFile(t, askFixture())})
+	})
+	if err != nil || out != "Decision requested #41. The owner can answer "+where+".\n" {
+		t.Fatalf("tt ask success = %v %q", err, out)
+	}
+}

@@ -32,6 +32,11 @@ type ownerReportFixture struct {
 	usage         api.ProviderUsage
 	tokens        map[string]string
 	needs         []api.Obligation
+	// decisions are the project's decision records in request order, served
+	// in pages of decisionPage (0 = the requested limit); agents is the roster.
+	decisions    []api.DecisionRecord
+	decisionPage int
+	agents       []api.Agent
 	// status is the owner status call's answer; nil serves the zero status
 	// of a project with nothing recorded.
 	status *api.OwnerStatus
@@ -201,6 +206,29 @@ func (f *ownerReportFixture) route(t *testing.T, r *http.Request) (string, any) 
 		return "owner-status", *f.status
 	case path == prefix+"/owner-helper/wakes":
 		return "wakes", f.wakes
+	case path == prefix:
+		return "task", api.TaskDetail{Task: api.Task{ID: ownerReportTestTask}, Agents: f.agents}
+	case path == prefix+"/decisions":
+		after, _ := strconv.ParseInt(q.Get("after"), 10, 64)
+		limit, _ := strconv.Atoi(q.Get("limit"))
+		if limit != api.MaxDecisionPage {
+			t.Errorf("decisions limit = %d, want %d", limit, api.MaxDecisionPage)
+		}
+		if f.decisionPage > 0 {
+			limit = f.decisionPage
+		}
+		out := api.DecisionList{Decisions: []api.DecisionRecord{}}
+		for _, d := range f.decisions {
+			if d.Request.Seq <= after {
+				continue
+			}
+			if len(out.Decisions) == limit {
+				out.NextAfter = out.Decisions[limit-1].Request.Seq
+				break
+			}
+			out.Decisions = append(out.Decisions, d)
+		}
+		return "decisions", out
 	case path == prefix+"/obligations":
 		if q.Get("owner") != "1" || q.Get("open") != "1" {
 			t.Errorf("owner obligations query = %s", r.URL.RawQuery)
@@ -886,7 +914,8 @@ func TestOwnerReportDocMatchesTemplate(t *testing.T) {
 		ownerReportNoCompletion, "`" + ownerReportNoneRecorded + "`", "- no provider reading for host <host>",
 		"- project tokens in window: none recorded", "- unavailable: could not read <source>",
 		ownerSourceReleases, ownerSourceTeamQueue, ownerSourceInterventions, ownerSourceProvider,
-		ownerSourceProjectUsage, ownerSourceObligations, ownerSourceNarrative,
+		ownerSourceProjectUsage, ownerSourceObligations, ownerSourceNarrative, ownerSourceDecisions,
+		"- #<seq> decision: <question> (asked <HH:MM>)", "GET /v1/tasks/{id}/decisions",
 		"## Windows", "## Exit status", "wi_35e9", "wi_475a", "wi_546279658420371a",
 		"## Sending on the hub schedule", "tt owner report hourly --post", "tt owner report morning --post", "tt owner report evening --post",
 		"--kind hourly-update --schedule '0 * * * *'", "--kind morning-summary --schedule '0 7 * * *'", "--kind evening-summary --schedule '0 21 * * *'",
@@ -1285,4 +1314,101 @@ func TestOwnerReportPostRepliesToWake(t *testing.T) {
 	if p := run(t, helper, "hourly", slot.Add(5*time.Minute), api.OwnerHelperWakeList{}); p.ReplyTo != 0 {
 		t.Fatalf("no wakes: replied to %d", p.ReplyTo)
 	}
+}
+
+// ownerReportNeedsYou is the last section, header included.
+func ownerReportNeedsYou(t *testing.T, out string) string {
+	t.Helper()
+	i := strings.Index(out, "\n**Needs you**")
+	if i < 0 {
+		t.Fatalf("no Needs you section in\n%s", out)
+	}
+	return out[i+1:]
+}
+
+func ownerReportDecisionRecord(seq int64, agent, question string, at time.Time, answered bool) api.DecisionRecord {
+	r := api.DecisionRecord{Request: api.Message{Seq: seq, TaskID: ownerReportTestTask, CreatedAt: at,
+		From: api.Sender{AgentID: agent}, DecisionRequest: &api.DecisionRequest{Question: question}}}
+	if answered {
+		r.Answer = &api.Message{Seq: seq + 1, TaskID: ownerReportTestTask, ReplyTo: seq}
+	}
+	return r
+}
+
+// TestOwnerReportNeedsYouDecisions (wi_be6e a3): an unanswered decision from
+// a live agent waits for the owner beside the open obligations; an answered
+// one, or one whose agent closed, does not. Every page is read.
+func TestOwnerReportNeedsYouDecisions(t *testing.T) {
+	now := time.Date(2026, 10, 31, 14, 0, 0, 0, time.UTC)
+	live, closed := "agt_00000000000000a1", "agt_00000000000000c1"
+	fixture := func() *ownerReportFixture {
+		f := fullOwnerReportFixture(now)
+		f.needs = f.needs[:1]
+		f.agents = []api.Agent{{ID: live, TaskID: ownerReportTestTask, Status: api.AgentRunning}, {ID: closed, TaskID: ownerReportTestTask, Status: api.AgentClosed}}
+		f.decisions = []api.DecisionRecord{
+			ownerReportDecisionRecord(920, live, "Which rollout?", now.Add(-50*time.Minute), true),
+			ownerReportDecisionRecord(930, closed, "Stale question from a closed agent", now.Add(-40*time.Minute), false),
+			ownerReportDecisionRecord(940, live, "Restart the  Mini\ntonight?", now.Add(-12*time.Minute), false),
+		}
+		f.decisionPage = 2
+		return f
+	}
+	f := fixture()
+	out, err := runOwnerReport(t, ownerReportEnv(f.serve(t)), ownerReportArgs("hourly", now)...)
+	if err != nil {
+		t.Fatalf("report: %v\n%s", err, out)
+	}
+	want := "**Needs you** (2)\n- #910 question: Approve the bridge restart (due 14:15)\n- #940 decision: Restart the Mini tonight? (asked 13:48)\n"
+	if got := ownerReportNeedsYou(t, out); got != want {
+		t.Fatalf("needs you =\n%s\nwant\n%s", got, want)
+	}
+	if got := f.calledTimes("decisions"); got != 2 {
+		t.Fatalf("decision pages read = %d, want 2", got)
+	}
+
+	t.Run("asked on an earlier day", func(t *testing.T) {
+		f := fixture()
+		f.decisions[2].Request.CreatedAt = now.Add(-26 * time.Hour)
+		out, err := runOwnerReport(t, ownerReportEnv(f.serve(t)), ownerReportArgs("hourly", now)...)
+		if err != nil || !strings.Contains(out, "- #940 decision: Restart the Mini tonight? (asked Oct 30 12:00)\n") {
+			t.Fatalf("earlier-day decision line missing: %v\n%s", err, out)
+		}
+	})
+	t.Run("decisions unavailable", func(t *testing.T) {
+		f := fixture()
+		f.fail = map[string]bool{"decisions": true}
+		out, err := runOwnerReport(t, ownerReportEnv(f.serve(t)), ownerReportArgs("hourly", now)...)
+		if err == nil || !strings.Contains(err.Error(), "could not be read") {
+			t.Fatalf("a failed decisions read must return an error, got %v", err)
+		}
+		want := "**Needs you**\n- unavailable: could not read decision requests\n- #910 question: Approve the bridge restart (due 14:15)\n"
+		if got := ownerReportNeedsYou(t, out); got != want {
+			t.Fatalf("needs you =\n%s\nwant\n%s", got, want)
+		}
+	})
+	t.Run("roster unavailable", func(t *testing.T) {
+		f := fixture()
+		f.fail = map[string]bool{"task": true}
+		out, _ := runOwnerReport(t, ownerReportEnv(f.serve(t)), ownerReportArgs("hourly", now)...)
+		if !strings.Contains(out, "**Needs you**\n- unavailable: could not read decision requests\n") {
+			t.Fatalf("a failed roster read must mark decisions unavailable:\n%s", out)
+		}
+	})
+	t.Run("obligations unavailable keeps decisions", func(t *testing.T) {
+		f := fixture()
+		f.fail = map[string]bool{"obligations": true}
+		out, _ := runOwnerReport(t, ownerReportEnv(f.serve(t)), ownerReportArgs("hourly", now)...)
+		want := "**Needs you**\n- unavailable: could not read owner obligations\n- #940 decision: Restart the Mini tonight? (asked 13:48)\n"
+		if got := ownerReportNeedsYou(t, out); got != want {
+			t.Fatalf("needs you =\n%s\nwant\n%s", got, want)
+		}
+	})
+	t.Run("nothing waiting", func(t *testing.T) {
+		f := fixture()
+		f.needs, f.decisions = nil, f.decisions[:2]
+		out, err := runOwnerReport(t, ownerReportEnv(f.serve(t)), ownerReportArgs("hourly", now)...)
+		if err != nil || !strings.Contains(out, "**Needs you** (0)\n"+ownerReportNothingWaiting+"\n") {
+			t.Fatalf("nothing waiting: %v\n%s", err, out)
+		}
+	})
 }

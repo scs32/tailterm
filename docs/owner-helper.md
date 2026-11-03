@@ -58,6 +58,28 @@ next registration after the `tt` release; a running session keeps what it was
 given. The helper's private notes are not a source of procedure: its state is
 the hub continuity record and wakes ([session handoff](session-handoff.md)).
 
+### Owner questions are `tt ask` decisions
+
+Bug `wi_be6e41aed949f387`, work order #56943 (owner principle #51832). Every
+question the helper puts to the owner goes through the product as a `tt ask`
+decision, asked one at a time under `tt helper env`: a short plain explanation,
+two to five options with IDs `a`, `b`, `c`… in order, and a recommendation with
+its reason. It is never a free-text Discord question tracked in the helper's
+notes. Once asked:
+
+- the Discord bridge posts it in the project channel as a **Decision for owner**
+  card, its options lettered A–E in their stored order, the recommended one
+  marked, with one button per option;
+- the owner answers with a button, with `/answer #<seq>` and a letter, an option
+  ID or their own words, or on the Board. A plain Discord reply to the card is
+  an ordinary Board reply and does not answer it;
+- `tt owner report` lists it under **Needs you** until it is answered
+  ([owner report](owner-report.md)).
+
+In the owner's DM or the helper channel the helper sends only a one-line
+pointer to it (`Decision #<seq> is waiting in #<channel>`) and never re-asks the
+options in free text.
+
 ## Register
 
 Run this in the owner's Claude Code or Codex session, in a dedicated one-pane tmux session:
@@ -258,6 +280,11 @@ directed owner messages. `tt helper reply --task tsk_... SEQ --text "..."` sends
 the answer back to the same DM or thread. `/status` and `/digest` work there from
 hub data even while the helper is offline. Reply to, or `tt ack`, each Discord
 message: each one is an obligation. See [Discord helper chat](discord-helper-chat.md).
+
+A question for the owner is not a `tt helper reply`: ask it with `tt ask`, and
+reply in the DM only with a one-line pointer to the decision's number. The
+decision card in the project channel carries the options and their buttons
+(see "Owner questions are `tt ask` decisions" above).
 
 ## Opening a window for the helper
 

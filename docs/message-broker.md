@@ -461,7 +461,8 @@ All of these are deterministic hub operations with request IDs. None is an LLM a
 | `/resume <agent>` | Resume a retired agent's existing online session |
 | `/reassign <obligation> <agent\|role>` | Supersede and re-issue to a new recipient |
 | `/extend <obligation> <duration>` | Move the due time; recorded with owner provenance |
-| `/answer <obligation> <text>` | Owner closes a question or block on the agent's behalf |
+| `/answer <obligation> <text>` | Owner closes a question or block on the agent's behalf. Given a `tt ask` decision's number that has no open obligation, it answers the decision: a letter A–E picks the option shown with that letter, an exact option ID picks that option, other text is the owner's own answer (`wi_be6e41aed949f387`) |
+| Decision card buttons | A `tt ask` decision mirrors as a **Decision for owner** card, options lettered A–E with one button each; a click stores the owner's answer once, and a decision answered before replies "Already answered" |
 | `/cancel <obligation> [reason]` | Terminal cancellation with provenance |
 | `/say [agent] <text>` or plain message | Owner `human` message (creates obligation if directed) |
 | `/bug <text>` | Owner intake message, then an open bug filed from it; replies with the item ID and TailOS link. Only filed, never queued |
