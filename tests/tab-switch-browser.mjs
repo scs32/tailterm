@@ -12,6 +12,13 @@
 // Features in matrix #52783, 45 ms on the retry), while 640 measured samples
 // never exceeded 200 ms (docs/measurements/warm-first-tab-switch-2026-10-31.md).
 // A tab that is slow on most passes still fails.
+//
+// Cold-shell (the first paint, loading shell or data, of each tab on an empty
+// cache) takes COLD_PASSES passes, each in a new browser context, so with an
+// empty vault and saved cache, and holds each tab's median over those samples
+// to TARGET_MS. One sample per tab let a single slow first paint fail a run
+// (201 ms WebKit Board, wi_21ad candidate 367abdec, where 16-24 ms was usual).
+// Cold-first (data on an empty cache) is recorded on every pass, not held.
 import { chromium, webkit } from "@playwright/test";
 import { createServer } from "vite";
 import assert from "node:assert/strict";
@@ -24,6 +31,11 @@ const ROUNDS = 5;
 // Reload passes in the warm-first case: each tab gets one warm-first sample
 // per pass, and its median over them is held to TARGET_MS.
 const WARM_PASSES = 3;
+// Empty-cache passes in the cold-shell case: each tab gets one cold-shell
+// sample per pass, and its median over them is held to TARGET_MS. Every pass
+// but the last runs in its own new browser context, closed before the next
+// opens; the last runs in the context the warm-first case then reloads.
+const COLD_PASSES = 3;
 // Retained global events the feed replays from the start, and the interval of
 // new live events while the page is open.
 const BACKLOG_EVENTS = 30000;
@@ -639,13 +651,14 @@ const median = (values) => {
   return sorted[Math.floor(sorted.length / 2)];
 };
 
-async function measure(browser, origin, engine) {
+// Opens the fixture page in a new browser context, so on an empty vault and
+// an empty saved cache. The caller closes the returned context.
+async function openFixture(browser, origin, errors) {
   const context = await browser.newContext({
     viewport: { width: 1440, height: 900 },
   });
   try {
     const page = await context.newPage();
-    const errors = [];
     page.on("pageerror", (error) => errors.push(error.message));
     const ready = async () => {
       await page.waitForFunction(
@@ -666,39 +679,66 @@ async function measure(browser, origin, engine) {
         }),
     );
     await ready();
-    const shellFailures = [];
-    let warmShells = 0,
-      warmSwitches = 0;
-    const visit = async (mode, cold = false) => {
-      const result = await page.evaluate(
-        ([m, s]) => window.qa.switchTo(m, s),
-        [mode, SELECTORS[mode]],
-      );
-      if (result.shell) {
-        const { heading, control, status } = result.shell;
-        if (!heading || !control || !status)
-          shellFailures.push(`${mode} shell ${JSON.stringify(result.shell)}`);
-        if (!cold) warmShells++;
-      }
-      if (!cold) warmSwitches++;
-      if (result.shellAfterData)
-        shellFailures.push(`${mode} shell remained after data painted`);
-      return result;
-    };
-    const switchTo = async (mode) => (await visit(mode)).data;
-    const samples = {};
-    const record = (name, mode, ms) =>
-      ((samples[name] ||= {})[mode] ||= []).push(ms);
-    // The first visit with an empty cache has to wait for the network for
-    // its data, so cold-first is recorded but not held to the target; it
-    // fills the saved cache. Its shell (or data) is: cold-shell.
+    return { context, page, ready };
+  } catch (error) {
+    await context.close();
+    throw error;
+  }
+}
+
+async function measure(browser, origin, engine) {
+  const errors = [];
+  const shellFailures = [];
+  let warmShells = 0,
+    warmSwitches = 0;
+  const visit = async (page, mode, cold = false) => {
+    const result = await page.evaluate(
+      ([m, s]) => window.qa.switchTo(m, s),
+      [mode, SELECTORS[mode]],
+    );
+    if (result.shell) {
+      const { heading, control, status } = result.shell;
+      if (!heading || !control || !status)
+        shellFailures.push(`${mode} shell ${JSON.stringify(result.shell)}`);
+      if (!cold) warmShells++;
+    }
+    if (!cold) warmSwitches++;
+    if (result.shellAfterData)
+      shellFailures.push(`${mode} shell remained after data painted`);
+    return result;
+  };
+  const samples = {};
+  const record = (name, mode, ms) =>
+    ((samples[name] ||= {})[mode] ||= []).push(ms);
+  // The first visit with an empty cache has to wait for the network for
+  // its data, so cold-first is recorded but not held to the target; it
+  // fills the saved cache. Its shell (or data) is: cold-shell.
+  const coldPass = async (page) => {
     for (const mode of TABS) {
-      const result = await visit(mode, true);
+      const result = await visit(page, mode, true);
       record("cold-first", mode, result.data);
       record("cold-shell", mode, result.first);
       if (DATA_TABS.includes(mode) && !SHELL_FREE.has(mode) && !result.shell)
         shellFailures.push(`${mode} painted no shell on an empty cache`);
     }
+  };
+  // Every cold pass but the last, each in its own new context, closed before
+  // the next opens. Timed: this is the whole extra cost of COLD_PASSES.
+  const extraStart = performance.now();
+  for (let pass = 1; pass < COLD_PASSES; pass++) {
+    const fixture = await openFixture(browser, origin, errors);
+    try {
+      await coldPass(fixture.page);
+    } finally {
+      await fixture.context.close();
+    }
+  }
+  const extraColdMs = Math.round(performance.now() - extraStart);
+  const { context, page, ready } = await openFixture(browser, origin, errors);
+  try {
+    const switchTo = async (mode) => (await visit(page, mode)).data;
+    // The last cold pass fills this context's saved cache for warm-first.
+    await coldPass(page);
     // The owner's usual first visit: a reload, the same vault unlocked again
     // with its saved cache, and a feed that replays the backlog from the start.
     // Each pass waits for saves to finish so every reload loads a whole cache.
@@ -766,6 +806,9 @@ async function measure(browser, origin, engine) {
     console.log(
       `${engine}: shells on warm switches ${warmShells}/${warmSwitches} (information only); most open long polls ${polls.max}; long polls closed ${disposed} ms after dispose`,
     );
+    console.log(
+      `${engine}: ${COLD_PASSES - 1} extra cold passes in new contexts took ${extraColdMs} ms`,
+    );
     assert.deepEqual(errors, [], `${engine}: page errors`);
     assert.deepEqual(failures, [], `${engine}: tab switches`);
     assert.deepEqual(shellFailures, [], `${engine}: loading shells`);
@@ -824,7 +867,12 @@ export async function exerciseTabSwitch(browser) {
   await server.listen();
   try {
     const origin = `http://127.0.0.1:${server.httpServer.address().port}`;
-    await measure(browser, origin, browser.browserType().name());
+    const started = performance.now();
+    const engine = browser.browserType().name();
+    await measure(browser, origin, engine);
+    console.log(
+      `${engine}: tab switch check took ${Math.round(performance.now() - started)} ms`,
+    );
   } finally {
     await server.close();
   }
