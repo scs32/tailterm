@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -656,10 +657,42 @@ func TestUsageCalibrationListsEveryDoneItem(t *testing.T) {
 		t.Fatalf("planned item: %+v", row)
 	}
 
+	// The summary reads the lifetime actual at the project's warning level.
+	// Only items[0] (measured, ratio 5/4) and items[2] (partial 450, no
+	// estimate) are small with an actual; no planned item has one.
+	if report.Actual != "lifetime" || report.WarningLevel != "1.5" || report.Recent != 15 || len(report.Lanes) != 2 || report.Lanes[0].Lane != "small" || report.Lanes[1].Lane != "planned" {
+		t.Fatalf("calibration summary header: actual=%q level=%q recent=%d lanes=%+v", report.Actual, report.WarningLevel, report.Recent, report.Lanes)
+	}
+	wantSmall := usageCalibrationStats{Count: 2, Partial: 1, ActualP25: "6250675/2", ActualMedian: "6250225", ActualP75: "18750225/2", RatioCount: 1, RatioMedian: "5/4", RatioP75: "5/4"}
+	if small := report.Lanes[0]; small.Recent != wantSmall || small.AllTime != wantSmall {
+		t.Fatalf("small lane summary: %+v", small)
+	}
+	if planned := report.Lanes[1]; planned.Recent != (usageCalibrationStats{}) || planned.AllTime != (usageCalibrationStats{}) {
+		t.Fatalf("planned lane summary: %+v", planned)
+	}
+	var narrow usageCalibrationReport
+	if err := json.Unmarshal([]byte(cliOK(t, func() error { return cmdUsage(f.e, []string{"--calibration", "--recent", "1", "--json"}) })), &narrow); err != nil {
+		t.Fatal(err)
+	}
+	if small := narrow.Lanes[0]; narrow.Recent != 1 || small.Recent.Count != 1 || small.Recent.Partial != 1 || small.Recent.ActualMedian != "450" || small.Recent.RatioCount != 0 || small.AllTime != wantSmall {
+		t.Fatalf("--recent 1 keeps the last small item by seq: %+v", narrow.Lanes)
+	}
+
 	text := cliOK(t, func() error { return cmdUsage(f.e, []string{"--calibration"}) })
-	lines := strings.Split(strings.TrimRight(text, "\n"), "\n")
+	rows, summary, found := strings.Cut(text, "\n\n")
+	if !found {
+		t.Fatalf("calibration text has no summary after the rows:\n%s", text)
+	}
+	lines := strings.Split(rows, "\n")
 	if len(lines) != done {
-		t.Fatalf("calibration text has %d lines, want %d", len(lines), done)
+		t.Fatalf("calibration text has %d row lines, want %d", len(lines), done)
+	}
+	if want := "Lane summary · lifetime actual · warning level 1.5× · recent = last 15 by item seq\n" +
+		"small recent 2: actual p25 3.13M · median 6.25M · p75 9.38M · 1 with estimate: ratio median 1.25× · p75 1.25× · 0 over 1.5× · 1 partial\n" +
+		"small all 2: actual p25 3.13M · median 6.25M · p75 9.38M · 1 with estimate: ratio median 1.25× · p75 1.25× · 0 over 1.5× · 1 partial\n" +
+		"planned recent 0: no items with an actual\n" +
+		"planned all 0: no items with an actual\n"; summary != want {
+		t.Fatalf("calibration summary text:\n%s\nwant:\n%s", summary, want)
 	}
 	for _, want := range []string{
 		items[0].ID + " bug lane=small paths=2 template=plan-only · estimate 10.00M · lifetime actual 12.50M · 1.25× · done fixture 000",
@@ -673,11 +706,128 @@ func TestUsageCalibrationListsEveryDoneItem(t *testing.T) {
 	if err := cmdUsage(f.e, []string{"--calibration", "--item", items[0].ID}); err == nil {
 		t.Fatal("calibration accepted an item filter")
 	}
+	for _, args := range [][]string{{"--calibration", "--recent", "0"}, {"--calibration", "--recent", "-2"}, {"--recent", "3"}} {
+		if err := cmdUsage(f.e, args); err == nil || !strings.Contains(err.Error(), "--calibration [--project ID] [--recent N] [--json]") {
+			t.Fatalf("tt usage %v: %v", args, err)
+		}
+	}
 
 	// tt usage prints the budget under each item and leaves overhead alone.
 	usage := cliOK(t, func() error { return cmdUsage(f.e, []string{"--item", items[0].ID}) })
 	if !strings.Contains(usage, "  budget: estimate 10.00M · lifetime actual 12.50M · 1.25×\n") || strings.Count(usage, "  budget: ") != 1 {
 		t.Fatalf("usage text:\n%s", usage)
+	}
+}
+
+// k2: the lane summary over synthetic rows. Each lane's window is its last N
+// done items by item seq that have an actual, measured or partial; lane none
+// and items not measured never count; quantiles interpolate exactly.
+func TestUsageCalibrationLaneSummary(t *testing.T) {
+	m := func(k int64) string { return fmt.Sprint(k * 1000000) }
+	var rows []usageCalibrationRow
+	// small k = 1..20 at seq 10k: actual k M, estimate 4M so ratio k/4. k = 10
+	// is partial (a lower bound, still counted); k = 12 has no estimate.
+	for k := int64(1); k <= 20; k++ {
+		row := usageCalibrationRow{ItemID: fmt.Sprintf("small-%02d", k), Seq: 10 * k, Lane: "small", ActualTokens: m(k), ActualState: "measured", EstimateTokens: 4000000, Ratio: big.NewRat(k, 4).RatString()}
+		if k == 10 {
+			row.ActualState = "partial"
+		}
+		if k == 12 {
+			row.EstimateTokens, row.Ratio = 0, ""
+		}
+		rows = append(rows, row)
+	}
+	// Small items not measured, one between and one after every measured
+	// one, take no window slot.
+	rows = append(rows,
+		usageCalibrationRow{ItemID: "small-unmeasured-mid", Seq: 195, Lane: "small", ActualTokens: "0", ActualState: "not measured", EstimateTokens: 4000000},
+		usageCalibrationRow{ItemID: "small-unmeasured-last", Seq: 250, Lane: "small", ActualTokens: "0", ActualState: "not measured", EstimateTokens: 4000000})
+	// Planned: three items, fewer than the window, interleaved by seq.
+	rows = append(rows,
+		usageCalibrationRow{ItemID: "planned-a", Seq: 15, Lane: "planned", ActualTokens: m(30), ActualState: "measured", EstimateTokens: 30000000, Ratio: "1"},
+		usageCalibrationRow{ItemID: "planned-b", Seq: 25, Lane: "planned", ActualTokens: m(10), ActualState: "measured", EstimateTokens: 5000000, Ratio: "2"},
+		usageCalibrationRow{ItemID: "planned-c", Seq: 35, Lane: "planned", ActualTokens: m(20), ActualState: "measured", EstimateTokens: 40000000, Ratio: "3/2"})
+	// Lane none: the latest and largest items, which must change nothing.
+	rows = append(rows,
+		usageCalibrationRow{ItemID: "none-a", Seq: 300, Lane: "none", ActualTokens: m(999), ActualState: "measured", EstimateTokens: 1000000, Ratio: "999"},
+		usageCalibrationRow{ItemID: "none-b", Seq: 310, Lane: "none", ActualTokens: m(999), ActualState: "partial", EstimateTokens: 1000000, Ratio: "999"})
+	// Hand the rows over latest first: the window is by seq, not input order.
+	for i, j := 0, len(rows)-1; i < j; i, j = i+1, j-1 {
+		rows[i], rows[j] = rows[j], rows[i]
+	}
+	level := big.NewRat(3, 2)
+
+	lanes := summarizeCalibration(rows, 15, level)
+	if len(lanes) != 2 || lanes[0].Lane != "small" || lanes[1].Lane != "planned" {
+		t.Fatalf("lanes: %+v", lanes)
+	}
+	// Window k = 6..20 (15 actuals). p25 at position 3.5 interpolates 9M and
+	// 10M; median is the 8th, 13M; p75 at 10.5 interpolates 16M and 17M.
+	// Ratios: 14 (k = 12 has none); median at 6.5 between 13/4 and 14/4, p75
+	// at 9.75 between 16/4 and 17/4. Over 3/2: k = 7..20 less 12; k = 6 is
+	// exactly 3/2, not over.
+	wantRecent := usageCalibrationStats{Count: 15, Partial: 1, ActualP25: "9500000", ActualMedian: "13000000", ActualP75: "16500000", RatioCount: 14, RatioMedian: "27/8", RatioP75: "67/16", OverWarning: 13}
+	if got := lanes[0].Recent; got != wantRecent {
+		t.Fatalf("small recent:\n got %+v\nwant %+v", got, wantRecent)
+	}
+	// All time, k = 1..20: p25 at 4.75, median at 9.5, p75 at 14.25; 19 ratios
+	// with median the 10th (k = 10) and p75 at 13.5 between k = 15 and 16.
+	wantAll := usageCalibrationStats{Count: 20, Partial: 1, ActualP25: "5750000", ActualMedian: "10500000", ActualP75: "15250000", RatioCount: 19, RatioMedian: "5/2", RatioP75: "31/8", OverWarning: 13}
+	if got := lanes[0].AllTime; got != wantAll {
+		t.Fatalf("small all time:\n got %+v\nwant %+v", got, wantAll)
+	}
+	// A window longer than the lane holds all of it.
+	wantPlanned := usageCalibrationStats{Count: 3, ActualP25: "15000000", ActualMedian: "20000000", ActualP75: "25000000", RatioCount: 3, RatioMedian: "3/2", RatioP75: "7/4", OverWarning: 1}
+	if lanes[1].Recent != wantPlanned || lanes[1].AllTime != wantPlanned {
+		t.Fatalf("planned window shorter than N: %+v", lanes[1])
+	}
+
+	// An even window: the last four, k = 17..20.
+	four := summarizeCalibration(rows, 4, level)[0].Recent
+	if want := (usageCalibrationStats{Count: 4, ActualP25: "17750000", ActualMedian: "18500000", ActualP75: "19250000", RatioCount: 4, RatioMedian: "37/8", RatioP75: "77/16", OverWarning: 4}); four != want {
+		t.Fatalf("even window:\n got %+v\nwant %+v", four, want)
+	}
+
+	// The warning boundary is strictly greater, compared exactly.
+	edge := summarizeCalibration([]usageCalibrationRow{
+		{Seq: 1, Lane: "small", ActualTokens: "1500000", ActualState: "measured", Ratio: "3/2"},
+		{Seq: 2, Lane: "small", ActualTokens: "1501000", ActualState: "measured", Ratio: "1501/1000"},
+	}, 15, level)[0].Recent
+	if edge.OverWarning != 1 || edge.RatioMedian != "3001/2000" {
+		t.Fatalf("warning boundary: %+v", edge)
+	}
+
+	// Lanes with only none rows, or nothing at all, are empty and still listed.
+	for _, in := range [][]usageCalibrationRow{nil, rows[:2]} {
+		got := summarizeCalibration(in, 15, level)
+		if len(got) != 2 || got[0].Recent != (usageCalibrationStats{}) || got[1].AllTime != (usageCalibrationStats{}) {
+			t.Fatalf("no small or planned rows: %+v", got)
+		}
+	}
+
+	// Text form.
+	report := usageCalibrationReport{Actual: "lifetime", WarningLevel: "1.5", Recent: 15, Lanes: lanes}
+	want := []string{
+		"Lane summary · lifetime actual · warning level 1.5× · recent = last 15 by item seq",
+		"small recent 15: actual p25 9.50M · median 13.00M · p75 16.50M · 14 with estimate: ratio median 3.38× · p75 4.19× · 13 over 1.5× · 1 partial",
+		"small all 20: actual p25 5.75M · median 10.50M · p75 15.25M · 19 with estimate: ratio median 2.50× · p75 3.88× · 13 over 1.5× · 1 partial",
+		"planned recent 3: actual p25 15.00M · median 20.00M · p75 25.00M · 3 with estimate: ratio median 1.50× · p75 1.75× · 1 over 1.5×",
+		"planned all 3: actual p25 15.00M · median 20.00M · p75 25.00M · 3 with estimate: ratio median 1.50× · p75 1.75× · 1 over 1.5×",
+	}
+	if got := formatCalibrationSummary(report); strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("summary text:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+	sparse := usageCalibrationReport{Actual: "lifetime", WarningLevel: "2", Recent: 5, Lanes: summarizeCalibration([]usageCalibrationRow{
+		{Seq: 1, Lane: "small", ActualTokens: "5000000", ActualState: "measured"},
+	}, 5, big.NewRat(2, 1))}
+	if got := formatCalibrationSummary(sparse); strings.Join(got, "\n") != strings.Join([]string{
+		"Lane summary · lifetime actual · warning level 2× · recent = last 5 by item seq",
+		"small recent 1: actual p25 5.00M · median 5.00M · p75 5.00M · no estimates",
+		"small all 1: actual p25 5.00M · median 5.00M · p75 5.00M · no estimates",
+		"planned recent 0: no items with an actual",
+		"planned all 0: no items with an actual",
+	}, "\n") {
+		t.Fatalf("sparse summary text:\n%s", strings.Join(got, "\n"))
 	}
 }
 

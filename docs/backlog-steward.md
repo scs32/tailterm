@@ -255,22 +255,31 @@ default when `--template` is omitted; see
 [project-queue.md](project-queue.md#small-change-lane).
 
 **Estimate.** Every filing and ranking REQUEST proposes a token estimate for the
-item with a one-line basis, such as "Small, 2 paths, median of 8 Small items"
+item with a one-line basis, such as "Small, 3 paths, recent-15 median 44.5M"
 (owner decision relayed in #28208, `wi_899863352c81e3b0`). The steward takes it
 from the item's lane, its owned-path count and comparable done items:
 
 ```
 tt usage --calibration --project PROJECT_ID
-tt usage --calibration --project PROJECT_ID --json
+tt usage --calibration --project PROJECT_ID --recent 15 --json
 ```
 
-Each line is one done item with its lane, owned-path count, team shape,
-lifetime actual tokens, saved estimate and ratio. A Small item is never
-estimated under 15M, the team start-up cost (calibration median 19.3M,
-`wi_e2d272ee9b4b3013`, merged into `wi_3d3364ecdb9831fa`); when the team shape
-changes, the steward re-derives that floor from the p25 of the Small items in
-the same calibration. A Planned estimate starts from the Planned items there and
-never falls below the Small floor. The steward only proposes:
+Each row line is one done item with its lane, owned-path count, team shape,
+lifetime actual tokens, saved estimate and ratio. Below the rows, the lane
+summary gives the Small and Planned lanes' recent window (the last 15 done
+items with an actual by item sequence, or `--recent N`) beside their all-time
+figures; see
+[usage-accounting.md](usage-accounting.md#calibrate-from-history). All-time
+figures lag today's costs (bug `wi_7e2ca6ae2b353f37`: recent Small items ran a
+median 2.6× their estimates), so a new estimate starts from its lane's
+**recent** median, scaled by the item's owned-path count against comparable
+rows in that window. A Small item is never estimated under the Small floor, the
+team start-up cost: the recent p25 of Small actuals in the same summary,
+re-derived at each estimate rather than fixed. A Planned estimate starts from
+the recent Planned median and never falls below the Small floor. The basis
+names the lane, the path count and the window, for example "Small, 3 paths,
+recent-15 median 44.5M" or "Planned, 4 paths, recent-15 median 100.4M, less
+for one CLI file and its test". The steward only proposes:
 the handler records the estimate with `tt work-items update --estimate-tokens N
 --estimate-basis TEXT`, which leaves the item revision unchanged. An item
 without one shows "no estimate" and nothing else changes; see

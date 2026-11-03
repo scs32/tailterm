@@ -39,18 +39,25 @@ func cmdUsage(e env, args []string) error {
 	from := fs.String("from", "", "inclusive RFC3339 request time")
 	to := fs.String("to", "", "exclusive RFC3339 request time")
 	asJSON := fs.Bool("json", false, "versioned JSON report")
-	calibration := fs.Bool("calibration", false, "list done items with actual tokens, lane, owned paths, template and estimate")
+	calibration := fs.Bool("calibration", false, "list done items with actual tokens, lane, owned paths, template and estimate, then a per-lane summary")
+	recent := fs.Int("recent", 15, "with --calibration, how many of each lane's latest done items with an actual the summary covers")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
 		}
 		return err
 	}
-	if fs.NArg() != 0 || !api.ValidID(*project, "tsk") || (*calibration && (*item != "" || *from != "" || *to != "")) {
-		return errors.New("usage: tt usage [--project ID] [--item ID] [--from RFC3339] [--to RFC3339] [--json] | tt usage --calibration [--project ID] [--json]")
+	recentSet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "recent" {
+			recentSet = true
+		}
+	})
+	if fs.NArg() != 0 || !api.ValidID(*project, "tsk") || (*calibration && (*item != "" || *from != "" || *to != "")) || (recentSet && !*calibration) || *recent < 1 {
+		return errors.New("usage: tt usage [--project ID] [--item ID] [--from RFC3339] [--to RFC3339] [--json] | tt usage --calibration [--project ID] [--recent N] [--json]")
 	}
 	if *calibration {
-		return usageCalibration(e, *project, *asJSON)
+		return usageCalibration(e, *project, *recent, *asJSON)
 	}
 	q := api.UsageQuery{Item: *item}
 	var err error
@@ -508,6 +515,154 @@ type usageCalibrationRow struct {
 type usageCalibrationReport struct {
 	ProjectID string                `json:"projectId"`
 	Items     []usageCalibrationRow `json:"items"`
+	// Actual names the figure the summary reads: always "lifetime", the
+	// item's whole actual, not the team figure the warning compares.
+	Actual string `json:"actual"`
+	// WarningLevel is the project's warning threshold as the hub gives it.
+	WarningLevel string `json:"warningLevel"`
+	// Recent is N, the window size asked for.
+	Recent int `json:"recent"`
+	// Lanes holds small then planned; lane none is never summarized.
+	Lanes []usageCalibrationLane `json:"lanes"`
+}
+
+// usageCalibrationStats summarizes done items of one lane that have an
+// actual, measured or partial. Quantities are exact rational strings and
+// empty when no item contributes. A partial actual, and its ratio, is a
+// lower bound; such items are counted and reported in Partial.
+type usageCalibrationStats struct {
+	Count        int    `json:"count"`
+	Partial      int    `json:"partial"`
+	ActualP25    string `json:"actualP25,omitempty"`
+	ActualMedian string `json:"actualMedian,omitempty"`
+	ActualP75    string `json:"actualP75,omitempty"`
+	// RatioCount is how many of Count have an estimate, so a ratio.
+	RatioCount  int    `json:"ratioCount"`
+	RatioMedian string `json:"ratioMedian,omitempty"`
+	RatioP75    string `json:"ratioP75,omitempty"`
+	// OverWarning counts ratios strictly greater than the warning level.
+	OverWarning int `json:"overWarning"`
+}
+
+// usageCalibrationLane is one lane's recent window beside its all-time figures.
+type usageCalibrationLane struct {
+	Lane    string                `json:"lane"`
+	Recent  usageCalibrationStats `json:"recent"`
+	AllTime usageCalibrationStats `json:"allTime"`
+}
+
+// calibrationQuantile is the p quantile of ascending values by linear
+// interpolation between closest ranks: position h = (n-1)p, value x[floor h]
+// plus (h - floor h) of the gap to the next value. So p = 1/2 is the usual
+// median, the mean of the two middle values for an even count.
+func calibrationQuantile(sorted []*big.Rat, p *big.Rat) *big.Rat {
+	h := new(big.Rat).Mul(big.NewRat(int64(len(sorted)-1), 1), p)
+	floor := new(big.Int).Quo(h.Num(), h.Denom())
+	i := int(floor.Int64())
+	v := new(big.Rat).Set(sorted[i])
+	frac := new(big.Rat).Sub(h, new(big.Rat).SetInt(floor))
+	if frac.Sign() > 0 && i+1 < len(sorted) {
+		gap := new(big.Rat).Sub(sorted[i+1], sorted[i])
+		v.Add(v, gap.Mul(gap, frac))
+	}
+	return v
+}
+
+// calibrationStats summarizes rows that all have an actual.
+func calibrationStats(rows []usageCalibrationRow, threshold *big.Rat) usageCalibrationStats {
+	out := usageCalibrationStats{Count: len(rows)}
+	var actuals, ratios []*big.Rat
+	for _, row := range rows {
+		if row.ActualState == "partial" {
+			out.Partial++
+		}
+		if a, ok := new(big.Rat).SetString(row.ActualTokens); ok {
+			actuals = append(actuals, a)
+		}
+		if row.Ratio == "" {
+			continue
+		}
+		r, ok := new(big.Rat).SetString(row.Ratio)
+		if !ok {
+			continue
+		}
+		ratios = append(ratios, r)
+		if threshold != nil && r.Cmp(threshold) > 0 {
+			out.OverWarning++
+		}
+	}
+	out.RatioCount = len(ratios)
+	ascending := func(v []*big.Rat) { sort.Slice(v, func(i, j int) bool { return v[i].Cmp(v[j]) < 0 }) }
+	if len(actuals) > 0 {
+		ascending(actuals)
+		out.ActualP25 = calibrationQuantile(actuals, big.NewRat(1, 4)).RatString()
+		out.ActualMedian = calibrationQuantile(actuals, big.NewRat(1, 2)).RatString()
+		out.ActualP75 = calibrationQuantile(actuals, big.NewRat(3, 4)).RatString()
+	}
+	if len(ratios) > 0 {
+		ascending(ratios)
+		out.RatioMedian = calibrationQuantile(ratios, big.NewRat(1, 2)).RatString()
+		out.RatioP75 = calibrationQuantile(ratios, big.NewRat(3, 4)).RatString()
+	}
+	return out
+}
+
+// summarizeCalibration gives the small and planned lanes, in that order, the
+// last recent done items by item seq that have an actual (measured or
+// partial) beside all of them. Items not measured take no window slot; lane
+// none is never summarized.
+func summarizeCalibration(rows []usageCalibrationRow, recent int, threshold *big.Rat) []usageCalibrationLane {
+	bySeq := append([]usageCalibrationRow(nil), rows...)
+	sort.SliceStable(bySeq, func(i, j int) bool { return bySeq[i].Seq < bySeq[j].Seq })
+	out := []usageCalibrationLane{}
+	for _, lane := range []string{"small", "planned"} {
+		var have []usageCalibrationRow
+		for _, row := range bySeq {
+			if row.Lane == lane && (row.ActualState == "measured" || row.ActualState == "partial") {
+				have = append(have, row)
+			}
+		}
+		window := have
+		if recent >= 0 && len(window) > recent {
+			window = window[len(window)-recent:]
+		}
+		out = append(out, usageCalibrationLane{Lane: lane, Recent: calibrationStats(window, threshold), AllTime: calibrationStats(have, threshold)})
+	}
+	return out
+}
+
+// formatCalibrationSummary is the text form of the lane summary: a header
+// naming the figure, the warning level and the window, then each lane's
+// recent and all-time lines.
+func formatCalibrationSummary(report usageCalibrationReport) []string {
+	lines := []string{fmt.Sprintf("Lane summary · %s actual · warning level %s× · recent = last %d by item seq", report.Actual, report.WarningLevel, report.Recent)}
+	ratio := func(exact string) string {
+		r, ok := new(big.Rat).SetString(exact)
+		if !ok {
+			return "unavailable"
+		}
+		return r.FloatString(2) + "×"
+	}
+	stats := func(lane, label string, s usageCalibrationStats) string {
+		head := fmt.Sprintf("%s %s %d: ", lane, label, s.Count)
+		if s.Count == 0 {
+			return head + "no items with an actual"
+		}
+		line := head + fmt.Sprintf("actual p25 %s · median %s · p75 %s · ", formatTokenCount(s.ActualP25), formatTokenCount(s.ActualMedian), formatTokenCount(s.ActualP75))
+		if s.RatioCount == 0 {
+			line += "no estimates"
+		} else {
+			line += fmt.Sprintf("%d with estimate: ratio median %s · p75 %s · %d over %s×", s.RatioCount, ratio(s.RatioMedian), ratio(s.RatioP75), s.OverWarning, report.WarningLevel)
+		}
+		if s.Partial > 0 {
+			line += fmt.Sprintf(" · %d partial", s.Partial)
+		}
+		return line
+	}
+	for _, l := range report.Lanes {
+		lines = append(lines, stats(l.Lane, "recent", l.Recent), stats(l.Lane, "all", l.AllTime))
+	}
+	return lines
 }
 
 // launchTeamShape mirrors the hub's team shape for an entry listed in full,
@@ -589,7 +744,7 @@ func collectUsageCalibration(ctx context.Context, c *api.Client, project string)
 	return out, nil
 }
 
-func usageCalibration(e env, project string, asJSON bool) error {
+func usageCalibration(e env, project string, recent int, asJSON bool) error {
 	c, err := e.client(30 * time.Second)
 	if err != nil {
 		return err
@@ -600,12 +755,28 @@ func usageCalibration(e env, project string, asJSON bool) error {
 	if err != nil {
 		return err
 	}
+	warnings, err := c.UsageWarnings(ctx, project)
+	if err != nil {
+		return err
+	}
+	threshold, ok := new(big.Rat).SetString(warnings.Threshold)
+	if !ok {
+		return fmt.Errorf("hub sent warning level %q, not a number", warnings.Threshold)
+	}
+	out.Actual, out.WarningLevel, out.Recent = "lifetime", warnings.Threshold, recent
+	out.Lanes = summarizeCalibration(out.Items, recent, threshold)
 	if asJSON {
 		printJSON(out)
 		return nil
 	}
 	for _, row := range out.Items {
 		fmt.Println(formatCalibrationRow(row))
+	}
+	if len(out.Items) > 0 {
+		fmt.Println()
+	}
+	for _, line := range formatCalibrationSummary(out) {
+		fmt.Println(line)
 	}
 	return nil
 }

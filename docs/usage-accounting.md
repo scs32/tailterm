@@ -154,9 +154,27 @@ Text forms say the same in one line. `tt work-items get` prints `Budget: estimat
 ```
 tt usage --calibration --project PROJECT_ID
 tt usage --calibration --project PROJECT_ID --json
+tt usage --calibration --project PROJECT_ID --recent N [--json]
 ```
 
 One line per done item, by item sequence: lane (the template of the item's latest team queue entry, `small` or `planned`, or `none` if it was never queued), owned-path count, team shape (`plan-review` or `plan-only`), lifetime actual with its state, and the saved estimate and ratio. The read follows the done items and the queue history to their last pages, so no item is cut off at a page limit. Usage before collection began (2026-09-27) is not in the ledger, so older items read "not measured".
+
+**Lane summary** (bug `wi_7e2ca6ae2b353f37`). After the rows, unchanged, an empty line and a summary for the `small` and `planned` lanes, so an estimate can follow recent costs rather than all-time ones. The figures below are illustrative:
+
+```
+Lane summary · lifetime actual · warning level 1.5× · recent = last 15 by item seq
+small recent 15: actual p25 30.00M · median 44.50M · p75 60.00M · 15 with estimate: ratio median 2.60× · p75 3.35× · 13 over 1.5× · 1 partial
+small all 312: actual p25 12.00M · median 23.10M · p75 35.00M · 312 with estimate: ratio median 1.47× · p75 1.94× · 140 over 1.5×
+planned recent 15: …
+planned all 190: …
+```
+
+- **Window.** A lane's recent window is its last N done items by item sequence (filing order, not completion order) that have an actual, measured or partial; N is 15 unless `--recent N` (at least 1, only with `--calibration`) says otherwise. Items not measured take no slot. A lane with fewer than N such items puts all of them in the window, and the line names the real count (`planned recent 3`). The `all` line is every such item of the lane, the all-time figures beside the window. Lane `none` (never queued) is not summarized.
+- **Figures.** The p25, median and p75 of the actual tokens over the window's items, and the median and p75 of the ratio over those with an estimate (`N with estimate`; `no estimates` when none has one). Quantiles are exact, by linear interpolation between closest ranks: at position (n−1)·p of the ascending values, so the median of an even count is the mean of the two middle values. `over` counts ratios strictly greater than the project's warning level (`tt usage warning get`), the same comparison the [warning](#warning) makes. A partial actual is counted as the lower bound it is, and the line ends `· P partial` when P of the items are partial.
+- **Which actual.** The summary reads each item's **lifetime** actual, the row figure, and the header says so. The warning compares the team figure of a running entry instead, so a lifetime ratio over the level does not mean the item was warned.
+- **JSON.** Beside `projectId` and `items`: `actual` (`"lifetime"`), `warningLevel` (the hub's threshold string), `recent` (N) and `lanes`, always `small` then `planned`, each `{"lane","recent":{…},"allTime":{…}}` with `count`, `partial`, `actualP25`, `actualMedian`, `actualP75`, `ratioCount`, `ratioMedian`, `ratioP75` and `overWarning`. Quantities are exact rational strings and absent when no item contributes.
+
+The backlog steward starts each new estimate from this summary; see [backlog-steward.md](backlog-steward.md#proposals) ("Estimate") for the rule.
 
 ### Storage
 
