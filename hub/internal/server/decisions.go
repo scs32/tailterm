@@ -81,6 +81,12 @@ func (s *Server) answerDecision(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &request) {
 		return
 	}
+	// The bridge only ever speaks for the owner: a delegate's agent, run or
+	// rationale from it would record an agent's answer (wi_be6e b1).
+	if caller.Node == api.BridgeNode && (request.AgentID != "" || request.RunID != "" || request.Rationale != "") {
+		writeError(w, http.StatusBadRequest, "the bridge answers as the owner, never as an agent")
+		return
+	}
 	message, err := s.store.AnswerDecision(r.Context(), task, seq, request, caller)
 	if err != nil {
 		fail(w, err)

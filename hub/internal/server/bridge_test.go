@@ -378,3 +378,46 @@ func TestBridgeCanReadAWorkItemOnly(t *testing.T) {
 		}
 	}
 }
+
+// wi_be6e b1: the bridge answers a decision only as the owner. With a
+// decision window open, a bridge answer carrying a delegate's agent, run or
+// rationale is refused and stores nothing; its plain answer is the owner's.
+func TestBridgeAnswersDecisionsOnlyAsOwner(t *testing.T) {
+	h := newTokenHub(t)
+	task, builder, _ := h.project()
+	lead := h.agentNamed(task, "lead")
+	base := "/v1/tasks/" + task.ID
+	open := api.OpenDelegationWindowRequest{Delegate: "lead", EndsAt: time.Now().Add(2 * time.Hour), Scope: api.DelegationScopeDecisions, Source: &api.DelegationSource{Kind: "tailos"}, RequestID: "open"}
+	if code, _ := h.do(ownerToken, "POST", base+"/delegation-windows", open, nil); code != http.StatusCreated {
+		t.Fatalf("open window = %d", code)
+	}
+	ask := api.CreateDecisionRequest{AgentID: builder.ID, RequestID: "decision", DecisionRequest: api.DecisionRequest{Question: "Which rollout?", RecommendedOptionID: "a", RecommendationReason: "Safer.",
+		Options: []api.DecisionOption{{ID: "a", Label: "Staged", Description: "a"}, {ID: "b", Label: "All", Description: "b"}}}}
+	if code, _ := h.do(bridgeToken, "POST", base+"/decisions", ask, nil); code != http.StatusForbidden {
+		t.Fatalf("bridge ask = %d, want 403", code)
+	}
+	var decision api.Message
+	if code, _ := h.do(ownerToken, "POST", base+"/decisions", ask, &decision); code != http.StatusCreated {
+		t.Fatalf("decision = %d", code)
+	}
+	path := base + "/decisions/" + itoa(decision.Seq) + "/answer"
+	for name, req := range map[string]api.AnswerDecisionRequest{
+		"as the delegate": {RequestID: "as-delegate", AgentID: lead.ID, RunID: lead.RunID, OptionID: "a", Rationale: "Recommended and safe."},
+		"agent only":      {RequestID: "agent-only", AgentID: lead.ID, OptionID: "a"},
+		"run only":        {RequestID: "run-only", RunID: lead.RunID, OptionID: "a"},
+		"rationale only":  {RequestID: "rationale-only", OptionID: "a", Rationale: "because"},
+	} {
+		if code, _ := h.do(bridgeToken, "POST", path, req, nil); code != http.StatusBadRequest {
+			t.Errorf("bridge answer %s = %d, want 400", name, code)
+		}
+	}
+	var list api.DecisionList
+	if code, _ := h.do(ownerToken, "GET", base+"/decisions", nil, &list); code != 200 || len(list.Decisions) != 1 || list.Decisions[0].Answer != nil {
+		t.Fatalf("a refused bridge answer was stored: %d %+v", code, list)
+	}
+	var answer api.Message
+	if code, _ := h.do(bridgeToken, "POST", path, api.AnswerDecisionRequest{RequestID: "discord-interaction-1", OptionID: "b"}, &answer); code != http.StatusCreated ||
+		answer.From.Node != api.BridgeNode || answer.From.User != "owner" || answer.From.AgentID != "" || answer.DecisionAnswer == nil || answer.DecisionAnswer.OptionID != "b" {
+		t.Fatalf("bridge answer for the owner = %d %+v", code, answer)
+	}
+}
