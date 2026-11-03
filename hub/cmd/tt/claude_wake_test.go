@@ -4777,8 +4777,9 @@ func TestClaudeWakeSkipOwnerHelperWorkingTurnResets(t *testing.T) {
 	}
 }
 
-// Review b1 (#57177): a draft wraps onto further rows, so a prefixed token or
-// the hub token split between two rows is stored with no piece of it.
+// Review b1 (#57177, #57199): a draft wraps onto further rows, so a prefixed
+// token or the hub token split between rows, or ending exactly at a row end
+// with the next row starting with a letter, is stored with no piece of it.
 func TestClaudeWakeSkipSnapshotRedactsWrappedSecrets(t *testing.T) {
 	t.Setenv("TAILTERM_RELAY_STATE", t.TempDir())
 	const token = "tthub_Zq9Zq9Zq9Zq9Zq9Zq9Zq9Zq9Zq9Zq9Zq9Zq9"
@@ -4786,18 +4787,32 @@ func TestClaudeWakeSkipSnapshotRedactsWrappedSecrets(t *testing.T) {
 	claudeSkipRedactToken = func(runtimeBinding) string { return token }
 	t.Cleanup(func() { claudeSkipRedactToken = old })
 	prefixed := "ghp_" + "A1b2C3d4E5A1b2C3d4E5" + "A1b2C3d4E5f6G7h8"
+	aws := "AKIA" + "Q7R2M9K4P1L8T3W6"
+	npm := "npm_" + "Zx8Yw7Vu6Ts5Rq4Po3Nm2Lk1Jh9Gf8Ed7Cb6"
 	rule := "\x1b[38;5;244m" + strings.Repeat("─", 60) + "\n"
 	footer := "\x1b[39m  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
-	for i, tc := range []struct{ name, first, second, secret string }{
-		{"prefixed token", "❯ export GH=" + prefixed[:24], "  " + prefixed[24:] + " and more", prefixed},
-		{"hub token", "❯ curl -H " + token[:20], "  " + token[20:] + " https://example.invalid", token},
-		{"hub token after faint text", "❯ \x1b[2mnote\x1b[0m x " + token[:12], "  " + token[12:], token},
+	for i, tc := range []struct {
+		name   string
+		rows   []string
+		secret string
+		pieces []int // rows that hold a piece of the secret
+	}{
+		{"prefixed token", []string{"❯ export GH=" + prefixed[:24], "  " + prefixed[24:] + " and more"}, prefixed, []int{0, 1}},
+		{"hub token", []string{"❯ curl -H " + token[:20], "  " + token[20:] + " https://example.invalid"}, token, []int{0, 1}},
+		{"hub token after faint text", []string{"❯ \x1b[2mnote\x1b[0m x " + token[:12], "  " + token[12:]}, token, []int{0, 1}},
+		// #57199: the row after the token starts with a letter, with and
+		// without the continuation indent.
+		{"prefixed token then a word row", []string{"❯ export GH=" + prefixed[:24], "  " + prefixed[24:], "   more words"}, prefixed, []int{0, 1}},
+		{"prefixed token then a row with no indent", []string{"❯ export GH=" + prefixed[:24], prefixed[24:], "more"}, prefixed, []int{0, 1}},
+		{"aws key whole at a row end", []string{"❯ key " + aws, "  next line"}, aws, []int{0}},
+		{"aws key split at a row end", []string{"❯ key " + aws[:10], "  " + aws[10:], "  next line"}, aws, []int{0, 1}},
+		{"npm token after a word row", []string{"❯ notes end with", "  " + npm[:20], "  " + npm[20:], "  then text"}, npm, []int{1, 2}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			b := testClaudeBinding()
 			b.Run = fmt.Sprintf("run_%016d", i+2)
 			now := time.Date(2026, 11, 2, 18, 25, 0, 0, time.UTC)
-			raw := "Answer.\n" + rule + "\x1b[39m" + tc.first + "\n" + tc.second + "\n" + rule + footer
+			raw := "Answer.\n" + rule + "\x1b[39m" + strings.Join(tc.rows, "\n") + "\n" + rule + footer
 			x, y := 9, 3
 			_ = claudeWakeWith(context.Background(), b, "Tailterm messages #3. Run tt inbox --unread --mark-read.", snapshotPaneOps(&raw, &x, &y, &now))
 			skip, data := readSkipRecord(t, b)
@@ -4807,8 +4822,13 @@ func TestClaudeWakeSkipSnapshotRedactsWrappedSecrets(t *testing.T) {
 				}
 			}
 			s := skip.LatestSnapshot
-			if s == nil || len(s.Rows) < 2 || !s.Rows[0][0].Mixed || !strings.Contains(s.Rows[0][0].Text, "[redacted]") || !strings.Contains(s.Rows[1][0].Text, "[redacted]") {
-				t.Fatalf("wrapped rows not redacted in both: %s", data)
+			if s == nil || len(s.Rows) < len(tc.rows) {
+				t.Fatalf("snapshot rows: %s", data)
+			}
+			for _, row := range tc.pieces {
+				if len(s.Rows[row]) != 1 || !s.Rows[row][0].Mixed || !strings.Contains(s.Rows[row][0].Text, "[redacted]") {
+					t.Fatalf("row %d not redacted: %s", row, data)
+				}
 			}
 		})
 	}

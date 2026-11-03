@@ -1656,17 +1656,20 @@ func claudeSkipRedactSnapshot(snap *claudeInputSnapshot, token, reason string, n
 	return out
 }
 
-// claudeSnapshotCrossRows scans the snapshot's rows as one string: each row
-// without its leading spaces (the editor's continuation indent), joined with
-// nothing between them, as a wrapped draft reads. It returns, for every row a
-// span of that scan touches, the row's text with the touched part replaced by
-// [redacted], so a secret wrapped across rows is cut out of each row that
-// holds a piece of it. ok is false when the scan did not finish.
+// claudeSnapshotCrossRows scans the snapshot's rows joined: every run of
+// consecutive rows, each row without its leading spaces (the editor's
+// continuation indent), joined with nothing between them, as a wrapped draft
+// reads. Every window is scanned on its own and the matches are united, so a
+// row before or after a wrapped secret can never extend it out of an
+// exact-length shape (ghp_ 36, AKIA 16, npm_ 36): the window holding exactly
+// the secret's rows still matches. A snapshot has at most claudeSnapshotRows
+// rows, so at most 36 small scans. It returns, for every row a match touches,
+// the row's text with the touched part replaced by [redacted], so a secret
+// wrapped across rows is cut out of each row that holds a piece of it. ok is
+// false when a scan did not finish.
 func claudeSnapshotCrossRows(rows [][]claudeInputRun, exact []string, deadline time.Time) (map[int]string, bool) {
 	texts := make([]string, len(rows))
 	lead := make([]int, len(rows))
-	base := make([]int, len(rows))
-	var joined strings.Builder
 	for i, row := range rows {
 		var text strings.Builder
 		for _, run := range row {
@@ -1674,31 +1677,40 @@ func claudeSnapshotCrossRows(rows [][]claudeInputRun, exact []string, deadline t
 		}
 		texts[i] = text.String()
 		lead[i] = len(texts[i]) - len(strings.TrimLeft(texts[i], " "))
-		base[i] = joined.Len()
-		joined.WriteString(texts[i][lead[i]:])
 	}
-	rewrite, counted, ok := redactScan(joined.String(), exact, deadline)
-	if !ok {
-		return nil, false
-	}
-	cuts := map[int][][2]int{}
-	for _, span := range redactMerge(append(rewrite, counted...)) {
-		for i := range rows {
-			start, end := base[i], base[i]+len(texts[i])-lead[i]
-			if span.end <= start || span.start >= end {
-				continue
+	cuts := map[int][]redactSpan{}
+	for first := range rows {
+		for last := first; last < len(rows); last++ {
+			var joined strings.Builder
+			base := make([]int, last-first+1)
+			for k := first; k <= last; k++ {
+				base[k-first] = joined.Len()
+				joined.WriteString(texts[k][lead[k]:])
 			}
-			cuts[i] = append(cuts[i], [2]int{max(span.start, start) - base[i] + lead[i], min(span.end, end) - base[i] + lead[i]})
+			rewrite, counted, ok := redactScan(joined.String(), exact, deadline)
+			if !ok {
+				return nil, false
+			}
+			for _, span := range append(rewrite, counted...) {
+				for k := first; k <= last; k++ {
+					start := base[k-first]
+					end := start + len(texts[k]) - lead[k]
+					if span.end <= start || span.start >= end {
+						continue
+					}
+					cuts[k] = append(cuts[k], redactSpan{start: max(span.start, start) - start + lead[k], end: min(span.end, end) - start + lead[k]})
+				}
+			}
 		}
 	}
 	out := map[int]string{}
 	for i, parts := range cuts {
 		var text strings.Builder
 		at := 0
-		for _, part := range parts { // spans are merged and in order
-			text.WriteString(texts[i][at:part[0]])
+		for _, part := range redactMerge(parts) { // sorted and merged
+			text.WriteString(texts[i][at:part.start])
 			text.WriteString("[redacted]")
-			at = part[1]
+			at = part.end
 		}
 		text.WriteString(texts[i][at:])
 		out[i] = text.String()
