@@ -1316,13 +1316,15 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 	}
 	// The agent that unheld a job, and the handlers that bound its inputs or
 	// imported its verification, hear once when it reaches a final state;
-	// members settled with their lead were in its batch, never final, and
-	// have no binders of their own (the lead's import settles them).
-	if err = s.releaseTerminalWake(ctx, tx, task, j, priorState, req.AgentID, req.RequestID); err != nil {
+	// members settled with their lead were in its batch, never final. A
+	// member wakes no binder: the lead's import settled it, and settling
+	// copies that verification onto the member, so a row from the member's
+	// own earlier, cleared claim would otherwise look current (review b1).
+	if err = s.releaseTerminalWake(ctx, tx, task, j, priorState, req.AgentID, req.RequestID, true); err != nil {
 		return zero, err
 	}
 	for _, m := range settled {
-		if err = s.releaseTerminalWake(ctx, tx, task, m, "", req.AgentID, req.RequestID); err != nil {
+		if err = s.releaseTerminalWake(ctx, tx, task, m, "", req.AgentID, req.RequestID, false); err != nil {
 			return zero, err
 		}
 	}
@@ -1419,15 +1421,17 @@ type releaseWakeRole struct {
 // deployment unhold, wi_c7a7b97e72fc151b), and the newest inputs and
 // verification binders of the job's current claim (wi_526b1c1bfd76743f),
 // each used only while the job still carries that binding, since clearing a
-// claim empties it. A role whose own agent makes this write is dropped. A
-// closed, exited or missing agent's role goes to the primary handler, with a
-// sentence saying why; with no open primary handler that role sends nothing.
+// claim empties it. binders is false for a batch member settled with its
+// lead, which wakes only its unholder. A role whose own agent makes this
+// write is dropped. A closed, exited or missing agent's role goes to the
+// primary handler, with a sentence saying why; with no open primary handler
+// that role sends nothing.
 // Roles that resolve to one recipient share one notice: its subject is the
 // unholder's when an unhold role is among them, the binder subject
 // otherwise. Nothing is sent to the writing actor. A replay returns its saved
 // receipt before any write, so each final state sends at most once per
 // recipient. receipt is the request ID of the settling write.
-func (s *Store) releaseTerminalWake(ctx context.Context, tx *sql.Tx, task string, j api.ReleaseJob, prior, actor, receipt string) error {
+func (s *Store) releaseTerminalWake(ctx context.Context, tx *sql.Tx, task string, j api.ReleaseJob, prior, actor, receipt string, binders bool) error {
 	if j.State == prior || !slices.Contains([]string{"released", "rolled_back", "refused", "superseded"}, j.State) {
 		return nil
 	}
@@ -1441,15 +1445,17 @@ func (s *Store) releaseTerminalWake(ctx context.Context, tx *sql.Tx, task string
 	if unhold != nil {
 		roles = append(roles, releaseWakeRole{step: "unhold", agent: unhold.AgentID, unhold: unhold})
 	}
-	inputs, verification, err := releaseBinders(ctx, tx, task, j.ID)
-	if err != nil {
-		return err
-	}
-	if inputs != nil && j.InputsDigest != "" {
-		roles = append(roles, releaseWakeRole{step: "inputs", agent: inputs.AgentID, binder: inputs})
-	}
-	if verification != nil && j.IntegratedVerification != nil {
-		roles = append(roles, releaseWakeRole{step: "verification", agent: verification.AgentID, binder: verification})
+	if binders {
+		inputs, verification, err := releaseBinders(ctx, tx, task, j.ID)
+		if err != nil {
+			return err
+		}
+		if inputs != nil && j.InputsDigest != "" {
+			roles = append(roles, releaseWakeRole{step: "inputs", agent: inputs.AgentID, binder: inputs})
+		}
+		if verification != nil && j.IntegratedVerification != nil {
+			roles = append(roles, releaseWakeRole{step: "verification", agent: verification.AgentID, binder: verification})
+		}
 	}
 	roles = slices.DeleteFunc(roles, func(r releaseWakeRole) bool { return r.agent == actor })
 	if len(roles) == 0 {

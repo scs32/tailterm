@@ -1234,9 +1234,11 @@ that notice stays unread until they next read their inbox.
   the final write sends nothing. A closed or exited binder's role goes to the
   primary database handler with a sentence saying why, merged with any other
   role that reaches it; with no primary handler open, that role sends nothing
-  and the write still succeeds. Batch members have no binders of their own:
-  the lead's import settles them, and the lead's binders hear when the lead
-  settles. The rows are not shown by `tt deployment show` yet.
+  and the write still succeeds. A batch member settled with its lead wakes no
+  binder, only its unholder: the lead's import settles it, and the lead's
+  binders hear when the lead settles. Settling copies the lead's verification
+  onto the member, so a row from the member's own earlier, cleared claim is
+  never woken. The rows are not shown by `tt deployment show` yet.
 - A restart is routine whether or not "Deployer now runs the published scripts"
   follows. A deployer that does not come back after its restart notice is
   reported by the hub instead (A silent deployer, below). A restart the

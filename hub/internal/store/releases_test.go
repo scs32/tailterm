@@ -10022,4 +10022,63 @@ func TestReleaseBinderWakeOnceAndBatch(t *testing.T) {
 			t.Fatal("project notices", n)
 		}
 	})
+	// Review b1 (reviewer repro TestReviewerReproStaleMemberImporter): a
+	// member whose own earlier claim had an import, cleared by an unclaim,
+	// settles with the lead's verification copied onto it. Its old importer
+	// hears nothing; its unholder and the lead's importer still hear.
+	t.Run("batch member with a cleared earlier import", func(t *testing.T) {
+		f := newBatchFixture(t, 1)
+		v := namedHandler(t, f.s, f.task, "stale-importer")
+		u := secondHandler(t, f.s, f.task)
+		if _, err := f.deployer("unclaim", "", ""); err != nil {
+			t.Fatal("unclaim lead", err)
+		}
+		m, err := f.claim(f.members[0])
+		if err != nil {
+			t.Fatal("claim member", err)
+		}
+		m = releaseStep(t, f.s, integratedImport(m, v, f.d, "stale-import", m.Plan.Checks), f.task)
+		m = wakeStep(t, f.s, f.task, f.d, m, "member-unclaim", "unclaim")
+		if m.IntegratedVerification != nil || m.State != "verified" {
+			t.Fatal("member not cleared", m.State)
+		}
+		if rows := binderRows(t, f.s, f.task, m.ID); len(rows) != 1 || rows[0].AgentID != v.ID {
+			t.Fatalf("member's cleared import row %+v", rows)
+		}
+		f.members[0] = heldThenUnheld(t, f.s, f.task, f.h, u, m)
+		if f.lead, err = f.claim(f.lead); err != nil {
+			t.Fatal("reclaim lead", err)
+		}
+		f.declare(t)
+		f.publish(t)
+		lead, err := f.finish("released", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		member := f.load(t, m.ID)
+		if member.State != "released" || member.IntegratedVerification == nil {
+			t.Fatal("member not settled with the lead's verification", member.State)
+		}
+		if n := len(wakesBySubject(t, f.s, f.task, v.ID, releaseBinderWakeSubject)) + len(wakesBySubject(t, f.s, f.task, v.ID, releaseTerminalWakeSubject)); n != 0 {
+			t.Fatal("the member's cleared importer was woken", n)
+		}
+		unheld := wakesBySubject(t, f.s, f.task, u.ID, releaseTerminalWakeSubject)
+		if len(unheld) != 1 {
+			t.Fatal("member unholder notices", len(unheld))
+		}
+		checkWakeRefs(t, unheld[0], u.ID, member, "released", unheld[0].Envelope.Refs["receipt"])
+		for _, text := range binderStepText {
+			if strings.Contains(unheld[0].Envelope.Body.Text, text) {
+				t.Fatalf("member unholder notice names a binder step: %q", unheld[0].Envelope.Body.Text)
+			}
+		}
+		wakes := wakesBySubject(t, f.s, f.task, f.h.ID, releaseBinderWakeSubject)
+		if len(wakes) != 1 {
+			t.Fatal("lead binder notices", len(wakes))
+		}
+		checkWakeRefs(t, wakes[0], f.h.ID, lead, "released", wakes[0].Envelope.Refs["receipt"])
+		if n := allReleaseWakes(t, f.s, f.task); n != 2 {
+			t.Fatal("project notices", n)
+		}
+	})
 }
