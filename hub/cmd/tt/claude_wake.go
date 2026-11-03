@@ -1572,11 +1572,27 @@ func claudeSkipRedactSnapshot(snap *claudeInputSnapshot, token, reason string, n
 	out := claudeSkipSnapshot{At: now, Reason: reason, CursorX: snap.CursorX, CursorY: snap.CursorY, PaneRows: snap.PaneRows, FirstRow: snap.FirstRow}
 	exact := toolRedactExact(token)
 	rows := make([][]claudeSnapshotRun, 0, len(snap.Rows))
-	complete := true
-	for _, row := range snap.Rows {
+	// A draft wraps onto further rows, so a secret can be split between them;
+	// the rows are scanned joined as well (claudeSnapshotCrossRows).
+	crossed, complete := claudeSnapshotCrossRows(snap.Rows, exact, deadline)
+	for i, row := range snap.Rows {
 		var joined strings.Builder
 		for _, run := range row {
 			joined.WriteString(run.Text)
+		}
+		if text, ok := crossed[i]; ok {
+			// A span of the joined scan touches this row: keep the row as one
+			// run with those parts redacted, then scanned again on its own.
+			redacted, _, ok := toolEvidenceRedact(text, exact, deadline)
+			if !ok {
+				complete = false
+				break
+			}
+			rows = append(rows, []claudeSnapshotRun{{Mixed: true, Text: claudeSnapshotSqueeze(redacted)}})
+			continue
+		}
+		if !complete {
+			break
 		}
 		redacted, found, ok := toolEvidenceRedact(joined.String(), exact, deadline)
 		if !ok {
@@ -1638,6 +1654,56 @@ func claudeSkipRedactSnapshot(snap *claudeInputSnapshot, token, reason string, n
 	}
 	out.Rows = rows
 	return out
+}
+
+// claudeSnapshotCrossRows scans the snapshot's rows as one string: each row
+// without its leading spaces (the editor's continuation indent), joined with
+// nothing between them, as a wrapped draft reads. It returns, for every row a
+// span of that scan touches, the row's text with the touched part replaced by
+// [redacted], so a secret wrapped across rows is cut out of each row that
+// holds a piece of it. ok is false when the scan did not finish.
+func claudeSnapshotCrossRows(rows [][]claudeInputRun, exact []string, deadline time.Time) (map[int]string, bool) {
+	texts := make([]string, len(rows))
+	lead := make([]int, len(rows))
+	base := make([]int, len(rows))
+	var joined strings.Builder
+	for i, row := range rows {
+		var text strings.Builder
+		for _, run := range row {
+			text.WriteString(run.Text)
+		}
+		texts[i] = text.String()
+		lead[i] = len(texts[i]) - len(strings.TrimLeft(texts[i], " "))
+		base[i] = joined.Len()
+		joined.WriteString(texts[i][lead[i]:])
+	}
+	rewrite, counted, ok := redactScan(joined.String(), exact, deadline)
+	if !ok {
+		return nil, false
+	}
+	cuts := map[int][][2]int{}
+	for _, span := range redactMerge(append(rewrite, counted...)) {
+		for i := range rows {
+			start, end := base[i], base[i]+len(texts[i])-lead[i]
+			if span.end <= start || span.start >= end {
+				continue
+			}
+			cuts[i] = append(cuts[i], [2]int{max(span.start, start) - base[i] + lead[i], min(span.end, end) - base[i] + lead[i]})
+		}
+	}
+	out := map[int]string{}
+	for i, parts := range cuts {
+		var text strings.Builder
+		at := 0
+		for _, part := range parts { // spans are merged and in order
+			text.WriteString(texts[i][at:part[0]])
+			text.WriteString("[redacted]")
+			at = part[1]
+		}
+		text.WriteString(texts[i][at:])
+		out[i] = text.String()
+	}
+	return out, true
 }
 
 // claudeSnapshotSqueeze keeps a run of eight or more of one character (a
@@ -1780,7 +1846,7 @@ func claudeOwnerSkipNotice(b runtimeBinding, skip claudeWakeSkip) (subject, text
 		key += fmt.Sprintf("-r%d", skip.Notices)
 	}
 	text = fmt.Sprintf("Your owner helper (agent %s, tmux session %s) is not reachable. The relay has skipped every wake to it since %s (%d minutes), so your messages are not reaching it. Reason now: %s. What to do: %s The relay keeps trying, and repeats this every %d minutes until a wake gets through.",
-		b.Agent, session, at(skip.Since), minutes(skip.LastAt.Sub(skip.Since)), skip.Reason, claudeOwnerSkipAction(skip.Reason, session), int(claudeWakeOwnerRepeat/time.Minute))
+		b.Agent, session, at(skip.Since), minutes(skip.LastAt.Sub(skip.Since)), skip.Reason, claudeOwnerSkipAction(skip, session), int(claudeWakeOwnerRepeat/time.Minute))
 	var other []string
 	for _, reason := range skip.Reasons {
 		if reason != skip.Reason {
@@ -1793,13 +1859,25 @@ func claudeOwnerSkipNotice(b runtimeBinding, skip claudeWakeSkip) (subject, text
 	return "The relay cannot reach your owner helper", claudeClip(text, claudeOwnerSkipNoticeLimit), key
 }
 
-// claudeOwnerSkipAction says what the owner can do about a skip reason.
-func claudeOwnerSkipAction(reason, session string) string {
+// claudeOwnerSkipAction says what the owner can do about the skip's current
+// reason. A turn in progress counts here only when its last transcript event
+// is ten minutes old or older (a newer one ends the episode). With a tool call
+// still out, the turn may be inside one long command, which writes nothing
+// until it returns, so the owner is told which tool and how long, and not to
+// press Esc; Esc is suggested only when no tool call is pending.
+func claudeOwnerSkipAction(skip claudeWakeSkip, session string) string {
+	reason := skip.Reason
+	quiet := ""
+	if !skip.LastEventAt.IsZero() && !skip.LastAt.IsZero() {
+		quiet = fmt.Sprintf(" (its last transcript event was %d minutes ago)", int(max(0, skip.LastAt.Sub(skip.LastEventAt))/time.Minute))
+	}
 	switch {
 	case strings.Contains(reason, "permission or selection prompt"):
 		return fmt.Sprintf("open the helper's terminal (tmux session %s) and answer or dismiss the question it shows.", session)
+	case strings.Contains(reason, "turn in progress") && skip.Tool != "":
+		return fmt.Sprintf("the helper's turn is inside a %s tool call that has not returned%s; a long command writes nothing until it ends. Open the helper's terminal (tmux session %s) to see whether it is still running; the relay wakes the helper when it finishes.", skip.Tool, quiet, session)
 	case strings.Contains(reason, "turn in progress"):
-		return fmt.Sprintf("its turn looks stopped; open the helper's terminal (tmux session %s) and press Esc there.", session)
+		return fmt.Sprintf("its turn looks stopped%s and no tool call is pending; open the helper's terminal (tmux session %s) and press Esc there.", quiet, session)
 	case reason == errClaudeWakeUnsafe.Error() || strings.Contains(reason, "busy"):
 		return fmt.Sprintf("open the helper's terminal (tmux session %s) and check whether it is working; if it looks stuck, press Esc there.", session)
 	case strings.Contains(reason, "input") || strings.Contains(reason, "cursor"):

@@ -4737,8 +4737,19 @@ func TestClaudeWakeSkipOwnerHelperWorkingTurnResets(t *testing.T) {
 		now = first.Add(time.Duration(minute-1) * time.Minute)
 		claudeWakeTrackSkip(context.Background(), b, ops, busy(first.Add(-20*time.Minute)))
 	}
-	if len(posted) != 1 || !posted[0].Owner || !posted[0].Since.Equal(first) || claudeOwnerSkipAction(posted[0].Reason, "s") != "its turn looks stopped; open the helper's terminal (tmux session s) and press Esc there." {
+	if len(posted) != 1 || !posted[0].Owner || !posted[0].Since.Equal(first) || claudeOwnerSkipAction(posted[0], "s") != "its turn looks stopped (its last transcript event was 35 minutes ago) and no tool call is pending; open the helper's terminal (tmux session s) and press Esc there." {
 		t.Fatalf("stopped turn: %+v", posted)
+	}
+	// Review f1: with a tool call out, the notice names the tool and its quiet
+	// time and does not suggest Esc.
+	pending := posted[0]
+	pending.Tool = "Bash"
+	if got := claudeOwnerSkipAction(pending, "s"); strings.Contains(got, "Esc") || !strings.Contains(got, "inside a Bash tool call that has not returned (its last transcript event was 35 minutes ago)") {
+		t.Fatalf("pending tool advice: %s", got)
+	}
+	_, text, _ := claudeOwnerSkipNotice(b, pending)
+	if strings.Contains(text, "Esc") || !strings.Contains(text, "Bash tool call") {
+		t.Fatalf("pending tool notice: %s", text)
 	}
 	// The recovery post fails once and goes on a later pass.
 	fail = errors.New("hub unavailable")
@@ -4763,5 +4774,42 @@ func TestClaudeWakeSkipOwnerHelperWorkingTurnResets(t *testing.T) {
 	}
 	if len(posted) != 1 || posted[0].Owner || !posted[0].EscalatedAt.IsZero() || now.Sub(posted[0].Since) != time.Hour {
 		t.Fatalf("builder notices: %+v", posted)
+	}
+}
+
+// Review b1 (#57177): a draft wraps onto further rows, so a prefixed token or
+// the hub token split between two rows is stored with no piece of it.
+func TestClaudeWakeSkipSnapshotRedactsWrappedSecrets(t *testing.T) {
+	t.Setenv("TAILTERM_RELAY_STATE", t.TempDir())
+	const token = "tthub_Zq9Zq9Zq9Zq9Zq9Zq9Zq9Zq9Zq9Zq9Zq9Zq9"
+	old := claudeSkipRedactToken
+	claudeSkipRedactToken = func(runtimeBinding) string { return token }
+	t.Cleanup(func() { claudeSkipRedactToken = old })
+	prefixed := "ghp_" + "A1b2C3d4E5A1b2C3d4E5" + "A1b2C3d4E5f6G7h8"
+	rule := "\x1b[38;5;244m" + strings.Repeat("─", 60) + "\n"
+	footer := "\x1b[39m  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
+	for i, tc := range []struct{ name, first, second, secret string }{
+		{"prefixed token", "❯ export GH=" + prefixed[:24], "  " + prefixed[24:] + " and more", prefixed},
+		{"hub token", "❯ curl -H " + token[:20], "  " + token[20:] + " https://example.invalid", token},
+		{"hub token after faint text", "❯ \x1b[2mnote\x1b[0m x " + token[:12], "  " + token[12:], token},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := testClaudeBinding()
+			b.Run = fmt.Sprintf("run_%016d", i+2)
+			now := time.Date(2026, 11, 2, 18, 25, 0, 0, time.UTC)
+			raw := "Answer.\n" + rule + "\x1b[39m" + tc.first + "\n" + tc.second + "\n" + rule + footer
+			x, y := 9, 3
+			_ = claudeWakeWith(context.Background(), b, "Tailterm messages #3. Run tt inbox --unread --mark-read.", snapshotPaneOps(&raw, &x, &y, &now))
+			skip, data := readSkipRecord(t, b)
+			for _, piece := range []string{tc.secret, tc.secret[:12], tc.secret[len(tc.secret)-12:]} {
+				if strings.Contains(data, piece) {
+					t.Fatalf("record holds %q of a wrapped secret: %s", piece, data)
+				}
+			}
+			s := skip.LatestSnapshot
+			if s == nil || len(s.Rows) < 2 || !s.Rows[0][0].Mixed || !strings.Contains(s.Rows[0][0].Text, "[redacted]") || !strings.Contains(s.Rows[1][0].Text, "[redacted]") {
+				t.Fatalf("wrapped rows not redacted in both: %s", data)
+			}
+		})
 	}
 }
