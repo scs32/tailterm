@@ -70,6 +70,12 @@ const releasesSchema = `CREATE TABLE IF NOT EXISTS release_jobs (
  scan_seq INTEGER NOT NULL DEFAULT 0,code_seq INTEGER NOT NULL DEFAULT 0);
  CREATE TABLE IF NOT EXISTS release_windows (
  task_id TEXT NOT NULL PRIMARY KEY REFERENCES tasks(id),record_json TEXT NOT NULL);
+ CREATE TABLE IF NOT EXISTS release_job_binders (
+ task_id TEXT NOT NULL REFERENCES tasks(id),job_id TEXT NOT NULL,generation INTEGER NOT NULL,
+ step TEXT NOT NULL,agent_id TEXT NOT NULL,run_id TEXT NOT NULL,request_id TEXT NOT NULL,at TEXT NOT NULL,
+ PRIMARY KEY(task_id,job_id,generation));
+ CREATE TRIGGER IF NOT EXISTS release_job_binder_no_update BEFORE UPDATE ON release_job_binders BEGIN SELECT RAISE(ABORT,'immutable release job binder'); END;
+ CREATE TRIGGER IF NOT EXISTS release_job_binder_no_delete BEFORE DELETE ON release_job_binders BEGIN SELECT RAISE(ABORT,'immutable release job binder'); END;
  CREATE INDEX IF NOT EXISTS messages_matrix_approvals ON messages(task_id,seq) WHERE ` + matrixApprovalCandidate + `;`
 
 var releaseTargetNames = []string{"hub", "bridge", "mini", "tailos"}
@@ -1289,6 +1295,16 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 	if err != nil {
 		return zero, releaseConflict("project already fenced or ledger conflict")
 	}
+	// The handler run that bound the inputs or imported the integrated
+	// verification is kept beside the job, append-only (wi_526b1c1bfd76743f
+	// k1): clearing a claim empties the job's own fields, never this row. A
+	// replay returned its receipt above and a refused write rolls back, so
+	// each accepted write adds exactly one row, at the job's new generation.
+	if req.Operation == "inputs" || req.Operation == "verification" {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO release_job_binders(task_id,job_id,generation,step,agent_id,run_id,request_id,at) VALUES(?,?,?,?,?,?,?,?)`, task, j.ID, j.Generation, req.Operation, req.AgentID, req.RunID, req.RequestID, ts(s.now())); err != nil {
+			return zero, err
+		}
+	}
 	for _, m := range settled {
 		mb, merr := json.Marshal(m)
 		if merr != nil {
@@ -1298,8 +1314,10 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 			return zero, err
 		}
 	}
-	// The agent that unheld a job hears once when it reaches a final state;
-	// members settled with their lead were in its batch, never final.
+	// The agent that unheld a job, and the handlers that bound its inputs or
+	// imported its verification, hear once when it reaches a final state;
+	// members settled with their lead were in its batch, never final, and
+	// have no binders of their own (the lead's import settles them).
 	if err = s.releaseTerminalWake(ctx, tx, task, j, priorState, req.AgentID, req.RequestID); err != nil {
 		return zero, err
 	}
@@ -1350,52 +1368,161 @@ func (s *Store) ReleaseAction(ctx context.Context, task string, req api.ReleaseR
 // releaseTerminalWakeSubject is the directed notice an unholder receives.
 const releaseTerminalWakeSubject = "A release job you unheld has reached a final state"
 
-// releaseTerminalWake posts one directed notice when job j enters a final
+// releaseBinderWakeSubject is the directed notice a handler that bound a
+// job's inputs or imported its integrated verification receives, when it did
+// not also unhold the job (wi_526b1c1bfd76743f).
+const releaseBinderWakeSubject = "A release job you bound or verified has reached a final state"
+
+// releaseBinder is one release_job_binders row: the exact handler run whose
+// inputs or verification write saved the job at generation.
+type releaseBinder struct {
+	Step, AgentID, RunID, RequestID, At string
+	Generation                          int64
+}
+
+// releaseBinders returns the newest inputs and the newest verification row
+// of job, either nil when that step was never written. Older rows stay saved
+// for audit; a repeated import adds a newer one.
+func releaseBinders(ctx context.Context, q queryRower, task, job string) (inputs, verification *releaseBinder, err error) {
+	rows, err := q.QueryContext(ctx, `SELECT step,agent_id,run_id,request_id,at,generation FROM release_job_binders WHERE task_id=? AND job_id=? ORDER BY generation`, task, job)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var b releaseBinder
+		if err = rows.Scan(&b.Step, &b.AgentID, &b.RunID, &b.RequestID, &b.At, &b.Generation); err != nil {
+			return nil, nil, err
+		}
+		switch b.Step {
+		case "inputs":
+			inputs = &b
+		case "verification":
+			verification = &b
+		}
+	}
+	return inputs, verification, rows.Err()
+}
+
+// releaseWakeRole is one reason an agent hears about a settled job: it
+// unheld it, bound its inputs or imported its integrated verification.
+type releaseWakeRole struct {
+	step   string // unhold, inputs or verification
+	agent  string
+	unhold *api.ReleaseHoldEvent
+	binder *releaseBinder
+}
+
+// releaseTerminalWake posts the directed notices for job j entering a final
 // state (released, rolled_back, refused or superseded) from another state.
-// Its recipient is the agent of the job's newest handler unhold (tt
-// deployment unhold); a closed or exited unholder's notice goes to the
-// primary handler instead. Nothing is sent for a job no agent unheld, when
-// the recipient makes this write itself, or when no recipient is open. A
-// replay returns its saved receipt before any write, so each final state
-// sends at most once. receipt is the request ID of the settling write.
+// An agent hears for each role it holds: the newest handler unhold (tt
+// deployment unhold, wi_c7a7b97e72fc151b), and the newest inputs and
+// verification binders of the job's current claim (wi_526b1c1bfd76743f),
+// each used only while the job still carries that binding, since clearing a
+// claim empties it. A role whose own agent makes this write is dropped. A
+// closed, exited or missing agent's role goes to the primary handler, with a
+// sentence saying why; with no open primary handler that role sends nothing.
+// Roles that resolve to one recipient share one notice: its subject is the
+// unholder's when an unhold role is among them, the binder subject
+// otherwise. Nothing is sent to the writing actor. A replay returns its saved
+// receipt before any write, so each final state sends at most once per
+// recipient. receipt is the request ID of the settling write.
 func (s *Store) releaseTerminalWake(ctx context.Context, tx *sql.Tx, task string, j api.ReleaseJob, prior, actor, receipt string) error {
 	if j.State == prior || !slices.Contains([]string{"released", "rolled_back", "refused", "superseded"}, j.State) {
 		return nil
 	}
+	var roles []releaseWakeRole
 	var unhold *api.ReleaseHoldEvent
 	for i := range j.HoldHistory {
 		if ev := &j.HoldHistory[i]; ev.Action == "release" && ev.Cause == "handler" && ev.AgentID != "" {
 			unhold = ev
 		}
 	}
-	if unhold == nil || unhold.AgentID == actor {
+	if unhold != nil {
+		roles = append(roles, releaseWakeRole{step: "unhold", agent: unhold.AgentID, unhold: unhold})
+	}
+	inputs, verification, err := releaseBinders(ctx, tx, task, j.ID)
+	if err != nil {
+		return err
+	}
+	if inputs != nil && j.InputsDigest != "" {
+		roles = append(roles, releaseWakeRole{step: "inputs", agent: inputs.AgentID, binder: inputs})
+	}
+	if verification != nil && j.IntegratedVerification != nil {
+		roles = append(roles, releaseWakeRole{step: "verification", agent: verification.AgentID, binder: verification})
+	}
+	roles = slices.DeleteFunc(roles, func(r releaseWakeRole) bool { return r.agent == actor })
+	if len(roles) == 0 {
 		return nil
 	}
 	t, err := scanTask(tx.QueryRowContext(ctx, `SELECT `+taskCols+` FROM tasks WHERE id=?`, task))
 	if err != nil {
 		return err
 	}
-	to, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND id=?`, task, unhold.AgentID))
-	if errors.Is(err, sql.ErrNoRows) {
-		to, err = api.Agent{Status: api.AgentClosed}, nil
+	var primary *api.Agent
+	type wake struct {
+		to      api.Agent
+		unhold  string   // the unholder sentence, when an unhold role is here
+		clauses []string // one per binder role, then each fallback sentence
 	}
-	if err != nil {
-		return err
-	}
-	unholder := to.Name
-	if unholder == "" {
-		unholder = unhold.AgentID
-	}
-	fallback := ""
-	if status := to.Status; status == api.AgentClosed || status == api.AgentExited {
-		if to, err = primaryHandler(ctx, tx, t); errors.Is(err, sql.ErrNoRows) {
-			return nil
-		} else if err != nil {
+	var wakes []*wake
+	for _, r := range roles {
+		to, err := scanAgent(tx.QueryRowContext(ctx, `SELECT `+agentCols+` FROM agents WHERE task_id=? AND id=?`, task, r.agent))
+		if errors.Is(err, sql.ErrNoRows) {
+			to, err = api.Agent{Status: api.AgentClosed}, nil
+		}
+		if err != nil {
 			return err
 		}
-		fallback = fmt.Sprintf(" The unholder %s (agent %s) is %s, so this goes to the primary handler.", unholder, unhold.AgentID, status)
+		name := to.Name
+		if name == "" {
+			name = r.agent
+		}
+		fallback := ""
+		if status := to.Status; status == api.AgentClosed || status == api.AgentExited {
+			if primary == nil {
+				p, perr := primaryHandler(ctx, tx, t)
+				if errors.Is(perr, sql.ErrNoRows) {
+					p, perr = api.Agent{}, nil
+				}
+				if perr != nil {
+					return perr
+				}
+				primary = &p
+			}
+			to = *primary
+			who := "The unholder"
+			switch r.step {
+			case "inputs":
+				who = "The inputs binder"
+			case "verification":
+				who = "The verification importer"
+			}
+			fallback = fmt.Sprintf(" %s %s (agent %s) is %s, so this goes to the primary handler.", who, name, r.agent, status)
+		}
+		if to.ID == "" || to.ID == actor {
+			continue
+		}
+		var w *wake
+		for _, seen := range wakes {
+			if seen.to.ID == to.ID {
+				w = seen
+			}
+		}
+		if w == nil {
+			w = &wake{to: to}
+			wakes = append(wakes, w)
+		}
+		switch r.step {
+		case "unhold":
+			w.unhold = fmt.Sprintf(" %s unheld it at %s: %s.%s", name, r.unhold.At, strings.TrimRight(r.unhold.Reason, "."), fallback)
+		case "inputs":
+			w.clauses = append(w.clauses, fmt.Sprintf(" %s (agent %s, run %s) bound its inputs at generation %d.%s", name, r.binder.AgentID, r.binder.RunID, r.binder.Generation, fallback))
+		case "verification":
+			w.clauses = append(w.clauses, fmt.Sprintf(" %s (agent %s, run %s) imported its integrated verification at generation %d.%s", name, r.binder.AgentID, r.binder.RunID, r.binder.Generation, fallback))
+		}
 	}
-	if to.ID == "" || to.ID == actor {
+	if len(wakes) == 0 {
 		return nil
 	}
 	shipped := ""
@@ -1415,10 +1542,19 @@ func (s *Store) releaseTerminalWake(ctx context.Context, tx *sql.Tx, task string
 	case j.Supersession != nil:
 		shipped = " Superseded by hand release " + j.Supersession.HandReleaseID + " (release " + j.Supersession.Release + ", commit " + j.Supersession.ReleasedCommit + ")."
 	}
-	text := fmt.Sprintf("Release job %s for item %s (entry %s) is %s at generation %d.%s %s unheld it at %s: %s.%s",
-		j.ID, j.ItemID, j.EntryID, j.State, j.Generation, shipped, unholder, unhold.At, strings.TrimRight(unhold.Reason, "."), fallback)
 	refs := map[string]string{"job": j.ID, "state": j.State, "item": j.ItemID, "entry": j.EntryID, "generation": fmt.Sprint(j.Generation), "receipt": receipt}
-	return s.postBrokerNotice(ctx, tx, t, to, "", releaseTerminalWakeSubject, releaseTerminalWakeSubject, text, refs)
+	for _, w := range wakes {
+		subject := releaseBinderWakeSubject
+		if w.unhold != "" {
+			subject = releaseTerminalWakeSubject
+		}
+		text := fmt.Sprintf("Release job %s for item %s (entry %s) is %s at generation %d.%s%s%s",
+			j.ID, j.ItemID, j.EntryID, j.State, j.Generation, shipped, w.unhold, strings.Join(w.clauses, ""))
+		if err = s.postBrokerNotice(ctx, tx, t, w.to, "", subject, subject, text, maps.Clone(refs)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // validateReleaseBatchDropped checks the batch exclusions a finish carries

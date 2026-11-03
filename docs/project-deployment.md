@@ -1177,6 +1177,7 @@ that notice stays unread until they next read their inbox.
 | Deployer is not claiming releases: ..., for every reason | `wake=attention` |
 | A release job is skipped because ..., the Board copy sent when a recipient was not reached | `wake=attention` |
 | A release job you unheld has reached a final state (hub-authored, directed) | none; a directed message wakes its recipient |
+| A release job you bound or verified has reached a final state (hub-authored, directed) | none; a directed message wakes its recipient |
 
 - A routine notice repeats what the handler already has or needs no action. For
   the two routine fence waits the handler holds the deployer's directed request
@@ -1208,8 +1209,34 @@ that notice stays unread until they next read their inbox.
   final write itself. `blocked`, `merged` and `claimed` are not final. A replay
   returns the saved receipt and sends nothing, so each job sends at most one
   notice per final state; a refused or rolled-back job later superseded sends
-  one more. An agent waiting on a job it did not unhold, such as one that
-  bound inputs or imported verification, is not woken by this notice.
+  one more. The handlers that bound the job's inputs or imported its
+  verification hear too, in this notice when they are its recipient (next
+  bullet).
+- **The handler that bound inputs or imported verification hears too
+  (wi_526b1c1bfd76743f).** Each accepted `inputs` or `verification` write
+  saves one row in the append-only table `release_job_binders`: the job, its
+  generation after the write, the step, the exact handler agent and run, the
+  request id and the hub time. UPDATE and DELETE on it abort, and a replay or
+  a refused write adds no row. Clearing a claim (an unclaim, a set-aside or a
+  requeue reconcile) empties the job's inputs and integrated verification but
+  keeps the rows. When the job enters a final state, the hub also wakes the
+  newest inputs binder while the job still carries its inputs, and the newest
+  verification importer while it still carries its integrated verification. So
+  a binding from a cleared claim is never woken, and after a repeated import
+  only the newest importer is. The inputs binder and the importer may be two
+  handlers; each is a recipient. Each recipient gets one directed NOTICE per
+  job per final state, with the same refs as the unholder's. The roles that
+  reach one agent share that one notice: when the unholder is among them it
+  keeps the subject "A release job you unheld has reached a final state" and
+  adds a sentence per binder role; otherwise the subject is "A release job you
+  bound or verified has reached a final state". Each binder sentence names the
+  agent, its run, the step and the generation. A role whose own agent makes
+  the final write sends nothing. A closed or exited binder's role goes to the
+  primary database handler with a sentence saying why, merged with any other
+  role that reaches it; with no primary handler open, that role sends nothing
+  and the write still succeeds. Batch members have no binders of their own:
+  the lead's import settles them, and the lead's binders hear when the lead
+  settles. The rows are not shown by `tt deployment show` yet.
 - A restart is routine whether or not "Deployer now runs the published scripts"
   follows. A deployer that does not come back after its restart notice is
   reported by the hub instead (A silent deployer, below). A restart the

@@ -9490,3 +9490,536 @@ func TestReleaseTerminalWakeNoneWithoutUnhold(t *testing.T) {
 		}
 	})
 }
+
+// Binder wake (wi_526b1c1bfd76743f k1-k2): the handler runs that bound a
+// release job's inputs and imported its integrated verification are recorded
+// beside the job and hear once when it reaches a final state, merged with the
+// unholder's notice when they resolve to one recipient.
+
+// namedHandler adds a database handler called name.
+func namedHandler(t *testing.T, s *Store, task api.Task, name string) api.Agent {
+	t.Helper()
+	a, err := s.AddAgent(context.Background(), task.ID, api.AddAgentRequest{AgentID: api.NewID("agt"), Name: name, Host: "fixture", Session: name, Role: api.AgentRoleDatabaseHandler}, api.Caller{Node: "fixture", User: "owner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return a
+}
+
+// binderFixture is holdFixture with two more handlers: i binds inputs and v
+// imports the integrated verification. h, the oldest, is the primary handler.
+func binderFixture(t *testing.T, n int) (*Store, api.Task, api.Agent, api.Agent, api.Agent, api.Agent, []api.ReleaseJob) {
+	t.Helper()
+	s, task, h, d, jobs := holdFixture(t, n)
+	return s, task, h, d, namedHandler(t, s, task, "inputs-binder"), namedHandler(t, s, task, "verifier-import"), jobs
+}
+
+func inputsRequest(key string, i api.Agent, j api.ReleaseJob) api.ReleaseRequest {
+	commit := j.Commit
+	if j.IntegratedVerification != nil {
+		commit = j.IntegratedCommit
+	}
+	return api.ReleaseRequest{RequestID: key, Operation: "inputs", AgentID: i.ID, RunID: i.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, IntegratedCommit: commit, InputsDigest: strings.Repeat("e", 64)}
+}
+
+func releaseStep(t *testing.T, s *Store, req api.ReleaseRequest, task api.Task) api.ReleaseJob {
+	t.Helper()
+	j, err := s.ReleaseAction(context.Background(), task.ID, req)
+	if err != nil {
+		t.Fatal(req.Operation, err)
+	}
+	return j
+}
+
+// bindJob claims j as the deployer, imports its integrated verification as v
+// and binds its inputs as i.
+func bindJob(t *testing.T, s *Store, task api.Task, d, i, v api.Agent, j api.ReleaseJob) api.ReleaseJob {
+	t.Helper()
+	j = releaseStep(t, s, claimRequest(j.ID+"-claim", d, j), task)
+	j = releaseStep(t, s, integratedImport(j, v, d, j.ID+"-import", j.Plan.Checks), task)
+	return releaseStep(t, s, inputsRequest(j.ID+"-inputs", i, j), task)
+}
+
+// settleRequest is the deployer's finish of a merged job with outcome
+// released or rolled_back, of its integrated commit.
+func settleRequest(key string, d api.Agent, j api.ReleaseJob, outcome string) api.ReleaseRequest {
+	r := &api.ReleaseReceipt{Version: 1, JobID: j.ID, Commit: j.IntegratedCommit, VerificationDigest: j.VerificationDigest, Outcome: "released", Targets: []api.ReleaseTargetReceipt{{Target: "tailos", Release: "fixture", ArtifactSHA256: strings.Repeat("a", 64), Outcome: "released"}}}
+	if outcome == "rolled_back" {
+		r = rolledBackReceipt(j)
+		r.Commit = j.IntegratedCommit
+	}
+	return api.ReleaseRequest{RequestID: key, Operation: "finish", AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, Receipt: r}
+}
+
+// mergeAndSettle records j merged at its integrated commit and finishes it.
+func mergeAndSettle(t *testing.T, s *Store, task api.Task, d api.Agent, j api.ReleaseJob, outcome string) api.ReleaseJob {
+	t.Helper()
+	j = releaseStep(t, s, api.ReleaseRequest{RequestID: j.ID + "-merged", Operation: "merged", AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, IntegratedCommit: j.IntegratedCommit}, task)
+	done := releaseStep(t, s, settleRequest(j.ID+"-finish", d, j, outcome), task)
+	if done.State != outcome {
+		t.Fatal("finish state", done.State)
+	}
+	return done
+}
+
+// wakesBySubject lists the notices in agent's inbox with subject.
+func wakesBySubject(t *testing.T, s *Store, task api.Task, agent, subject string) []api.Message {
+	t.Helper()
+	messages, err := s.ListMessages(context.Background(), task.ID, 0, agent, 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []api.Message
+	for _, m := range messages {
+		if m.Envelope != nil && m.Envelope.Subject == subject {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// allReleaseWakes counts the project's final-state notices of both subjects.
+func allReleaseWakes(t *testing.T, s *Store, task api.Task) int {
+	t.Helper()
+	var n int
+	if err := s.db.QueryRow(`SELECT count(*) FROM messages WHERE task_id=? AND json_valid(envelope) AND json_extract(envelope,'$.subject') IN (?,?)`, task.ID, releaseTerminalWakeSubject, releaseBinderWakeSubject).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+var binderStepText = map[string]string{"inputs": "bound its inputs", "verification": "imported its integrated verification"}
+
+// checkWakeRefs requires m to be a directed notice to agent naming j in state
+// with the receipt of the settling request, as checkTerminalWake does.
+func checkWakeRefs(t *testing.T, m api.Message, agent string, j api.ReleaseJob, state, receipt string) {
+	t.Helper()
+	want := map[string]string{"job": j.ID, "state": state, "item": j.ItemID, "entry": j.EntryID, "generation": fmt.Sprint(j.Generation), "receipt": receipt}
+	if m.To != agent || m.Envelope.Kind != api.EnvelopeKindNotice || !reflect.DeepEqual(m.Envelope.Refs, want) {
+		t.Fatalf("notice to %s: to %s refs %+v want %+v", agent, m.To, m.Envelope.Refs, want)
+	}
+	if !strings.Contains(m.Envelope.Body.Text, j.ID) {
+		t.Fatalf("notice text %q does not name the job", m.Envelope.Body.Text)
+	}
+}
+
+// checkBinderWake requires exactly one binder notice to binder naming j in
+// state, whose text names the binder's agent, run and each step.
+func checkBinderWake(t *testing.T, s *Store, task api.Task, binder api.Agent, j api.ReleaseJob, state, receipt string, steps ...string) api.Message {
+	t.Helper()
+	wakes := wakesBySubject(t, s, task, binder.ID, releaseBinderWakeSubject)
+	if len(wakes) != 1 {
+		t.Fatalf("want one binder notice to %s, got %d", binder.Name, len(wakes))
+	}
+	m := wakes[0]
+	checkWakeRefs(t, m, binder.ID, j, state, receipt)
+	for _, want := range []string{binder.ID, binder.RunID} {
+		if !strings.Contains(m.Envelope.Body.Text, want) {
+			t.Fatalf("binder notice %q does not name %s", m.Envelope.Body.Text, want)
+		}
+	}
+	for _, step := range steps {
+		if !strings.Contains(m.Envelope.Body.Text, binderStepText[step]) {
+			t.Fatalf("binder notice %q does not name step %s", m.Envelope.Body.Text, step)
+		}
+	}
+	for step, text := range binderStepText {
+		if !slices.Contains(steps, step) && strings.Contains(m.Envelope.Body.Text, text) {
+			t.Fatalf("binder notice %q names step %s it did not do", m.Envelope.Body.Text, step)
+		}
+	}
+	return m
+}
+
+type binderRow struct {
+	Step, AgentID, RunID, RequestID string
+	Generation                      int64
+}
+
+func binderRows(t *testing.T, s *Store, task api.Task, job string) []binderRow {
+	t.Helper()
+	rows, err := s.db.Query(`SELECT step,agent_id,run_id,request_id,generation FROM release_job_binders WHERE task_id=? AND job_id=? ORDER BY generation`, task.ID, job)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var out []binderRow
+	for rows.Next() {
+		var r binderRow
+		if err = rows.Scan(&r.Step, &r.AgentID, &r.RunID, &r.RequestID, &r.Generation); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, r)
+	}
+	if err = rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// a1, a2: each accepted inputs or verification write saves one row of its
+// exact handler run at the job's new generation; a replay or a refused write
+// adds none, and the rows cannot be changed or deleted.
+func TestReleaseBinderRecordsInputsAndVerification(t *testing.T) {
+	ctx := context.Background()
+	s, task, _, d, i, v, jobs := binderFixture(t, 2)
+	j := releaseStep(t, s, claimRequest("claim", d, jobs[0]), task)
+	if _, err := s.ReleaseAction(ctx, task.ID, inputsRequest("inputs-unclaimed", i, jobs[1])); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("inputs on a verified job", err)
+	}
+	if _, err := s.ReleaseAction(ctx, task.ID, integratedImport(jobs[1], v, d, "import-unclaimed", jobs[1].Plan.Checks)); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("verification on a verified job", err)
+	}
+	importReq := integratedImport(j, v, d, "import", j.Plan.Checks)
+	imported := releaseStep(t, s, importReq, task)
+	inputsReq := inputsRequest("inputs", i, imported)
+	bound := releaseStep(t, s, inputsReq, task)
+	want := []binderRow{
+		{Step: "verification", AgentID: v.ID, RunID: v.RunID, RequestID: "import", Generation: imported.Generation},
+		{Step: "inputs", AgentID: i.ID, RunID: i.RunID, RequestID: "inputs", Generation: bound.Generation},
+	}
+	if got := binderRows(t, s, task, j.ID); !reflect.DeepEqual(got, want) {
+		t.Fatalf("binder rows %+v want %+v", got, want)
+	}
+	if imported.Generation != j.Generation+1 || bound.Generation != imported.Generation+1 {
+		t.Fatal("generations", j.Generation, imported.Generation, bound.Generation)
+	}
+	// Replays return their receipts and add nothing.
+	for _, req := range []api.ReleaseRequest{importReq, inputsReq} {
+		if _, err := s.ReleaseAction(ctx, task.ID, req); err != nil {
+			t.Fatal("replay", req.Operation, err)
+		}
+	}
+	// A second inputs is refused and adds nothing.
+	second := inputsRequest("inputs-again", i, bound)
+	if _, err := s.ReleaseAction(ctx, task.ID, second); !errors.Is(err, api.ErrConflict) {
+		t.Fatal("second inputs", err)
+	}
+	if got := binderRows(t, s, task, j.ID); !reflect.DeepEqual(got, want) {
+		t.Fatalf("replay or refusal changed the rows %+v", got)
+	}
+	if got := binderRows(t, s, task, jobs[1].ID); len(got) != 0 {
+		t.Fatalf("refused writes saved rows %+v", got)
+	}
+	inputs, verification, err := releaseBinders(ctx, s.db, task.ID, j.ID)
+	if err != nil || inputs == nil || verification == nil || inputs.AgentID != i.ID || inputs.RunID != i.RunID || verification.AgentID != v.ID || verification.RunID != v.RunID || verification.Generation != imported.Generation {
+		t.Fatalf("releaseBinders %+v %+v %v", inputs, verification, err)
+	}
+	if _, err = s.db.Exec(`UPDATE release_job_binders SET agent_id='x' WHERE job_id=?`, j.ID); err == nil || !strings.Contains(err.Error(), "immutable release job binder") {
+		t.Fatal("binder row rewritten", err)
+	}
+	if _, err = s.db.Exec(`DELETE FROM release_job_binders WHERE job_id=?`, j.ID); err == nil || !strings.Contains(err.Error(), "immutable release job binder") {
+		t.Fatal("binder row deleted", err)
+	}
+	if err = s.ValidateReleaseDatabase(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// a3: a binding from a cleared claim is kept on disk but never woken; a fresh
+// import on the new claim is the one that hears.
+func TestReleaseBinderClearedClaimIsNotWoken(t *testing.T) {
+	ctx := context.Background()
+	reclaimed := func(t *testing.T) (*Store, api.Task, api.Agent, api.Agent, api.ReleaseJob) {
+		t.Helper()
+		s, task, _, d, _, v, jobs := binderFixture(t, 1)
+		j := releaseStep(t, s, claimRequest("claim", d, jobs[0]), task)
+		j = releaseStep(t, s, integratedImport(j, v, d, "import", j.Plan.Checks), task)
+		j = wakeStep(t, s, task, d, j, "unclaim", "unclaim")
+		if j.State != "verified" || j.IntegratedVerification != nil {
+			t.Fatal("unclaim kept the import", j.State)
+		}
+		return s, task, d, v, releaseStep(t, s, claimRequest("claim-again", d, j), task)
+	}
+	t.Run("no new import", func(t *testing.T) {
+		s, task, d, v, j := reclaimed(t)
+		wakeStep(t, s, task, d, j, "refuse", "refuse")
+		if n := allReleaseWakes(t, s, task); n != 0 {
+			t.Fatal("a cleared binding was woken", n)
+		}
+		if rows := binderRows(t, s, task, j.ID); len(rows) != 1 || rows[0].AgentID != v.ID {
+			t.Fatalf("cleared binding not kept %+v", rows)
+		}
+	})
+	t.Run("fresh import by another handler", func(t *testing.T) {
+		s, task, d, v, j := reclaimed(t)
+		v2 := namedHandler(t, s, task, "second-import")
+		j = releaseStep(t, s, integratedImport(j, v2, d, "import-again", j.Plan.Checks), task)
+		_, verification, err := releaseBinders(ctx, s.db, task.ID, j.ID)
+		if err != nil || verification == nil || verification.AgentID != v2.ID || verification.RunID != v2.RunID {
+			t.Fatalf("newest binder %+v %v", verification, err)
+		}
+		done := wakeStep(t, s, task, d, j, "refuse", "refuse")
+		checkBinderWake(t, s, task, v2, done, "refused", "refuse", "verification")
+		if n := len(wakesBySubject(t, s, task, v.ID, releaseBinderWakeSubject)); n != 0 {
+			t.Fatal("the cleared claim's importer was woken", n)
+		}
+		if n := allReleaseWakes(t, s, task); n != 1 {
+			t.Fatal("project notices", n)
+		}
+		if rows := binderRows(t, s, task, j.ID); len(rows) != 2 || rows[0].AgentID != v.ID || rows[1].AgentID != v2.ID {
+			t.Fatalf("binder rows %+v", rows)
+		}
+	})
+}
+
+// a4: with distinct binders and no unholder, every final state sends one
+// binder notice to each.
+func TestReleaseBinderWakeEachFinalState(t *testing.T) {
+	ctx := context.Background()
+	check := func(t *testing.T, s *Store, task api.Task, i, v api.Agent, done api.ReleaseJob, state, receipt string) {
+		t.Helper()
+		checkBinderWake(t, s, task, i, done, state, receipt, "inputs")
+		checkBinderWake(t, s, task, v, done, state, receipt, "verification")
+		if n := allReleaseWakes(t, s, task); n != 2 {
+			t.Fatal("project notices", n)
+		}
+	}
+	for _, outcome := range []string{"released", "rolled_back"} {
+		t.Run(outcome, func(t *testing.T) {
+			s, task, h, d, i, v, jobs := binderFixture(t, 1)
+			done := mergeAndSettle(t, s, task, d, bindJob(t, s, task, d, i, v, jobs[0]), outcome)
+			check(t, s, task, i, v, done, outcome, done.ID+"-finish")
+			if n := len(wakesBySubject(t, s, task, h.ID, releaseBinderWakeSubject)) + len(wakesBySubject(t, s, task, d.ID, releaseBinderWakeSubject)); n != 0 {
+				t.Fatal("notice to an agent that bound nothing", n)
+			}
+		})
+	}
+	t.Run("refused by the deployer, then superseded", func(t *testing.T) {
+		s, task, h, d, i, v, jobs := binderFixture(t, 1)
+		refused := wakeStep(t, s, task, d, bindJob(t, s, task, d, i, v, jobs[0]), "refuse", "refuse")
+		check(t, s, task, i, v, refused, "refused", "refuse")
+		hand := recordHandRelease(t, s, task, "hand", candidateB, []string{candidateB})
+		done, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "supersede", Operation: "supersede", AgentID: h.ID, RunID: h.RunID, JobID: refused.ID, ExpectedGeneration: refused.Generation, Supersession: &api.ReleaseSupersession{ReleasedCommit: candidateB, HandReleaseID: hand.ID}})
+		if err != nil || done.State != "superseded" {
+			t.Fatal(done.State, err)
+		}
+		for _, a := range []api.Agent{i, v} {
+			wakes := wakesBySubject(t, s, task, a.ID, releaseBinderWakeSubject)
+			if len(wakes) != 2 {
+				t.Fatalf("%s notices %d", a.Name, len(wakes))
+			}
+			checkWakeRefs(t, wakes[1], a.ID, done, "superseded", "supersede")
+			if !strings.Contains(wakes[1].Envelope.Body.Text, hand.ID) {
+				t.Fatalf("superseded notice does not name the hand release: %q", wakes[1].Envelope.Body.Text)
+			}
+		}
+		if n := allReleaseWakes(t, s, task); n != 4 {
+			t.Fatal("project notices", n)
+		}
+	})
+	t.Run("refused by a reconcile after block", func(t *testing.T) {
+		s, task, h, d, i, v, jobs := binderFixture(t, 1)
+		j := bindJob(t, s, task, d, i, v, jobs[0])
+		j = releaseStep(t, s, api.ReleaseRequest{RequestID: "merged", Operation: "merged", AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, IntegratedCommit: j.IntegratedCommit}, task)
+		j = wakeStep(t, s, task, d, j, "block", "block")
+		if n := allReleaseWakes(t, s, task); n != 0 {
+			t.Fatal("merged or blocked sent a notice", n)
+		}
+		evidence := recoveryEvidence(t, s, task, h, j)
+		evidence.Disposition, evidence.NoPublication, evidence.JournalState = "refuse", false, "restored"
+		if _, err := s.db.Exec(`UPDATE agents SET status='exited' WHERE id=?`, d.ID); err != nil {
+			t.Fatal(err)
+		}
+		done, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "reconcile", Operation: "reconcile", AgentID: h.ID, RunID: h.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, Reconciliation: &evidence})
+		if err != nil || done.State != "refused" {
+			t.Fatal(done.State, err)
+		}
+		check(t, s, task, i, v, done, "refused", "reconcile")
+	})
+}
+
+// a5: one notice per recipient: one binder of both steps, an unholder that
+// also bound inputs, and fallbacks that resolve to one primary handler.
+func TestReleaseBinderWakeMergesRecipients(t *testing.T) {
+	t.Run("one handler bound both", func(t *testing.T) {
+		s, task, _, d, i, _, jobs := binderFixture(t, 1)
+		done := mergeAndSettle(t, s, task, d, bindJob(t, s, task, d, i, i, jobs[0]), "released")
+		checkBinderWake(t, s, task, i, done, "released", done.ID+"-finish", "inputs", "verification")
+		if n := allReleaseWakes(t, s, task); n != 1 {
+			t.Fatal("project notices", n)
+		}
+	})
+	t.Run("unholder bound inputs", func(t *testing.T) {
+		s, task, h, d, i, v, jobs := binderFixture(t, 1)
+		j := heldThenUnheld(t, s, task, h, i, jobs[0])
+		done := mergeAndSettle(t, s, task, d, bindJob(t, s, task, d, i, v, j), "released")
+		m := checkTerminalWake(t, s, task, i.ID, done, "released", done.ID+"-finish")
+		if !strings.Contains(m.Envelope.Body.Text, binderStepText["inputs"]) || !strings.Contains(m.Envelope.Body.Text, i.RunID) || strings.Contains(m.Envelope.Body.Text, binderStepText["verification"]) {
+			t.Fatalf("unholder notice lacks only its inputs clause: %q", m.Envelope.Body.Text)
+		}
+		if n := len(wakesBySubject(t, s, task, i.ID, releaseBinderWakeSubject)); n != 0 {
+			t.Fatal("unholder also got a binder notice", n)
+		}
+		checkBinderWake(t, s, task, v, done, "released", done.ID+"-finish", "verification")
+		if n := allReleaseWakes(t, s, task); n != 2 {
+			t.Fatal("project notices", n)
+		}
+	})
+	t.Run("closed unholder and closed binder share the primary handler", func(t *testing.T) {
+		s, task, h, d, i, v, jobs := binderFixture(t, 1)
+		u := secondHandler(t, s, task)
+		j := heldThenUnheld(t, s, task, h, u, jobs[0])
+		j = bindJob(t, s, task, d, i, v, j)
+		if _, err := s.db.Exec(`UPDATE agents SET status=? WHERE id IN (?,?)`, api.AgentClosed, u.ID, i.ID); err != nil {
+			t.Fatal(err)
+		}
+		done := mergeAndSettle(t, s, task, d, j, "released")
+		m := checkTerminalWake(t, s, task, h.ID, done, "released", done.ID+"-finish")
+		for _, want := range []string{"The unholder unholder (agent " + u.ID + ") is closed", "The inputs binder inputs-binder (agent " + i.ID + ") is closed", binderStepText["inputs"]} {
+			if !strings.Contains(m.Envelope.Body.Text, want) {
+				t.Fatalf("merged fallback notice lacks %q: %q", want, m.Envelope.Body.Text)
+			}
+		}
+		if n := len(wakesBySubject(t, s, task, h.ID, releaseBinderWakeSubject)); n != 0 {
+			t.Fatal("primary handler got a second notice", n)
+		}
+		checkBinderWake(t, s, task, v, done, "released", done.ID+"-finish", "verification")
+		if n := allReleaseWakes(t, s, task); n != 2 {
+			t.Fatal("project notices", n)
+		}
+	})
+}
+
+// a6: a binder making the final write hears nothing for its role; a closed or
+// exited binder's role goes to the primary handler, or nowhere without one.
+func TestReleaseBinderWakeActorAndFallback(t *testing.T) {
+	ctx := context.Background()
+	t.Run("binders that settle the job themselves", func(t *testing.T) {
+		s, task, _, d, i, v, jobs := binderFixture(t, 1)
+		j := bindJob(t, s, task, d, i, v, jobs[0])
+		j = releaseStep(t, s, api.ReleaseRequest{RequestID: "merged", Operation: "merged", AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, IntegratedCommit: j.IntegratedCommit}, task)
+		j = wakeStep(t, s, task, d, j, "block", "block")
+		evidence := recoveryEvidence(t, s, task, i, j)
+		evidence.Disposition, evidence.NoPublication, evidence.JournalState = "refuse", false, "restored"
+		if _, err := s.db.Exec(`UPDATE agents SET status='exited' WHERE id=?`, d.ID); err != nil {
+			t.Fatal(err)
+		}
+		refused, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "reconcile", Operation: "reconcile", AgentID: i.ID, RunID: i.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, Reconciliation: &evidence})
+		if err != nil || refused.State != "refused" {
+			t.Fatal(refused.State, err)
+		}
+		checkBinderWake(t, s, task, v, refused, "refused", "reconcile", "verification")
+		if n := allReleaseWakes(t, s, task); n != 1 {
+			t.Fatal("the reconciling binder heard of its own write", n)
+		}
+		hand := recordHandRelease(t, s, task, "hand", candidateB, []string{candidateB})
+		done, err := s.ReleaseAction(ctx, task.ID, api.ReleaseRequest{RequestID: "supersede", Operation: "supersede", AgentID: v.ID, RunID: v.RunID, JobID: refused.ID, ExpectedGeneration: refused.Generation, Supersession: &api.ReleaseSupersession{ReleasedCommit: candidateB, HandReleaseID: hand.ID}})
+		if err != nil || done.State != "superseded" {
+			t.Fatal(done.State, err)
+		}
+		checkBinderWake(t, s, task, i, done, "superseded", "supersede", "inputs")
+		if n := len(wakesBySubject(t, s, task, v.ID, releaseBinderWakeSubject)); n != 1 {
+			t.Fatal("the superseding binder heard of its own write", n)
+		}
+		if n := allReleaseWakes(t, s, task); n != 2 {
+			t.Fatal("project notices", n)
+		}
+	})
+	t.Run("closed and exited binders go to the primary handler", func(t *testing.T) {
+		s, task, h, d, i, v, jobs := binderFixture(t, 1)
+		j := bindJob(t, s, task, d, i, v, jobs[0])
+		if _, err := s.db.Exec(`UPDATE agents SET status=? WHERE id=?`, api.AgentClosed, i.ID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.db.Exec(`UPDATE agents SET status=? WHERE id=?`, api.AgentExited, v.ID); err != nil {
+			t.Fatal(err)
+		}
+		done := mergeAndSettle(t, s, task, d, j, "released")
+		wakes := wakesBySubject(t, s, task, h.ID, releaseBinderWakeSubject)
+		if len(wakes) != 1 {
+			t.Fatal("primary handler notices", len(wakes))
+		}
+		checkWakeRefs(t, wakes[0], h.ID, done, "released", done.ID+"-finish")
+		for _, want := range []string{
+			"The inputs binder inputs-binder (agent " + i.ID + ") is closed, so this goes to the primary handler.",
+			"The verification importer verifier-import (agent " + v.ID + ") is exited, so this goes to the primary handler.",
+			i.RunID, v.RunID, binderStepText["inputs"], binderStepText["verification"],
+		} {
+			if !strings.Contains(wakes[0].Envelope.Body.Text, want) {
+				t.Fatalf("fallback notice lacks %q: %q", want, wakes[0].Envelope.Body.Text)
+			}
+		}
+		if n := allReleaseWakes(t, s, task); n != 1 {
+			t.Fatal("project notices", n)
+		}
+	})
+	t.Run("closed binders and no open handler", func(t *testing.T) {
+		s, task, h, d, i, v, jobs := binderFixture(t, 1)
+		j := bindJob(t, s, task, d, i, v, jobs[0])
+		if _, err := s.db.Exec(`UPDATE agents SET status=? WHERE id IN (?,?,?)`, api.AgentClosed, h.ID, i.ID, v.ID); err != nil {
+			t.Fatal(err)
+		}
+		if done := mergeAndSettle(t, s, task, d, j, "released"); done.State != "released" {
+			t.Fatal("finish failed", done.State)
+		}
+		if n := allReleaseWakes(t, s, task); n != 0 {
+			t.Fatal("notice sent with no open recipient", n)
+		}
+	})
+}
+
+// a7: a replayed settle sends nothing more, a job with no binders and no
+// unholder sends nothing, and a batch member has no binders of its own.
+func TestReleaseBinderWakeOnceAndBatch(t *testing.T) {
+	ctx := context.Background()
+	t.Run("replayed finish and refuse", func(t *testing.T) {
+		s, task, _, d, i, v, jobs := binderFixture(t, 2)
+		j := bindJob(t, s, task, d, i, v, jobs[0])
+		j = releaseStep(t, s, api.ReleaseRequest{RequestID: "merged", Operation: "merged", AgentID: d.ID, RunID: d.RunID, JobID: j.ID, ExpectedGeneration: j.Generation, IntegratedCommit: j.IntegratedCommit}, task)
+		finish := settleRequest("finish", d, j, "released")
+		done := releaseStep(t, s, finish, task)
+		if again, err := s.ReleaseAction(ctx, task.ID, finish); err != nil || again.Generation != done.Generation {
+			t.Fatal("finish replay", again.Generation, err)
+		}
+		if n := allReleaseWakes(t, s, task); n != 2 {
+			t.Fatal("finish notices", n)
+		}
+		k := bindJob(t, s, task, d, i, v, jobs[1])
+		refuse := api.ReleaseRequest{RequestID: "refuse-k", Operation: "refuse", AgentID: d.ID, RunID: d.RunID, JobID: k.ID, ExpectedGeneration: k.Generation, IntegratedCommit: k.Commit}
+		releaseStep(t, s, refuse, task)
+		if _, err := s.ReleaseAction(ctx, task.ID, refuse); err != nil {
+			t.Fatal("refuse replay", err)
+		}
+		for _, a := range []api.Agent{i, v} {
+			if n := len(wakesBySubject(t, s, task, a.ID, releaseBinderWakeSubject)); n != 2 {
+				t.Fatalf("%s notices %d", a.Name, n)
+			}
+		}
+		if n := allReleaseWakes(t, s, task); n != 4 {
+			t.Fatal("project notices", n)
+		}
+	})
+	t.Run("no binders and no unholder", func(t *testing.T) {
+		s, task, _, d, _, _, jobs := binderFixture(t, 1)
+		releaseThrough(t, s, task, d, jobs[0])
+		if n := allReleaseWakes(t, s, task); n != 0 {
+			t.Fatal(n)
+		}
+	})
+	t.Run("batch lead binder hears, members add nothing", func(t *testing.T) {
+		f := newBatchFixture(t, 2)
+		f.declare(t)
+		f.publish(t)
+		lead, err := f.finish("released", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, m := range f.members {
+			if got := f.load(t, m.ID); got.State != "released" {
+				t.Fatal("member not settled", got.State)
+			}
+			if rows := binderRows(t, f.s, f.task, m.ID); len(rows) != 0 {
+				t.Fatalf("member has binders %+v", rows)
+			}
+		}
+		wakes := wakesBySubject(t, f.s, f.task, f.h.ID, releaseBinderWakeSubject)
+		if len(wakes) != 1 {
+			t.Fatal("lead binder notices", len(wakes))
+		}
+		checkWakeRefs(t, wakes[0], f.h.ID, lead, "released", wakes[0].Envelope.Refs["receipt"])
+		if n := allReleaseWakes(t, f.s, f.task); n != 1 {
+			t.Fatal("project notices", n)
+		}
+	})
+}
