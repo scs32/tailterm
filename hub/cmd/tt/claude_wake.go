@@ -282,6 +282,9 @@ type claudeInputError struct {
 	// Empty reports a refused read for typed text that found the input box
 	// empty: the text is not drawn yet, or is gone.
 	Empty bool
+	// snap is the prompt area the refusal saw, unredacted and in memory only;
+	// claudeWakeTrackSkip keeps a redacted copy in the skip record.
+	snap *claudeInputSnapshot
 }
 
 func (e claudeInputError) Error() string { return e.reason }
@@ -799,7 +802,9 @@ func nativeClaudeInspect(ctx context.Context, b runtimeBinding, expected string)
 	}
 	transcript, err := claudeTranscriptSnapshotContext(ctx, b, time.Now())
 	if err != nil {
-		return claudeWakeSnapshot{}, err
+		// The pane passed; its snapshot goes with the transcript's refusal so
+		// the skip record shows what the pane check read.
+		return claudeWakeSnapshot{}, claudeSnapError{err: err, snap: claudeInputSnapshotOf(pane.Raw, pane.CursorX, pane.CursorY)}
 	}
 	transcript.Pane, transcript.SessionID, transcript.Created, transcript.PanePID, transcript.Screen = pane.Pane, pane.SessionID, pane.Created, pane.PanePID, visible
 	transcript.CaretX, transcript.CaretY = pane.CursorX, pane.CursorY
@@ -811,14 +816,21 @@ func nativeClaudeInspect(ctx context.Context, b runtimeBinding, expected string)
 // the start of an empty input, and only the screen from the cursor row down
 // is returned.
 func claudeInputScreen(raw string, cursorX, cursorY int, expected string) (string, error) {
-	full, visible, err := claudePlainScreen(raw)
+	rows, bad, err := claudeParseCells(raw)
 	if err != nil {
 		return "", err
+	}
+	// Every refusal below carries the prompt area's snapshot (claudeInputError
+	// snap) for the skip record; its message is unchanged.
+	snap := claudeSnapshotOf(rows, cursorX, cursorY)
+	full, visible, err := claudePlainRows(rows, bad)
+	if err != nil {
+		return "", claudeInputError{reason: err.Error(), snap: snap}
 	}
 	// Dialogs are detected on everything drawn in the active prompt area,
 	// faint text included; the transcript above the input box is not a prompt.
 	if match, blocked := claudeDialog(full); blocked {
-		return "", errors.New("Claude pane has a permission or selection prompt: " + match)
+		return "", claudeInputError{reason: "Claude pane has a permission or selection prompt: " + match, snap: snap}
 	}
 	// A refusal carries the typed text when the input box is readable, so a
 	// wake can tell stray terminal replies from anything else.
@@ -826,12 +838,12 @@ func claudeInputScreen(raw string, cursorX, cursorY int, expected string) (strin
 	if expected == "" {
 		lines := strings.Split(visible, "\n")
 		if cursorX != 2 || cursorY >= len(lines) {
-			return "", claudeInputError{reason: "Claude cursor is not at an empty input", Text: held}
+			return "", claudeInputError{reason: "Claude cursor is not at an empty input", Text: held, snap: snap}
 		}
 		visible = strings.Join(lines[cursorY:], "\n")
 	}
 	if !exactClaudeInput(visible, expected) {
-		return "", claudeInputError{reason: "Claude input is occupied, prompting, or unknown", Text: held, Empty: expected != "" && emptyClaudeInput(visible)}
+		return "", claudeInputError{reason: "Claude input is occupied, prompting, or unknown", Text: held, Empty: expected != "" && emptyClaudeInput(visible), snap: snap}
 	}
 	return visible, nil
 }
@@ -845,10 +857,22 @@ type claudeCell struct {
 // text and a copy without the faint text Claude Code draws after the input
 // marker: its prompt suggestion and its Try "…" placeholder, neither of
 // which is input (Claude Code 2.1.284 draws both with SGR 2 and removes the suggestion as soon as a key is typed; see
-// testdata/claude-pane). Faint text must be a trailing run: faint text followed
+// testdata/claude-pane; 2.1.316 draws them the same way, the v2316 captures of
+// bug wi_8ebd8c723dec5777). Faint text must be a trailing run: faint text followed
 // by normal text, or any escape other than SGR in the input area, fails closed.
 // Attributes carry across rows, as tmux emits only changes.
 func claudePlainScreen(raw string) (string, string, error) {
+	rows, bad, err := claudeParseCells(raw)
+	if err != nil {
+		return "", "", err
+	}
+	return claudePlainRows(rows, bad)
+}
+
+// claudeParseCells reads a `capture-pane -p -e` capture into rows of cells
+// with their faint attribute. bad marks a row with an escape other than a
+// known SGR.
+func claudeParseCells(raw string) ([][]claudeCell, []bool, error) {
 	var rows [][]claudeCell
 	var bad []bool
 	var row []claudeCell
@@ -866,7 +890,7 @@ func claudePlainScreen(raw string) (string, string, error) {
 				j++
 			}
 			if j >= len(raw) {
-				return "", "", errors.New("Claude pane capture has a truncated escape")
+				return nil, nil, errors.New("Claude pane capture has a truncated escape")
 			}
 			if raw[j] != 'm' || !applyClaudeSGR(raw[i+2:j], &faint) {
 				rowBad = true
@@ -879,7 +903,7 @@ func claudePlainScreen(raw string) (string, string, error) {
 				j++
 			}
 			if j >= len(raw) {
-				return "", "", errors.New("Claude pane capture has a truncated escape")
+				return nil, nil, errors.New("Claude pane capture has a truncated escape")
 			}
 			if raw[j] == 0x1b {
 				j++
@@ -896,12 +920,12 @@ func claudePlainScreen(raw string) (string, string, error) {
 	if len(row) > 0 {
 		rows, bad = append(rows, row), append(bad, rowBad)
 	}
-	input := -1
-	for i, cells := range rows {
-		if strings.HasPrefix(strings.TrimSpace(claudeCellText(cells)), "❯") {
-			input = i
-		}
-	}
+	return rows, bad, nil
+}
+
+// claudePlainRows is claudePlainScreen on parsed rows.
+func claudePlainRows(rows [][]claudeCell, bad []bool) (string, string, error) {
+	input := claudeInputRow(rows)
 	lines := make([]string, len(rows))
 	for i, cells := range rows {
 		lines[i] = claudeCellText(cells)
@@ -944,6 +968,110 @@ func claudePlainScreen(raw string) (string, string, error) {
 		}
 	}
 	return full, strings.Join(lines, "\n"), nil
+}
+
+// claudeInputRow is the last row whose text starts with the input marker ❯,
+// or -1.
+func claudeInputRow(rows [][]claudeCell) int {
+	input := -1
+	for i, cells := range rows {
+		if strings.HasPrefix(strings.TrimSpace(claudeCellText(cells)), "❯") {
+			input = i
+		}
+	}
+	return input
+}
+
+// claudeInputRun is one run of captured text with one faint attribute.
+type claudeInputRun struct {
+	Faint bool
+	Text  string
+}
+
+// claudeInputSnapshot is the prompt area of one capture, in memory only and
+// unredacted: the last ❯ row and the rows below it to the end of the capture,
+// at most claudeSnapshotRows (with no ❯ row, the last rows of the capture),
+// each as runs of faint and normal text, with the cursor and the pane's row
+// count. A refusal carries it so the skip record can keep a redacted copy.
+type claudeInputSnapshot struct {
+	CursorX, CursorY, PaneRows, FirstRow int
+	Rows                                 [][]claudeInputRun
+}
+
+const claudeSnapshotRows = 8
+
+// claudeSnapshotOf builds the snapshot of parsed rows. Trailing spaces of a
+// row are dropped.
+func claudeSnapshotOf(rows [][]claudeCell, cursorX, cursorY int) *claudeInputSnapshot {
+	snap := &claudeInputSnapshot{CursorX: cursorX, CursorY: cursorY, PaneRows: len(rows)}
+	for len(rows) > 0 && len(rows[len(rows)-1]) == 0 {
+		rows = rows[:len(rows)-1] // blank rows at the bottom of the pane
+	}
+	first := claudeInputRow(rows)
+	if first < 0 {
+		first = max(0, len(rows)-claudeSnapshotRows)
+	}
+	snap.FirstRow = first
+	for _, cells := range rows[first:min(len(rows), first+claudeSnapshotRows)] {
+		end := len(cells)
+		for end > 0 && unicode.IsSpace(cells[end-1].r) {
+			end--
+		}
+		var runs []claudeInputRun
+		for _, cell := range cells[:end] {
+			if n := len(runs); n > 0 && runs[n-1].Faint == cell.faint {
+				runs[n-1].Text += string(cell.r)
+				continue
+			}
+			runs = append(runs, claudeInputRun{Faint: cell.faint, Text: string(cell.r)})
+		}
+		snap.Rows = append(snap.Rows, runs)
+	}
+	return snap
+}
+
+// claudeInputSnapshotOf parses a capture for its snapshot; nil when the
+// capture cannot be read.
+func claudeInputSnapshotOf(raw string, cursorX, cursorY int) *claudeInputSnapshot {
+	rows, _, err := claudeParseCells(raw)
+	if err != nil {
+		return nil
+	}
+	return claudeSnapshotOf(rows, cursorX, cursorY)
+}
+
+// claudeSnapError carries the pane snapshot beside a refusal that did not
+// come from the pane check (the transcript check after it, for example).
+type claudeSnapError struct {
+	err  error
+	snap *claudeInputSnapshot
+}
+
+func (e claudeSnapError) Error() string { return e.err.Error() }
+func (e claudeSnapError) Unwrap() error { return e.err }
+
+// claudeWrapError keeps a message and lets errors.Is and errors.As reach
+// every error in errs: a refusal built from another refusal's text keeps that
+// refusal's snapshot and busy-turn times for the skip record.
+type claudeWrapError struct {
+	msg  string
+	errs []error
+}
+
+func (e claudeWrapError) Error() string   { return e.msg }
+func (e claudeWrapError) Unwrap() []error { return e.errs }
+
+// claudeErrorSnapshot returns the pane snapshot an error carries, or nil.
+func claudeErrorSnapshot(err error) *claudeInputSnapshot {
+	var input claudeInputError
+	if errors.As(err, &input) && input.snap != nil {
+		return input.snap
+	}
+	var other claudeSnapError
+	if errors.As(err, &other) {
+		return other.snap
+	}
+	return nil
 }
 
 func claudeCellText(cells []claudeCell) string {
@@ -1138,8 +1266,13 @@ func claudeWakeSaveReason(intent *claudeWakeIntent, reason string) {
 	intent.LastRetry = claudeClip(strings.Join(strings.Fields(reason), " "), 200)
 }
 
-// claudeWakeSkip is one episode of unsafe skips with the same reason: private
-// host state beside the wake intent, scoped to a run.
+// claudeWakeSkip is one episode of unsafe skips: private host state beside the
+// wake intent, scoped to a run, at claudeWakeSkipPath, written 0600. For most
+// agents an episode keeps one reason; for the owner helper (Owner) it spans
+// reason changes and keeps the reasons it saw. The record outlives its episode:
+// a confirmed wake sets EndedAt and the next skip starts a new episode in the
+// same file, carrying the snapshots and any recovery notice still due. The
+// relay never prunes it and never posts, logs or sends the snapshots.
 type claudeWakeSkip struct {
 	Run         string    `json:"run"`
 	Reason      string    `json:"reason"`
@@ -1154,6 +1287,71 @@ type claudeWakeSkip struct {
 	TurnStartedAt time.Time `json:"turnStartedAt,omitempty"`
 	LastEventAt   time.Time `json:"lastEventAt,omitempty"`
 	Tool          string    `json:"tool,omitempty"`
+	// EndedAt is set when the episode ended: a confirmed wake, a quiet gap,
+	// or, for the owner helper, a working turn.
+	EndedAt time.Time `json:"endedAt,omitempty"`
+	// Owner marks an owner-helper episode (binding role owner_helper): owner
+	// notices at claudeWakeOwnerFirst, then every claudeWakeOwnerRepeat, and
+	// one recovery notice when a wake gets through.
+	Owner bool `json:"owner,omitempty"`
+	// Reasons are the distinct reasons of an owner episode, oldest first, at
+	// most claudeWakeOwnerReasons.
+	Reasons []string `json:"reasons,omitempty"`
+	// Notices counts the owner notices posted in the episode; FirstNoticeAt is
+	// when the first was posted, the base of the repeats.
+	Notices       int       `json:"notices,omitempty"`
+	FirstNoticeAt time.Time `json:"firstNoticeAt,omitempty"`
+	// RecoveredAt is set only on the copy handed to escalate for a recovery
+	// notice: when the wake got through.
+	RecoveredAt time.Time `json:"recoveredAt,omitempty"`
+	// Recovery is an ended owner episode that had notices and still owes the
+	// owner its recovery notice.
+	Recovery *claudeWakeRecovery `json:"recovery,omitempty"`
+	// Snapshots keeps the first snapshot of each distinct reason, at most
+	// claudeSkipFirstSnapshots; LatestSnapshot is the latest skip's, replaced
+	// by every skip. At most four in all, across episodes of the run.
+	Snapshots      []claudeSkipSnapshot `json:"snapshots,omitempty"`
+	LatestSnapshot *claudeSkipSnapshot  `json:"latestSnapshot,omitempty"`
+}
+
+// claudeWakeRecovery is an owner episode that ended after at least one owner
+// notice. WokenAt is the confirmed wake that makes the recovery notice due;
+// TriedAt spaces its retries.
+type claudeWakeRecovery struct {
+	Since   time.Time `json:"since"`
+	LastAt  time.Time `json:"lastAt"`
+	Notices int       `json:"notices"`
+	Reasons []string  `json:"reasons,omitempty"`
+	WokenAt time.Time `json:"wokenAt,omitempty"`
+	TriedAt time.Time `json:"triedAt,omitempty"`
+}
+
+// claudeSkipSnapshot is the redacted, bounded copy of a refusal's
+// claudeInputSnapshot kept in the skip record, so the classification can be
+// audited: each row's runs of faint and normal text, at most
+// claudeSkipSnapshotBytes of text in all (Truncated when cut). A run of eight
+// or more of one character is kept as the character, ×, and its count. Text
+// passes the secret scan first; a scan that did not finish keeps no text, only
+// each run's attribute and length, with Redaction "incomplete".
+type claudeSkipSnapshot struct {
+	At        time.Time             `json:"at"`
+	Reason    string                `json:"reason"`
+	CursorX   int                   `json:"cursorX"`
+	CursorY   int                   `json:"cursorY"`
+	PaneRows  int                   `json:"paneRows"`
+	FirstRow  int                   `json:"firstRow"`
+	Rows      [][]claudeSnapshotRun `json:"rows"`
+	Truncated bool                  `json:"truncated,omitempty"`
+	Redaction string                `json:"redaction,omitempty"`
+}
+
+// claudeSnapshotRun is one stored run: its text, or only its length when the
+// redaction scan did not finish.
+type claudeSnapshotRun struct {
+	Faint bool   `json:"faint,omitempty"`
+	Mixed bool   `json:"mixed,omitempty"`
+	Text  string `json:"text,omitempty"`
+	Len   int    `json:"len,omitempty"`
 }
 
 const (
@@ -1166,7 +1364,28 @@ const (
 	claudeWakeSkipGap = 6 * time.Minute
 	// claudeWakeEscalateRetry spaces attempts to report after a failed one.
 	claudeWakeEscalateRetry = time.Minute
+	// claudeWakeOwnerFirst is how long the owner helper's wakes may be skipped
+	// before the owner is told; claudeWakeOwnerRepeat spaces the repeats from
+	// the first notice (bug wi_8ebd8c723dec5777 f3, order #56805).
+	claudeWakeOwnerFirst  = 15 * time.Minute
+	claudeWakeOwnerRepeat = 30 * time.Minute
+	// claudeWakeOwnerReasons bounds the reasons an owner episode keeps.
+	claudeWakeOwnerReasons = 5
+	// claudeSkipFirstSnapshots bounds the first-of-a-reason snapshots and
+	// claudeSkipSnapshotBytes the text of one snapshot.
+	claudeSkipFirstSnapshots = 3
+	claudeSkipSnapshotBytes  = 480
+	// claudeSkipRedactBudget bounds the secret scan of one snapshot.
+	claudeSkipRedactBudget = 50 * time.Millisecond
 )
+
+// claudeSkipRedactToken is the hub token the snapshot scan redacts exactly,
+// as the tool ledger does (toolRedactExact). A variable so tests use their own.
+var claudeSkipRedactToken = func(b runtimeBinding) string {
+	e := env{hub: b.Hub}
+	e.loadConfig()
+	return e.token
+}
 
 func claudeWakeSkipPath(b runtimeBinding) string {
 	return filepath.Join(relayDir(), bindingKey(b)+"-"+b.Run+".claude-wake-skip.json")
@@ -1181,50 +1400,264 @@ func claudeWakeWith(ctx context.Context, b runtimeBinding, prompt string, ops cl
 	return err
 }
 
-// claudeWakeTrackSkip keeps the current skip episode and escalates it once
-// when it has lasted claudeWakeSkipBound. Only unsafe skips count: a busy
-// turn, a pending tool, a dialog, an unreadable transcript. A confirmed wake
-// ends the episode; an unconfirmed one has its own retry and stuck reporting
-// and leaves the episode as it is. A changed reason starts a new episode, so
-// an agent that moves between tools is working, not reported. A turn in
-// progress is one reason for the whole turn, whatever tools it runs, so the
-// record also keeps that turn's start and last transcript event for the
-// report to state. A failed report is tried again at most once a minute,
-// under the same request identity.
+// claudeWakeTrackSkip keeps the current skip episode and reports it. Only
+// unsafe skips count: a busy turn, a pending tool, a dialog, an unreadable
+// transcript. Each one saves a redacted snapshot of what the pane check read
+// (claudeSkipSnapshot). A confirmed wake ends the episode; an unconfirmed one
+// has its own retry and stuck reporting and leaves the episode as it is. A
+// quiet gap longer than claudeWakeSkipGap also ends it. A failed report is
+// tried again at most once a minute, under the same request identity.
+//
+// For every agent but the owner helper, a changed reason starts a new
+// episode, so an agent that moves between tools is working, not reported,
+// and an episode is reported once, when it has lasted claudeWakeSkipBound. A
+// turn in progress is one reason for the whole turn, whatever tools it runs,
+// so the record also keeps that turn's start and last transcript event for
+// the report to state.
+//
+// For the owner helper (binding role owner_helper) only the owner can act, so
+// the owner is told, through owner notices the Discord bridge mirrors: the
+// first at claudeWakeOwnerFirst, then every claudeWakeOwnerRepeat after it
+// while the skips last, and one recovery notice when a wake gets through. A
+// changed reason does not restart its clock. A turn in progress whose last
+// transcript event is newer than claudeWakeSkipBound means the helper is
+// working, not unreachable: it ends the episode.
 func claudeWakeTrackSkip(ctx context.Context, b runtimeBinding, ops claudeWakeOps, wakeErr error) {
 	path := claudeWakeSkipPath(b)
+	now := ops.now().UTC()
+	var skip claudeWakeSkip
+	data, readErr := os.ReadFile(path)
+	if readErr == nil && (json.Unmarshal(data, &skip) != nil || skip.Run != b.Run) {
+		skip = claudeWakeSkip{}
+	}
 	if wakeErr == nil {
-		_ = os.Remove(path)
+		if readErr != nil || skip.Run == "" {
+			return
+		}
+		claudeWakeSkipEnd(&skip, now)
+		if skip.Recovery != nil && skip.Recovery.WokenAt.IsZero() {
+			skip.Recovery.WokenAt = now
+		}
+		claudeWakeSkipRecover(ctx, b, ops, &skip, now)
+		claudeWakeSkipSave(path, b, skip, now)
 		return
 	}
 	if !errors.Is(wakeErr, errClaudeWakeUnsafe) {
 		return
 	}
-	now := ops.now().UTC()
 	reason := claudeClip(strings.Join(strings.Fields(strings.TrimPrefix(wakeErr.Error(), errClaudeWakeUnsafe.Error()+": ")), " "), 200)
-	var skip claudeWakeSkip
-	if data, err := os.ReadFile(path); err == nil {
-		_ = json.Unmarshal(data, &skip)
-	}
-	if skip.Run != b.Run || skip.Reason != reason || skip.Since.IsZero() || now.Sub(skip.LastAt) > claudeWakeSkipGap {
-		skip = claudeWakeSkip{Run: b.Run, Reason: reason, Since: now}
-	}
-	skip.LastAt = now
+	owner := b.Role == api.AgentRoleOwnerHelper
+	claudeSkipKeepSnapshot(&skip, b, reason, claudeErrorSnapshot(wakeErr), now)
+	claudeWakeSkipRecover(ctx, b, ops, &skip, now)
 	var busy claudeTurnBusyError
-	_ = errors.As(wakeErr, &busy)
+	isBusy := errors.As(wakeErr, &busy)
+	working := owner && isBusy && !busy.LastEventAt.IsZero() && now.Sub(busy.LastEventAt) < claudeWakeSkipBound
+	if skip.EndedAt.IsZero() && !skip.Since.IsZero() && now.Sub(skip.LastAt) > claudeWakeSkipGap {
+		claudeWakeSkipEnd(&skip, skip.LastAt)
+	}
+	if working {
+		claudeWakeSkipEnd(&skip, now)
+		claudeWakeSkipSave(path, b, skip, now)
+		return
+	}
+	if skip.Since.IsZero() || !skip.EndedAt.IsZero() || skip.Owner != owner || (!owner && skip.Reason != reason) {
+		skip = claudeWakeSkip{Run: b.Run, Since: now, Owner: owner, Snapshots: skip.Snapshots, LatestSnapshot: skip.LatestSnapshot, Recovery: skip.Recovery}
+	}
+	skip.Reason, skip.LastAt = reason, now
+	if owner && !slices.Contains(skip.Reasons, reason) && len(skip.Reasons) < claudeWakeOwnerReasons {
+		skip.Reasons = append(skip.Reasons, reason)
+	}
 	skip.TurnStartedAt, skip.LastEventAt, skip.Tool = busy.TurnStartAt.UTC(), busy.LastEventAt.UTC(), claudeClip(busy.Tool, 64)
-	if skip.EscalatedAt.IsZero() && now.Sub(skip.Since) >= claudeWakeSkipBound && ops.escalate != nil && (skip.TriedAt.IsZero() || now.Sub(skip.TriedAt) >= claudeWakeEscalateRetry) {
+	retryOK := skip.TriedAt.IsZero() || now.Sub(skip.TriedAt) >= claudeWakeEscalateRetry
+	switch {
+	case !owner:
+		if skip.EscalatedAt.IsZero() && now.Sub(skip.Since) >= claudeWakeSkipBound && ops.escalate != nil && retryOK {
+			skip.TriedAt = now
+			if err := ops.escalate(ctx, b, skip); err != nil {
+				fmt.Fprintf(os.Stderr, "[tt relay] %s %s Claude wake skip escalation failed: %v\n", now.Format(time.RFC3339), b.Agent, err)
+			} else {
+				skip.EscalatedAt = now
+				fmt.Fprintf(os.Stderr, "[tt relay] %s %s Claude wake skipped since %s, escalated once: %s\n", now.Format(time.RFC3339), b.Agent, skip.Since.Format(time.RFC3339), skip.Reason)
+			}
+		}
+	case claudeWakeOwnerDue(skip, now) && ops.escalate != nil && retryOK:
 		skip.TriedAt = now
 		if err := ops.escalate(ctx, b, skip); err != nil {
-			fmt.Fprintf(os.Stderr, "[tt relay] %s %s Claude wake skip escalation failed: %v\n", now.Format(time.RFC3339), b.Agent, err)
-		} else {
-			skip.EscalatedAt = now
-			fmt.Fprintf(os.Stderr, "[tt relay] %s %s Claude wake skipped since %s, escalated once: %s\n", now.Format(time.RFC3339), b.Agent, skip.Since.Format(time.RFC3339), skip.Reason)
+			fmt.Fprintf(os.Stderr, "[tt relay] %s %s Claude wake skip owner notice %d failed: %v\n", now.Format(time.RFC3339), b.Agent, skip.Notices+1, err)
+			break
 		}
+		if skip.Notices == 0 {
+			// A newer episode's first notice supersedes an older recovery.
+			skip.FirstNoticeAt, skip.Recovery = now, nil
+		}
+		skip.Notices++
+		skip.EscalatedAt = now
+		fmt.Fprintf(os.Stderr, "[tt relay] %s %s Claude wake skipped since %s, owner notice %d: %s\n", now.Format(time.RFC3339), b.Agent, skip.Since.Format(time.RFC3339), skip.Notices, skip.Reason)
 	}
+	claudeWakeSkipSave(path, b, skip, now)
+}
+
+// claudeWakeOwnerDue reports an owner notice due: the first once the episode
+// has lasted claudeWakeOwnerFirst, repeat n once claudeWakeOwnerRepeat times n
+// has passed since the first.
+func claudeWakeOwnerDue(skip claudeWakeSkip, now time.Time) bool {
+	if skip.Notices == 0 {
+		return now.Sub(skip.Since) >= claudeWakeOwnerFirst
+	}
+	return now.Sub(skip.FirstNoticeAt) >= time.Duration(skip.Notices)*claudeWakeOwnerRepeat
+}
+
+// claudeWakeSkipEnd ends an open episode at at. An owner episode that told the
+// owner keeps a recovery notice due on the next confirmed wake.
+func claudeWakeSkipEnd(skip *claudeWakeSkip, at time.Time) {
+	if skip.Since.IsZero() || !skip.EndedAt.IsZero() {
+		return
+	}
+	skip.EndedAt = at
+	if skip.Owner && skip.Notices > 0 {
+		skip.Recovery = &claudeWakeRecovery{Since: skip.Since, LastAt: skip.LastAt, Notices: skip.Notices, Reasons: skip.Reasons}
+	}
+}
+
+// claudeWakeSkipRecover posts a recovery notice that is due: an ended owner
+// episode with notices whose wake has since got through. A failed post is
+// tried again on a later wake pass, at most once a minute.
+func claudeWakeSkipRecover(ctx context.Context, b runtimeBinding, ops claudeWakeOps, skip *claudeWakeSkip, now time.Time) {
+	r := skip.Recovery
+	if r == nil || r.WokenAt.IsZero() || ops.escalate == nil || (!r.TriedAt.IsZero() && now.Sub(r.TriedAt) < claudeWakeEscalateRetry) {
+		return
+	}
+	r.TriedAt = now
+	notice := claudeWakeSkip{Run: b.Run, Owner: true, Since: r.Since, LastAt: r.LastAt, Notices: r.Notices, Reasons: r.Reasons, RecoveredAt: r.WokenAt}
+	if err := ops.escalate(ctx, b, notice); err != nil {
+		fmt.Fprintf(os.Stderr, "[tt relay] %s %s Claude wake recovery notice failed: %v\n", now.Format(time.RFC3339), b.Agent, err)
+		return
+	}
+	skip.Recovery = nil
+	fmt.Fprintf(os.Stderr, "[tt relay] %s %s Claude wake got through at %s after skips since %s, owner told\n", now.Format(time.RFC3339), b.Agent, r.WokenAt.Format(time.RFC3339), r.Since.Format(time.RFC3339))
+}
+
+func claudeWakeSkipSave(path string, b runtimeBinding, skip claudeWakeSkip, now time.Time) {
 	if err := writePrivateJSON(path, skip); err != nil {
 		fmt.Fprintf(os.Stderr, "[tt relay] %s %s Claude wake skip record not saved: %v\n", now.Format(time.RFC3339), b.Agent, err)
 	}
+}
+
+// claudeSkipKeepSnapshot stores this skip's snapshot: as the latest, and as
+// the first of its reason while fewer than claudeSkipFirstSnapshots reasons
+// have one. A skip with no pane snapshot (a refusal before the pane was read)
+// keeps the latest as it was.
+func claudeSkipKeepSnapshot(skip *claudeWakeSkip, b runtimeBinding, reason string, snap *claudeInputSnapshot, now time.Time) {
+	if snap == nil {
+		return
+	}
+	stored := claudeSkipRedactSnapshot(snap, claudeSkipRedactToken(b), reason, now, time.Now().Add(claudeSkipRedactBudget))
+	skip.LatestSnapshot = &stored
+	for _, s := range skip.Snapshots {
+		if s.Reason == reason {
+			return
+		}
+	}
+	if len(skip.Snapshots) < claudeSkipFirstSnapshots {
+		skip.Snapshots = append(skip.Snapshots, stored)
+	}
+}
+
+// claudeSkipRedactSnapshot is the stored copy of snap: runs of eight or more
+// of one character compressed, every row through the secret scan
+// (toolEvidenceRedact with the hub token exact), then cut to
+// claudeSkipSnapshotBytes of text. deadline is wall time, not the relay's
+// clock: the scan's own budget.
+func claudeSkipRedactSnapshot(snap *claudeInputSnapshot, token, reason string, now, deadline time.Time) claudeSkipSnapshot {
+	out := claudeSkipSnapshot{At: now, Reason: reason, CursorX: snap.CursorX, CursorY: snap.CursorY, PaneRows: snap.PaneRows, FirstRow: snap.FirstRow}
+	exact := toolRedactExact(token)
+	rows := make([][]claudeSnapshotRun, 0, len(snap.Rows))
+	complete := true
+	for _, row := range snap.Rows {
+		var joined strings.Builder
+		for _, run := range row {
+			joined.WriteString(run.Text)
+		}
+		redacted, found, ok := toolEvidenceRedact(joined.String(), exact, deadline)
+		if !ok {
+			complete = false
+			break
+		}
+		stored := []claudeSnapshotRun{}
+		perRun := 0
+		for _, run := range row {
+			text, n, ok := toolEvidenceRedact(run.Text, exact, deadline)
+			if !ok {
+				complete = false
+				break
+			}
+			perRun += n
+			stored = append(stored, claudeSnapshotRun{Faint: run.Faint, Text: claudeSnapshotSqueeze(text)})
+		}
+		if !complete {
+			break
+		}
+		if found > perRun {
+			// A secret spans runs: keep the row's redacted text as one run.
+			stored = []claudeSnapshotRun{{Mixed: true, Text: claudeSnapshotSqueeze(redacted)}}
+		}
+		rows = append(rows, stored)
+	}
+	if !complete {
+		out.Redaction = "incomplete"
+		out.Rows = nil
+		for _, row := range snap.Rows {
+			lens := []claudeSnapshotRun{}
+			for _, run := range row {
+				lens = append(lens, claudeSnapshotRun{Faint: run.Faint, Len: utf8.RuneCountInString(run.Text)})
+			}
+			out.Rows = append(out.Rows, lens)
+		}
+		return out
+	}
+	budget := claudeSkipSnapshotBytes
+	for i, row := range rows {
+		for k, run := range row {
+			if len(run.Text) <= budget {
+				budget -= len(run.Text)
+				continue
+			}
+			cut := 0
+			for cut < len(run.Text) {
+				_, size := utf8.DecodeRuneInString(run.Text[cut:])
+				if cut+size > budget {
+					break
+				}
+				cut += size
+			}
+			row[k].Text = run.Text[:cut]
+			rows[i] = row[:k+1]
+			out.Rows, out.Truncated = rows[:i+1], true
+			return out
+		}
+	}
+	out.Rows = rows
+	return out
+}
+
+// claudeSnapshotSqueeze keeps a run of eight or more of one character (a
+// rule, padding) as the character, ×, and its count.
+func claudeSnapshotSqueeze(text string) string {
+	var out strings.Builder
+	runes := []rune(text)
+	for i := 0; i < len(runes); {
+		j := i
+		for j < len(runes) && runes[j] == runes[i] {
+			j++
+		}
+		if j-i >= 8 {
+			fmt.Fprintf(&out, "%c×%d", runes[i], j-i)
+		} else {
+			out.WriteString(string(runes[i:j]))
+		}
+		i = j
+	}
+	return out.String()
 }
 
 // relayAuthorHeader is the server's RelayAuthorHeader: the hub records a post
@@ -1253,7 +1686,8 @@ func (t relayAuthorTransport) RoundTrip(req *http.Request) (*http.Response, erro
 // owner can clear or wake that session, so the notice is the owner's: no agent
 // recipient, and the refs the Discord bridge pings on (claudeSkipNoticeRefs).
 // The request identity is the run and the episode start, so a retry or a
-// restarted relay cannot post it twice.
+// restarted relay cannot post it twice. An owner-helper episode (skip.Owner)
+// posts the owner notices of claudeOwnerSkipNotice instead, with no hub read.
 func nativeClaudeEscalate(ctx context.Context, b runtimeBinding, skip claudeWakeSkip) error {
 	e := env{hub: b.Hub}
 	e.loadConfig()
@@ -1263,6 +1697,12 @@ func nativeClaudeEscalate(ctx context.Context, b runtimeBinding, skip claudeWake
 	}
 	c.HTTP.Transport = relayAuthorTransport{base: c.HTTP.Transport}
 	attachRelayBudget(c, activeRelayBudget)
+	if skip.Owner {
+		subject, text, key := claudeOwnerSkipNotice(b, skip)
+		env := api.Envelope{Kind: api.EnvelopeKindNotice, Subject: subject, Refs: claudeSkipNoticeRefs(b, true), Body: api.EnvelopeBody{Text: text}}
+		_, err = c.PostMessage(ctx, b.Task, api.PostMessageRequest{Envelope: &env, Text: api.RenderText(env), RequestID: key})
+		return err
+	}
 	agents, err := c.ListAgents(ctx, b.Task)
 	if err != nil {
 		return err
@@ -1304,6 +1744,68 @@ func claudeSkipNoticeText(b runtimeBinding, skip claudeWakeSkip) string {
 		return head + ages + fmt.Sprintf(", at or past the %s skip bound, so the turn looks stopped, or is inside one long tool call (%s), which writes nothing until it returns.", bound, skip.Tool) + act + once
 	}
 	return head + ages + fmt.Sprintf(", at or past the %s skip bound, so the turn looks stopped.", bound) + act + once
+}
+
+// claudeOwnerSkipNoticeLimit keeps an owner notice whole in Discord: the
+// bridge cuts an escalation's body at 1400 characters (internal/bridge,
+// renderEscalation).
+const claudeOwnerSkipNoticeLimit = 1400
+
+// claudeOwnerSkipNotice is the owner-helper notice for skip: its subject, its
+// plain-words body and its request identity. The first notice's identity is
+// the run and the episode start, as for other agents; repeat n adds -r<n>,
+// and the recovery notice (skip.RecoveredAt set) adds -ok, so a retry or a
+// restarted relay posts none of them twice. The body says the helper is not
+// reachable, since when, the current reason and what to do, then the other
+// reasons the episode saw; it never quotes input text (the reasons name only
+// kinds and lengths).
+func claudeOwnerSkipNotice(b runtimeBinding, skip claudeWakeSkip) (subject, text, key string) {
+	key = fmt.Sprintf("claude-wake-skip-%s-%d", strings.TrimPrefix(b.Run, "run_"), skip.Since.Unix())
+	at := func(t time.Time) string { return t.Local().Format("Jan 2 15:04 MST") }
+	minutes := func(d time.Duration) int { return int(max(0, d) / time.Minute) }
+	session := b.Session
+	if session == "" {
+		session = "(unknown)"
+	}
+	if !skip.RecoveredAt.IsZero() {
+		sent := "1 notice"
+		if skip.Notices != 1 {
+			sent = fmt.Sprintf("%d notices", skip.Notices)
+		}
+		text = fmt.Sprintf("A wake reached your owner helper (agent %s, tmux session %s) at %s. The relay had skipped every wake to it from %s to %s (%d minutes) and sent you %s about it. No action is needed.",
+			b.Agent, session, at(skip.RecoveredAt), at(skip.Since), at(skip.LastAt), minutes(skip.LastAt.Sub(skip.Since)), sent)
+		return "Your owner helper is reachable again", claudeClip(text, claudeOwnerSkipNoticeLimit), key + "-ok"
+	}
+	if skip.Notices > 0 {
+		key += fmt.Sprintf("-r%d", skip.Notices)
+	}
+	text = fmt.Sprintf("Your owner helper (agent %s, tmux session %s) is not reachable. The relay has skipped every wake to it since %s (%d minutes), so your messages are not reaching it. Reason now: %s. What to do: %s The relay keeps trying, and repeats this every %d minutes until a wake gets through.",
+		b.Agent, session, at(skip.Since), minutes(skip.LastAt.Sub(skip.Since)), skip.Reason, claudeOwnerSkipAction(skip.Reason, session), int(claudeWakeOwnerRepeat/time.Minute))
+	var other []string
+	for _, reason := range skip.Reasons {
+		if reason != skip.Reason {
+			other = append(other, reason)
+		}
+	}
+	if len(other) > 0 {
+		text += " Also seen in this stretch: " + strings.Join(other, "; ") + "."
+	}
+	return "The relay cannot reach your owner helper", claudeClip(text, claudeOwnerSkipNoticeLimit), key
+}
+
+// claudeOwnerSkipAction says what the owner can do about a skip reason.
+func claudeOwnerSkipAction(reason, session string) string {
+	switch {
+	case strings.Contains(reason, "permission or selection prompt"):
+		return fmt.Sprintf("open the helper's terminal (tmux session %s) and answer or dismiss the question it shows.", session)
+	case strings.Contains(reason, "turn in progress"):
+		return fmt.Sprintf("its turn looks stopped; open the helper's terminal (tmux session %s) and press Esc there.", session)
+	case reason == errClaudeWakeUnsafe.Error() || strings.Contains(reason, "busy"):
+		return fmt.Sprintf("open the helper's terminal (tmux session %s) and check whether it is working; if it looks stuck, press Esc there.", session)
+	case strings.Contains(reason, "input") || strings.Contains(reason, "cursor"):
+		return fmt.Sprintf("open the helper's terminal (tmux session %s). If its input box holds text you do not want to send, clear it. If a question or menu is showing, answer or close it.", session)
+	}
+	return fmt.Sprintf("check that the helper's tmux session %s is running.", session)
 }
 
 // claudeSkippedOwnerHelper reports that the agent that cannot be woken is the
@@ -1426,7 +1928,7 @@ func claudeWakeEmpty(ctx context.Context, b runtimeBinding, ops claudeWakeOps, o
 	var before claudeWakeSnapshot
 	fail := func(err error) (claudeWakeSnapshot, []string, error) {
 		if len(kinds) > 0 {
-			err = fmt.Errorf("%v (after it cleared %s)", err, strings.Join(kinds, "; "))
+			err = fmt.Errorf("%w (after it cleared %s)", err, strings.Join(kinds, "; "))
 		}
 		return claudeWakeSnapshot{}, cleared, err
 	}
@@ -1457,13 +1959,13 @@ func claudeWakeEmpty(ctx context.Context, b runtimeBinding, ops claudeWakeOps, o
 		case alone && keep:
 			return fail(err) // the saved wake's own text alone: the Enter retry's case
 		case !alone && stray == "":
-			return fail(fmt.Errorf("%v: stray input in the input line is not a terminal reply; left untouched", err))
+			return fail(fmt.Errorf("%w: stray input in the input line is not a terminal reply; left untouched", err))
 		case ops.clear == nil:
-			return fail(fmt.Errorf("%v: stray input in the input line (%s); no clear available", err, what))
+			return fail(fmt.Errorf("%w: stray input in the input line (%s); no clear available", err, what))
 		case n > claudeStrayClearRunes:
-			return fail(fmt.Errorf("%v: stray input in the input line (%s) is too long to clear", err, what))
+			return fail(fmt.Errorf("%w: stray input in the input line (%s) is too long to clear", err, what))
 		case len(cleared) >= claudeStrayClearMax:
-			return fail(fmt.Errorf("%v: stray input in the input line returned after %d clears in one pass", err, len(cleared)))
+			return fail(fmt.Errorf("%w: stray input in the input line returned after %d clears in one pass", err, len(cleared)))
 		}
 		held, err := ops.inspect(ctx, b, occupied.Text)
 		if err != nil {
@@ -1588,7 +2090,13 @@ func claudeWakeRetry(ctx context.Context, b runtimeBinding, prompt string, ops c
 	if err := writePrivateJSON(path, previous); err != nil {
 		return true, err
 	}
-	return true, fmt.Errorf("%w: prior wake unconfirmed; %s", errClaudeWakeUnsafe, reason)
+	unsafe := fmt.Errorf("%w: prior wake unconfirmed; %s", errClaudeWakeUnsafe, reason)
+	if emptyErr != nil {
+		// The empty check's refusal stays reachable: its snapshot, and a busy
+		// turn's times, which tell a working owner helper from an unreachable one.
+		return true, claudeWrapError{msg: unsafe.Error(), errs: []error{errClaudeWakeUnsafe, emptyErr}}
+	}
+	return true, unsafe
 }
 
 // claudeWakeRetryAt is when an unconfirmed intent's next retry is due. An
@@ -1687,7 +2195,7 @@ func claudeWakeCheckSaw(err error, prompt string) string {
 func claudeWakeType(ctx context.Context, b runtimeBinding, prompt string, ops claudeWakeOps, path string, intent *claudeWakeIntent, first claudeWakeSnapshot) error {
 	second, err := ops.inspect(ctx, b, "")
 	if err != nil {
-		return fmt.Errorf("%w: Claude input recheck: %v", errClaudeWakeUnsafe, err)
+		return fmt.Errorf("%w: Claude input recheck: %w", errClaudeWakeUnsafe, err)
 	}
 	if !sameClaudeSnapshot(first, second) {
 		return fmt.Errorf("%w: Claude identity or input changed before wake", errClaudeWakeUnsafe)

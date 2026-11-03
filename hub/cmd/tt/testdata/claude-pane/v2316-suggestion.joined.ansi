@@ -1,0 +1,23 @@
+
+[38;5;231m⏺[39m Red 
+  Blue                                                                                                                                   
+  Green
+
+[38;5;246m✻[39m [38;5;246mCrunched for 2s · done 4:53 PM
+
+[48;5;237m❯ [38;5;231mDo not use any tools. List three files a small Go project usually has, one per line. Then ask whether I want the full list or only the[39m 
+  [38;5;231mtest files.[39m                                                                                                                            
+
+[38;5;231m[49m⏺[39m go.mod 
+  main.go                       
+  main_test.go
+                                                                                                                                         
+  Do you want the full list, or only the test files?
+
+[38;5;246m✻[39m [38;5;246mBaked for 1s · done 4:53 PM[39m                                                                     
+
+[38;5;244m─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m❯ [2monly the test files[0m                                              
+[38;5;244m─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+[39m  [38;5;211m⏵⏵ bypass permissions on[38;5;246m (shift+tab to cycle)[39m               

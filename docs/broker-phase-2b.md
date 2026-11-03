@@ -132,6 +132,15 @@ Out of scope:
 - **Rate limits.** The bridge follows per-route buckets and `retry_after`. Status-card
   edits are coalesced to at most one per channel per 30 seconds. A 429 never loses a queued
   send.
+- **Owner-helper wake skips** (bug `wi_8ebd8c723dec5777`, order #56805). When the host relay
+  cannot wake the owner helper, it posts notices with `escalation=owner` and
+  `recipientKind=owner` and no agent recipient: the first after 15 minutes of skipped
+  wakes, a repeat every 30 minutes while the skips last, and one "Your owner helper is
+  reachable again" notice when a wake gets through. Each body is at most 1400 characters
+  and quotes no input text. The bridge renders them as owner escalations with the owner
+  mention, unchanged (`renderEscalation`, which cuts a body at 1400 characters); each is
+  one post with its own request identity. Details: [claude-wake.md](claude-wake.md),
+  "Owner-helper notices".
 - **Failure isolation.** A bridge outage leaves Tailterm fully usable. The bridge catches up
   from its cursors, and the hub's escalation timers are unaffected.
 - **Library.** Prefer the standard library plus `github.com/coder/websocket`, which is

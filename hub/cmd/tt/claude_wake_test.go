@@ -3254,8 +3254,9 @@ func TestClaudeWakeSkipOwnerHelperNoticePingsOwner(t *testing.T) {
 }
 
 // n1, n3: the whole path. An owner's draft holds the owner helper's input, the
-// relay skips every wake and leaves the draft alone, and after ten minutes it
-// posts one owner notice for the episode, however long the skip lasts.
+// relay skips every wake and leaves the draft alone, and after fifteen
+// minutes it posts one owner notice; the first repeat is not due within the
+// next half hour (bug wi_8ebd8c723dec5777 f3: 15 minutes, then every 30).
 func TestClaudeWakeSkipOwnerHelperEpisodePingsOnce(t *testing.T) {
 	h := newStallHub(t)
 	h.add(t, "database", api.AgentRoleDatabaseHandler)
@@ -3266,7 +3267,8 @@ func TestClaudeWakeSkipOwnerHelperEpisodePingsOnce(t *testing.T) {
 	ops := f.ops()
 	ops.escalate = nativeClaudeEscalate
 	b := h.binding(helper)
-	for minute := 0; minute <= 28; minute += 4 {
+	b.Role = api.AgentRoleOwnerHelper
+	for minute := 0; minute <= 44; minute += 4 {
 		if err := claudeWakeWith(context.Background(), b, "Tailterm messages #32699. Run tt helper inbox --task "+b.Task+".", ops); !errors.Is(err, errClaudeWakeUnsafe) {
 			t.Fatalf("minute %d: %v", minute, err)
 		}
@@ -4351,5 +4353,415 @@ func TestClaudeWakeManualModeFooterKeepsDialogsRefused(t *testing.T) {
 	}
 	if text, ok := claudeInputText(above); ok {
 		t.Fatalf("claudeInputText read a footer above the lower rule as %q", text)
+	}
+}
+
+// Bug wi_8ebd8c723dec5777 f2 (order #56805): live Claude Code 2.1.316
+// captures (testdata/claude-pane/README.md, "Claude Code 2.1.316 captures").
+// Each row names the exact refusal; real typed text, a pasted draft and a
+// draft whose cursor is off the ❯ row still refuse, and the faint suggestion,
+// the Try placeholder and the diff panel beside the transcript do not.
+func TestClaudeInputV2316Fixtures(t *testing.T) {
+	const notEmpty = "Claude cursor is not at an empty input"
+	for _, tc := range []struct {
+		fixture, expected, refusal, held string
+	}{
+		{fixture: "v2316-suggestion"},
+		{fixture: "v2316-try-placeholder"},
+		{fixture: "v2316-try-placeholder-100x30"},
+		{fixture: "v2316-diff-panel"},
+		{fixture: "v2316-suggestion-panel"},
+		// Mid-turn, edited excerpt of the owner helper's 14:55 pane: the pane
+		// check passes; the transcript check refuses a turn in progress.
+		{fixture: "helper-1455-midturn"},
+		{fixture: "v2316-partial-draft", refusal: notEmpty, held: "only the"},
+		{fixture: "v2316-cursor-off-row", refusal: notEmpty, held: "only the second line"},
+		{fixture: "v2316-midturn-typed", refusal: notEmpty, held: "next question"},
+		// The footer says "paste again to expand", which is no known footer,
+		// so the box's text is not read either.
+		{fixture: "v2316-pasted-draft", refusal: notEmpty},
+		// Pre-Enter reads of the joined captures.
+		{fixture: "v2316-partial-draft.joined", expected: "only the"},
+		{fixture: "v2316-cursor-off-row.joined", expected: "only the second line"},
+		{fixture: "v2316-suggestion.joined", expected: "only the test files", refusal: "Claude input is occupied, prompting, or unknown"},
+	} {
+		t.Run(tc.fixture+"/"+tc.expected, func(t *testing.T) {
+			raw, x, y := readClaudePaneFixture(t, tc.fixture)
+			screen, err := claudeInputScreen(raw, x, y, tc.expected)
+			if tc.refusal == "" {
+				if err != nil {
+					t.Fatalf("refused: %v", err)
+				}
+				if tc.expected == "" && !emptyClaudeInput(screen) {
+					t.Fatalf("idle screen not empty for the wake guard: %q", screen)
+				}
+				return
+			}
+			var refused claudeInputError
+			if !errors.As(err, &refused) || err.Error() != tc.refusal || refused.Text != tc.held {
+				t.Fatalf("err = %v (held %q), want %q (held %q)", err, refused.Text, tc.refusal, tc.held)
+			}
+			if refused.snap == nil || len(refused.snap.Rows) == 0 || refused.snap.CursorX != x || refused.snap.CursorY != y {
+				t.Fatalf("refusal carries no snapshot: %+v", refused.snap)
+			}
+		})
+	}
+	raw, x, y := readClaudePaneFixture(t, "v2316-suggestion")
+	plain := regexp.MustCompile("\x1b\\[[0-9;]*m").ReplaceAllString(raw, "")
+	if _, err := claudeInputScreen(plain, x, y, ""); err == nil {
+		t.Fatal("unattributed 2.1.316 suggestion was treated as empty input")
+	}
+}
+
+// snapshotPane is a fake pane for skip snapshot tests: every inspect runs the
+// real classifier on raw.
+func snapshotPaneOps(raw *string, x, y *int, now *time.Time) claudeWakeOps {
+	return claudeWakeOps{
+		inspect: func(_ context.Context, _ runtimeBinding, expected string) (claudeWakeSnapshot, error) {
+			_, err := claudeInputScreen(*raw, *x, *y, expected)
+			if err == nil {
+				err = errors.New("snapshot test pane never wakes")
+			}
+			return claudeWakeSnapshot{}, err
+		},
+		sleep: func(time.Duration) {},
+		now:   func() time.Time { return *now },
+	}
+}
+
+func readSkipRecord(t *testing.T, b runtimeBinding) (claudeWakeSkip, string) {
+	t.Helper()
+	path := claudeWakeSkipPath(b)
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0600 {
+		t.Fatalf("skip record mode %v, want 0600", info.Mode().Perm())
+	}
+	data, _ := os.ReadFile(path)
+	var skip claudeWakeSkip
+	if err := json.Unmarshal(data, &skip); err != nil {
+		t.Fatal(err)
+	}
+	return skip, string(data)
+}
+
+func snapshotTextBytes(s claudeSkipSnapshot) int {
+	n := 0
+	for _, row := range s.Rows {
+		for _, run := range row {
+			n += len(run.Text)
+		}
+	}
+	return n
+}
+
+// f6/f1: each of the three refusals seen on 2026-11-02 saves a snapshot of
+// the prompt area, with faint and normal runs, in the skip record; the stray
+// input refusal keeps it through its wraps.
+func TestClaudeWakeSkipSavesInputSnapshot(t *testing.T) {
+	rule := "\x1b[38;5;244m" + strings.Repeat("─", 60) + "\n"
+	footer := "\x1b[39m  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
+	draft, dx, dy := readClaudePaneFixture(t, "v2316-partial-draft")
+	for _, tc := range []struct {
+		name, raw, reason string
+		x, y              int
+		want              []claudeSnapshotRun // the ❯ row's runs
+		lastRow           []claudeSnapshotRun
+	}{
+		{name: "faint then typed (:938)", raw: "Answer.\n" + rule + "\x1b[39m❯ \x1b[2mRun\x1b[0m typed\n" + rule + footer, x: 2, y: 2,
+			reason: "Claude input mixes faint and typed text",
+			want:   []claudeSnapshotRun{{Text: "❯ "}, {Faint: true, Text: "Run"}, {Text: " typed"}}},
+		{name: "partial draft (:829)", raw: draft, x: dx, y: dy,
+			reason: "Claude cursor is not at an empty input: stray input in the input line is not a terminal reply; left untouched",
+			want:   []claudeSnapshotRun{{Text: "❯\u00a0only the"}}},
+		// Synthetic, not captured: 2.1.316 can draw this hint in the footer.
+		{name: "unknown footer (:834)", raw: "Answer.\n" + rule + "\x1b[39m❯ \n" + rule + "\x1b[39m  Showing fewer prompt suggestions\x1b[2m · use one to bring them back\x1b[0m\n", x: 2, y: 2,
+			reason:  "Claude input is occupied, prompting, or unknown",
+			want:    []claudeSnapshotRun{{Text: "❯"}},
+			lastRow: []claudeSnapshotRun{{Text: "  Showing fewer prompt suggestions"}, {Faint: true, Text: " · use one to bring them back"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("TAILTERM_RELAY_STATE", t.TempDir())
+			b := testClaudeBinding()
+			now := time.Date(2026, 11, 2, 18, 25, 0, 0, time.UTC)
+			raw, x, y := tc.raw, tc.x, tc.y
+			err := claudeWakeWith(context.Background(), b, "Tailterm messages #1. Run tt inbox --unread --mark-read.", snapshotPaneOps(&raw, &x, &y, &now))
+			if !errors.Is(err, errClaudeWakeUnsafe) || claudeErrorSnapshot(err) == nil {
+				t.Fatalf("skip %v kept no snapshot through its wraps", err)
+			}
+			skip, data := readSkipRecord(t, b)
+			if skip.Reason != tc.reason || skip.LatestSnapshot == nil || len(skip.Snapshots) != 1 {
+				t.Fatalf("record %s", data)
+			}
+			got := *skip.LatestSnapshot
+			if got.Reason != tc.reason || !got.At.Equal(now) || got.CursorX != x || got.CursorY != y || got.Redaction != "" || got.Truncated || snapshotTextBytes(got) > claudeSkipSnapshotBytes {
+				t.Fatalf("snapshot %+v", got)
+			}
+			if !slices.Equal(got.Rows[0], tc.want) {
+				t.Fatalf("❯ row runs %+v, want %+v", got.Rows[0], tc.want)
+			}
+			if tc.lastRow != nil && !slices.Equal(got.Rows[len(got.Rows)-1], tc.lastRow) {
+				t.Fatalf("last row runs %+v, want %+v", got.Rows[len(got.Rows)-1], tc.lastRow)
+			}
+			if !regexp.MustCompile(`"─×(60|137)"`).MatchString(data) {
+				t.Fatalf("rule not compressed: %s", data)
+			}
+		})
+	}
+}
+
+// f6: the stored text is redacted (the hub token, a prefixed token and an
+// assigned password), bounded and kept after a confirmed wake; at most four
+// snapshots are kept; a scan past its deadline keeps no text.
+func TestClaudeWakeSkipSnapshotRedactedBoundedKept(t *testing.T) {
+	t.Setenv("TAILTERM_RELAY_STATE", t.TempDir())
+	const token = "hubtoken-0123456789abcdefghijklmnopqrstuvwxyz"
+	prefixed := "ghp_" + strings.Repeat("aB3dE5", 6)
+	const password = "Xq7vR2mK9pL4sT8wZ3nB"
+	old := claudeSkipRedactToken
+	claudeSkipRedactToken = func(runtimeBinding) string { return token }
+	t.Cleanup(func() { claudeSkipRedactToken = old })
+	b := testClaudeBinding()
+	now := time.Date(2026, 11, 2, 19, 18, 0, 0, time.UTC)
+	rule := "\x1b[38;5;244m" + strings.Repeat("─", 100) + "\n"
+	footer := "\x1b[39m  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
+	box := func(rows ...string) string {
+		return "Answer.\n" + rule + strings.Join(rows, "\n") + "\n" + rule + footer
+	}
+	raw := box("\x1b[39m❯ deploy "+prefixed+" with password="+password+" and "+token, "  \x1b[2mfaint tail\x1b[0m")
+	x, y := 30, 2
+	ops := snapshotPaneOps(&raw, &x, &y, &now)
+	prompt := "Tailterm messages #2. Run tt inbox --unread --mark-read."
+	_ = claudeWakeWith(context.Background(), b, prompt, ops)
+	skip, data := readSkipRecord(t, b)
+	for _, secret := range []string{token, prefixed, password} {
+		if strings.Contains(data, secret) {
+			t.Fatalf("skip record holds a secret: %s", data)
+		}
+	}
+	if s := skip.LatestSnapshot; s == nil || strings.Count(fmt.Sprint(s.Rows), "[redacted]") != 3 {
+		t.Fatalf("want three redactions: %s", data)
+	}
+
+	// A long draft is cut at the byte bound.
+	long := strings.Repeat("word ", 30)
+	raw = box("\x1b[39m❯ "+long, "  "+long, "  "+long, "  "+long)
+	now = now.Add(time.Minute)
+	_ = claudeWakeWith(context.Background(), b, prompt, ops)
+	skip, data = readSkipRecord(t, b)
+	if s := skip.LatestSnapshot; s == nil || !s.Truncated || snapshotTextBytes(*s) > claudeSkipSnapshotBytes || snapshotTextBytes(*s) < claudeSkipSnapshotBytes-8 {
+		t.Fatalf("long draft not bounded: %s", data)
+	}
+
+	// Four reasons: the first of three and the latest are kept.
+	reasons := []string{"Claude pane has a permission or selection prompt", "Claude transcript busy, incomplete, or unknown: turn in progress", "Claude input is occupied, prompting, or unknown", "Claude input mixes faint and typed text"}
+	snap := &claudeInputSnapshot{CursorX: 2, CursorY: 1, PaneRows: 3, Rows: [][]claudeInputRun{{{Text: "❯"}}}}
+	for _, reason := range reasons {
+		now = now.Add(time.Minute)
+		claudeWakeTrackSkip(context.Background(), b, claudeWakeOps{now: func() time.Time { return now }}, claudeSnapError{err: fmt.Errorf("%w: %s", errClaudeWakeUnsafe, reason), snap: snap})
+	}
+	skip, data = readSkipRecord(t, b)
+	if len(skip.Snapshots) != claudeSkipFirstSnapshots || skip.LatestSnapshot == nil || skip.LatestSnapshot.Reason != reasons[3] {
+		t.Fatalf("snapshots kept: %s", data)
+	}
+
+	// A confirmed wake ends the episode and keeps the record and snapshots.
+	now = now.Add(time.Minute)
+	claudeWakeTrackSkip(context.Background(), b, claudeWakeOps{now: func() time.Time { return now }}, nil)
+	ended, data := readSkipRecord(t, b)
+	if !ended.EndedAt.Equal(now) || ended.LatestSnapshot == nil || len(ended.Snapshots) != claudeSkipFirstSnapshots {
+		t.Fatalf("record after a confirmed wake: %s", data)
+	}
+	// The next skip starts a new episode in the same record.
+	now = now.Add(time.Minute)
+	claudeWakeTrackSkip(context.Background(), b, claudeWakeOps{now: func() time.Time { return now }}, claudeSnapError{err: fmt.Errorf("%w: %s", errClaudeWakeUnsafe, reasons[0]), snap: snap})
+	next, data := readSkipRecord(t, b)
+	if !next.Since.Equal(now) || !next.EndedAt.IsZero() || len(next.Snapshots) != claudeSkipFirstSnapshots {
+		t.Fatalf("new episode: %s", data)
+	}
+
+	// A scan that misses its deadline keeps lengths and attributes only.
+	late := claudeSkipRedactSnapshot(&claudeInputSnapshot{Rows: [][]claudeInputRun{{{Text: "❯ "}, {Faint: true, Text: "secret words"}}}}, token, "r", now, time.Now().Add(-time.Second))
+	if late.Redaction != "incomplete" || !slices.Equal(late.Rows[0], []claudeSnapshotRun{{Len: 2}, {Faint: true, Len: 12}}) {
+		t.Fatalf("late scan: %+v", late)
+	}
+}
+
+// f3/f4 (order #56805): the owner helper's wakes are skipped from t=0 with
+// reason changes at 5 and 50 minutes. The owner gets no notice at 14 minutes,
+// the first at 15, none at 44, repeats at 45 and 75, then exactly one
+// recovery notice when a wake gets through. Each is an owner notice on the
+// Board (no agent recipient, escalation owner, mirrored to Discord), at most
+// 1400 characters, never quoting the draft, posted once under its own request
+// identity even when every post is sent twice (a retry or a restart).
+func TestClaudeWakeSkipOwnerHelperCadence(t *testing.T) {
+	h := newStallHub(t)
+	h.add(t, "database", api.AgentRoleDatabaseHandler)
+	helper := h.helper(t, "ohreg-wake-cadence-1")
+	const draft = "a note the owner is still writing"
+	f := newStrayPane(t, draft)
+	f.submit = true
+	start := f.now
+	b := h.binding(helper)
+	b.Role = api.AgentRoleOwnerHelper
+	ops := f.ops()
+	ops.escalate = func(ctx context.Context, b runtimeBinding, skip claudeWakeSkip) error {
+		if err := nativeClaudeEscalate(ctx, b, skip); err != nil {
+			return err
+		}
+		return nativeClaudeEscalate(ctx, b, skip) // the same identity again
+	}
+	prompt := "Tailterm messages #56359. Run tt helper inbox --task " + b.Task + "."
+	at := func(minute int) {
+		t.Helper()
+		f.now = start.Add(time.Duration(minute) * time.Minute)
+		switch {
+		case minute >= 5 && minute < 50:
+			f.input, f.busy = "", true // an idle-looking box, not safely idle
+		default:
+			f.input, f.busy = draft, false
+		}
+		if err := claudeWakeWith(context.Background(), b, prompt, ops); !errors.Is(err, errClaudeWakeUnsafe) {
+			t.Fatalf("minute %d: %v", minute, err)
+		}
+	}
+	want := map[int]int{14: 0, 15: 1, 44: 1, 45: 2, 74: 2, 75: 3, 80: 3}
+	for minute := 0; minute <= 80; minute++ {
+		at(minute)
+		if n, ok := want[minute]; ok {
+			if got := len(h.notices(t)); got != n {
+				t.Fatalf("minute %d: %d notices, want %d", minute, got, n)
+			}
+		}
+	}
+	if len(f.sends) != 0 || f.input != draft {
+		t.Fatalf("owner draft touched: sends %v input %q", f.sends, f.input)
+	}
+	// The owner clears the box; the next wake gets through.
+	f.now, f.input, f.busy = start.Add(81*time.Minute), "", false
+	if err := claudeWakeWith(context.Background(), b, prompt, ops); err != nil {
+		t.Fatalf("wake after the owner cleared the box: %v", err)
+	}
+	f.now = f.now.Add(3 * time.Minute)
+	_ = claudeWakeWith(context.Background(), b, prompt, ops) // already delivered
+	got := h.notices(t)
+	if len(got) != 4 {
+		t.Fatalf("want 3 skip notices and 1 recovery notice, got %d: %+v", len(got), got)
+	}
+	base := fmt.Sprintf("claude-wake-skip-%s-%d", strings.TrimPrefix(b.Run, "run_"), start.Unix())
+	ids := []string{base, base + "-r1", base + "-r2", base + "-ok"}
+	for i, n := range got {
+		if n.To != "" || n.Envelope.To != "" || n.Envelope.Refs["escalation"] != "owner" || n.Envelope.Refs["recipientKind"] != "owner" || n.Envelope.Refs["agent"] != helper.ID {
+			t.Fatalf("notice %d is not the owner's: %+v", i, n)
+		}
+		if n.PostReceipt == nil || n.PostReceipt.RequestID != ids[i] {
+			t.Fatalf("notice %d identity %+v, want %s", i, n.PostReceipt, ids[i])
+		}
+		if len([]rune(n.Envelope.Body.Text)) > 1400 || strings.Contains(n.Text, "still writing") || n.Text != api.RenderText(*n.Envelope) {
+			t.Fatalf("notice %d body: %s", i, n.Envelope.Body.Text)
+		}
+		if from := n.From; from != (api.Sender{Node: server.RelayNode, User: server.RelayUser}) {
+			t.Fatalf("notice %d author %+v", i, from)
+		}
+	}
+	for i, action := range []string{"check whether it is working", "check whether it is working", "If its input box holds text you do not want to send, clear it."} {
+		body := got[i].Envelope.Body.Text
+		for _, w := range []string{"is not reachable", "tmux session " + b.Session, "Reason now: ", "What to do: " + "open the helper's terminal", action, "every 30 minutes"} {
+			if !strings.Contains(body, w) || got[i].Envelope.Subject != "The relay cannot reach your owner helper" {
+				t.Fatalf("notice %d lacks %q: %s", i, w, body)
+			}
+		}
+	}
+	if !strings.Contains(got[0].Envelope.Body.Text, "(15 minutes)") || !strings.Contains(got[2].Envelope.Body.Text, "(75 minutes)") || !strings.Contains(got[2].Envelope.Body.Text, "Also seen in this stretch: Claude is not safely idle") {
+		t.Fatalf("notice times or reasons: %s | %s", got[0].Envelope.Body.Text, got[2].Envelope.Body.Text)
+	}
+	if r := got[3]; r.Envelope.Subject != "Your owner helper is reachable again" || !strings.Contains(r.Envelope.Body.Text, "(80 minutes)") || !strings.Contains(r.Envelope.Body.Text, "3 notices") {
+		t.Fatalf("recovery notice: %+v", r.Envelope)
+	}
+	skip, data := readSkipRecord(t, b)
+	if skip.EndedAt.IsZero() || skip.Recovery != nil || skip.Notices != 3 || !slices.Equal(skip.Reasons, []string{"Claude cursor is not at an empty input: stray input in the input line is not a terminal reply; left untouched", "Claude is not safely idle"}) {
+		t.Fatalf("record after recovery: %s", data)
+	}
+}
+
+// R2: a working turn is not unreachable. The 23:18/23:54 pattern, occupied
+// between turns whose last transcript event is fresh, never pings and ends
+// the episode; a turn whose last event is past the bound counts. A failed
+// recovery post is retried on a later pass; a builder keeps its rule.
+func TestClaudeWakeSkipOwnerHelperWorkingTurnResets(t *testing.T) {
+	t.Setenv("TAILTERM_RELAY_STATE", t.TempDir())
+	b := testClaudeBinding()
+	b.Role = api.AgentRoleOwnerHelper
+	start := time.Date(2026, 11, 2, 22, 45, 0, 0, time.UTC)
+	now := start
+	var posted []claudeWakeSkip
+	var fail error
+	ops := claudeWakeOps{now: func() time.Time { return now }, escalate: func(_ context.Context, _ runtimeBinding, skip claudeWakeSkip) error {
+		if fail != nil {
+			return fail
+		}
+		posted = append(posted, skip)
+		return nil
+	}}
+	occupied := fmt.Errorf("%w: Claude input is occupied, prompting, or unknown", errClaudeWakeUnsafe)
+	busy := func(lastEvent time.Time) error {
+		return fmt.Errorf("%w: %w", errClaudeWakeUnsafe, claudeTurnBusyError{TurnStartAt: lastEvent.Add(-time.Minute), LastEventAt: lastEvent})
+	}
+	for minute := 0; minute < 70; minute++ {
+		now = start.Add(time.Duration(minute) * time.Minute)
+		err := occupied
+		if minute%2 == 1 {
+			err = busy(now.Add(-20 * time.Second))
+		}
+		claudeWakeTrackSkip(context.Background(), b, ops, err)
+	}
+	// The same through the retry path's refusal, which names the empty check's
+	// refusal in its text and keeps it reachable.
+	for minute := 70; minute < 140; minute++ {
+		now = start.Add(time.Duration(minute) * time.Minute)
+		var err error = claudeWrapError{msg: errClaudeWakeUnsafe.Error() + ": prior wake unconfirmed; pane not safe for retry: Claude input is occupied, prompting, or unknown", errs: []error{errClaudeWakeUnsafe, errors.New("Claude input is occupied, prompting, or unknown")}}
+		if minute%2 == 1 {
+			busyErr := busy(now.Add(-20 * time.Second))
+			err = claudeWrapError{msg: errClaudeWakeUnsafe.Error() + ": prior wake unconfirmed; pane not safe for retry: " + strings.TrimPrefix(busyErr.Error(), errClaudeWakeUnsafe.Error()+": "), errs: []error{errClaudeWakeUnsafe, busyErr}}
+		}
+		claudeWakeTrackSkip(context.Background(), b, ops, err)
+	}
+	if len(posted) != 0 {
+		t.Fatalf("a working helper was reported: %+v", posted)
+	}
+	// A stopped turn (last event 20 minutes old) is unreachable.
+	first := now.Add(7 * time.Minute)
+	for minute := 1; minute <= 16; minute++ {
+		now = first.Add(time.Duration(minute-1) * time.Minute)
+		claudeWakeTrackSkip(context.Background(), b, ops, busy(first.Add(-20*time.Minute)))
+	}
+	if len(posted) != 1 || !posted[0].Owner || !posted[0].Since.Equal(first) || claudeOwnerSkipAction(posted[0].Reason, "s") != "its turn looks stopped; open the helper's terminal (tmux session s) and press Esc there." {
+		t.Fatalf("stopped turn: %+v", posted)
+	}
+	// The recovery post fails once and goes on a later pass.
+	fail = errors.New("hub unavailable")
+	now = now.Add(time.Minute)
+	claudeWakeTrackSkip(context.Background(), b, ops, nil)
+	if skip, data := readSkipRecord(t, b); skip.Recovery == nil || skip.Recovery.WokenAt.IsZero() {
+		t.Fatalf("failed recovery not kept: %s", data)
+	}
+	fail = nil
+	now = now.Add(2 * time.Minute)
+	claudeWakeTrackSkip(context.Background(), b, ops, nil)
+	if len(posted) != 2 || posted[1].RecoveredAt.IsZero() {
+		t.Fatalf("recovery not retried: %+v", posted)
+	}
+	// A builder's binding keeps one ten-minute notice per reason.
+	builder := testClaudeBinding()
+	builder.Agent, builder.Run = "agt_0000000000000002", "run_0000000000000002"
+	posted, now = nil, start
+	for minute := 0; minute <= 60; minute++ {
+		now = start.Add(time.Duration(minute) * time.Minute)
+		claudeWakeTrackSkip(context.Background(), builder, ops, occupied)
+	}
+	if len(posted) != 1 || posted[0].Owner || !posted[0].EscalatedAt.IsZero() || now.Sub(posted[0].Since) != time.Hour {
+		t.Fatalf("builder notices: %+v", posted)
 	}
 }
