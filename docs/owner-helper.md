@@ -82,6 +82,15 @@ options in free text.
 
 ## Register
 
+A Claude Code helper starts as `claude --disallowedTools=SendFeedback`, added to any
+other flags you use (`--resume`, `--continue`, a permission mode). Keep the `=`
+single-token form so the flag cannot swallow a following prompt. Start any Claude
+session you open by hand for work in this repository the same way. A queued feedback
+draft's review box holds the idle prompt, so the relay skips every wake to that
+session (wi_2de400b506cacc1f). A running session keeps its tools until it is
+restarted, and a restart needs registering again (see **Re-register after a Claude
+restart or `/clear`** below). Codex is unchanged.
+
 Run this in the owner's Claude Code or Codex session, in a dedicated one-pane tmux session:
 
 ```sh

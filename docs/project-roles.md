@@ -93,14 +93,17 @@ there (wi_2c46d9d964b335da).
 - Every Claude Code agent that `tt spawn` starts (item team members, database
   handlers, the backlog steward, the deployment agent and helpers) runs with
   AskUserQuestion, EnterPlanMode, ExitPlanMode, ShowOnboardingRolePicker,
-  OfferChromeSetup and PublishPlugin disallowed
-  (`--disallowedTools=AskUserQuestion,EnterPlanMode,ExitPlanMode,ShowOnboardingRolePicker,OfferChromeSetup,PublishPlugin`),
-  so no question, plan-approval, onboarding, Chrome-setup or plugin-publish
-  dialog can wait in its pane.
+  OfferChromeSetup, PublishPlugin and SendFeedback disallowed
+  (`--disallowedTools=AskUserQuestion,EnterPlanMode,ExitPlanMode,ShowOnboardingRolePicker,OfferChromeSetup,PublishPlugin,SendFeedback`),
+  so no question, plan-approval, onboarding, Chrome-setup, plugin-publish
+  or feedback-draft review dialog can wait in its pane.
 - Agents ask the owner with `tt ask` (a Board decision) and a teammate with
   `tt send --kind question`. Every role template says so.
 - The owner session helper is the owner's own session. `tt` does not spawn it,
-  so its tools are unchanged.
+  so the spawn flag never reaches it; it starts with
+  `claude --disallowedTools=SendFeedback` (see
+  [owner-helper.md](owner-helper.md#register)). The same goes for any Claude
+  session started by hand in this repository.
 - If a Claude selection dialog still appears in an agent's pane, the relay's
   runtime-prompt escalation posts a notice to the owner, with the item in its
   refs, and sends a directed copy to the item lead unless the lead is the one
