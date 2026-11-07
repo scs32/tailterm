@@ -544,6 +544,12 @@ func TestToolDenySummary(t *testing.T) {
 		{`pkill -f "^sleep 303$" -u $(id -u)`, []string{"host-pkill: pkill -f (+3 args)"}},
 		{`pgrep -f ab12cd34 -u 501 | xargs kill`, []string{"host-pkill: pgrep -f | kill (+3 args)"}},
 		{`pkill -fu "$USER" ab12cd34`, []string{"host-pkill: pkill (+3 args)"}},
+		// Review b1 (#59121): the deployer rule steps over an option's value as
+		// the host-pkill parse does, so -f after -u 0 is still an option.
+		{`pkill -u 0 -f tt-deployer-compact`, []string{"deployer-signal: pkill -f tt-deployer-compact (+2 args)"}},
+		// -fu holds a letter that is not a summary option, so the word is
+		// counted, as host-pkill counts it; -x after the pattern is a pattern.
+		{`pkill -P 1 -fu 0 tt-deployer-compact -x`, []string{"deployer-signal: pkill tt-deployer-compact (+5 args)"}},
 		{`files=(scripts/deploy-static.mjs ab12cd34); case $x in pkill|killall) tmux send-keys -t tt-builder-1 'tt-deployer-compact' ;; esac; [[ $x =~ (pkill|killall) ]]; pkill --help; pkill -0 -f vite; killall -d node`, nil},
 	}
 	for i, c := range cases {

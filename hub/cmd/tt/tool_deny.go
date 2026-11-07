@@ -466,6 +466,29 @@ func (c *toolDenyScan) pkillScope(name string, args []string) (sum toolDenySum, 
 	return sum, true
 }
 
+// toolDenyPkillEnd returns the index in args of pkill's first pattern, or
+// of "--", reading options as pkillScope does: the value of a letter that
+// takes one, as the next word, is stepped over. It is len(args) when every
+// word is an option or a value.
+func toolDenyPkillEnd(args []string) int {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" || len(a) < 2 || a[0] != '-' {
+			return i
+		}
+		if strings.HasPrefix(a, "--") {
+			continue
+		}
+		if _, ok := toolDenySignal(a[1:]); ok {
+			continue
+		}
+		if at := strings.IndexAny(a[1:], toolDenyPkillValued) + 1; at > 0 && at == len(a)-1 {
+			i++ // the value is the next word
+		}
+	}
+	return len(args)
+}
+
 // pkill fires host-pkill unless an option narrows the match, as pkillScope
 // reads pkill's options, or for killall to a user or terminal, or only
 // lists. A killall -s whose value is a signal sends it and narrows nothing.
@@ -555,12 +578,13 @@ func (c *toolDenyScan) deployer(name, kind, sub string, at int, args []string) {
 		skip = at + 1
 	}
 	named = false
-	ended := false // pkill only: past its options
+	end := len(args) // pkill only: where its options end
+	if name == "pkill" {
+		end = toolDenyPkillEnd(args)
+	}
 	for i := skip; i < len(args); i++ {
 		a := args[i]
-		if name == "pkill" && (a == "--" || len(a) < 2 || a[0] != '-') {
-			ended = true
-		}
+		ended := i >= end
 		switch {
 		case toolDenyDeployerName(a):
 			sum.add(a)
