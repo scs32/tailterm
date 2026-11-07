@@ -674,22 +674,6 @@ type toolEvidence struct {
 	Commit          string   `json:"commit,omitempty"`
 	CommitSource    string   `json:"commitSource,omitempty"` // pre | post
 	CommitSkip      string   `json:"commitSkip,omitempty"`   // changed-directory, the only reason given
-	// Test counts (feature wi_512ca524b2432974), only on a row whose kinds
-	// hold go-test, node-test or npm-test: counts with their source, or the
-	// reason there are none. Numbers and fixed-list values only.
-	Counts      *toolEvidenceCounts `json:"counts,omitempty"`
-	CountSource string              `json:"countSource,omitempty"` // go-test-v | go-test-packages | node-summary
-	CountSkip   string              `json:"countSkip,omitempty"`   // background | unreadable | timeout | interrupted | no-summary | truncated | mixed
-}
-
-// toolEvidenceCounts are a test run's counts. Every field is written, 0
-// included. Total is node's own "tests" line, which also counts todo and
-// cancelled tests; for go it is pass+fail+skip.
-type toolEvidenceCounts struct {
-	Total int `json:"total"`
-	Pass  int `json:"pass"`
-	Fail  int `json:"fail"`
-	Skip  int `json:"skip"`
 }
 
 // toolEvidenceCall is what a Bash call's input says: the verification kinds
@@ -887,7 +871,6 @@ func (l toolLedger) evidence(call toolEvidenceCall, p toolHookInput, data []byte
 	} else {
 		ev.CommandSkip = "timeout"
 	}
-	var texts []string
 	switch {
 	case call.background:
 		ev.OutputSkip = "background" // what returned is the start, not the command's end
@@ -897,9 +880,8 @@ func (l toolLedger) evidence(call toolEvidenceCall, p toolHookInput, data []byte
 			ev.ExitCode, ev.ExitSource = new(int), "success"
 		}
 	default:
-		texts = ev.output(p, data)
+		ev.output(p, data)
 	}
-	ev.count(texts, p.IsInterrupt, l.started.Add(l.evidenceBudget))
 	switch {
 	case call.moved:
 		ev.CommitSkip = "changed-directory" // cwd's commit may not be the one it ran at
@@ -947,19 +929,17 @@ func (l toolLedger) awaitCommit(read <-chan string) string {
 	}
 }
 
-// output sets the exit code and the output digest from the post's payload,
-// and returns the decoded output for the test counts, never stored: stdout
-// and stderr, or the failure's error text.
+// output sets the exit code and the output digest from the post's payload.
 // Claude Code gives no numeric exit code: a call that ends with status 0 is
 // a PostToolUse, any other a PostToolUseFailure whose error text names it.
-func (ev *toolEvidence) output(p toolHookInput, data []byte) []string {
+func (ev *toolEvidence) output(p toolHookInput, data []byte) {
 	var out struct {
 		Response json.RawMessage `json:"tool_response"`
 		Error    json.RawMessage `json:"error"`
 	}
 	if json.Unmarshal(data, &out) != nil {
 		ev.OutputSkip = "unreadable"
-		return nil
+		return
 	}
 	if p.Event == "PostToolUse" {
 		ev.ExitCode, ev.ExitSource = new(int), "success"
@@ -970,348 +950,24 @@ func (ev *toolEvidence) output(p toolHookInput, data []byte) []string {
 		if json.Unmarshal(out.Response, &resp) != nil || json.Unmarshal(resp.Stdout, &stdout) != nil ||
 			len(resp.Stderr) > 0 && string(resp.Stderr) != "null" && json.Unmarshal(resp.Stderr, &stderr) != nil {
 			ev.OutputSkip = "unreadable"
-			return nil
+			return
 		}
 		sum := sha256.New()
 		_, _ = io.WriteString(sum, stdout)
 		_, _ = sum.Write([]byte{0})
 		_, _ = io.WriteString(sum, stderr)
 		ev.OutputDigest, ev.OutputSource = fmt.Sprintf("%x", sum.Sum(nil)), "stdout+stderr"
-		return []string{stdout, stderr}
+		return
 	}
 	var msg string
 	if json.Unmarshal(out.Error, &msg) != nil {
 		ev.OutputSkip = "unreadable"
-		return nil
+		return
 	}
 	ev.OutputDigest, ev.OutputSource = fmt.Sprintf("%x", sha256.Sum256([]byte(msg))), "error"
 	if code, ok := toolEvidenceExitCode(msg); ok && !p.IsInterrupt {
 		ev.ExitCode, ev.ExitSource = &code, "error-text"
 	}
-	return []string{msg}
-}
-
-// count sets the test counts of a go-test, node-test or npm-test row from
-// its decoded output, or the reason there are none. Any other row gets
-// neither, so it is written exactly as before the counts existed. An
-// interrupted call is never counted: what it printed may look finished (go
-// prints each package whole) while the run itself was cut short.
-func (ev *toolEvidence) count(texts []string, interrupted bool, deadline time.Time) {
-	goTest, node := false, false
-	for _, k := range ev.Kinds {
-		switch k {
-		case "go-test":
-			goTest = true
-		case "node-test", "npm-test":
-			node = true
-		}
-	}
-	switch {
-	case !goTest && !node:
-		return
-	case ev.OutputSkip != "": // background | unreadable | timeout
-		ev.CountSkip = ev.OutputSkip
-		return
-	case interrupted:
-		ev.CountSkip = "interrupted"
-		return
-	}
-	ev.Counts, ev.CountSource, ev.CountSkip = toolEvidenceCount(texts, goTest, node, deadline)
-}
-
-// toolEvidenceCountLines is how many lines are read between deadline
-// checks, the first before the first line.
-const toolEvidenceCountLines = 4096
-
-// toolEvidenceCount reads the test counts from a run's output, the texts in
-// order (stdout then stderr, or the error text), each line on its own; the
-// text is never kept. It returns the counts and their source, or a skip
-// reason: timeout past the deadline, truncated when any part it can see is
-// unfinished, mixed when both a go and a node summary are present,
-// no-summary when there is none. Counts are not taken from a run with any
-// visible unfinished part; a cut that leaves no unfinished part (whole
-// packages, or whole tests inside a -v package) cannot be seen.
-func toolEvidenceCount(texts []string, goTest, node bool, deadline time.Time) (*toolEvidenceCounts, string, string) {
-	var g toolCountGo
-	var n toolCountNode
-	lines := 0
-	for _, text := range texts {
-		for len(text) > 0 {
-			line := text
-			if i := strings.IndexByte(text, '\n'); i >= 0 {
-				line, text = text[:i], text[i+1:]
-			} else {
-				text = ""
-			}
-			if lines%toolEvidenceCountLines == 0 && !time.Now().Before(deadline) {
-				return nil, "", "timeout"
-			}
-			lines++
-			line = toolCountClean(line)
-			if goTest {
-				g.line(line)
-			}
-			if node {
-				n.line(line)
-			}
-		}
-	}
-	goSum, goTrunc := g.end()
-	nodeSum, nodeTrunc := n.end()
-	switch {
-	case goTrunc || nodeTrunc:
-		return nil, "", "truncated"
-	case goSum != nil && nodeSum != nil:
-		return nil, "", "mixed"
-	case goSum != nil:
-		if g.verbose {
-			return goSum, "go-test-v", ""
-		}
-		return goSum, "go-test-packages", ""
-	case nodeSum != nil:
-		return nodeSum, "node-summary", ""
-	}
-	return nil, "", "no-summary"
-}
-
-// toolCountClean drops a trailing carriage return and ANSI SGR sequences
-// (ESC [ digits and semicolons m) from a line.
-func toolCountClean(line string) string {
-	line = strings.TrimSuffix(line, "\r")
-	if strings.IndexByte(line, 0x1b) < 0 {
-		return line
-	}
-	var b strings.Builder
-	for i := 0; i < len(line); i++ {
-		if line[i] == 0x1b && i+1 < len(line) && line[i+1] == '[' {
-			j := i + 2
-			for j < len(line) && (line[j] >= '0' && line[j] <= '9' || line[j] == ';') {
-				j++
-			}
-			if j < len(line) && line[j] == 'm' {
-				i = j
-				continue
-			}
-		}
-		b.WriteByte(line[i])
-	}
-	return b.String()
-}
-
-// toolCountGo reads go test's output. Each package's output is contiguous
-// and ends with its result line (ok, FAIL or ?), which cuts the output into
-// package segments. Run lines (=== RUN) appear only under -v.
-type toolCountGo struct {
-	packages            toolEvidenceCounts // per package result line
-	tests               toolEvidenceCounts // per top-level --- PASS/FAIL/SKIP line
-	verbose             bool               // some segment has a run line
-	unbalanced          bool               // some segment's top-level runs and results differ
-	segRuns, segResults int
-	segMarker           bool // the open segment holds a go marker
-	segMarkerNotFail    bool // ... other than a bare FAIL line
-}
-
-func (g *toolCountGo) line(line string) {
-	if g.result(line) {
-		if g.segRuns != g.segResults {
-			g.unbalanced = true
-		}
-		g.segRuns, g.segResults, g.segMarker, g.segMarkerNotFail = 0, 0, false, false
-		return
-	}
-	marker, bareFail := false, false
-	trimmed := strings.TrimLeft(line, " \t")
-	switch {
-	case strings.HasPrefix(line, "=== RUN "):
-		marker, g.verbose = true, true
-		if !strings.Contains(strings.TrimSpace(line[len("=== RUN "):]), "/") {
-			g.segRuns++
-		}
-	case strings.HasPrefix(line, "=== PAUSE "), strings.HasPrefix(line, "=== CONT "), strings.HasPrefix(line, "=== NAME "):
-		marker = true
-	case strings.HasPrefix(trimmed, "--- PASS: "), strings.HasPrefix(trimmed, "--- FAIL: "), strings.HasPrefix(trimmed, "--- SKIP: "):
-		marker = true
-		name, _, _ := strings.Cut(trimmed[len("--- PASS: "):], " ")
-		if trimmed == line && name != "" && !strings.Contains(name, "/") {
-			g.segResults++
-			switch trimmed[4:8] {
-			case "PASS":
-				g.tests.Pass++
-			case "FAIL":
-				g.tests.Fail++
-			default:
-				g.tests.Skip++
-			}
-		}
-	case line == "PASS":
-		marker = true
-	case line == "FAIL":
-		marker, bareFail = true, true
-	case strings.HasPrefix(line, "exit status "), strings.HasPrefix(line, "panic:"):
-		marker = true
-	}
-	if marker {
-		g.segMarker = true
-		if !bareFail {
-			g.segMarkerNotFail = true
-		}
-	}
-}
-
-// result counts a package result line: at column 0, ok, FAIL or ? and at
-// least one more field ("ok  \tpkg\t0.1s", "FAIL\tpkg [build failed]",
-// "?   \tpkg\t[no test files]"). A bare FAIL line is not one.
-func (g *toolCountGo) result(line string) bool {
-	first, rest, _ := strings.Cut(line, "\t")
-	if i := strings.IndexByte(first, ' '); i >= 0 {
-		first, rest = line[:i], line[i+1:]
-	}
-	if strings.TrimSpace(rest) == "" {
-		return false
-	}
-	switch first {
-	case "ok":
-		g.packages.Pass++
-	case "FAIL":
-		g.packages.Fail++
-	case "?":
-		g.packages.Skip++
-	default:
-		return false
-	}
-	return true
-}
-
-// end gives the counts, nil when there is no package result line, and
-// whether some segment is unfinished: go markers after the last result line
-// other than go's own closing bare FAIL, go markers with no result line at
-// all, or under -v a segment whose top-level runs and results differ.
-func (g *toolCountGo) end() (*toolEvidenceCounts, bool) {
-	pkgs := g.packages.Pass + g.packages.Fail + g.packages.Skip
-	switch {
-	case pkgs == 0:
-		return nil, g.segMarker
-	case g.segMarkerNotFail, g.verbose && (g.unbalanced || g.segRuns != g.segResults):
-		return nil, true
-	}
-	c := g.packages
-	if g.verbose {
-		c = g.tests
-	}
-	c.Total = c.Pass + c.Fail + c.Skip
-	return &c, false
-}
-
-// toolCountNode reads node --test's footer: "# key value" (TAP) or
-// "ℹ key value" (spec) lines at column 0, a block from its tests line to
-// its duration_ms line.
-type toolCountNode struct {
-	sum      toolEvidenceCounts
-	blocks   int  // complete blocks
-	open     bool // a tests line with no duration_ms yet
-	seen     map[string]int
-	bad      bool // a block line repeated or with a bad value
-	stray    bool // a footer line outside any block
-	runAfter bool // a new run starts after the last closed block
-}
-
-// toolCountNodeKeys are the footer's keys; true for those whose value is read.
-var toolCountNodeKeys = map[string]bool{"tests": true, "suites": false, "pass": true, "fail": true,
-	"cancelled": true, "skipped": true, "todo": true, "duration_ms": false}
-
-func (n *toolCountNode) line(line string) {
-	rest, ok := strings.CutPrefix(line, "# ")
-	if !ok {
-		rest, ok = strings.CutPrefix(line, "ℹ ")
-	}
-	if ok {
-		key, value, _ := strings.Cut(rest, " ")
-		if read, footer := toolCountNodeKeys[key]; footer {
-			n.footer(key, value, read)
-			return
-		}
-	}
-	if strings.HasPrefix(line, "TAP version") || toolCountTAPPoint(line) ||
-		strings.HasPrefix(line, "✔") || strings.HasPrefix(line, "▶") || strings.HasPrefix(line, "﹣") {
-		n.runAfter = true
-	}
-}
-
-func (n *toolCountNode) footer(key, value string, read bool) {
-	switch {
-	case key == "tests":
-		if n.open {
-			n.bad = true // the previous block never closed
-		}
-		n.open, n.seen = true, map[string]int{}
-	case !n.open:
-		n.stray = true
-		return
-	}
-	if !read {
-		if key == "duration_ms" {
-			n.close()
-		}
-		return
-	}
-	v, ok := toolCountValue(value)
-	if !ok || n.seen[key] != 0 {
-		n.bad = true
-		return
-	}
-	n.seen[key] = v + 1 // 0 means not seen
-}
-
-func (n *toolCountNode) close() {
-	n.open, n.runAfter = false, false
-	for _, k := range []string{"tests", "pass", "fail", "cancelled", "skipped", "todo"} {
-		if n.seen[k] == 0 {
-			n.bad = true
-			return
-		}
-	}
-	n.blocks++
-	n.sum.Total += n.seen["tests"] - 1
-	n.sum.Pass += n.seen["pass"] - 1
-	n.sum.Fail += n.seen["fail"] - 1
-	n.sum.Skip += n.seen["skipped"] - 1
-}
-
-// end gives the summed counts of the complete blocks, nil when there is no
-// footer line, and whether some block is unfinished or a run follows the
-// last one.
-func (n *toolCountNode) end() (*toolEvidenceCounts, bool) {
-	if n.open || n.bad || n.stray || n.blocks > 0 && n.runAfter {
-		return nil, true
-	}
-	if n.blocks == 0 {
-		return nil, false
-	}
-	c := n.sum
-	return &c, false
-}
-
-// toolCountValue reads a footer count: 1 to 9 ASCII digits, nothing else.
-func toolCountValue(s string) (int, bool) {
-	if len(s) == 0 || len(s) > 9 {
-		return 0, false
-	}
-	for i := 0; i < len(s); i++ {
-		if s[i] < '0' || s[i] > '9' {
-			return 0, false
-		}
-	}
-	v, err := strconv.Atoi(s)
-	return v, err == nil
-}
-
-// toolCountTAPPoint reports a column-0 TAP test point: "ok N" or "not ok N".
-func toolCountTAPPoint(line string) bool {
-	rest, ok := strings.CutPrefix(line, "ok ")
-	if !ok {
-		rest, ok = strings.CutPrefix(line, "not ok ")
-	}
-	return ok && rest != "" && rest[0] >= '0' && rest[0] <= '9'
 }
 
 // toolEvidenceExitCode reads "Exit code N" or "Error: Exit code N" at the

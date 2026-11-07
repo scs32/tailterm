@@ -403,10 +403,9 @@ func TestToolLedgerOneRowPerCall(t *testing.T) {
 	}
 	digest, _ := rows[0]["argsDigest"].(string)
 	// go test is a verification command (feature wi_95d33b4e3248bac5); the
-	// payload's cwd is no repository, so there is no commit. Its output "ok"
-	// holds no test summary (feature wi_512ca524b2432974).
+	// payload's cwd is no repository, so there is no commit.
 	evidence := map[string]any{"kinds": []any{"go-test"}, "command": "go test ./...", "exitCode": float64(0), "exitSource": "success",
-		"outputDigest": fmt.Sprintf("%x", sha256.Sum256([]byte("ok\x00"))), "outputSource": "stdout+stderr", "countSkip": "no-summary"}
+		"outputDigest": fmt.Sprintf("%x", sha256.Sum256([]byte("ok\x00"))), "outputSource": "stdout+stderr"}
 	want := map[string]any{"v": float64(1), "time": rows[0]["time"], "task": "tsk_ledger", "agent": "agt_ledger", "run": "run_ledger", "session": "s1", "tool": "Bash", "toolUseId": "u1", "argsDigest": digest, "outcome": "ok", "durationMs": float64(1234), "durationSource": "claude", "evidence": evidence}
 	if fmt.Sprint(rows[0]) != fmt.Sprint(want) || !toolDigestRE.MatchString(digest) {
 		t.Fatalf("row = %v\nwant  %v", rows[0], want)
@@ -1758,19 +1757,14 @@ func TestToolLedgerEvidenceRow(t *testing.T) {
 		t.Fatalf("rows = %v", rows)
 	}
 	want := map[string]any{"kinds": []any{"go-test"}, "command": command, "exitCode": float64(0), "exitSource": "success",
-		"outputDigest": evidenceDigest("ok  \tx\t0.1s\n", "warn\n"), "outputSource": "stdout+stderr", "commit": head, "commitSource": "pre",
-		"counts": map[string]any{"total": float64(1), "pass": float64(1), "fail": float64(0), "skip": float64(0)}, "countSource": "go-test-packages"}
+		"outputDigest": evidenceDigest("ok  \tx\t0.1s\n", "warn\n"), "outputSource": "stdout+stderr", "commit": head, "commitSource": "pre"}
 	if got := evidenceOf(t, rows[0]); fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("evidence = %v\nwant       %v", got, want)
 	}
 	for i, c := range []struct {
 		error string
 		code  float64
-		count []any // counts and source, or the skip reason
-	}{
-		{"Exit code 3\nFAIL x 0.2s", 3, []any{map[string]any{"total": float64(1), "pass": float64(0), "fail": float64(1), "skip": float64(0)}, "go-test-packages"}},
-		{"Error: Exit code 128", 128, []any{"no-summary"}},
-	} {
+	}{{"Exit code 3\nFAIL x 0.2s", 3}, {"Error: Exit code 128", 128}} {
 		call := evidenceBash(fmt.Sprintf("f%d", i), command, repo)
 		toolHook(t, e, "PreToolUse", call)
 		toolHook(t, e, "PostToolUseFailure", evidenceWith(call, map[string]any{"error": c.error}))
@@ -1778,11 +1772,6 @@ func TestToolLedgerEvidenceRow(t *testing.T) {
 		row := rows[len(rows)-1]
 		want := map[string]any{"kinds": []any{"go-test"}, "command": command, "exitCode": c.code, "exitSource": "error-text",
 			"outputDigest": evidenceDigest(c.error), "outputSource": "error", "commit": head, "commitSource": "pre"}
-		if len(c.count) == 2 {
-			want["counts"], want["countSource"] = c.count[0], c.count[1]
-		} else {
-			want["countSkip"] = c.count[0]
-		}
 		if got := evidenceOf(t, row); row["outcome"] != "error" || fmt.Sprint(got) != fmt.Sprint(want) {
 			t.Fatalf("failure %q: row %v\nwant evidence %v", c.error, row, want)
 		}
@@ -1944,7 +1933,7 @@ func TestToolLedgerEvidenceRedactTimeout(t *testing.T) {
 	toolHook(t, e, "PostToolUseFailure", evidenceWith(call, map[string]any{"error": "Exit code 2\nbuild failed"}))
 	rows := toolLedgerRows(t, root, e.agent)
 	want := map[string]any{"kinds": []any{"go-test"}, "commandSkip": "timeout", "exitCode": float64(2), "exitSource": "error-text",
-		"outputDigest": evidenceDigest("Exit code 2\nbuild failed"), "outputSource": "error", "commit": head, "commitSource": "pre", "countSkip": "no-summary"}
+		"outputDigest": evidenceDigest("Exit code 2\nbuild failed"), "outputSource": "error", "commit": head, "commitSource": "pre"}
 	if len(rows) != 1 || fmt.Sprint(evidenceOf(t, rows[0])) != fmt.Sprint(want) {
 		t.Fatalf("rows = %v\nwant evidence %v", rows, want)
 	}
@@ -2029,7 +2018,7 @@ func TestToolLedgerEvidenceExitCode(t *testing.T) {
 	toolHook(t, e, "PreToolUse", call)
 	toolHook(t, e, "PostToolUse", evidenceWith(call, map[string]any{"tool_response": map[string]any{"stdout": "", "backgroundTaskId": "b1"}}))
 	rows := toolLedgerRows(t, root, e.agent)
-	want := map[string]any{"kinds": []any{"go-test"}, "command": "go test ./x", "outputSkip": "background", "countSkip": "background"}
+	want := map[string]any{"kinds": []any{"go-test"}, "command": "go test ./x", "outputSkip": "background"}
 	if ev := evidenceOf(t, rows[len(rows)-1]); fmt.Sprint(ev) != fmt.Sprint(want) {
 		t.Fatalf("background evidence = %v; want %v", ev, want)
 	}
@@ -2092,18 +2081,10 @@ func TestToolLedgerEvidenceWithinBound(t *testing.T) {
 		if len(rows) != 1 {
 			t.Fatalf("rows = %v", rows)
 		}
-		// The digest, the counts and the commit are only expected from a hook
-		// that read them within their budgets.
-		ev := evidenceOf(t, rows[0])
-		if ev["commit"] != head && ev["commit"] != nil || ev["outputDigest"] == nil && ev["outputSkip"] != "timeout" {
+		// The digest and the commit are only expected from a hook that read
+		// them within their budgets.
+		if ev := evidenceOf(t, rows[0]); ev["commit"] != head && ev["commit"] != nil || ev["outputDigest"] == nil && ev["outputSkip"] != "timeout" {
 			t.Fatalf("evidence = %v", ev)
-		}
-		if counts, ok := ev["counts"].(map[string]any); ok {
-			if n := float64((4 << 20) / 12); counts["pass"] != n || counts["total"] != n || ev["countSource"] != "go-test-packages" {
-				t.Fatalf("counts = %v from %v", counts, ev["countSource"])
-			}
-		} else if ev["countSkip"] != "timeout" {
-			t.Fatalf("evidence has neither counts nor a timeout: %v", ev)
 		}
 		break
 	}
@@ -2270,206 +2251,6 @@ func TestToolLedgerEvidenceChangedDirectory(t *testing.T) {
 	} {
 		if ev := evidenceOf(t, rows[i]); ev["commit"] != want.commit || ev["commitSource"] != want.source || ev["commitSkip"] != want.skip || ev["exitCode"] != float64(0) {
 			t.Errorf("row %d evidence = %v; want commit %v from %v, skip %v", i, ev, want.commit, want.source, want.skip)
-		}
-	}
-}
-
-// Test counts (feature wi_512ca524b2432974). Outputs below are synthetic,
-// shaped as go 1.26 and node 26 print them.
-const (
-	countGoV = "=== RUN   TestP\n=== PAUSE TestP\n=== RUN   TestF\n=== RUN   TestF/sub\n    a_test.go:4: boom\n" +
-		"--- FAIL: TestF (0.00s)\n    --- FAIL: TestF/sub (0.00s)\n=== RUN   TestS\n    a_test.go:5: no\n--- SKIP: TestS (0.00s)\n" +
-		"=== CONT  TestP\n--- PASS: TestP (0.00s)\nFAIL\nFAIL\tgt/a\t0.476s\n" +
-		"=== RUN   TestOK\n--- PASS: TestOK (0.00s)\nPASS\nok  \tgt/b\t0.322s\n?   \tgt/c\t[no test files]\nFAIL\n"
-	countGoNoV = "--- FAIL: TestF (0.00s)\n    --- FAIL: TestF/sub (0.00s)\n        a_test.go:4: boom\nFAIL\nFAIL\tgt/a\t0.146s\n" +
-		"ok  \tgt/b\t0.253s\n?   \tgt/c\t[no test files]\nFAIL\n"
-	countGoPackages = "ok  \tgt/a\t0.1s\nok  \tgt/b\t(cached)\nFAIL\tgt/c\t0.2s\nFAIL\tgt/d [build failed]\n?   \tgt/e\t[no test files]\nFAIL\n"
-	countNodeTAP    = "TAP version 13\n# Subtest: p\nok 1 - p\n  ---\n  duration_ms: 0.3\n  ...\nnot ok 2 - f\n1..2\n" +
-		"# tests 6\n# suites 0\n# pass 3\n# fail 1\n# cancelled 0\n# skipped 1\n# todo 1\n# duration_ms 50.983\n"
-	countNodeSpec = "✔ p (0.3ms)\n✖ f (0.1ms)\n﹣ s (0.1ms) # SKIP\n▶ sub\n  ✔ inner (0.1ms)\n✔ sub (0.2ms)\n" +
-		"ℹ tests 6\nℹ suites 0\nℹ pass 3\nℹ fail 1\nℹ cancelled 0\nℹ skipped 1\nℹ todo 1\nℹ duration_ms 46.178666\n" +
-		"\n✖ failing tests:\n\ntest at a.test.js:2:23\n✖ f (0.1ms)\n  Error: x\n"
-)
-
-func countWant(total, pass, fail, skip int) *toolEvidenceCounts {
-	return &toolEvidenceCounts{Total: total, Pass: pass, Fail: fail, Skip: skip}
-}
-
-// a1, a4: the parser over complete, truncated and summary-less outputs of
-// each kind. Counts are never taken from part of a run.
-func TestToolLedgerEvidenceCounts(t *testing.T) {
-	colour := func(s string) string { return "\x1b[34m" + s + "\x1b[39m" }
-	ansiSpec := ""
-	for _, l := range strings.Split(strings.TrimSuffix(countNodeSpec, "\n"), "\n") {
-		if strings.HasPrefix(l, "ℹ ") {
-			l = colour(l)
-		}
-		ansiSpec += l + "\r\n"
-	}
-	nodeFooter := func(tests, pass, fail, skipped int) string {
-		return fmt.Sprintf("# tests %d\n# suites 0\n# pass %d\n# fail %d\n# cancelled 0\n# skipped %d\n# todo 0\n# duration_ms 9\n", tests, pass, fail, skipped)
-	}
-	npm := "\n> tailterm@1.0.0 test\n> node scripts/build-team-plan.mjs --check && node tests/run-unit-tests.mjs --concurrency 12\n\n" + countNodeSpec
-	const goTest, node = "go", "node"
-	for _, c := range []struct {
-		name   string
-		kind   string // go, node or both
-		texts  []string
-		want   *toolEvidenceCounts
-		source string
-		skip   string
-	}{
-		// Complete.
-		{"go -v, two packages, subtest, parallel, trailing FAIL", goTest, []string{countGoV}, countWant(4, 2, 1, 1), "go-test-v", ""},
-		{"go without -v, a --- FAIL line and no run line", goTest, []string{countGoNoV}, countWant(3, 1, 1, 1), "go-test-packages", ""},
-		{"go package lines only", goTest, []string{countGoPackages}, countWant(5, 2, 2, 1), "go-test-packages", ""},
-		{"go build failure, compiler output on stderr", goTest, []string{"FAIL\tgt/d [build failed]\nok  \tgt/b\t(cached)\nFAIL\n", "# gt/d [gt/d.test]\nd/d.go:2:9: syntax error\n"}, countWant(2, 1, 1, 0), "go-test-packages", ""},
-		{"go -count=2 under -v", goTest, []string{"=== RUN   TestA\n--- PASS: TestA (0.00s)\n=== RUN   TestA\n--- PASS: TestA (0.00s)\nPASS\nok  \tgt/a\t0.1s\n"}, countWant(2, 2, 0, 0), "go-test-v", ""},
-		{"node TAP footer", node, []string{countNodeTAP}, countWant(6, 3, 1, 1), "node-summary", ""},
-		{"node spec footer and failing tests recap", node, []string{countNodeSpec}, countWant(6, 3, 1, 1), "node-summary", ""},
-		{"node spec footer in colour, CRLF", node, []string{ansiSpec}, countWant(6, 3, 1, 1), "node-summary", ""},
-		{"npm test header and spec footer", node, []string{npm, ""}, countWant(6, 3, 1, 1), "node-summary", ""},
-		{"two node footers summed", node, []string{nodeFooter(4, 3, 1, 0) + "ok 1 - x\n" + nodeFooter(2, 1, 0, 1)}, countWant(6, 4, 1, 1), "node-summary", ""},
-		{"todo and cancelled only in total", node, []string{"# tests 9\n# suites 1\n# pass 2\n# fail 0\n# cancelled 3\n# skipped 0\n# todo 4\n# duration_ms 1\n"}, countWant(9, 2, 0, 0), "node-summary", ""},
-
-		// Complete, then truncated.
-		{"go finished package, then an unterminated run", goTest, []string{"ok  \tgt/a\t0.1s\n=== RUN   TestX\n"}, nil, "", "truncated"},
-		{"go -v two packages, then a third without its package line", goTest, []string{countGoV + "=== RUN   TestZ\n--- PASS: TestZ (0.00s)\n"}, nil, "", "truncated"},
-		{"go -v segment with three runs and two results", goTest, []string{"=== RUN   TestA\n--- PASS: TestA (0.00s)\n=== RUN   TestB\n--- PASS: TestB (0.00s)\n=== RUN   TestC\nok  \tgt/a\t0.1s\n"}, nil, "", "truncated"},
-		{"go -v cut across packages: runs before the first result", goTest, []string{"=== RUN   TestA\n=== RUN   TestB\n--- PASS: TestB (0.00s)\nok  \tgt/a\t0.1s\n=== RUN   TestC\n--- PASS: TestC (0.00s)\nok  \tgt/b\t0.1s\n"}, nil, "", "truncated"},
-		{"go markers with no package line", goTest, []string{"=== RUN   TestF\n--- FAIL: TestF (0.00s)\n"}, nil, "", "truncated"},
-		{"go bare FAIL with no package line", goTest, []string{"FAIL\n"}, nil, "", "truncated"},
-		{"node complete footer, then a cut footer", node, []string{countNodeTAP + "# tests 9\n# pass 8\n"}, nil, "", "truncated"},
-		{"node two complete footers, then a third open", node, []string{nodeFooter(1, 1, 0, 0) + nodeFooter(1, 1, 0, 0) + "# tests 3\n# suites 0\n"}, nil, "", "truncated"},
-		{"node closed block missing skipped", node, []string{"# tests 1\n# suites 0\n# pass 1\n# fail 0\n# cancelled 0\n# todo 0\n# duration_ms 1\n"}, nil, "", "truncated"},
-		{"node block repeating pass", node, []string{"# tests 1\n# suites 0\n# pass 1\n# pass 1\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n# duration_ms 1\n"}, nil, "", "truncated"},
-		{"node pass line with no tests line", node, []string{"ok 1 - x\n# pass 3\n# fail 0\n"}, nil, "", "truncated"},
-		{"node footer, then a new TAP run", node, []string{countNodeTAP + "TAP version 13\nok 1 - x\n"}, nil, "", "truncated"},
-		{"node spec footer, then a new test line", node, []string{nodeFooter(1, 1, 0, 0) + "✔ x (1ms)\n"}, nil, "", "truncated"},
-		{"node footer value of 10 digits", node, []string{"# tests 1234567890\n# suites 0\n# pass 1\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n# duration_ms 1\n"}, nil, "", "truncated"},
-
-		// No summary.
-		{"go test -json lines", goTest, []string{`{"Action":"run","Test":"TestA","Output":"=== RUN   TestA\n"}` + "\n" + `{"Action":"pass","Test":"TestA"}` + "\n"}, nil, "", "no-summary"},
-		{"plain text, go", goTest, []string{"building...\nno summary here\n"}, nil, "", "no-summary"},
-		{"plain text, node", node, []string{"ok 1 - x\nnot ok 2 - y\n"}, nil, "", "no-summary"},
-		{"exit code only", goTest, []string{"Exit code 1"}, nil, "", "no-summary"},
-		{"empty stdout", node, []string{"", ""}, nil, "", "no-summary"},
-
-		// Both.
-		{"go and node summaries", "both", []string{"ok  \tgt/a\t0.1s\n" + nodeFooter(1, 1, 0, 0)}, nil, "", "mixed"},
-		{"go truncated and a node summary", "both", []string{"=== RUN   TestA\n" + nodeFooter(1, 1, 0, 0)}, nil, "", "truncated"},
-		{"go summary in a both row", "both", []string{"ok  \tgt/a\t0.1s\n"}, countWant(1, 1, 0, 0), "go-test-packages", ""},
-	} {
-		counts, source, skip := toolEvidenceCount(c.texts, c.kind != node, c.kind != goTest, time.Now().Add(time.Minute))
-		if fmt.Sprint(counts) != fmt.Sprint(c.want) || source != c.source || skip != c.skip {
-			t.Errorf("%s: counts %v source %q skip %q; want %v %q %q", c.name, counts, source, skip, c.want, c.source, c.skip)
-		}
-	}
-	if counts, source, skip := toolEvidenceCount([]string{countGoV}, true, false, time.Now().Add(-time.Second)); counts != nil || source != "" || skip != "timeout" {
-		t.Errorf("past deadline: %v %q %q", counts, source, skip)
-	}
-}
-
-// a1, a4: counts through the hook, on the post row, the whole evidence
-// object asserted for each kind and each skip reason.
-func TestToolLedgerEvidenceCountsRow(t *testing.T) {
-	e, root := toolLedgerSandbox(t)
-	setToolLedger(t, &toolLedgerDeadline, 30*time.Second) // the row is the subject here, not timing
-	setToolLedger(t, &toolRedactScanBudget, 30*time.Second)
-	setToolLedger(t, &toolEvidenceOutputBudget, 30*time.Second)
-	nodeFail := "Exit code 1\n" + countNodeTAP
-	for i, c := range []struct {
-		command string
-		event   string
-		extra   map[string]any
-		want    map[string]any
-	}{
-		{"go test ./... -v -count=1", "PostToolUse", map[string]any{"tool_response": map[string]any{"stdout": countGoV[:strings.Index(countGoV, "FAIL\tgt/a")], "stderr": countGoV[strings.Index(countGoV, "FAIL\tgt/a"):]}},
-			map[string]any{"kinds": []any{"go-test"}, "exitCode": float64(0), "exitSource": "success", "outputSource": "stdout+stderr",
-				"counts": map[string]any{"total": float64(4), "pass": float64(2), "fail": float64(1), "skip": float64(1)}, "countSource": "go-test-v"}},
-		{"node --test tests/a.test.js", "PostToolUseFailure", map[string]any{"error": nodeFail},
-			map[string]any{"kinds": []any{"node-test"}, "exitCode": float64(1), "exitSource": "error-text", "outputSource": "error",
-				"counts": map[string]any{"total": float64(6), "pass": float64(3), "fail": float64(1), "skip": float64(1)}, "countSource": "node-summary"}},
-		{"npm test", "PostToolUse", map[string]any{"tool_response": map[string]any{"stdout": "\n> x test\n> node tests/run-unit-tests.mjs\n\n" + countNodeSpec}},
-			map[string]any{"kinds": []any{"npm-test"}, "exitCode": float64(0), "exitSource": "success", "outputSource": "stdout+stderr",
-				"counts": map[string]any{"total": float64(6), "pass": float64(3), "fail": float64(1), "skip": float64(1)}, "countSource": "node-summary"}},
-		{"go test ./x", "PostToolUseFailure", map[string]any{"error": "Exit code 1"},
-			map[string]any{"kinds": []any{"go-test"}, "exitCode": float64(1), "exitSource": "error-text", "outputSource": "error", "countSkip": "no-summary"}},
-		{"go test ./x", "PostToolUse", map[string]any{"tool_response": map[string]any{"stdout": "ok  \tgt/a\t0.1s\n=== RUN   TestX\n"}},
-			map[string]any{"kinds": []any{"go-test"}, "exitCode": float64(0), "exitSource": "success", "outputSource": "stdout+stderr", "countSkip": "truncated"}},
-		{"go test ./x", "PostToolUse", map[string]any{"tool_response": map[string]any{"stdout": 7}},
-			map[string]any{"kinds": []any{"go-test"}, "exitCode": float64(0), "exitSource": "success", "outputSkip": "unreadable", "countSkip": "unreadable"}},
-		// Interrupted after whole packages printed: they look finished, but
-		// the run was cut short, so nothing is counted (review finding f1).
-		{"go test ./... -v", "PostToolUseFailure", map[string]any{"error": "Exit code 130\n" + countGoV, "is_interrupt": true},
-			map[string]any{"kinds": []any{"go-test"}, "outputSource": "error", "countSkip": "interrupted"}},
-		{"node --test", "PostToolUseFailure", map[string]any{"error": "Exit code 130\n" + countNodeTAP, "is_interrupt": true},
-			map[string]any{"kinds": []any{"node-test"}, "outputSource": "error", "countSkip": "interrupted"}},
-	} {
-		call := evidenceBash(fmt.Sprintf("u%d", i), c.command, "/no/repo")
-		toolHook(t, e, "PreToolUse", call)
-		toolHook(t, e, c.event, evidenceWith(call, c.extra))
-		rows := toolLedgerRows(t, root, e.agent)
-		ev := evidenceOf(t, rows[len(rows)-1])
-		c.want["command"] = c.command
-		if d, ok := ev["outputDigest"].(string); ok && len(d) == 64 {
-			c.want["outputDigest"] = d // the digest's own value is TestToolLedgerEvidenceRow's subject
-		}
-		if fmt.Sprint(ev) != fmt.Sprint(c.want) {
-			t.Errorf("%s %s: evidence %v\nwant          %v", c.command, c.event, ev, c.want)
-		}
-	}
-	// A background start has no output to count.
-	call := evidenceBash("bg", "node --test", "/no/repo")
-	call["tool_input"] = map[string]any{"command": "node --test", "run_in_background": true}
-	toolHook(t, e, "PreToolUse", call)
-	toolHook(t, e, "PostToolUse", evidenceWith(call, map[string]any{"tool_response": map[string]any{"stdout": "", "backgroundTaskId": "b1"}}))
-	rows := toolLedgerRows(t, root, e.agent)
-	want := map[string]any{"kinds": []any{"node-test"}, "command": "node --test", "outputSkip": "background", "countSkip": "background"}
-	if ev := evidenceOf(t, rows[len(rows)-1]); fmt.Sprint(ev) != fmt.Sprint(want) {
-		t.Errorf("background evidence = %v; want %v", ev, want)
-	}
-	// Output past its budget is neither decoded nor counted.
-	setToolLedger(t, &toolEvidenceOutputBudget, 0)
-	call = evidenceBash("late", "go test ./x", "/no/repo")
-	toolHook(t, e, "PostToolUse", evidenceWith(call, map[string]any{"tool_response": map[string]any{"stdout": countGoPackages}}))
-	rows = toolLedgerRows(t, root, e.agent)
-	want = map[string]any{"kinds": []any{"go-test"}, "command": "go test ./x", "exitCode": float64(0), "exitSource": "success", "outputSkip": "timeout", "countSkip": "timeout"}
-	if ev := evidenceOf(t, rows[len(rows)-1]); fmt.Sprint(ev) != fmt.Sprint(want) {
-		t.Errorf("late evidence = %v; want %v", ev, want)
-	}
-}
-
-// a2: a row whose kinds hold no test kind is written byte for byte as before
-// the counts existed, even when its output holds a test summary.
-func TestToolLedgerEvidenceCountsOnlyTestRows(t *testing.T) {
-	e, root := toolLedgerSandbox(t)
-	setToolLedger(t, &toolLedgerDeadline, 30*time.Second) // the rows are the subject here, not timing
-	setToolLedger(t, &toolRedactScanBudget, 30*time.Second)
-	setToolLedger(t, &toolEvidenceOutputBudget, 30*time.Second)
-	stdout := countGoPackages + countNodeTAP
-	digest := evidenceDigest(stdout, "")
-	for i, c := range []struct{ command, want string }{
-		{"go vet ./cmd/tt", `{"kinds":["go-vet"],"command":"go vet ./cmd/tt","exitCode":0,"exitSource":"success","outputDigest":"` + digest + `","outputSource":"stdout+stderr"}`},
-		{"node scripts/verify-matrix.mjs run --mode go", `{"kinds":["verify-matrix"],"command":"node scripts/verify-matrix.mjs run --mode go","exitCode":0,"exitSource":"success","outputDigest":"` + digest + `","outputSource":"stdout+stderr"}`},
-		{"go vet ./x && node scripts/verify-matrix.mjs run", `{"kinds":["go-vet","verify-matrix"],"command":"go vet ./x \u0026\u0026 node scripts/verify-matrix.mjs run","exitCode":0,"exitSource":"success","outputDigest":"` + digest + `","outputSource":"stdout+stderr"}`},
-	} {
-		call := evidenceBash(fmt.Sprintf("u%d", i), c.command, "/no/repo")
-		toolHook(t, e, "PreToolUse", call)
-		toolHook(t, e, "PostToolUse", evidenceWith(call, map[string]any{"tool_response": map[string]any{"stdout": stdout, "stderr": ""}}))
-		data, err := os.ReadFile(filepath.Join(root, e.agent, "ledger.jsonl"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		lines := bytes.Split(bytes.TrimSpace(data), []byte("\n"))
-		var row struct {
-			Evidence json.RawMessage `json:"evidence"`
-		}
-		if err := json.Unmarshal(lines[len(lines)-1], &row); err != nil {
-			t.Fatal(err)
-		}
-		if string(row.Evidence) != c.want {
-			t.Errorf("%s: evidence %s\nwant           %s", c.command, row.Evidence, c.want)
 		}
 	}
 }

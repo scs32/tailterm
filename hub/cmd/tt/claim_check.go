@@ -10,7 +10,6 @@ import (
 	"regexp"
 	"slices"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -28,10 +27,9 @@ import (
 // Only the sender's own ledger is read, read-only and bounded; nothing is
 // written, and nothing reaches the hub, the Board or AIV. A sender with no
 // ledger (a Codex worker, no agent identity) is not checked and sees nothing.
-// Test counts cited in a command's outcome ("62 tests", "4 pass 0 skipped")
-// are compared with the counts the ledger read from that run's output
-// (feature wi_512ca524b2432974). See the claim checker page in docs/, "Claim
-// checker for Claude sessions".
+// Counts are not checked: the ledger keeps a digest of the output, never the
+// output. See the claim checker page in docs/, "Claim checker for Claude
+// sessions".
 
 // claimCheckBudget bounds the whole check. A variable so tests can shrink it.
 var claimCheckBudget = 500 * time.Millisecond
@@ -44,14 +42,13 @@ type claimState int
 
 const (
 	claimContradicted claimState = iota
-	claimMismatched
 	claimUnproven
 	claimUnmatched
 	claimMatched
 )
 
 var claimStateNames = map[claimState]string{
-	claimContradicted: "contradicted", claimMismatched: "mismatched", claimUnproven: "unproven", claimUnmatched: "unmatched", claimMatched: "matched",
+	claimContradicted: "contradicted", claimUnproven: "unproven", claimUnmatched: "unmatched", claimMatched: "matched",
 }
 
 type claimKind int
@@ -60,7 +57,6 @@ const (
 	claimCommit claimKind = iota
 	claimCommand
 	claimReceipt
-	claimCount
 )
 
 // citedClaim is one checkable claim the message makes.
@@ -71,14 +67,6 @@ type citedClaim struct {
 	outcome string   // a command's claimed outcome
 	exit    *int     // a command's claimed exit (api.EvidenceExit), if any
 	words   []string // a command's single simple command
-	counts  []claimCitedCount
-}
-
-// claimCitedCount is one count a command's outcome cites, such as "62 tests".
-type claimCitedCount struct {
-	n     int
-	word  string // as cited
-	field string // total | pass | fail | skip
 }
 
 type claimFinding struct {
@@ -104,43 +92,9 @@ func (r *claimReport) skip(reason string) {
 }
 
 const (
-	claimReasonCommand      = "commands that are not one isolated verification command"
-	claimReasonReceipt      = "receipts without a readable local file"
-	claimReasonCountRun     = "counts without a recorded run"
-	claimReasonCountNone    = "counts your run did not record"
-	claimReasonCountPackage = "counts your run recorded per package (go test without -v)"
+	claimReasonCommand = "commands that are not one isolated verification command"
+	claimReasonReceipt = "receipts without a readable local file"
 )
-
-// claimCountRe finds a cited count: a whole run of digits at the start of the
-// outcome or after whitespace or one of , ; : ( [, then a count word ending
-// at a word boundary. "62/62 tests", "1.5 tests", "x62 tests", "62tests" and
-// "62 testsuites" are not counts.
-var claimCountRe = regexp.MustCompile(`(?i)(?:^|[\s,;:(\[])([0-9]+)[ \t]+(tests|test|passing|passes|passed|pass|failures|failure|failing|failed|fails|fail|skipping|skipped|skips|skip)\b`)
-
-// claimCountFields maps a count word to the ledger field it is compared with.
-var claimCountFields = map[string]string{
-	"test": "total", "tests": "total",
-	"pass": "pass", "passed": "pass", "passes": "pass", "passing": "pass",
-	"fail": "fail", "failed": "fail", "fails": "fail", "failing": "fail", "failure": "fail", "failures": "fail",
-	"skip": "skip", "skipped": "skip", "skips": "skip", "skipping": "skip",
-}
-
-// claimCounts reads the counts an outcome cites. A run of more than nine
-// digits is not read at all, never cut to nine.
-func claimCounts(outcome string) []claimCitedCount {
-	var counts []claimCitedCount
-	for _, m := range claimCountRe.FindAllStringSubmatch(outcome, -1) {
-		if len(m[1]) > 9 {
-			continue
-		}
-		n, err := strconv.Atoi(m[1])
-		if err != nil {
-			continue
-		}
-		counts = append(counts, claimCitedCount{n: n, word: m[2], field: claimCountFields[strings.ToLower(m[2])]})
-	}
-	return counts
-}
 
 // claimCheckable reports whether a message of this kind is checked: every
 // RESULT, and a notice that is a lead's accept disposition.
@@ -200,12 +154,7 @@ func claimExtract(m api.Envelope, r *claimReport) []citedClaim {
 			r.skip(claimReasonCommand)
 			continue
 		}
-		c := citedClaim{kind: claimCommand, source: k, text: ev.Value, outcome: ev.Outcome, exit: api.EvidenceExit(ev), words: words}
-		claims = append(claims, c)
-		if counts := claimCounts(ev.Outcome); len(counts) > 0 {
-			c.kind, c.counts = claimCount, counts
-			claims = append(claims, c)
-		}
+		claims = append(claims, citedClaim{kind: claimCommand, source: k, text: ev.Value, outcome: ev.Outcome, exit: api.EvidenceExit(ev), words: words})
 	}
 	receipt := func(v, source string) {
 		v = strings.TrimSpace(v)
@@ -481,47 +430,6 @@ func claimCheckCommand(c citedClaim, rows []claimRow, single string) claimFindin
 	return claimFinding{claim: c, state: claimMatched, detail: fmt.Sprintf("exit %d at %s", *exit, claimAt(latest.at))}
 }
 
-// claimCheckCount compares the counts a command's outcome cites with those of
-// the run claimCheckCommand reads: the latest identical isolated single
-// command. A run that recorded no counts, or only per-package ones, is not
-// checked; the commit guard stays on the command's own finding.
-func claimCheckCount(c citedClaim, rows []claimRow, r *claimReport) (claimFinding, bool) {
-	latest, ok := claimLatest(rows, func(r claimRow) bool { return r.isolated && slices.Equal(r.words, c.words) })
-	switch {
-	case !ok:
-		r.skip(claimReasonCountRun)
-		return claimFinding{}, false
-	case latest.ev.Counts == nil:
-		r.skip(claimReasonCountNone)
-		return claimFinding{}, false
-	case latest.ev.CountSource == "go-test-packages":
-		r.skip(claimReasonCountPackage)
-		return claimFinding{}, false
-	}
-	got := latest.ev.Counts
-	recorded := map[string]int{"total": got.Total, "pass": got.Pass, "fail": got.Fail, "skip": got.Skip}
-	state := claimMatched
-	for _, n := range c.counts {
-		if recorded[n.field] != n.n {
-			state = claimMismatched
-		}
-	}
-	run := fmt.Sprintf("total %d, pass %d, fail %d, skip %d at %s", got.Total, got.Pass, got.Fail, got.Skip, claimAt(latest.at))
-	if state == claimMatched {
-		return claimFinding{claim: c, state: state, detail: run}, true
-	}
-	return claimFinding{claim: c, state: state, detail: "you cited " + c.countText() + "; your latest run recorded " + run}, true
-}
-
-// countText is the cited counts as cited: "62 passed, 0 failed".
-func (c citedClaim) countText() string {
-	parts := make([]string, len(c.counts))
-	for i, n := range c.counts {
-		parts[i] = fmt.Sprintf("%d %s", n.n, n.word)
-	}
-	return strings.Join(parts, ", ")
-}
-
 // claimReceiptFile is the part of a verify-matrix receipt the check reads.
 type claimReceiptFile struct {
 	Commit      string                     `json:"commit"`
@@ -684,10 +592,6 @@ func claimRun(agent string, m api.Envelope, deadline time.Time) (claimReport, bo
 			if f, ok := claimCheckReceipt(c, rows, single, &r); ok {
 				r.findings = append(r.findings, f)
 			}
-		case claimCount:
-			if f, ok := claimCheckCount(c, rows, &r); ok {
-				r.findings = append(r.findings, f)
-			}
 		}
 	}
 	if time.Now().After(deadline) {
@@ -769,8 +673,6 @@ func (c citedClaim) label() string {
 			text += " -> " + c.outcome
 		}
 		return text
-	case claimCount:
-		return fmt.Sprintf("%s counts %s (%s)", c.source, c.countText(), c.text)
 	}
 	return fmt.Sprintf("receipt %s (%s)", c.text, c.source)
 }
