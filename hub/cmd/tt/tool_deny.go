@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -12,7 +14,9 @@ import (
 // protected-operation rules and appends one would_deny row per matched rule.
 // It blocks nothing and prints nothing, and any failure in the check writes
 // nothing extra. It only reads the command text: no process is started, no
-// file is read and the hub is never asked. See docs/claude-wake.md.
+// file is read and the hub is never asked. Besides the text it knows only
+// the caller's own user, read once when tt starts, so that a pkill scoped
+// to that user is not taken as narrowed. See docs/claude-wake.md.
 //
 // The handler-gate report (feature wi_cbc08bd2b2a419a0) is report-only too
 // and shares that check: the same parse of the same command is also matched
@@ -110,6 +114,41 @@ var toolDenyWrapperValued = map[string]bool{
 	"--delimiter": true, "--arg-file": true, "--max-lines": true, "--max-chars": true, "--eof": true,
 }
 
+// toolDenyUser is the user a check runs as: a uid in decimal and a login
+// name, either empty when it is not known.
+type toolDenyUser struct{ uid, name string }
+
+// toolDenyCaller is the caller's own user, read once. Every agent on a host
+// runs as it, so a pkill scoped to it still reaches them all.
+var toolDenyCaller = func() toolDenyUser {
+	name := os.Getenv("USER")
+	if name == "" {
+		name = os.Getenv("LOGNAME")
+	}
+	return toolDenyUser{strconv.Itoa(os.Getuid()), name}
+}()
+
+// wide reports whether the value of a pkill or pgrep -u or -U leaves the
+// match as wide as no scope: one of the users in its comma list is the
+// caller's own, or one cannot be told from the text. A word with a variable
+// or a substitution in it, such as $USER or $(id -u), cannot be told, nor can
+// a number or a name when the caller's uid or name is not known.
+func (u toolDenyUser) wide(value string) bool {
+	for _, user := range strings.Split(value, ",") {
+		switch {
+		case user == "" || strings.ContainsAny(user, "$`"):
+			return true
+		case toolDenyDigits(user):
+			if u.uid == "" || strings.TrimLeft(user, "0")+"0" == strings.TrimLeft(u.uid, "0")+"0" {
+				return true
+			}
+		case u.name == "" || user == u.name:
+			return true
+		}
+	}
+	return false
+}
+
 // toolDenyMatch is one rule a command matched. parts are the words of its
 // summary: fixed words the classifier recognised and a count of the rest,
 // never text copied from the command.
@@ -119,10 +158,16 @@ type toolDenyMatch struct {
 }
 
 // toolDenyClassify returns at most one match per rule, the first found, in
-// rule order. It is a pure function of the text. A command it cannot follow
-// to the end, nested too deep or too often, matches nothing.
+// rule order. It is a pure function of the text and the caller's user. A
+// command it cannot follow to the end, nested too deep or too often, matches
+// nothing.
 func toolDenyClassify(command string) []toolDenyMatch {
-	deny, _ := toolGateClassify(command, "", false)
+	return toolDenyClassifyAs(command, toolDenyCaller)
+}
+
+// toolDenyClassifyAs is toolDenyClassify for a check run as self.
+func toolDenyClassifyAs(command string, self toolDenyUser) []toolDenyMatch {
+	deny, _ := toolGateClassifyAs(command, "", false, self)
 	return deny
 }
 
@@ -131,7 +176,11 @@ func toolDenyClassify(command string) []toolDenyMatch {
 // same way: at most one per rule, in toolGateRules order. hub is the
 // TAILTERM_HUB value. The gate matches never change the deny matches.
 func toolGateClassify(command, hub string, gate bool) (deny, gates []toolDenyMatch) {
-	c := toolDenyScan{budget: 8*len(command) + 1024, gate: gate}
+	return toolGateClassifyAs(command, hub, gate, toolDenyCaller)
+}
+
+func toolGateClassifyAs(command, hub string, gate bool, self toolDenyUser) (deny, gates []toolDenyMatch) {
+	c := toolDenyScan{budget: 8*len(command) + 1024, gate: gate, self: self}
 	if gate {
 		c.hubHost, c.hubPort = toolGateAuthority(hub, "")
 	}
@@ -155,6 +204,7 @@ func toolGateClassify(command, hub string, gate bool) (deny, gates []toolDenyMat
 type toolDenyScan struct {
 	budget  int // bytes of shell text still allowed, nested commands included
 	failed  bool
+	self    toolDenyUser // who the check runs as
 	matches []toolDenyMatch
 	// The handler-gate report.
 	gate             bool
@@ -187,8 +237,19 @@ func (c *toolDenyScan) shell(text string, depth int) {
 		c.failed = true
 		return
 	}
+	// The wide pgrep calls of this text, by index, for a kill they pipe into.
+	var pgreps map[int]*toolDenySum
 	for i, words := range p.cmds {
-		c.command(words, depth, p.stdin[i])
+		in := p.stdin[i]
+		if in.from > 0 {
+			in.pgrep = pgreps[in.from-1]
+		}
+		if sum := c.command(words, depth, in); sum != nil {
+			if pgreps == nil {
+				pgreps = map[int]*toolDenySum{}
+			}
+			pgreps[i] = sum
+		}
 	}
 }
 
@@ -198,21 +259,33 @@ func (c *toolDenyScan) nested(text string, depth int) {
 	}
 }
 
-func (c *toolDenyScan) command(words []string, depth int, in toolDenyStdin) {
+// command classifies one simple command. For a pgrep with no option that
+// narrows it, it returns the summary a kill it pipes into is reported with.
+func (c *toolDenyScan) command(words []string, depth int, in toolDenyStdin) *toolDenySum {
 	words = toolDenyCommandWords(words)
 	if len(words) == 0 {
-		return
+		return nil
 	}
 	name, args := toolDenyBase(words[0]), words[1:]
 	switch name {
 	case "pkill", "killall", "kill":
 		if toolDenySendsNothing(name, args) {
-			return
+			return nil
+		}
+		if name == "kill" && in.pgrep != nil {
+			// pgrep -f PATTERN | xargs kill signals all that pgrep lists.
+			c.add(toolDenyHostPkill, "pgrep", *in.pgrep)
 		}
 		if name != "kill" {
 			c.pkill(name, args)
 		}
 		c.deployer(name, name, "", 0, args)
+	case "pgrep":
+		if sum, wide := c.pkillScope(name, args); wide {
+			sum.add("|")
+			sum.add("kill")
+			return &sum
+		}
 	case "tmux":
 		c.tmux(args)
 	case "npm", "pnpm", "yarn", "bun":
@@ -240,6 +313,7 @@ func (c *toolDenyScan) command(words []string, depth int, in toolDenyStdin) {
 	case "eval":
 		c.nested(strings.Join(args, " "), depth)
 	}
+	return nil
 }
 
 // toolDenyShellArgs reads the options of bash, sh or zsh. It returns the
@@ -335,16 +409,76 @@ func toolDenyKillallSignal(args []string, i int) (sig string, at int, ok bool) {
 	return sig, at, ok
 }
 
-// pkill fires host-pkill unless an option narrows the match to a user,
-// parent, group, session, terminal or pid file, or only lists. A killall
-// -s whose value is a signal sends it and narrows nothing. killall's
-// options end at its first operand, as toolDenySendsNothing reads them:
-// a later word is an operand however it is spelled.
-func (c *toolDenyScan) pkill(name string, args []string) {
-	scoping, flags := "UuPgGstF", "fxinola"
-	if name == "killall" {
-		scoping, flags = "utls", "eIqvwm" // -l lists signals, a show-only -s only shows what it would do
+// The options of macOS pkill and pgrep that take a value, attached or as
+// the next word, and the ones of those that narrow the match: to a parent,
+// a process group, a real group, a session, a terminal or a pid file. -u and
+// -U narrow it to users unless toolDenyUser.wide says otherwise.
+const (
+	toolDenyPkillValued  = "FGMNPUcdgstu"
+	toolDenyPkillScoping = "FGPgst"
+)
+
+// pkillScope reads the options of pkill or pgrep as macOS getopt does: up
+// to the first word that is not an option, or "--". Every later word is a
+// pattern however it is spelled, so pkill -f node -u 501 has the three
+// patterns node, -u and 501 and is not narrowed (the pkill of 2026-11-03,
+// bug wi_de679d2a42cdaec2). A group such as -fu reads as its letters given
+// separately, and a letter that takes a value ends its word: the value is
+// the rest of the word or, when nothing follows, the next word. It returns
+// the match's summary and whether no option narrows it.
+func (c *toolDenyScan) pkillScope(name string, args []string) (sum toolDenySum, wide bool) {
+	sum.add(name)
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" || len(a) < 2 || a[0] != '-' {
+			sum.omitted += len(args) - i // "--" or the first pattern, and the rest
+			break
+		}
+		if strings.HasPrefix(a, "--") {
+			sum.omitted++
+			continue
+		}
+		if sig, ok := toolDenySignal(a[1:]); ok {
+			sum.add("-" + sig)
+			continue
+		}
+		at := strings.IndexAny(a[1:], toolDenyPkillValued) + 1
+		if at == 0 {
+			sum.flags(a, "fxinola")
+			continue
+		}
+		value := a[at+1:]
+		if value == "" && i+1 < len(args) {
+			i++
+			value = args[i]
+			sum.omitted++
+		}
+		switch letter := a[at]; {
+		case letter == 'u' || letter == 'U':
+			if !c.self.wide(value) {
+				return sum, false
+			}
+		case strings.IndexByte(toolDenyPkillScoping, letter) >= 0:
+			return sum, false
+		}
+		sum.flags(a[:at+1], "fxinola") // the valued letter is not one: the word is counted
 	}
+	return sum, true
+}
+
+// pkill fires host-pkill unless an option narrows the match, as pkillScope
+// reads pkill's options, or for killall to a user or terminal, or only
+// lists. A killall -s whose value is a signal sends it and narrows nothing.
+// killall's options end at its first operand, as toolDenySendsNothing reads
+// them: a later word is an operand however it is spelled.
+func (c *toolDenyScan) pkill(name string, args []string) {
+	if name != "killall" {
+		if sum, wide := c.pkillScope(name, args); wide {
+			c.add(toolDenyHostPkill, name, sum)
+		}
+		return
+	}
+	scoping, flags := "utls", "eIqvwm" // -l lists signals, a show-only -s only shows what it would do
 	sum := toolDenySum{}
 	sum.add(name)
 	for i := 0; i < len(args); i++ {
@@ -354,35 +488,29 @@ func (c *toolDenyScan) pkill(name string, args []string) {
 			break
 		}
 		if len(a) < 2 || a[0] != '-' || strings.HasPrefix(a, "--") {
-			if name == "killall" {
-				sum.omitted += len(args) - i
-				break
-			}
-			sum.omitted++
-			continue
+			sum.omitted += len(args) - i
+			break
 		}
 		if sig, ok := toolDenySignal(a[1:]); ok {
 			sum.add("-" + sig)
 			continue
 		}
-		if name == "killall" {
-			if a == "-c" && i+1 < len(args) {
-				sum.omitted += 2 // -c and the name it limits the match to
-				i++
-				continue
+		if a == "-c" && i+1 < len(args) {
+			sum.omitted += 2 // -c and the name it limits the match to
+			i++
+			continue
+		}
+		if sig, at, ok := toolDenyKillallSignal(args, i); ok {
+			// Only the letters before the s are options; the rest is the value.
+			if strings.ContainsAny(a[1:at], scoping) {
+				return
 			}
-			if sig, at, ok := toolDenyKillallSignal(args, i); ok {
-				// Only the letters before the s are options; the rest is the value.
-				if strings.ContainsAny(a[1:at], scoping) {
-					return
-				}
-				sum.flags(a[:at], flags)
-				sum.add("-" + sig)
-				if at == len(a)-1 {
-					i++ // the value is the next word
-				}
-				continue
+			sum.flags(a[:at], flags)
+			sum.add("-" + sig)
+			if at == len(a)-1 {
+				i++ // the value is the next word
 			}
+			continue
 		}
 		if strings.ContainsAny(a[1:], scoping) {
 			return
@@ -395,6 +523,8 @@ func (c *toolDenyScan) pkill(name string, args []string) {
 // deployer fires deployer-signal for a signalling command whose own words
 // name the deployer's tmux session. For tmux, sub is the subcommand and at
 // the index of its word; the caller has checked that its target is named.
+// pkill's options end where pkillScope ends them: a later word spelled as
+// an option is a pattern and is counted, not named.
 func (c *toolDenyScan) deployer(name, kind, sub string, at int, args []string) {
 	named := false
 	for _, a := range args {
@@ -425,8 +555,12 @@ func (c *toolDenyScan) deployer(name, kind, sub string, at int, args []string) {
 		skip = at + 1
 	}
 	named = false
+	ended := false // pkill only: past its options
 	for i := skip; i < len(args); i++ {
 		a := args[i]
+		if name == "pkill" && (a == "--" || len(a) < 2 || a[0] != '-') {
+			ended = true
+		}
 		switch {
 		case toolDenyDeployerName(a):
 			sum.add(a)
@@ -437,7 +571,7 @@ func (c *toolDenyScan) deployer(name, kind, sub string, at int, args []string) {
 				named = true
 			}
 			sum.omitted++
-		case len(a) > 1 && a[0] == '-' && !strings.HasPrefix(a, "--"):
+		case !ended && len(a) > 1 && a[0] == '-' && !strings.HasPrefix(a, "--"):
 			if sig, ok := toolDenySignal(a[1:]); ok && name != "tmux" {
 				sum.add("-" + sig)
 			} else {
@@ -822,8 +956,12 @@ type toolDenyParser struct {
 
 // toolDenyStdin is what a simple command's standard input is known to be.
 type toolDenyStdin struct {
-	fed bool   // a pipe, a redirect or a heredoc feeds it
-	doc string // the body of its heredoc
+	fed  bool   // a pipe, a redirect or a heredoc feeds it
+	doc  string // the body of its heredoc
+	from int    // 1 + the index in cmds of the command that pipes into it, or 0
+	// Set by the scan, not the parser: the summary of a pgrep that pipes
+	// into it and that no option narrows.
+	pgrep *toolDenySum
 }
 
 // toolDenySpecial marks the bytes that can end a run of plain word text.
@@ -871,6 +1009,7 @@ func (p *toolDenyParser) parse(pos int, term byte, nest int) int {
 		docsFrom int  // heredocs[docsFrom:] were opened by the command being read
 		fed      bool // the command being read has its standard input redirected
 		piped    bool // the command before this one pipes into it
+		pipeFrom int  // then 1 + its index in cmds
 		parens   int
 		array    bool // inside NAME=( ), whose words are values
 		cases    int  // case statements not yet closed by esac
@@ -930,7 +1069,11 @@ func (p *toolDenyParser) parse(pos int, term byte, nest int) int {
 				if p.stdin == nil {
 					p.stdin = map[int]toolDenyStdin{}
 				}
-				p.stdin[len(p.cmds)] = toolDenyStdin{fed: true}
+				in := toolDenyStdin{fed: true}
+				if piped {
+					in.from = pipeFrom
+				}
+				p.stdin[len(p.cmds)] = in
 			}
 			for i := docsFrom; i < len(heredocs); i++ {
 				if heredocs[i].stdin {
@@ -1012,7 +1155,7 @@ func (p *toolDenyParser) parse(pos int, term byte, nest int) int {
 			case c == '|' && pos < len(s) && s[pos] == '|': // "||" is not a pipe
 				pos++
 			case c == '|':
-				piped = true
+				piped, pipeFrom = true, len(p.cmds)
 			case cases > 0 && pos < len(s) && (s[pos] == ';' || s[pos] == '&'):
 				// ";;", ";&" and ";;&" end a case clause: patterns follow.
 				for pos < len(s) && (s[pos] == ';' || s[pos] == '&') {
@@ -1275,7 +1418,9 @@ func (p *toolDenyParser) heredocs(pos int, heredocs []toolDenyHeredoc) int {
 			}
 		}
 		if doc.cmd >= 0 {
-			p.stdin[doc.cmd] = toolDenyStdin{fed: true, doc: s[start:end]}
+			in := p.stdin[doc.cmd]
+			in.fed, in.doc = true, s[start:end]
+			p.stdin[doc.cmd] = in
 		}
 	}
 	return pos

@@ -114,7 +114,15 @@ func TestToolDenyClassify(t *testing.T) {
 		{"host-pkill", `echo $(( $(pkill node; echo 1) + 1 ))`},
 		{"deployer-signal", `tmux send-keys -t tt-deployer-compact 'check status' Enter`},
 		{"deployer-signal", `tmux kill-session -ttt-deployer-compact`},
-		{"deployer-signal", `pkill -f tt-deployer -u "$USER"`},
+		// Changed by bug wi_de679d2a42cdaec2 (order #59051): pkill's options
+		// end at its first pattern, so -u and "$USER" here are two more
+		// patterns and narrow nothing. This was a deployer-signal row only;
+		// it is now a host-pkill row too.
+		{"host-pkill,deployer-signal", `pkill -f tt-deployer -u "$USER"`},
+		// Changed by the same bug: a -u naming the caller's own user narrows
+		// nothing, and "$USER" cannot be told from the text, so the rule
+		// fires. This was a near-miss.
+		{"host-pkill", `pkill -u "$USER" -f vite`},
 	}
 	for _, c := range fires {
 		t.Run("fires/"+c.command, func(t *testing.T) {
@@ -126,7 +134,6 @@ func TestToolDenyClassify(t *testing.T) {
 	nearMisses := []string{
 		// host-pkill
 		`pkill -U self node`,
-		`pkill -u "$USER" -f vite`,
 		`pkill -P 12345 node`,
 		`pkill -TERM -P $$ node`,
 		`kill 12345`,
@@ -269,6 +276,110 @@ func TestToolDenySilencingWords(t *testing.T) {
 		if got := toolDenyClassify(command); len(got) != 0 {
 			t.Errorf("%s: rules = %q; want none", command, denyRuleNames(got))
 		}
+	}
+}
+
+// bug wi_de679d2a42cdaec2 (order #59051), k1 to k4: pkill and pgrep read
+// options only up to their first pattern, as macOS getopt does, and a user
+// scope naming only the caller's own user narrows nothing. The 11-03 call
+// pkill -f "^sleep 303$" -u $(id -u) left no row and ended 17 agents.
+// The caller is injected: two different users show the result does not
+// depend on who runs the test.
+func TestToolDenyPkillOptionEnd(t *testing.T) {
+	for _, self := range []toolDenyUser{{"501", "stephen"}, {"612", "agent"}} {
+		other := "0" // root: never either injected caller
+		for _, c := range []struct{ rules, command string }{
+			// k1: a scoping letter after the pattern is a pattern.
+			{"host-pkill", `pkill -f "^sleep 303$" -u $(id -u)`},
+			{"host-pkill", `pkill -f node -u 501`},
+			{"host-pkill", `pkill -f node -u ` + other},
+			{"host-pkill", `pkill node -P 12345`},
+			{"host-pkill", `pkill -f node -- -u ` + other},
+			{"host-pkill", `pkill -9 -f node -g 42`},
+			{"host-pkill", `sudo pkill -f vite -U ` + other},
+			{"host-pkill", `ssh air 'pkill -f node -u ` + other + `'`},
+			// k2: the caller's own user, by number, name, $USER or $(id -u).
+			{"host-pkill", `pkill -u ` + self.uid + ` -f node`},
+			{"host-pkill", `pkill -u0` + self.uid + ` -f node`},
+			{"host-pkill", `pkill -U ` + self.uid + ` node`},
+			{"host-pkill", `pkill -U ` + self.name + ` node`},
+			{"host-pkill", `pkill -u` + self.name + ` node`},
+			{"host-pkill", `pkill -u "$USER" -f node`},
+			{"host-pkill", `pkill -u ${USER} -f node`},
+			{"host-pkill", `pkill -u $(id -u) -f node`},
+			{"host-pkill", "pkill -u `id -un` -f node"},
+			{"host-pkill", `pkill -fu "$USER" node`},
+			{"host-pkill", `pkill -u ` + other + `,` + self.uid + ` node`},
+			{"host-pkill", `pkill -u "$OTHER" node`}, // cannot be told: fires
+			{"host-pkill", `pkill -u , node`},
+			// k3: the deployer rule reads the same option end.
+			{"host-pkill,deployer-signal", `pkill -f tt-deployer -u "$USER"`},
+			{"host-pkill,deployer-signal", `pkill -f tt-deployer-compact -u ` + self.uid},
+			{"deployer-signal", `pkill -u ` + other + ` -f tt-deployer-compact`},
+			// k4: a pgrep that no option narrows, piped into kill.
+			{"host-pkill", `pgrep -f PATTERN -u ` + self.uid + ` | xargs kill`},
+			{"host-pkill", `pgrep -f PATTERN -u ` + other + ` | xargs kill`},
+			{"host-pkill", `pgrep -u ` + self.uid + ` -f PATTERN | xargs kill -9`},
+			{"host-pkill", `pgrep -f PATTERN | xargs -n 1 kill -TERM`},
+			{"host-pkill", `pgrep -f PATTERN | sudo xargs kill`},
+			{"host-pkill", `echo start; pgrep -f PATTERN | xargs kill`},
+			{"host-pkill", `pgrep -f PATTERN | xargs kill $(echo -9)`},
+			{"host-pkill", `pgrep node | xargs -n 1 pkill`},
+			// Unchanged killall cases: options end at the first operand,
+			// and -u and -t narrow wherever they stand before it.
+			{"host-pkill", `killall --ignore-case node -u me`},
+			{"host-pkill", `killall -c tt node -u me`},
+			{"host-pkill", `killall node -u ` + self.name},
+			{"host-pkill", `killall -s KILL node`},
+		} {
+			if got := denyRuleNames(toolDenyClassifyAs(c.command, self)); got != c.rules {
+				t.Errorf("%v: %s: rules = %q; want %q", self, c.command, got, c.rules)
+			}
+		}
+		for _, command := range []string{
+			// k1: options first keep today's reading.
+			`pkill -u ` + other + ` -f node`,
+			`pkill -u` + other + ` -f node`,
+			`pkill -fu ` + other + ` node`,
+			`pkill -U ` + other + ` node`,
+			`pkill -U self node`,
+			`pkill -9 -u ` + other + ` -f node`,
+			// k2: every other scope still narrows, wherever its value is.
+			`pkill -P 12345 node`, `pkill -P12345 node`, `pkill -TERM -P $$ node`, `pkill -fP 1 node`,
+			`pkill -g 42 node`, `pkill -G staff node`, `pkill -s 0 node`, `pkill -t ttys001 node`,
+			`pkill -F /tmp/x.pid`, `pkill -f -F /tmp/x.pid node`,
+			`pkill -u ` + self.uid + ` -P 1 -f node`, `pkill -u "$USER" -t ttys001 node`,
+			`pkill -u ` + other + `,1 node`,
+			// k4: pgrep alone, a narrowed pgrep, and a pgrep not piped into kill.
+			`pgrep -f PATTERN`,
+			`pgrep -f PATTERN -u ` + self.uid,
+			`pgrep -u ` + other + ` -f PATTERN | xargs kill`,
+			`pgrep -P 12345 node | xargs kill`,
+			`pgrep -f PATTERN | wc -l`,
+			`pgrep -f PATTERN; kill 12345`,
+			`pgrep -f PATTERN | xargs echo | xargs kill`,
+			`pgrep -f PATTERN | xargs kill -0`,
+			`pgrep -f PATTERN || kill 12345`,
+			// Unchanged killall cases.
+			`killall -u stephen node`, `killall -u ` + self.name + ` node`, `killall -t pts/1 node`,
+			`killall -c tt -u me node`, `killall -l`, `killall -s node`, `killall -d node`,
+		} {
+			if got := toolDenyClassifyAs(command, self); len(got) != 0 {
+				t.Errorf("%v: %s: rules = %q; want none", self, command, denyRuleNames(got))
+			}
+		}
+	}
+	// Unknown caller: a literal user cannot be told, so the rule fires.
+	for _, command := range []string{`pkill -u 501 -f node`, `pkill -U stephen node`} {
+		if got := denyRuleNames(toolDenyClassifyAs(command, toolDenyUser{})); got != "host-pkill" {
+			t.Errorf("unknown caller: %s: rules = %q; want host-pkill", command, got)
+		}
+	}
+	if got := denyRuleNames(toolDenyClassifyAs(`pkill -u 501 -f node`, toolDenyUser{uid: "501"})); got != "host-pkill" {
+		t.Errorf("uid only: rules = %q; want host-pkill", got)
+	}
+	if got := denyRuleNames(toolDenyClassifyAs(`pkill -U stephen node`, toolDenyUser{uid: "501"})); got != "host-pkill" {
+		t.Errorf("name unknown: rules = %q; want host-pkill", got)
 	}
 }
 
@@ -429,6 +540,10 @@ func TestToolDenySummary(t *testing.T) {
 		{`killall -vs KILL tt-deployer-compact`, []string{"host-pkill: killall -v -KILL (+1 args)", "deployer-signal: killall tt-deployer-compact (+2 args)"}},
 		{`killall -vsKILL tt-deployer-` + e.token, []string{"host-pkill: killall -v -KILL (+1 args)", "deployer-signal: killall tt-deployer (+2 args)"}},
 		{`killall -s SIGTERM ` + e.token, []string{"host-pkill: killall -TERM (+1 args)"}},
+		// wi_de679d2a42cdaec2: the 11-03 command, and a wide pgrep piped into kill.
+		{`pkill -f "^sleep 303$" -u $(id -u)`, []string{"host-pkill: pkill -f (+3 args)"}},
+		{`pgrep -f ab12cd34 -u 501 | xargs kill`, []string{"host-pkill: pgrep -f | kill (+3 args)"}},
+		{`pkill -fu "$USER" ab12cd34`, []string{"host-pkill: pkill (+3 args)"}},
 		{`files=(scripts/deploy-static.mjs ab12cd34); case $x in pkill|killall) tmux send-keys -t tt-builder-1 'tt-deployer-compact' ;; esac; [[ $x =~ (pkill|killall) ]]; pkill --help; pkill -0 -f vite; killall -d node`, nil},
 	}
 	for i, c := range cases {
