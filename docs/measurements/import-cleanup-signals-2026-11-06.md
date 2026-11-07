@@ -51,7 +51,9 @@ Missing captures: r80's tmux session and final pane are gone (as #58773
 says). lead-0937d6d9's "status 143" pane text comes only from #58773, and this
 order forbids re-capturing panes. The argv of the dead processes was never
 captured. The backlog steward's run (pid 73112) has no transcript path in its
-relay activity record.
+relay activity record. Its transcript was found by search instead, as
+`~/.claude/projects/-Users-stephenspeicher-projects-tailterm/dd6b2ca4-dff9-4d09-b48c-2fd6de267911.jsonl`.
+Its last entry is 13:22:34.356Z.
 
 Raw extracts are kept outside the repository, in
 `/Users/stephenspeicher/projects/tailterm-artifacts/wi_e4578e89a217972f/raw/`.
@@ -68,7 +70,7 @@ are all in one burst. No exit is recorded at 12:15Z, 13:21Z or 13:22Z.
 | db-handler-r80 (codex, 60241, 11-02 22:17:24 PST) | Was mid-intake of steward REQUEST 58163: a `python3` exec started 13:23:41.779Z, and its rollout ends at 13:23:41.825Z with no output. Last Board post 58122 at 13:02:17Z | file the low bug, then reply to the steward | `exitedAt` 13:23:42.211Z. Wrapper exit 0 (#58773 and rotation notice 58176) |
 | db-handler-o3, o4, o5, o6, o7 (codex; pids 57313, 57569, 93476, 47750, 76227; started 10-03 to 10-05) | o4: last post 58159 13:18:09Z (wi_89d4 gate); o3: 58062 12:13:55Z | wait for wi_89d4 commits / the owner decision | `exitedAt` 13:23:42.176–.219Z. No pane receipt (`panePid` absent) |
 | plan-reviewer-0937d6d9 (codex, 7233) | not checked further | idle | `exitedAt` 13:23:42.157Z |
-| backlog-steward agt_ee9b (claude, 73112, 09-30) | REQUEST 58163 13:22:26Z and NOTICE 58164 13:22:34Z to r80 | wait for r80's RESULT | `exitedAt` 13:23:43.876Z. The source's 13:21:57Z is contradicted by its own posts 29 s and 37 s later |
+| backlog-steward agt_ee9b (claude, 73112, 09-30) | REQUEST 58163 13:22:26Z and NOTICE 58164 13:22:34Z to r80. Transcript: `tt send` 13:22:31Z, then an `until tt inbox --unread … grep …; do sleep 10; done` wait loop from 13:22:33Z, still running when it died | wait for r80's RESULT | `exitedAt` 13:23:43.876Z. The source's 13:21:57Z is contradicted by its own posts 29 s and 37 s later |
 | lead-0937d6d9 (claude, 6939, 11-03 03:05:56 PST) | RESULT 58160 13:18:17Z; last tool call `tt inbox --unread` 13:21:33Z; turn complete, last transcript entry 13:21:42.265Z | wait for builder's identity fix (58155) and verifier sweep | `exitedAt` 13:23:43.715Z. Pane "status 143" per #58773. The source's 13:22:47Z is not reproduced |
 | verifier-0937d6d9 (claude, 7707) | RESULT 58161 13:21:26Z, FINDING 58162 13:21:36Z, `tt progress` 13:21:39Z | wait for the new commit (lead 58156) | `exitedAt` 13:23:43.475Z |
 | reviewer-0937d6d9 (claude, 8010) | RESULT 58151 13:16:45Z; last tool call 13:16:49Z | wait for the next REVIEW | `exitedAt` 13:23:44.916Z |
@@ -99,9 +101,14 @@ Board. The first and second columns give UTC times.
 | 13:23:40.805 | builder | TaskStop b94eux373 (result 13:23:40.852) | its own background shell | none in the next 1.3 s |
 | **13:23:41.795 → 13:23:42.188** | builder | **`pkill -f "^sleep 303$" -u $(id -u)`** | **SIGTERM to every user process whose argv contains `-u` or `501`, except its own ancestors** | **all 17, from 13:23:42.157** |
 
-From 13:22:30Z to 13:23:45Z, across all 32 Claude transcripts written in that
-window, the only tool calls are this TaskStop and this `pkill`. The only Codex
-call is r80's intake exec.
+From 13:22:30Z to 13:23:45Z, the only calls able to send a signal are this
+TaskStop and this `pkill`. That covers the 32 Claude transcripts reachable
+from relay activity records, the steward's transcript and the Codex rollouts.
+The other calls in the window send no signal:
+- the steward's `tt send` (58164) at 13:22:31Z and its `tt inbox` wait loop
+  from 13:22:33Z;
+- r80's `tt status` exec at 13:22:56.715Z, its `tt ack 58163` / `tt inbox`
+  exec at 13:23:16.455Z, and its `python3` intake exec at 13:23:41.779Z.
 
 ## a2. Signal paths and causality
 
@@ -109,12 +116,12 @@ call is r80's intake exec.
 
 | Commit | Site | Target, signal | Where the target comes from | Identity checks | Could it reach an unrelated agent? |
 | --- | --- | --- | --- | --- | --- |
-| b754f64d (04:55) | `hub/cmd/tt/project_import.go:1398` | none: `Setsid: true` makes each job its own group (PGID = PID) | — | — | no signal path. e569cf95, 08ba2b06 and fd908cae add no signal sites in hub/cmd/tt or tests |
+| b754f64d (04:55) | `hub/cmd/tt/project_import.go:1397` (`:1398` at 6ad64840) | none: `Setsid: true` makes each job its own group (PGID = PID) | — | — | no signal path. e569cf95, 08ba2b06 and fd908cae add no signal sites in hub/cmd/tt or tests |
 | 6ad64840 (05:14) | `hub/cmd/tt/project_import_test.go:81` and `:87` | `syscall.Kill(-pgid, SIGTERM)`, then SIGKILL after 10 s | `*.pid` under the test's `importJobDir()` (isolated HOME). Records are written by the job via `syscall.Getpgid(0)` (`project_import.go:1420`) | `pid > 1 && pgid > 1`. "Alive" is `Wait4` for own children, else `Kill(pid, 0)`. **No start-time check** | Only through a stale record. A SIGTERM'd Go job leaves its `.pid` (defers do not run). The second cleanup (`t.Cleanup` at `:1448`, after the explicit call at `:1537`) can then see `Kill(pid, 0)` succeed on a **reused** PID and signal its group. Every tt-wrapped agent is a group leader (`hub/internal/spawn/spawn.go:382`, `Setpgid: true`), so a reused PID would hit a whole agent. This needs a PID reuse within one test (macOS PIDs are sequential), and it can reach at most one group, never 17 |
 | 6ad64840 | `tests/task-form-browser.mjs:136` and `:142` | `process.kill(-job.pgid, SIGTERM / SIGKILL)` | `*.pid` under `importHome` inside this run's `mkdtemp` state | `pid > 1 && pgid > 1`; group alive by `kill(-pgid, 0)`; **no start-time check** | Same stale-record PID-reuse gap, at most one group. Runs only in the browser test's `finally` (`:2198`), and no browser run happened after 12:47:47Z |
 | 74cc93fc (05:20) | `project_import_test.go:81` and `:87`; `task-form-browser.mjs:171` and `:177` | same | the browser test reads creator-written `KEY.start` | browser test: PID/PGID/lstart match before SIGTERM | gap narrowed in the browser test |
 | 9419d90d (05:30) | `project_import_test.go:123` and `:130` (through the `importJobSignal` seam, `:72`); `task-form-browser.mjs:199` and `:206` | `-pgid` SIGTERM, then SIGKILL only if still the same job | `*.pid` (Go) / `*.start` (browser) under the test's own state | `sameImportJob`: `Getpgid(pid) == pgid` and the same `lstart`, rechecked before SIGKILL; JS `matches()` is the same | A reused PID now fails the start-time check. Remaining gap: the check proves the PID is the recorded process, not that every member of `-pgid` belongs to the job |
-| (all) | `task-form-browser.mjs:2199`, `backend.kill("SIGTERM")` | its own hub child | `spawn` handle | — | no |
+| (all) | `task-form-browser.mjs:2199` at 6ad64840, `:2281` at 9419d90d: `backend.kill("SIGTERM")` | its own hub child | `spawn` handle | — | no |
 
 None of these signal by name or pattern, none uses `pkill`/`killall`/`kill -1`
 (`git grep` at 9419d90d over the three changed code files finds none), and none ran between 13:21:26Z and
@@ -173,7 +180,8 @@ None of these signal by name or pattern, none uses `pkill`/`killall`/`kill -1`
      apps.
    - Survived: exactly the `pkill` caller's ancestors and the processes with
      neither `-u` nor `501` in argv.
-4. **No competitor.** No other tool call ran on the host in that window.
+4. **No competitor.** No other call able to send a signal ran in that
+   window. The steward's and r80's calls listed in a1 only post and read.
    No cleanup code ran between 13:21:26Z and the burst.
 
 ### Alternative hypotheses
