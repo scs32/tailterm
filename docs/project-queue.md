@@ -2457,9 +2457,12 @@ same `ps` and `lsof` route as the verifier home probe. A process (other than
 the sweep and its ancestors) whose cwd or any open path it reports lies inside
 a folder keeps that folder `in-use`, and the reason names the process by pid,
 start time and command name only: the program and the script it runs, never
-its other arguments or its environment. When `ps` or `lsof` fails, every such
-folder is kept `failed` with the probe's error. A folder already kept for
-another reason is not probed.
+its other arguments or its environment. The start time is computed from
+`ps`'s elapsed time, which prints the same in every locale. When `ps` or `lsof`
+fails, or `ps` prints a line that is not a process row or no row for the sweep
+itself, every such folder is kept `failed` with the probe's error, and the
+orphan report below names the failure instead of listing nothing. A folder
+already kept for another reason is not probed.
 
 **Orphan report.** The dry run (no `--apply`) also lists processes left
 behind by earlier removals, one `orphan KIND pid= pgid= ppid= started cpu=
