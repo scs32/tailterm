@@ -4743,7 +4743,8 @@ var (
 	// hostProcessRow is one ps row: pid, ppid, pgid, uid, elapsed time,
 	// CPU time and command. Elapsed time ([[dd-]hh:]mm:ss) is printed the
 	// same in every locale, unlike lstart, so the start is computed from it.
-	hostProcessRow = regexp.MustCompile(`^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+((?:\d+-)?(?:\d+:)?\d+:\d+)\s+(\S+)\s(.*)$`)
+	// The uid may be negative: macOS ps prints nobody as -2.
+	hostProcessRow = regexp.MustCompile(`^\s*(\d+)\s+(\d+)\s+(\d+)\s+(-?\d+)\s+((?:\d+-)?(?:\d+:)?\d+:\d+)\s+(\S+)\s(.*)$`)
 	elapsedField   = regexp.MustCompile(`^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$`)
 	scriptArgument = regexp.MustCompile(`\.(js|mjs|cjs|ts|mts|cts|py|rb|pl|sh)$`)
 )
