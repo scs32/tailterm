@@ -1432,7 +1432,7 @@ export async function runRelease(config, adapter) {
     if(error?.batchWait)return {jobId:job.id,outcome:"waiting_batch"};
     // The first failed target step is kept; a resumed run never rewrites it.
     const failed=step||staged;
-    if(failed && !state.failure){const rehearsal=failureRehearsal(error);state.failure={...failed,reason:failureReason(error),...(rehearsal?{rehearsal}:{})};state.failureDetail??=failureDetail(error);checkpoint();}
+    if(failed && !state.failure){const rehearsal=failureRehearsal(error),hostOutput=failureHostOutput(error);state.failure={...failed,reason:failureReason(error),...(rehearsal?{rehearsal}:{}),...(hostOutput?{hostOutput}:{})};state.failureDetail??=failureDetail(error);checkpoint();}
     // The first failure's validated detail is kept even when no step was set;
     // a journal that cannot be written here is left to the checkpoints below.
     if(!state.failureDetail){state.failureDetail=failureDetail(error);try{checkpoint();}catch{}}
@@ -1460,6 +1460,7 @@ export async function runRelease(config, adapter) {
       try{await fence();restored=await adapter.rollback(effect.target,effect.release)===true;}catch{}
       blocked ||= !restored;effect.rollback=restored?"restored":"blocked";
       const wait=adapter.probeWait?.(effect.target,"rollback");if(wait)effect.rollbackCheck=wait;
+      const host=failureHostOutput({hostOutput:adapter.hostRollbackOutput?.(effect.target)});if(host)effect.rollbackHostOutput=host;
       checkpoint();
     }
     state.phase="blocked";state.outcome=blocked?"blocked":"rolled_back";checkpoint();
@@ -1599,6 +1600,29 @@ export function failureRehearsal(error){
     || !Array.isArray(r.lines) || r.lines.length>REHEARSAL_LINES || r.lines.some(l=>typeof l!=="string" || l.length>REHEARSAL_LINE_LENGTH))return null;
   return {runtime:r.runtime,image:r.image,exit:r.exit,lines:[...r.lines]};
 }
+// What the private job journal keeps of a failed Mini host setup or host
+// rollback call (wi_b1891ff7796aaffd): which call, how it ended in
+// childReason's vocabulary, the first step a "STATE  NAME  DETAIL" line of
+// tt host setup reports as failed or conflict, and the last HOST_LINES
+// non-empty lines of its stdout (the step lines and doctor's lines beneath
+// them) and of its stderr, each redacted and cut by sanitizeCapture. Only the
+// journal keeps it: Board notices and hub receipts still carry only the
+// failure reason.
+const HOST_LINES=40,HOST_CALLS=["setup","rollback"],HOST_STEP_LINE=/^(failed|conflict)\s+([a-z][a-z0-9-]{0,31})(?:\s|$)/,HOST_STEP=/^[a-z][a-z0-9-]{0,31}$/;
+function hostOutput(call,error){
+  const text=v=>typeof v==="string"?v:Buffer.isBuffer(v)?v.toString("utf8"):"",lines=v=>text(v).split(/\r?\n/).filter(l=>l.trim());
+  const clean=all=>sanitizeCapture({logs:[{service:"tt",lines:all.slice(-HOST_LINES)}]}).logs[0].lines;
+  const how=error?.code==="ETIMEDOUT"?"timeout":/^SIG[A-Z0-9]{1,12}$/.test(error?.signal||"")?`signal ${error.signal}`:Number.isInteger(error?.status) && error.status>=0 && error.status<1000?`exit ${error.status}`:"not started";
+  const out=lines(error?.stdout),step=out.map(l=>HOST_STEP_LINE.exec(l)).find(Boolean);
+  return {call,exit:how,...(step?{step:step[2],stepState:step[1]}:{}),stdout:clean(out),stderr:clean(lines(error?.stderr))};
+}
+// The only shape of that record the journal keeps; anything else is dropped.
+export function failureHostOutput(error){
+  const r=error?.hostOutput,bounded=l=>Array.isArray(l) && l.length<=HOST_LINES && l.every(x=>typeof x==="string" && x.length<=REHEARSAL_LINE_LENGTH);
+  if(!r || typeof r!=="object" || !HOST_CALLS.includes(r.call) || typeof r.exit!=="string" || !REHEARSAL_HOW.test(r.exit) || !bounded(r.stdout) || !bounded(r.stderr))return null;
+  const step=HOST_STEP.test(r.step||"") && ["failed","conflict"].includes(r.stepState)?{step:r.step,stepState:r.stepState}:{};
+  return {call:r.call,exit:r.exit,...step,stdout:[...r.stdout],stderr:[...r.stderr]};
+}
 // The cause a push-failure notice names, built only from re-validated typed
 // values; anything else in the cause is dropped, never echoed. The stderr
 // itself stays in the private journal and only its sha256 prefix is named.
@@ -1624,6 +1648,8 @@ export class HostAdapter {
     this.matrixChildren=MATRIX_CHILDREN;this.matrixWait=null;this.matrixHeld=null;
     // Failed calls of the configured CLI this adapter recorded privately.
     this.cliFailures=[];
+    // A failed Mini host rollback call's redacted output, by target.
+    this.hostRollbackOutputs=new Map();
     // Progress reports are opt-in (the deployment daemon turns them on) and
     // share one withdraw state across the adapters of a daemon.
     this.progressOn=false;this.progressState={withdrawn:false};this.matrixPid=null;}
@@ -1655,7 +1681,9 @@ export class HostAdapter {
       }catch{}
     }
   }
-  command(argv,cwd=this.config.cwd,{timeout=600000,retry=true}={}){
+  // output names a Mini host call (HOST_CALLS) whose failure keeps its
+  // redacted output on the thrown error, for the private journal only.
+  command(argv,cwd=this.config.cwd,{timeout=600000,retry=true,output=null}={}){
     if(!Array.isArray(argv)||!argv.length||argv.some(a=>typeof a!=="string"||/[\0\r\n]/.test(a)))throw releaseError("Invalid host operation argv");
     // Only an idempotent call of the configured CLI is made again, and only
     // after a transport error (cliRetry). The error thrown carries transport
@@ -1676,6 +1704,7 @@ export class HostAdapter {
         if(argv[0]===cli && argv[1]==="deployment" && generationChanged(error))failed.generationChanged=true;
         if(argv[0]===cli && argv[1]==="deployment" && ((argv[2]==="refuse" && argv.includes("--reason")) || (argv[2]==="block" && argv.includes("--revert-outcome")) || (argv[2]==="finish" && argv.includes("--batch-dropped"))) && refusalRefused(error))failed.refusalRefused=true;
         if(kept)this.cliFailures.push(cause?{...kept,transport:true}:kept);
+        if(HOST_CALLS.includes(output))failed.hostOutput=hostOutput(output,error);
         throw failed;
       }
     }
@@ -2174,7 +2203,7 @@ export class HostAdapter {
       const log=this.config.targets?.mini?.relayLog;if(log)save(join(this.config.journalDirectory,"mini-relay-offset.json"),{jobId:this.job.id,offset:existsSync(log)?statSync(log).size:0});
       // tt host setup installs the binary with its own rollback copy, updates
       // the hooks, restarts the relay and runs doctor (docs/host-setup.md).
-      this.command(a.hostSetup||[a.artifactPath,"host","setup","--from",a.artifactPath]);
+      this.command(a.hostSetup||[a.artifactPath,"host","setup","--from",a.artifactPath],undefined,{output:"setup"});
       if(fileDigest(a.installPath)!==a.artifactSHA256)throw releaseError("Mini install does not match the pinned artifact");
     }else{
       const bin=pinnedWrangler(this.config.cwd);if(!bin)throw releaseError("Pinned wrangler not installed; run npm ci");
@@ -2222,8 +2251,10 @@ export class HostAdapter {
       // The host command is never trusted alone: it may be missing in an old
       // CLI, lack its rollback copy, restore other bytes or fail doctor. Unless
       // it left exactly the prior binary, restore this job's journal copy.
-      let hostRestored=true;
-      try{this.command(a.hostRollback||[a.installPath,"host","setup","--rollback"]);}catch{hostRestored=false;}
+      // A failed host rollback's redacted output is kept for the journal
+      // (hostRollbackOutput), whatever the journal copy restore does next.
+      let hostRestored=true;this.hostRollbackOutputs.delete(target);
+      try{this.command(a.hostRollback||[a.installPath,"host","setup","--rollback"],undefined,{output:"rollback"});}catch(error){hostRestored=false;const kept=failureHostOutput(error);if(kept)this.hostRollbackOutputs.set(target,kept);}
       if(!hostRestored || fileDigest(a.installPath)!==a.priorArtifactSHA256){
         copyFileSync(a.rollbackPath,a.installPath+".rollback");chmodSync(a.installPath+".rollback",0o755);renameSync(a.installPath+".rollback",a.installPath);this.command(a.relayRestart);
       }
@@ -2245,6 +2276,7 @@ export class HostAdapter {
     return r.restored===true && r.databaseWritesPreserved===true;
   }
   probeWait(target,kind){return this.probeWaits.get(target+":"+kind);}
+  hostRollbackOutput(target){return this.hostRollbackOutputs.get(target);}
   // B10: the verified TailOS build stays on the host so the next release can
   // roll back to it; release-inputs names it in that job's rollback program.
   async retain(target,a){

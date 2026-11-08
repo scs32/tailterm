@@ -1010,7 +1010,9 @@ asking for a re-provision. A stop during the load check prints a line only when
 its checkout could not be restored (`load-unproven`, above).
 
 **Failed CLI calls.** When a call of the configured `tt` fails, the journal
-directory keeps the evidence in `cli-failures.json`, mode 0600: for each
+directory keeps the evidence in `cli-failures.json`, mode 0600 (the Mini host
+setup and rollback run another binary, so they are kept in the job journal
+instead; see "A failed Mini host setup"): for each
 failure `at`, `jobId`, `agentId`, `runId`, the exact `argv`, `cwd`, `exitCode`,
 `signal`, `errorCode`, the last 16384 bytes of `stderr`, `stderrBytes`,
 `stderrTruncated`, `count` and `lastAt`. The newest 20 distinct failures are
@@ -2309,7 +2311,8 @@ the step. `fence`, `matrix`, `inputs`, `publish` and a resumed `integrate` are
 journal steps only; the runner's progress reports keep their phases and steps.
 A released job's journal has no `failure`. A failed
 rehearsal container
-run adds `rehearsal` (see "Migration rehearsal container"). The reason is at most 160
+run adds `rehearsal` (see "Migration rehearsal container"), and a failed Mini
+host setup adds `hostOutput` (below). The reason is at most 160
 characters and is only a fixed message the runner or adapter tagged (for example
 `live verification failed` or `release fence lost`) or, for a host program, its
 name, exit status and the `classification`/`stage` of its last JSON line (for
@@ -2317,7 +2320,33 @@ example `deploy-truenas-hub.py exit 2: remote-operation-failed at
 bridge-binary-upload`); anything else is `unclassified`. Program stderr,
 messages, paths and credentials never reach it, except that the
 `Unknown release path` reason names one changed repository path made only of
-letters, digits and `_ . / -`. `scripts/deploy-truenas-hub.py
+letters, digits and `_ . / -`.
+
+**A failed Mini host setup (wi_b1891ff7796aaffd).** When the Mini deploy's
+host setup call (the configured `hostSetup`, or the candidate's own
+`tt host setup --from ARTIFACT`) fails, the job journal's `failure` keeps its
+output beside the reason:
+
+```
+hostOutput: {call: "setup", exit: "exit N" | "signal NAME" | "timeout" | "not started",
+             step, stepState: "failed" | "conflict", stdout: [...], stderr: [...]}
+```
+
+`stdout` and `stderr` are each at most the last 40 non-empty lines, so the
+`STATE  NAME  DETAIL` step lines of `tt host setup` and doctor's lines beneath
+its `doctor` step are among them. Each line is redacted by the same rules as a
+probe capture (labelled credentials, `Bearer` values and long opaque runs
+become `[redacted]`) and cut to 300 characters. `step` and `stepState` name
+the first step line whose state is `failed` or `conflict`, and are absent when
+there is none. A failed Mini host rollback call (the configured
+`hostRollback`, or the installed `tt host setup --rollback`) keeps the same
+record, with `call: "rollback"`, as `effects[].rollbackHostOutput` of the Mini
+effect; the runner still restores its own journal copy afterwards. A call that
+passes keeps no output. A record of any other shape is dropped. None of it
+reaches the hub receipt, the Board or any notice: they keep only the reason
+(for example `tt-rel_JOB exit 1`).
+
+`scripts/deploy-truenas-hub.py
 --rollback-to RELEASE --target hub|bridge --expect-sha256 SHA` verifies the
 retained binary at `BASE/releases/RELEASE/` over SSH, then changes only that
 target's executable mount in the live app definition (`app.update`, `app.start`).

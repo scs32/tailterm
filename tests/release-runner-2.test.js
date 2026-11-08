@@ -113,6 +113,39 @@ test("host Mini deploy that fails in host setup rolls back to the prior digest",
  await assert.rejects(bare.adapter.deploy("mini",bare.a),/Host operation failed/);assert.equal(await bare.adapter.rollback("mini"),true);
  assert.deepEqual(argvs.slice(0,2),[[bare.artifact,"host","setup","--from",bare.artifact],[bare.install,"host","setup","--rollback"]]);assert.equal(readFileSync(bare.install,"utf8"),"old CLI");
 });
+// wi_b1891ff7796aaffd: a failed Mini host setup, and a failed host rollback,
+// leave their redacted step, doctor and stderr lines in the private job
+// journal; the receipt and the escalation keep only the short reason.
+test("hso1 a failed Mini host setup and host rollback keep redacted output in the job journal only",async()=>{
+ const SECRET="SYNTHETIC_PRIVATE_TOKEN_9f8e7d6c",OPAQUE="ghp9A1b2C3d4E5f6G7h8I9j0K1l2M3n4";
+ const setup="const fs=require('fs'),[i,a]=process.argv.slice(1);fs.copyFileSync(a,i);"
+  +"console.log('ok         binary         installed');console.log('failed     relay-service  launchctl bootstrap exit 5 token="+SECRET+"');"
+  +"console.log('           relay: not running ("+OPAQUE+")');console.error('host setup: 1 step(s) failed');process.exit(1)";
+ const rollback="console.log('failed     rollback       no tt.previous');console.error('rollback stderr Bearer "+SECRET+"');process.exit(1)";
+ const run=async over=>{
+  const m=miniFixture(over),f=fixture();mkdirSync(join(f.cwd,"hub/cmd/tt"),{recursive:true});
+  const j=job(f,change(f,"hub/cmd/tt/fixture.go","fixture")),c=config(f,j),a=fake();let receipt,escalation;
+  Object.assign(a,{deploy:async t=>{a.calls.push("deploy:"+t);await m.adapter.deploy("mini",m.a);},rollback:async t=>{a.calls.push("rollback:"+t);return m.adapter.rollback("mini");},
+   hostRollbackOutput:t=>m.adapter.hostRollbackOutput(t),finish:async r=>{receipt=r;a.calls.push("finish");},escalate:async e=>{escalation=e;a.calls.push("escalate");}});
+  let thrown=null;try{await runRelease(c,a);}catch(error){thrown=error;}
+  const raw=readFileSync(c.journalPath,"utf8");return {m,a,raw,journal:JSON.parse(raw),receipt,escalation,thrown};
+ };
+ const failed=await run((node,f)=>({hostSetup:node(setup,f.install,f.artifact),hostRollback:node(rollback)}));
+ assert.ok(failed.thrown);assert.deepEqual(failed.a.calls.slice(0,3),["merged","deploy:mini","rollback:mini"]);
+ const {hostOutput,...failure}=failed.journal.failure;assert.deepEqual(failure,{step:"deploy",target:"mini",reason:"node exit 1"});
+ assert.equal(hostOutput.call,"setup");assert.equal(hostOutput.exit,"exit 1");assert.equal(hostOutput.step,"relay-service");assert.equal(hostOutput.stepState,"failed");
+ assert.equal(hostOutput.stdout[0],"ok         binary         installed");assert.match(hostOutput.stdout[1],/^failed     relay-service  launchctl bootstrap exit 5 \[redacted\]$/);
+ assert.equal(hostOutput.stdout[2],"           relay: not running ([redacted])","the doctor line under the step is kept");assert.deepEqual(hostOutput.stderr,["host setup: 1 step(s) failed"]);
+ const effect=failed.journal.effects.find(e=>e.target==="mini");assert.equal(effect.rollback,"restored","the journal copy restored the prior binary");
+ assert.deepEqual(effect.rollbackHostOutput,{call:"rollback",exit:"exit 1",step:"rollback",stepState:"failed",stdout:["failed     rollback       no tt.previous"],stderr:["rollback stderr [redacted]"]});
+ assert.equal(readFileSync(failed.m.install,"utf8"),"old CLI");
+ for(const planted of [SECRET,OPAQUE])assert.ok(!failed.raw.includes(planted),"a planted secret never reaches the journal");
+ const outside=JSON.stringify([failed.receipt,failed.escalation]);assert.equal(failed.receipt.failure.reason,"node exit 1");
+ for(const kept of ["relay-service","host setup:","rollback stderr","not running","binary"])assert.ok(!outside.includes(kept),kept+" stays in the private journal");
+ // A host setup that passes keeps no output, and a passing host rollback keeps none either.
+ const passed=await run(()=>({}));assert.equal(passed.thrown,null);assert.equal(passed.journal.failure,undefined);assert.ok(!passed.raw.includes("hostOutput"));
+ const live=miniFixture(()=>({}));await live.adapter.deploy("mini",live.a);assert.equal(await live.adapter.rollback("mini"),true);assert.equal(live.adapter.hostRollbackOutput("mini"),undefined);
+});
 test("host receipt adapter writes its receipt beneath the provisioned journal directory",async()=>{
  const cwd=mkdtempSync(join(tmpdir(),"receipt-adapter-")),adapter=new HostAdapter({cwd,journalDirectory:cwd},{id:"rel_fixture",state:"merged",generation:5});let args;
  adapter.command=argv=>{args=argv;return JSON.stringify({...adapter.job,generation:6,state:"released",receipt});};
