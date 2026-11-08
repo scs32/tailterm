@@ -4413,6 +4413,160 @@ func TestClaudeInputV2316Fixtures(t *testing.T) {
 	}
 }
 
+// Bug wi_5151b0616820455e r1/r2 (order #58795): the empty check needs the
+// cursor on the input row itself, not only at x=2. helper-1740-sidepanel is
+// the owner helper's 17:40 capture (testdata/claude-pane/README.md), with the
+// side panel open: it passes with the cursor on its ❯ row (2,19) and refuses
+// at x=2 on the rule above it (2,18, finding #57212), on a transcript row and
+// below the input box. Every other fixture that passes refuses the same way
+// with the cursor moved to any other row, and the refusal carries no text, so
+// the stray input clear never types while the cursor is off the input row.
+func TestClaudeInputCursorRowFixtures(t *testing.T) {
+	const notEmpty = "Claude cursor is not at an empty input"
+	for _, tc := range []struct {
+		fixture string
+		x, y    int
+		refusal string
+	}{
+		{fixture: "helper-1740-sidepanel", x: 2, y: 19},
+		{fixture: "helper-1740-sidepanel", x: 2, y: 18, refusal: notEmpty + ": cursor row 18 is not the input row 19"},
+		{fixture: "helper-1740-sidepanel", x: 2, y: 10, refusal: notEmpty + ": cursor row 10 is not the input row 19"},
+		{fixture: "helper-1740-sidepanel", x: 2, y: 0, refusal: notEmpty + ": cursor row 0 is not the input row 19"},
+		{fixture: "helper-1740-sidepanel", x: 2, y: 20, refusal: notEmpty + ": cursor row 20 is not the input row 19"},
+		{fixture: "helper-1740-sidepanel", x: 2, y: 22, refusal: notEmpty + ": cursor row 22 is not the input row 19"},
+		// The cursor column rule is unchanged.
+		{fixture: "helper-1740-sidepanel", x: 3, y: 19, refusal: notEmpty},
+		// The 2.1.316 diff panel: accepted only with the cursor on the ❯ row.
+		{fixture: "v2316-diff-panel", x: 2, y: 19},
+		{fixture: "v2316-diff-panel", x: 2, y: 12, refusal: notEmpty + ": cursor row 12 is not the input row 19"},
+		{fixture: "v2316-suggestion-panel", x: 2, y: 18, refusal: notEmpty + ": cursor row 18 is not the input row 19"},
+	} {
+		t.Run(fmt.Sprintf("%s/%d,%d", tc.fixture, tc.x, tc.y), func(t *testing.T) {
+			raw, _, _ := readClaudePaneFixture(t, tc.fixture)
+			screen, err := claudeInputScreen(raw, tc.x, tc.y, "")
+			if tc.refusal == "" {
+				if err != nil || !emptyClaudeInput(screen) {
+					t.Fatalf("refused: %v (screen %q)", err, screen)
+				}
+				return
+			}
+			var refused claudeInputError
+			if !errors.As(err, &refused) || err.Error() != tc.refusal || refused.Text != "" {
+				t.Fatalf("err = %v (held %q), want %q (held nothing)", err, refused.Text, tc.refusal)
+			}
+			if refused.snap == nil || refused.snap.CursorX != tc.x || refused.snap.CursorY != tc.y {
+				t.Fatalf("refusal carries no snapshot: %+v", refused.snap)
+			}
+		})
+	}
+	for _, fixture := range []string{"helper-1740-sidepanel", "helper-1455-midturn", "v2316-suggestion", "v2316-try-placeholder", "v2316-try-placeholder-100x30", "v2316-diff-panel", "v2316-suggestion-panel", "suggestion", "try-placeholder", "scrollback-dialog-words", "interrupted"} {
+		raw, x, y := readClaudePaneFixture(t, fixture)
+		if _, err := claudeInputScreen(raw, x, y, ""); err != nil {
+			t.Fatalf("%s at its own cursor %d,%d: %v", fixture, x, y, err)
+		}
+		rows := strings.Count(raw, "\n")
+		for row := 0; row < rows; row++ {
+			if row == y {
+				continue
+			}
+			_, err := claudeInputScreen(raw, 2, row, "")
+			var refused claudeInputError
+			if !errors.As(err, &refused) || !strings.HasPrefix(err.Error(), notEmpty) || refused.Text != "" {
+				t.Fatalf("%s with the cursor at 2,%d (input row %d): err = %v, held %q", fixture, row, y, err, refused.Text)
+			}
+		}
+	}
+}
+
+// Bug wi_5151b0616820455e r4 (order #58795): Claude Code's feedback-draft
+// review box is a named prompt, not the catch-all. v2319-feedback-draft is the
+// box above an empty input box, which the old check accepted as idle;
+// v2319-feedback-draft-offscreen is the owner helper's 2026-11-03 layout, the
+// box pushing the input box off the pane (cursor 2,22), which the old check
+// refused as faint text followed by typed text. Both are private-socket
+// reproductions (testdata/claude-pane/README.md).
+func TestClaudeInputFeedbackDraftFixtures(t *testing.T) {
+	const hint = `"1 to review · 2 to send · 0 to dismiss"`
+	for _, tc := range []struct {
+		fixture, expected, refusal string
+	}{
+		{fixture: "v2319-feedback-draft", refusal: claudeFeedbackDraftReason + ": " + hint + " in capture row 15"},
+		{fixture: "v2319-feedback-draft.joined", expected: "next question", refusal: claudeFeedbackDraftReason + ": " + hint + " in capture row 15"},
+		{fixture: "v2319-feedback-draft-offscreen", refusal: claudeFeedbackDraftReason + ": " + hint + " in capture row 20"},
+	} {
+		t.Run(tc.fixture, func(t *testing.T) {
+			raw, x, y := readClaudePaneFixture(t, tc.fixture)
+			_, err := claudeInputScreen(raw, x, y, tc.expected)
+			var refused claudeInputError
+			if !errors.As(err, &refused) || err.Error() != tc.refusal || refused.Text != "" {
+				t.Fatalf("err = %v (held %q), want %q", err, refused.Text, tc.refusal)
+			}
+			if refused.snap == nil || len(refused.snap.Rows) == 0 {
+				t.Fatalf("refusal carries no snapshot: %+v", refused.snap)
+			}
+		})
+	}
+	// Synthetic, from the typed-input state seen in the same reproduction:
+	// with text in the input box the hint row reads "clear text to …".
+	rule := strings.Repeat("─", 60)
+	box := "╭" + strings.Repeat("─", 40) + "╮\n│ ✻ Bug report drafted: A title          │\n│ clear text to review, send, or dismiss │\n╰" + strings.Repeat("─", 40) + "╯\n"
+	typed := "⏺ Done.\n\n" + box + "\n" + rule + "\n❯ next question\n" + rule + "\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · 1 feedback draft\n"
+	if _, err := claudeInputScreen(typed, 15, 6, "next question"); err == nil || err.Error() != claudeFeedbackDraftReason+`: "clear text to review, send, or dismiss" in capture row 5` {
+		t.Fatalf("typed-input box: %v", err)
+	}
+	// The hint quoted in an answer, indented or not above a box border, is
+	// transcript: the empty input below it still wakes.
+	for _, quoted := range []string{
+		"⏺ The box ends with: 1 to review · 2 to send · 0 to dismiss\n",
+		"  │ 1 to review · 2 to send · 0 to dismiss │\n  ╰────╯\n",
+		"│ 1 to review · 2 to send · 0 to dismiss │\nAnswer text.\n",
+	} {
+		screen := quoted + "\n" + rule + "\n❯ \n" + rule + "\n  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
+		y := strings.Count(quoted, "\n") + 2
+		if _, err := claudeInputScreen(screen, 2, y, ""); err != nil {
+			t.Fatalf("quoted hint refused: %v\n%s", err, screen)
+		}
+	}
+}
+
+// r4: the owner helper's notice for the feedback-draft box says in plain
+// words that a draft is waiting and how to clear it, through the retry
+// path's wrapped refusal the relay reports.
+func TestClaudeWakeSkipOwnerFeedbackDraftNotice(t *testing.T) {
+	t.Setenv("TAILTERM_RELAY_STATE", t.TempDir())
+	b := testClaudeBinding()
+	b.Role = api.AgentRoleOwnerHelper
+	raw, x, y := readClaudePaneFixture(t, "v2319-feedback-draft-offscreen")
+	_, refusal := claudeInputScreen(raw, x, y, "")
+	if refusal == nil {
+		t.Fatal("fixture passed the pane check")
+	}
+	start := time.Date(2026, 11, 3, 5, 43, 0, 0, time.UTC)
+	now := start
+	var posted []claudeWakeSkip
+	ops := claudeWakeOps{now: func() time.Time { return now }, escalate: func(_ context.Context, _ runtimeBinding, skip claudeWakeSkip) error {
+		posted = append(posted, skip)
+		return nil
+	}}
+	for minute := 0; minute <= 16; minute++ {
+		now = start.Add(time.Duration(minute) * time.Minute)
+		err := claudeWrapError{msg: errClaudeWakeUnsafe.Error() + ": prior wake unconfirmed; pane not safe for retry: " + refusal.Error(), errs: []error{errClaudeWakeUnsafe, refusal}}
+		claudeWakeTrackSkip(context.Background(), b, ops, err)
+	}
+	if len(posted) != 1 || !strings.Contains(posted[0].Reason, claudeFeedbackDraftReason) {
+		t.Fatalf("posted %+v", posted)
+	}
+	_, text, _ := claudeOwnerSkipNotice(b, posted[0])
+	for _, want := range []string{"feedback draft is waiting for your review", "type /feedback and press Enter, then press d on each draft to discard it", "Pressing 0 in the box only hides the box: the draft stays queued"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("notice lacks %q: %s", want, text)
+		}
+	}
+	if strings.Contains(text, "occupied, prompting, or unknown") || strings.Contains(text, "Esc there") || len(text) > claudeOwnerSkipNoticeLimit || strings.HasSuffix(text, "…") {
+		t.Fatalf("notice (%d chars): %s", len(text), text)
+	}
+}
+
 // snapshotPane is a fake pane for skip snapshot tests: every inspect runs the
 // real classifier on raw.
 func snapshotPaneOps(raw *string, x, y *int, now *time.Time) claudeWakeOps {

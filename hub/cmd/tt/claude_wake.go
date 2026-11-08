@@ -185,6 +185,45 @@ func claudeDialog(screen string) (string, bool) {
 	return "", false
 }
 
+// claudeFeedbackDraftReason names Claude Code's feedback-draft review box
+// (bug wi_5151b0616820455e r4): after its SendFeedback tool queues a draft,
+// Claude Code 2.1.319 draws a rounded box whose last inner row reads
+// "1 to review · 2 to send · 0 to dismiss" (with typed input, "clear text to
+// review, send, or dismiss"). While the draft stays queued the box can come
+// back (the owner helper's, steward #57846). With an empty input those digits
+// act on the box, and a tall box can leave the input box off the bottom of
+// the pane (the owner helper's 2026-11-03 skips; testdata/claude-pane,
+// v2319-feedback-draft-offscreen). claudeOwnerSkipAction keys on it.
+const claudeFeedbackDraftReason = "Claude pane has a feedback draft review prompt"
+
+// claudeFeedbackDraftKeys start the box's key-hint row: the empty-input form
+// and the typed-input "clear text to review" form were captured; the others
+// are the send-confirm and error forms in Claude Code 2.1.319's own strings.
+var claudeFeedbackDraftKeys = []string{"1 to review", "2 to send", "clear text to review", "clear text to open review", "clear text to dismiss"}
+
+// claudeFeedbackDraftBox finds the feedback-draft review box in a plain
+// capture: a row that starts at column 0 with the box's "│ " border and a key
+// hint, directly above the box's "╰" bottom border. Transcript text never
+// starts at column 0 with "│" (answers and tool output are indented), so a
+// quoted hint in an answer does not match. It returns the hint and its 1-based
+// capture row, which stay the same for an unchanged screen.
+func claudeFeedbackDraftBox(screen string) (string, bool) {
+	lines := strings.Split(strings.TrimRight(screen, "\n"), "\n")
+	for i := len(lines) - 2; i >= 0; i-- {
+		inner, ok := strings.CutPrefix(lines[i], "│ ")
+		if !ok || !strings.HasPrefix(lines[i+1], "╰") {
+			continue
+		}
+		hint := strings.TrimSpace(strings.SplitN(inner, "│", 2)[0])
+		for _, key := range claudeFeedbackDraftKeys {
+			if strings.HasPrefix(hint, key) {
+				return fmt.Sprintf("%q in capture row %d", hint, i+1), true
+			}
+		}
+	}
+	return "", false
+}
+
 // A captured pane is accepted only with a single, empty Claude input line in
 // the active prompt area. Unknown footers, choices, a cursor in an editor, and
 // multiline input fail closed. ANSI escapes are not requested from capture-pane.
@@ -823,6 +862,17 @@ func claudeInputScreen(raw string, cursorX, cursorY int, expected string) (strin
 	// Every refusal below carries the prompt area's snapshot (claudeInputError
 	// snap) for the skip record; its message is unchanged.
 	snap := claudeSnapshotOf(rows, cursorX, cursorY)
+	// The feedback-draft box is named before the input area is read: when it
+	// pushes the input box off the pane, the last ❯ row is a transcript row and
+	// the box's faint quote bars below it would read as faint text followed by
+	// typed text.
+	text := make([]string, len(rows))
+	for i, cells := range rows {
+		text[i] = claudeCellText(cells)
+	}
+	if match, ok := claudeFeedbackDraftBox(strings.Join(text, "\n")); ok {
+		return "", claudeInputError{reason: claudeFeedbackDraftReason + ": " + match, snap: snap}
+	}
 	full, visible, err := claudePlainRows(rows, bad)
 	if err != nil {
 		return "", claudeInputError{reason: err.Error(), snap: snap}
@@ -839,6 +889,14 @@ func claudeInputScreen(raw string, cursorX, cursorY int, expected string) (strin
 		lines := strings.Split(visible, "\n")
 		if cursorX != 2 || cursorY >= len(lines) {
 			return "", claudeInputError{reason: "Claude cursor is not at an empty input", Text: held, snap: snap}
+		}
+		// The cursor must be on the input row itself (bug wi_5151b0616820455e
+		// r1): x=2 on a transcript row, a rule or a second input row is not
+		// the start of an empty input. The refusal carries no text, so the
+		// stray input clear never types while the cursor is elsewhere. With no
+		// ❯ row the check below refuses the screen anyway.
+		if input := claudeInputRow(rows); input >= 0 && cursorY != input {
+			return "", claudeInputError{reason: fmt.Sprintf("Claude cursor is not at an empty input: cursor row %d is not the input row %d", cursorY, input), snap: snap}
 		}
 		visible = strings.Join(lines[cursorY:], "\n")
 	}
@@ -1884,6 +1942,8 @@ func claudeOwnerSkipAction(skip claudeWakeSkip, session string) string {
 		quiet = fmt.Sprintf(" (its last transcript event was %d minutes ago)", int(max(0, skip.LastAt.Sub(skip.LastEventAt))/time.Minute))
 	}
 	switch {
+	case strings.Contains(reason, claudeFeedbackDraftReason):
+		return fmt.Sprintf("a Claude Code feedback draft is waiting for your review in the helper's terminal (tmux session %s), in a box that ends \"1 to review · 2 to send · 0 to dismiss\". To clear it for good, open that terminal, type /feedback and press Enter, then press d on each draft to discard it (or Enter to review and send it), and Esc to close the list. Pressing 0 in the box only hides the box: the draft stays queued, the footer still says \"feedback draft\", and the box can come back.", session)
 	case strings.Contains(reason, "permission or selection prompt"):
 		return fmt.Sprintf("open the helper's terminal (tmux session %s) and answer or dismiss the question it shows.", session)
 	case strings.Contains(reason, "turn in progress") && skip.Tool != "":

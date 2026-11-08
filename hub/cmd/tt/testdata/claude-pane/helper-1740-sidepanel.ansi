@@ -1,0 +1,23 @@
+                                                                            │                                                          ✕
+  Ran 3 shell commands                                                      │
+                                                                            │                                          source: Current ▾
+⏺ The garden has three rows of tomatoes and two rows of beans this year,    │
+  and the soil by the fence stays damp after rain, so the squash went       │
+  there. The path between the beds is gravel, and the shed holds the        │
+  rakes, two spades and a wheelbarrow that needs a new tire before          │
+  spring                                                                    │
+                                                                            │
+⏺ Listing the seed packets and writing the planting dates on                │
+  ⎿  $ ls seeds && cat seeds/notes.txt && wc -l seeds/notes.t               │                  No changes this session
+     -n 3 seeds/notes.txt && date && echo planted beans, peas and squash in │
+     the north bed; the south bed waits for the tomatoes && echo d          │
+     with the list for today, and tomorrow the fence and the shed door,     │
+     then the hose …                                                        │
+                                                                            │
+✻ Sautéing… (58s · ↓ 4.3k tokens)                                           │
+                                    ✔ Update installed · /restart to apply  │
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents · 1 feedback draft
