@@ -337,6 +337,20 @@ func TestToolDenyPkillOptionEnd(t *testing.T) {
 			{"host-pkill", `echo start; pgrep -f PATTERN | xargs kill`},
 			{"host-pkill", `pgrep -f PATTERN | xargs kill $(echo -9)`},
 			{"host-pkill", `pgrep node | xargs -n 1 pkill`},
+			// k5: a -v among the options inverts the selection, so no option
+			// narrows it (wi_28df1ec85544c660).
+			{"host-pkill", `pkill -v -u ` + other + ` node`},
+			{"host-pkill", `pkill -vu ` + other + ` node`},
+			{"host-pkill", `pkill -u ` + other + ` -v node`},
+			{"host-pkill", `pkill -v -P 1 sleep`},
+			{"host-pkill", `pgrep -v -u ` + other + ` node | xargs kill`},
+			{"host-pkill", `pkill -vf -u ` + other + ` node`},
+			{"host-pkill", `pkill -u ` + other + ` -fv node`},
+			{"host-pkill", `pkill -vP1 node`},
+			{"host-pkill", `pkill -v -F /tmp/x.pid`},
+			{"host-pkill", `pkill -9 -v -t ttys001 node`},
+			{"host-pkill", `pgrep -v -P 1 node | xargs -n 1 pkill`},
+			{"host-pkill,deployer-signal", `pkill -v -u ` + other + ` tt-deployer-compact`},
 			// Unchanged killall cases: options end at the first operand,
 			// and -u and -t narrow wherever they stand before it.
 			{"host-pkill", `killall --ignore-case node -u me`},
@@ -372,6 +386,14 @@ func TestToolDenyPkillOptionEnd(t *testing.T) {
 			`pgrep -f PATTERN | xargs echo | xargs kill`,
 			`pgrep -f PATTERN | xargs kill -0`,
 			`pgrep -f PATTERN || kill 12345`,
+			// k5: a -v after the first pattern or "--" is a pattern, and a v
+			// in an option's value is not -v; a -v pgrep not piped into kill.
+			`pkill -u ` + other + ` node`,
+			`pkill -u ` + other + ` node -v`,
+			`pkill -u ` + other + ` -- -v node`,
+			`pkill -uv node`, `pkill -u v node`, `pkill -G v -f node`,
+			`pgrep -v -u ` + other + ` node`,
+			`pgrep -u ` + other + ` node -v | xargs kill`,
 			// Unchanged killall cases.
 			`killall -u stephen node`, `killall -u ` + self.name + ` node`, `killall -t pts/1 node`,
 			`killall -c tt -u me node`, `killall -l`, `killall -s node`, `killall -d node`,
@@ -562,6 +584,10 @@ func TestToolDenySummary(t *testing.T) {
 		// -fu holds a letter that is not a summary option, so the word is
 		// counted, as host-pkill counts it; -x after the pattern is a pattern.
 		{`pkill -P 1 -fu 0 tt-deployer-compact -x`, []string{"deployer-signal: pkill tt-deployer-compact (+5 args)"}},
+		// wi_28df1ec85544c660: a -v that inverts the selection is kept.
+		{`pkill -v -u 0 ab12cd34`, []string{"host-pkill: pkill -v (+3 args)"}},
+		{`pkill -vf ab12cd34`, []string{"host-pkill: pkill -v -f (+1 args)"}},
+		{`pgrep -v -u 0 ab12cd34 | xargs kill`, []string{"host-pkill: pgrep -v | kill (+3 args)"}},
 		{`files=(scripts/deploy-static.mjs ab12cd34); case $x in pkill|killall) tmux send-keys -t tt-builder-1 'tt-deployer-compact' ;; esac; [[ $x =~ (pkill|killall) ]]; pkill --help; pkill -0 -f vite; killall -d node`, nil},
 	}
 	for i, c := range cases {

@@ -424,10 +424,14 @@ const (
 // patterns node, -u and 501 and is not narrowed (the pkill of 2026-11-03,
 // bug wi_de679d2a42cdaec2). A group such as -fu reads as its letters given
 // separately, and a letter that takes a value ends its word: the value is
-// the rest of the word or, when nothing follows, the next word. It returns
-// the match's summary and whether no option narrows it.
+// the rest of the word or, when nothing follows, the next word. A -v among
+// the options inverts the selection, so every process the pattern and the
+// other options do not select is signalled: with it no option narrows the
+// match (bug wi_28df1ec85544c660). It returns the match's summary and whether
+// no option narrows it.
 func (c *toolDenyScan) pkillScope(name string, args []string) (sum toolDenySum, wide bool) {
 	sum.add(name)
+	narrowed, inverted := false, false
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		if a == "--" || len(a) < 2 || a[0] != '-' {
@@ -444,9 +448,11 @@ func (c *toolDenyScan) pkillScope(name string, args []string) (sum toolDenySum, 
 		}
 		at := strings.IndexAny(a[1:], toolDenyPkillValued) + 1
 		if at == 0 {
-			sum.flags(a, "fxinola")
+			inverted = inverted || strings.IndexByte(a, 'v') > 0
+			sum.flags(a, "fxinolav")
 			continue
 		}
+		inverted = inverted || strings.IndexByte(a[:at], 'v') > 0 // a v in the value is not an option
 		value := a[at+1:]
 		if value == "" && i+1 < len(args) {
 			i++
@@ -455,15 +461,13 @@ func (c *toolDenyScan) pkillScope(name string, args []string) (sum toolDenySum, 
 		}
 		switch letter := a[at]; {
 		case letter == 'u' || letter == 'U':
-			if !c.self.wide(value) {
-				return sum, false
-			}
+			narrowed = narrowed || !c.self.wide(value)
 		case strings.IndexByte(toolDenyPkillScoping, letter) >= 0:
-			return sum, false
+			narrowed = true
 		}
-		sum.flags(a[:at+1], "fxinola") // the valued letter is not one: the word is counted
+		sum.flags(a[:at+1], "fxinolav") // the valued letter is not one: the word is counted
 	}
-	return sum, true
+	return sum, inverted || !narrowed
 }
 
 // toolDenyPkillEnd returns the index in args of pkill's first pattern, or
