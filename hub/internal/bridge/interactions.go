@@ -79,9 +79,11 @@ func (b *Bridge) runInteraction(ctx context.Context, m Mapping, in discord.Inter
 		_ = b.cfg.State.FinishInbound(ctx, source, "rejected: project closed")
 		return
 	}
-	// Only /say answers publicly. /bug and /feature defer ephemerally, so
-	// their usage and error replies reach only the owner; fileItem announces
-	// a success in the channel itself.
+	// Only /say answers publicly. Every other interaction defers
+	// ephemerally, so its usage, refusal and error replies reach only the
+	// owner. A filed /bug or /feature, a stored decision answer and an
+	// obligation /answer are also posted in the channel, as a separate
+	// message (announceOnce).
 	flags := discord.FlagEphemeral
 	if in.Type == discord.InteractionCommand && in.Data.Name == "say" {
 		flags = 0
@@ -132,7 +134,7 @@ func (b *Bridge) act(ctx context.Context, taskID string, in discord.Interaction)
 		case "extend":
 			return b.extend(ctx, taskID, option("obligation"), option("for"), option("reason"), in.ID)
 		case "answer":
-			return b.answer(ctx, taskID, option("obligation"), option("text"), in.ID)
+			return b.answer(ctx, taskID, in, option("obligation"), option("text"))
 		case "cancel":
 			return b.cancel(ctx, taskID, option("obligation"), option("reason"), in.ID)
 		case "resume":
@@ -176,7 +178,7 @@ func (b *Bridge) act(ctx context.Context, taskID string, in discord.Interaction)
 		if err != nil {
 			return decisionLookupReply(seq, err)
 		}
-		return b.answerDecision(ctx, taskID, d, api.AnswerDecisionRequest{OptionID: optionID}, in.ID)
+		return b.answerDecision(ctx, taskID, d, api.AnswerDecisionRequest{OptionID: optionID}, in)
 	case id == "stalled":
 		return b.stalledReply(ctx, taskID)
 	case strings.HasPrefix(id, "nudge:"):
@@ -481,7 +483,7 @@ func (b *Bridge) extend(ctx context.Context, taskID, ref, duration, reason, inte
 	return ephemeral("⏱️ Extended #%d until %s. Escalation restarts from there.", o.MessageSeq, out.Obligation.DueAt.UTC().Format("15:04 UTC"))
 }
 
-func (b *Bridge) answer(ctx context.Context, taskID, ref, text, interactionID string) reply {
+func (b *Bridge) answer(ctx context.Context, taskID string, in discord.Interaction, ref, text string) reply {
 	o, err := b.obligation(ctx, taskID, ref)
 	if errors.Is(err, errNotOpen) {
 		// No open obligation: the number may be a tt ask decision.
@@ -492,7 +494,7 @@ func (b *Bridge) answer(ctx context.Context, taskID, ref, text, interactionID st
 				if strings.TrimSpace(text) == "" {
 					return ephemeral("Say what the answer is: a letter, an option or your own words.")
 				}
-				return b.answerDecision(ctx, taskID, d, decisionChoice(d.Request.DecisionRequest, text), interactionID)
+				return b.answerDecision(ctx, taskID, d, decisionChoice(d.Request.DecisionRequest, text), in)
 			case !errors.Is(dErr, errNotOpen):
 				return decisionLookupReply(seq, dErr)
 			}
@@ -504,7 +506,7 @@ func (b *Bridge) answer(ctx context.Context, taskID, ref, text, interactionID st
 	if strings.TrimSpace(text) == "" {
 		return ephemeral("Say what the answer is.")
 	}
-	out, err := b.cfg.Hub.AnswerObligation(ctx, taskID, o.ID, api.ObligationAnswerRequest{Text: text, RequestID: "discord-interaction-" + interactionID})
+	out, err := b.cfg.Hub.AnswerObligation(ctx, taskID, o.ID, api.ObligationAnswerRequest{Text: text, RequestID: "discord-interaction-" + in.ID})
 	if r, done := ownerOutcome(err); done {
 		return r
 	}
@@ -512,7 +514,20 @@ func (b *Bridge) answer(ctx context.Context, taskID, ref, text, interactionID st
 	if out.Message != nil {
 		seq = out.Message.Seq
 	}
-	return reply{Public: true, Content: truncate(fmt.Sprintf("**owner** answered #%d on the recipient's behalf:\n%s", o.MessageSeq, text), contentLimit-40) + "\n" + marker(seq, 1, 1, "")}
+	mk := marker(seq, 1, 1, "")
+	return b.confirmInChannel(ctx, in, mk, truncate(fmt.Sprintf("**owner** answered #%d on the recipient's behalf:\n%s", o.MessageSeq, text), contentLimit-len(mk)-1)+"\n"+mk)
+}
+
+// confirmInChannel posts an answer's confirmation in the interaction's
+// channel, once, and returns the owner's private copy. The bridge's own
+// board message is never mirrored, so this post is how the channel sees the
+// answer. A failed post keeps the saved answer and tells only the owner.
+func (b *Bridge) confirmInChannel(ctx context.Context, in discord.Interaction, mk, content string) reply {
+	if err := b.announceOnce(ctx, in, mk, content); err != nil {
+		b.logf("discord bridge: confirm interaction %s in the channel: %v", in.ID, err)
+		return ephemeral("⚠️ Answer saved, but posting it in the channel failed: %s.\n%s", truncate(err.Error(), 300), mk)
+	}
+	return reply{Content: content}
 }
 
 // decision finds the tt ask decision a message number names; errNotOpen
@@ -558,26 +573,116 @@ func decisionChoice(req *api.DecisionRequest, text string) api.AnswerDecisionReq
 // answerDecision stores the owner's answer to a decision. The interaction ID
 // is the retry key, so a resumed interaction returns the same answer; a
 // decision answered before gets "Already answered" and nothing is stored.
-func (b *Bridge) answerDecision(ctx context.Context, taskID string, d api.DecisionRecord, choice api.AnswerDecisionRequest, interactionID string) reply {
+// A stored answer is confirmed in the channel, and in either case the card
+// is closed: it shows the stored answer and loses its buttons.
+func (b *Bridge) answerDecision(ctx context.Context, taskID string, d api.DecisionRecord, choice api.AnswerDecisionRequest, in discord.Interaction) reply {
 	seq, req := d.Request.Seq, d.Request.DecisionRequest
-	choice.RequestID = "discord-interaction-" + interactionID
+	choice.RequestID = "discord-interaction-" + in.ID
 	out, err := b.cfg.Hub.AnswerDecision(ctx, taskID, seq, choice)
 	if err != nil {
 		var h *api.HTTPError
 		if errors.As(err, &h) && h.Status == http.StatusConflict && strings.Contains(h.Msg, "already answered") {
+			// Close the card with the answer the hub holds, however it came.
+			if rec, lerr := b.decision(ctx, taskID, seq); lerr == nil && rec.Answer != nil && rec.Answer.DecisionAnswer != nil {
+				what := decisionWhat(req, rec.Answer.DecisionAnswer.OptionID, rec.Answer.DecisionAnswer.Text)
+				if cerr := b.closeDecisionCard(ctx, in, seq, d.Request.CreatedAt, what); cerr != nil {
+					b.logf("discord bridge: close decision #%d card: %v", seq, cerr)
+				}
+			}
 			return ephemeral("✔️ Already answered: decision #%d.", seq)
 		}
 		return ephemeral("⚠️ %s.", hubMessage(err))
 	}
-	what := choice.Text
+	what := decisionWhat(req, choice.OptionID, choice.Text)
+	mk := marker(out.Seq, 1, 1, "")
+	r := b.confirmInChannel(ctx, in, mk, truncate(fmt.Sprintf("**owner** answered decision #%d: %s", seq, what), contentLimit-len(mk)-1)+"\n"+mk)
+	if err := b.closeDecisionCard(ctx, in, seq, d.Request.CreatedAt, what); err != nil {
+		b.logf("discord bridge: close decision #%d card: %v", seq, err)
+		r.Content = truncate(r.Content, contentLimit-200) + "\n" + truncate(fmt.Sprintf("⚠️ Answered, but closing the card failed: %v.", err), 199)
+	}
+	return r
+}
+
+// decisionWhat names an answer as the card shows it: the option's letter and
+// label, or the owner's own words.
+func decisionWhat(req *api.DecisionRequest, optionID, text string) string {
 	for i, o := range req.Options {
-		if choice.OptionID != "" && o.ID == choice.OptionID {
-			what = decisionLetter(i) + " · " + clean(redactSecrets(o.Label))
-			break
+		if optionID != "" && o.ID == optionID {
+			return decisionLetter(i) + " · " + clean(redactSecrets(o.Label))
 		}
 	}
-	mk := marker(out.Seq, 1, 1, "")
-	return reply{Public: true, Content: truncate(fmt.Sprintf("**owner** answered decision #%d: %s", seq, what), contentLimit-len(mk)-1) + "\n" + mk}
+	return text
+}
+
+// closeDecisionCard edits a decision card's buttoned (last) part to show the
+// answer and drops its buttons. A click names the card itself; /answer
+// finds it in the channel by its marker, read forward from when the decision
+// was asked. A card not mirrored yet is left alone: a click on it later gets
+// "Already answered" and closes it then. Editing again is harmless.
+func (b *Bridge) closeDecisionCard(ctx context.Context, in discord.Interaction, seq int64, asked time.Time, what string) error {
+	var card discord.Message
+	if in.Message != nil && lastDecisionPart(in.Message.Content, seq) {
+		card = *in.Message
+	} else {
+		found, err := b.findDecisionCard(ctx, in.ChannelID, seq, asked)
+		if err != nil {
+			return err
+		}
+		if found == nil {
+			b.logf("discord bridge: decision #%d card not found in the channel; left open", seq)
+			return nil
+		}
+		card = *found
+	}
+	lines := strings.Split(card.Content, "\n")
+	head, mk := lines[0], lines[len(lines)-1]
+	answered := truncate("✅ **Answered:** "+clean(what), 300) // one line
+	content := truncate(head, contentLimit-len(answered)-len(mk)-2) + "\n" + answered + "\n" + mk
+	none := []discord.Component{}
+	_, err := b.cfg.Discord.EditMessage(ctx, in.ChannelID, card.ID, discord.MessageEdit{Content: &content, Components: &none, AllowedMentions: &discord.AllowedMentions{Parse: []string{}}})
+	return err
+}
+
+// lastDecisionPart reports whether a bot message is the part of decision
+// seq's card that carries the buttons: its last (or only) part.
+func lastDecisionPart(content string, seq int64) bool {
+	lines := strings.Split(content, "\n")
+	last := lines[len(lines)-1]
+	if last == marker(seq, 1, 1, "decision") {
+		return true
+	}
+	var n int64
+	var part, parts int
+	if _, err := fmt.Sscanf(last, "-# #%d · part %d/%d · decision", &n, &part, &parts); err != nil {
+		return false
+	}
+	return n == seq && parts > 1 && part == parts && last == marker(seq, part, parts, "decision")
+}
+
+// findDecisionCard finds the bot's buttoned part of a decision card, among
+// messages sent since shortly before the decision was asked. Like findOwn,
+// an error means "unknown"; nil means not found.
+func (b *Bridge) findDecisionCard(ctx context.Context, channelID string, seq int64, asked time.Time) (*discord.Message, error) {
+	after := snowflakeAt(asked.Add(-2 * time.Minute))
+	b.mu.Lock()
+	bot := b.botID
+	b.mu.Unlock()
+	for page := 0; page < maxReconcilePages; page++ {
+		msgs, err := b.cfg.Discord.ChannelMessages(ctx, channelID, after, 100)
+		if err != nil {
+			return nil, err
+		}
+		for i := range msgs {
+			if msgs[i].Author.ID == bot && lastDecisionPart(msgs[i].Content, seq) {
+				return &msgs[i], nil
+			}
+			after = msgs[i].ID
+		}
+		if len(msgs) < 100 {
+			return nil, nil
+		}
+	}
+	return nil, nil
 }
 
 func (b *Bridge) cancel(ctx context.Context, taskID, ref, reason, interactionID string) reply {
@@ -710,18 +815,19 @@ func (b *Bridge) fileItem(ctx context.Context, taskID string, in discord.Interac
 	mk := marker(m.Seq, 1, 1, "")
 	lines = append(lines, mk)
 	content := strings.Join(lines, "\n")
-	if err := b.announceFiled(ctx, in, mk, content); err != nil {
+	if err := b.announceOnce(ctx, in, mk, content); err != nil {
 		b.logf("discord bridge: /%s announce %s for interaction %s: %v", kind, item.ID, in.ID, err)
 		content += fmt.Sprintf("\n⚠️ Filed, but posting it in the channel failed: %v.", err)
 	}
 	return reply{Content: content}
 }
 
-// announceFiled posts a filing in the interaction's channel, once: a
-// replayed or resumed interaction finds its earlier post by the marker, and
-// the nonce covers a send whose answer was lost. A failed send is looked for
-// again, since it may have landed; a failed look keeps the send's error.
-func (b *Bridge) announceFiled(ctx context.Context, in discord.Interaction, mk, content string) error {
+// announceOnce posts a filing or an answer in the interaction's channel,
+// once: a replayed or resumed interaction finds its earlier post by the
+// marker, and the nonce covers a send whose answer was lost. A failed send is
+// looked for again, since it may have landed; a failed look keeps the send's
+// error.
+func (b *Bridge) announceOnce(ctx context.Context, in discord.Interaction, mk, content string) error {
 	since := time.Now().Add(-InteractionLifetime)
 	found, err := b.findOwn(ctx, in.ChannelID, mk, since)
 	if err != nil || found != "" {

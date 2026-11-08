@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -164,6 +165,22 @@ func TestDecisionCardLongQuestionButtonsOnLastPart(t *testing.T) {
 			}
 		}
 	}
+
+	// wi_6ac93c7e030b5dad g3: /answer closes only the part with the buttons.
+	h.interact(discord.Interaction{ID: "960000000000000101", Type: discord.InteractionCommand, Data: discord.InteractionData{Name: "answer",
+		Options: []discord.InteractionOption{stringOption("obligation", itoa(d.Seq)), stringOption("text", "c")}}})
+	last := parts[len(parts)-1]
+	for i, p := range parts[:len(parts)-1] {
+		if n := len(h.messageEdits(p.ID)); n != 0 {
+			t.Fatalf("part %d edited %d times", i+1, n)
+		}
+	}
+	edits := h.messageEdits(last.ID)
+	mk := marker(d.Seq, len(parts), len(parts), "decision")
+	if len(edits) != 1 || edits[0].Components == nil || len(*edits[0].Components) != 0 ||
+		!strings.HasSuffix(last.Content, "\n✅ **Answered:** C · "+clean(req.Options[2].Label)+"\n"+mk) {
+		t.Fatalf("last part after /answer = %q, edits %+v", last.Content, edits)
+	}
 }
 
 // a4: an owner helper's decision is redacted in every field of its card.
@@ -196,41 +213,138 @@ func TestDecisionCardRedactsHelperSecrets(t *testing.T) {
 	}
 }
 
-// a5: an owner's button click answers the decision once; a resumed
-// interaction returns the same answer, another option then reads already
-// answered, and a non-owner click changes nothing.
+// deferFlags are the flags of the deferral the bridge sent an interaction.
+func (h *harness) deferFlags(id string) (int, bool) {
+	h.fake.mu.Lock()
+	defer h.fake.mu.Unlock()
+	for _, cb := range h.fake.callbacks {
+		if cb.ID == id && cb.Response.Type == discord.ResponseDeferredMessage && cb.Response.Data != nil {
+			return cb.Response.Data.Flags, true
+		}
+	}
+	return 0, false
+}
+
+// messageEdits are the bot's edits of one channel message, in order.
+func (h *harness) messageEdits(id string) []discord.MessageEdit {
+	h.t.Helper()
+	h.fake.mu.Lock()
+	defer h.fake.mu.Unlock()
+	var out []discord.MessageEdit
+	for _, r := range h.fake.requests {
+		if r.Method == http.MethodPatch && r.Path == "/channels/"+h.channel+"/messages/"+id {
+			raw, _ := json.Marshal(r.Body)
+			var e discord.MessageEdit
+			if err := json.Unmarshal(raw, &e); err != nil {
+				h.t.Fatalf("edit body: %v", err)
+			}
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// postsWith are the bot's channel messages that carry a marker line.
+func (h *harness) postsWith(mk string) []*fakeMessage {
+	var out []*fakeMessage
+	for _, m := range h.lines() {
+		if hasLine(m.Content, mk) {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// wantClosedCard checks the card's latest edit: the answer shown above its
+// marker and no buttons left.
+func (h *harness) wantClosedCard(card *fakeMessage, seq int64, what string, edits int) {
+	h.t.Helper()
+	got := h.messageEdits(card.ID)
+	if len(got) != edits {
+		h.t.Fatalf("card edits = %d, want %d: %+v", len(got), edits, got)
+	}
+	last := got[len(got)-1]
+	want := "**Decision for owner** from **builder-41b1c632**\n✅ **Answered:** " + what + "\n" + marker(seq, 1, 1, "decision")
+	if last.Content == nil || *last.Content != want || card.Content != want {
+		h.t.Fatalf("closed card content = %v (now %q), want %q", last.Content, card.Content, want)
+	}
+	if last.Components == nil || len(*last.Components) != 0 {
+		h.t.Fatalf("closed card components = %v, want none", last.Components)
+	}
+	if last.AllowedMentions == nil || len(last.AllowedMentions.Parse) != 0 {
+		h.t.Fatalf("closed card mentions = %+v", last.AllowedMentions)
+	}
+}
+
+// a5, wi_6ac93c7e030b5dad g1–g4: an owner's button click answers the
+// decision once. The click defers ephemerally, the confirmation is posted
+// once in the channel and the card is closed; a resumed interaction returns
+// the same answer, another option then reads already answered (and closes
+// the card with the stored answer), and a non-owner click changes nothing.
 func TestDecisionButtonAnswersOnce(t *testing.T) {
 	h := newHarness(t)
 	d := h.decide(h.builder, "button", threeOptionDecision())
 	h.cycle()
-	buttons := cardButtons(h.decisionCards(d.Seq)[0])
-
-	before := len(h.boardMessages())
-	h.interact(discord.Interaction{ID: "950000000000000001", Type: discord.InteractionComponent, Data: discord.InteractionData{CustomID: buttons[1].CustomID}, Member: &discord.Member{User: &discord.User{ID: strangerID}}})
-	if len(h.boardMessages()) != before || h.decisionRecord(d.Seq).Answer != nil {
-		t.Fatal("a non-owner click answered the decision")
+	card := h.decisionCards(d.Seq)[0]
+	buttons := cardButtons(card)
+	click := func(id, user string, button int) discord.Interaction {
+		in := discord.Interaction{ID: id, Type: discord.InteractionComponent, Data: discord.InteractionData{CustomID: buttons[button].CustomID},
+			GuildID: "guild", ChannelID: h.channel, Member: &discord.Member{User: &discord.User{ID: user}}, Token: "token-" + id}
+		msg := card.Message // Discord sends the clicked message with the click
+		in.Message = &msg
+		return in
 	}
 
-	in := discord.Interaction{ID: "950000000000000002", Type: discord.InteractionComponent, Data: discord.InteractionData{CustomID: buttons[1].CustomID}}
+	before, lines := len(h.boardMessages()), len(h.lines())
+	h.interact(click("950000000000000001", strangerID, 1))
+	if len(h.boardMessages()) != before || h.decisionRecord(d.Seq).Answer != nil || len(h.lines()) != lines || len(h.messageEdits(card.ID)) != 0 {
+		t.Fatal("a non-owner click answered, posted or edited")
+	}
+
+	in := click("950000000000000002", ownerID, 1)
 	got := editContent(h.interact(in))
+	if flags, ok := h.deferFlags(in.ID); !ok || flags != discord.FlagEphemeral {
+		t.Fatalf("click deferral flags = %d (sent %v), want ephemeral", flags, ok)
+	}
 	rec := h.decisionRecord(d.Seq)
 	if rec.Answer == nil || rec.Answer.DecisionAnswer == nil || rec.Answer.DecisionAnswer.OptionID != "b" || rec.Answer.ReplyTo != d.Seq || rec.Answer.To != h.builder.ID {
 		t.Fatalf("stored answer = %+v", rec.Answer)
 	}
-	want := fmt.Sprintf("**owner** answered decision #%d: B · Restart at 03:00\n%s", d.Seq, marker(rec.Answer.Seq, 1, 1, ""))
+	mk := marker(rec.Answer.Seq, 1, 1, "")
+	want := fmt.Sprintf("**owner** answered decision #%d: B · Restart at 03:00\n%s", d.Seq, mk)
 	if got != want {
 		t.Fatalf("click reply = %q, want %q", got, want)
 	}
-	// The resumed interaction (same ID) replays the stored answer.
+	// The channel sees the answer: one post, without mentions.
+	posts := h.postsWith(mk)
+	if len(posts) != 1 || posts[0].Content != want || posts[0].AllowedMentions == nil || len(posts[0].AllowedMentions.Parse) != 0 {
+		t.Fatalf("channel confirmation = %+v, want one %q", posts, want)
+	}
+	h.wantClosedCard(card, d.Seq, "B · Restart at 03:00", 1)
+
+	// The resumed interaction (same ID) replays the stored answer and finds
+	// its channel post instead of posting again.
 	again := h.b.act(h.ctx, h.task.ID, in)
-	if again.Content != want || !again.Public {
-		t.Fatalf("replayed click = %+v, want %q", again, want)
+	if again.Content != want || again.Public {
+		t.Fatalf("replayed click = %+v, want the private %q", again, want)
 	}
-	afterAnswer := len(h.boardMessages())
-	other := editContent(h.interact(discord.Interaction{ID: "950000000000000003", Type: discord.InteractionComponent, Data: discord.InteractionData{CustomID: buttons[2].CustomID}}))
-	if other != fmt.Sprintf("✔️ Already answered: decision #%d.", d.Seq) || len(h.boardMessages()) != afterAnswer {
-		t.Fatalf("second option = %q, board %d → %d", other, afterAnswer, len(h.boardMessages()))
+	if n := len(h.postsWith(mk)); n != 1 {
+		t.Fatalf("channel confirmations after a replay = %d, want 1", n)
 	}
+	h.wantClosedCard(card, d.Seq, "B · Restart at 03:00", 2)
+
+	// A click on another option (an open card in another client) is refused
+	// and closes the card with the stored answer, not the clicked one.
+	afterAnswer, lines := len(h.boardMessages()), len(h.lines())
+	other := click("950000000000000003", ownerID, 2)
+	got = editContent(h.interact(other))
+	if got != fmt.Sprintf("✔️ Already answered: decision #%d.", d.Seq) || len(h.boardMessages()) != afterAnswer || len(h.lines()) != lines {
+		t.Fatalf("second option = %q, board %d → %d, lines %d → %d", got, afterAnswer, len(h.boardMessages()), lines, len(h.lines()))
+	}
+	if flags, _ := h.deferFlags(other.ID); flags != discord.FlagEphemeral {
+		t.Fatalf("already-answered deferral flags = %d, want ephemeral", flags)
+	}
+	h.wantClosedCard(card, d.Seq, "B · Restart at 03:00", 3)
 	if r := h.decisionRecord(d.Seq); r.Answer.Seq != rec.Answer.Seq || r.Answer.DecisionAnswer.OptionID != "b" {
 		t.Fatalf("answer changed: %+v", r.Answer)
 	}
@@ -240,22 +354,26 @@ func TestDecisionButtonAnswersOnce(t *testing.T) {
 	if !errors.As(err, &refused) || refused.Status != http.StatusForbidden {
 		t.Fatalf("bridge create decision err = %v, want 403", err)
 	}
-	// The bridge's own answer is not mirrored back as a line.
+	// The bridge's own answer is not mirrored back as a second line.
 	h.cycle()
-	for _, m := range h.lines() {
-		if hasLine(m.Content, marker(rec.Answer.Seq, 1, 1, "")) {
-			t.Fatalf("answer mirrored: %q", m.Content)
-		}
+	if n := len(h.postsWith(mk)); n != 1 {
+		t.Fatalf("answer lines after a mirror pass = %d, want only the confirmation", n)
 	}
 }
 
-// a6: /answer #<seq> takes a letter by position, an exact option ID or the
-// owner's own words; an open obligation's /answer is unchanged.
+// a6, wi_6ac93c7e030b5dad g1–g4: /answer #<seq> takes a letter by position,
+// an exact option ID or the owner's own words, posts the confirmation in the
+// channel and closes the card it finds there; an open obligation's /answer
+// is confirmed in the channel too. Usage and refusal replies stay private.
 func TestDecisionSlashAnswer(t *testing.T) {
 	h := newHarness(t)
 	cmd := func(id, ref, text string) string {
-		return editContent(h.interact(discord.Interaction{ID: id, Type: discord.InteractionCommand, Data: discord.InteractionData{Name: "answer",
+		got := editContent(h.interact(discord.Interaction{ID: id, Type: discord.InteractionCommand, Data: discord.InteractionData{Name: "answer",
 			Options: []discord.InteractionOption{stringOption("obligation", ref), stringOption("text", text)}}}))
+		if flags, ok := h.deferFlags(id); !ok || flags != discord.FlagEphemeral {
+			t.Fatalf("/answer %s deferral flags = %d (sent %v), want ephemeral", id, flags, ok)
+		}
+		return got
 	}
 	// Option IDs out of letter order: the letter is the shown position.
 	outOfOrder := api.DecisionRequest{Question: "Which lane?", Options: []api.DecisionOption{
@@ -274,29 +392,60 @@ func TestDecisionSlashAnswer(t *testing.T) {
 		{"exact option ID", "later", api.DecisionRequest{Question: "When?", Options: []api.DecisionOption{
 			{ID: "now", Label: "Now", Description: "Today."}, {ID: "later", Label: "Later", Description: "Next week."}}, RecommendedOptionID: "now", RecommendationReason: "Sooner is cheaper."}, "later", "", "B · Later"},
 		{"own words", "Restart only after the release lands.", threeOptionDecision(), "", "Restart only after the release lands.", "Restart only after the release lands."},
-		{"letter past the options is own words", "e", threeOptionDecision(), "", "e", ": e"},
+		{"letter past the options is own words", "e", threeOptionDecision(), "", "e", "e"},
 	}
 	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			d := h.decide(h.builder, fmt.Sprintf("slash-%d", i), tc.req)
+			h.cycle()
+			card := h.decisionCards(d.Seq)[0]
 			got := cmd(fmt.Sprintf("96000000000000000%d", i), "#"+itoa(d.Seq), tc.text)
 			rec := h.decisionRecord(d.Seq)
 			if rec.Answer == nil || rec.Answer.DecisionAnswer == nil || rec.Answer.DecisionAnswer.OptionID != tc.option || rec.Answer.DecisionAnswer.Text != tc.own {
 				t.Fatalf("stored answer = %+v", rec.Answer)
 			}
-			if !strings.HasPrefix(got, fmt.Sprintf("**owner** answered decision #%d: ", d.Seq)) || !strings.Contains(got, tc.replyContain) || !hasLine(got, marker(rec.Answer.Seq, 1, 1, "")) {
-				t.Fatalf("/answer reply = %q", got)
+			mk := marker(rec.Answer.Seq, 1, 1, "")
+			want := fmt.Sprintf("**owner** answered decision #%d: %s\n%s", d.Seq, tc.replyContain, mk)
+			if got != want {
+				t.Fatalf("/answer reply = %q, want %q", got, want)
 			}
+			if posts := h.postsWith(mk); len(posts) != 1 || posts[0].Content != want {
+				t.Fatalf("channel confirmation = %+v, want one %q", posts, want)
+			}
+			h.wantClosedCard(card, d.Seq, tc.replyContain, 1)
+			lines := len(h.lines())
 			if again := cmd(fmt.Sprintf("97000000000000000%d", i), itoa(d.Seq), "b"); again != fmt.Sprintf("✔️ Already answered: decision #%d.", d.Seq) {
 				t.Fatalf("second /answer = %q", again)
 			}
+			if len(h.lines()) != lines {
+				t.Fatal("an already answered /answer posted in the channel")
+			}
+			h.wantClosedCard(card, d.Seq, tc.replyContain, 2)
 		})
 	}
 
-	// An open obligation keeps today's /answer.
+	// A usage error and a refusal reach only the owner: nothing is posted.
+	d := h.decide(h.builder, "slash-usage", threeOptionDecision())
+	h.cycle()
+	lines := len(h.lines())
+	if got := cmd("980000000000000003", itoa(d.Seq), " "); got != "Say what the answer is: a letter, an option or your own words." {
+		t.Fatalf("/answer without text = %q", got)
+	}
+	h.interact(discord.Interaction{ID: "980000000000000004", Type: discord.InteractionCommand, Member: &discord.Member{User: &discord.User{ID: strangerID}},
+		Data: discord.InteractionData{Name: "answer", Options: []discord.InteractionOption{stringOption("obligation", itoa(d.Seq)), stringOption("text", "a")}}})
+	if len(h.lines()) != lines || h.decisionRecord(d.Seq).Answer != nil || len(h.messageEdits(h.decisionCards(d.Seq)[0].ID)) != 0 {
+		t.Fatal("a usage error or a refusal posted, answered or edited")
+	}
+
+	// An open obligation's /answer is confirmed in the channel as well.
 	question := h.post(typed(h.builder, h.lead, api.EnvelopeKindQuestion, "Which fixture should the test use"))
-	if got := cmd("980000000000000001", itoa(question.Seq), "Use the static fixture."); !strings.Contains(got, "answered #"+itoa(question.Seq)+" on the recipient's behalf") {
+	got := cmd("980000000000000001", itoa(question.Seq), "Use the static fixture.")
+	if !strings.Contains(got, "answered #"+itoa(question.Seq)+" on the recipient's behalf") {
 		t.Fatalf("/answer on an obligation = %q", got)
+	}
+	lastLine := got[strings.LastIndex(got, "\n")+1:]
+	if posts := h.postsWith(lastLine); !strings.HasPrefix(lastLine, "-# #") || len(posts) != 1 || posts[0].Content != got {
+		t.Fatalf("obligation confirmation in the channel = %+v, want one %q", posts, got)
 	}
 	// A number that is neither keeps today's reply.
 	if got := cmd("980000000000000002", "#999999", "a"); got != "✔️ Already handled: that obligation is closed or was moved." {
