@@ -16,9 +16,9 @@ What the reads establish:
 - **Ruled out for 11-06:**
   - a hub release: none is journaled between 11-03 10:08 and 11-07 16:24 PST (R8);
   - a step in database size: 3.03 GB on 11-03, 3.06 GB on 11-07 (R8);
-  - TrueNAS CPU, load or memory pressure: flat across the onset (R4);
-  - a network delay today: the round trip is 1 ms (R9).
-- **Agent activity rose at the same moment.** Board posts went from about 6 an hour (15-19Z) to 32 and 41 (R3). db-handler-r81 went from 2 tool calls an hour to 46 and 73, starting in the 20:30Z bucket. Its calls were strictly serial (R6). The steward and owner-helper made 94 and 91 tool calls in 20Z, and 60 and 51 in 21Z (R5).
+  - TrueNAS CPU, load or memory pressure: flat across the onset (R4).
+- **The network path on 11-06 is not ruled out** (Unknowns, item 8). All 201 relay errors that day were `context deadline exceeded`. None was a dial, refused, reset, unreachable or i/o-timeout error (R1). So the hub was reachable but slow to answer, which bounds but does not exclude a network delay. The 1 ms round trip (R9) was measured on 11-08 and says nothing about 11-06.
+- **Agent activity rose at the same moment.** Board posts went from about 6 an hour (15-19Z) to 32 in 20Z and 41 in 21:00-21:30Z alone (R3). db-handler-r81 went from 2 tool calls an hour to 46 and 73, starting in the 20:30Z bucket. Its calls were strictly serial (R6). The steward and owner-helper made 94 and 91 tool calls in 20Z, and 60 and 51 in 21Z (R5).
 - **Pool writes rose in the same window.** On the single-HDD pool that holds the hub database, mean writes rose about 35% and peaks doubled, 20:30-21:30Z, then fell back by 21:45Z. The same rise appears at the 11-07 22Z timeout peak and is absent on the 11-05 baseline (R4). These graphs cannot attribute the writes to the hub.
 
 Most consistent explanation (a hypothesis, not a finding): requests queued inside the hub. Every store call shares one SQLite connection (R10), in a container capped at 1.0 CPU (R7). At that point, a burst of agent reads and writes on top of the relay's steady polling of 19-21 bindings (R2) turned queueing delay into seconds. Two facts do not fit it cleanly:
@@ -40,8 +40,8 @@ No cause is claimed from co-occurrence alone.
 | R6 | db-handler-r81's Codex rollout (thread `01a1a19e`, found from its relay binding file) | tool calls per 10 min, `tt` subcommand counts, `--limit` values, overlap. Counts only; no arguments or content copied |
 | R7 | Middleware `app.config tailterm-hub` (only volume paths and resource limits printed), `app.get_instance`, `app.container_log_follow` (newest 60 lines, redacted), `app.stats` (6 samples, now), `pool.query` (pool and disk names) | 1.0 CPU / 512 MiB cap; state on pool `deepfreeze` = one HDD `sda`; container log starts 11-08 02:35Z; current CPU sample |
 | R8 | Deployer journal `~/.local/state/tailterm-deploy/tsk_e7af3c28a444b09a` (file times and numeric size fields of preflight receipts) | hub release times; database size at each TrueNAS release |
-| R9 | `ping -c 5 100.116.238.37`; three serial `tt status` | 0.58-1.14 ms RTT; 0.01 / 1.29 / 1.99 s |
-| R10 | Source at `b08a3157` | `hub/internal/store/store.go:42` `busy_timeout=5000`; `store.go:87` `SetMaxOpenConns(1)`; `hub/cmd/tt/relay.go:2080` 5 s activity tick; `relay.go:1368-1369` slow pass above 30 s, logged at most once per 2 min; CLI deadlines (57 commands use 10 s, 14 use 20 s, 10 use 5 s) |
+| R9 | `ping -c 5 100.116.238.37`; three serial `tt status` | measured 11-08 about 04:3xZ: 0.58-1.14 ms RTT; 0.01 / 1.29 / 1.99 s; no bearing on 11-06 |
+| R10 | Source at `b08a3157` | `hub/internal/store/store.go:42` `busy_timeout=5000`; `store.go:87` `SetMaxOpenConns(1)`; `hub/cmd/tt/relay.go:2080` 5 s activity tick; `relay.go:1368-1369` slow pass above 30 s, logged at most once per 2 min; CLI deadlines: of the 106 `e.client(...)` call sites in non-test `hub/cmd/tt/*.go`, 57 pass 10 s, 14 pass 20 s and 10 pass 5 s (counted with `grep -ho 'e\.client([^)]*)'`; call sites, not commands) |
 
 Also used:
 
@@ -99,7 +99,7 @@ Limit: the relay logs only failures and slow passes. It gives no latency distrib
 
 ## Concurrent callers and request rates
 
-**Agents on the board (R3).** Messages per hour were 3, 6, 6, 6 and 6 for 15Z through 19Z, then 32 (20Z) and 41 (21Z).
+**Agents on the board (R3).** Messages per hour were 3 (15Z, from 15:28Z only), then 6, 6, 6 and 6 for 16Z through 19Z, then 32 (20Z). The second page ends at #58840 (21:30:39Z), so 41 is the count for 21:00-21:30Z only, not the full 21Z hour.
 
 From 19:42Z to 20:28Z only broker and relay notices were posted. At 20:32:23Z owner-helper posted #58772, and the owner-helper, r81 and steward exchange began. Of the 67 messages from 20:30Z to 21:30Z:
 
@@ -203,7 +203,8 @@ The graph covers the whole pool. The reads did not establish whether the hub, th
 **Hub container (R7).**
 
 - It is capped at `cpus: 1.0` and `mem_limit: 512m`.
-- `app.stats`, sampled now (11-08 about 04:40Z, while timeouts were still raised), read `cpu_usage` 4.97-5.18 in all 6 samples, with memory at 86-140 MB.
+- `app.stats` was sampled on 11-08 between 04:30Z and 04:37Z, while timeouts were still raised. The sample itself carries no timestamp. The bound comes from my own tool ledger (R5): the middleware probes ran after 04:30:37Z, and the report file was first written at 04:36:53Z. It read `cpu_usage` 4.97-5.18 in all 6 samples, with memory at 86-140 MB.
+- Hub release `rel_5fa94cf666da9cc2` began its TrueNAS preflight at 04:39:25Z (lead REQUEST #59270). By that bound the sample came before the preflight. The job's journal record was written at 04:28Z (R8), though, so the job existed during the sample. Whether it put load on the hub before its preflight is unknown, so the sample may not represent ordinary load.
 - If `cpu_usage` is a share of all 20 host CPUs, 5% is exactly one CPU: the hub would be at its cap. The tight plateau fits that reading.
 - The normalization was not confirmed from middleware documentation or source, so this is **unverified**.
 - No CPU history for the container exists for 11-06; only host graphs are kept.
@@ -217,6 +218,7 @@ The graph covers the whole pool. The reads did not establish whether the hub, th
 5. Why the raised rate persisted overnight on 11-07 with low agent activity, and through the 11-08 restart.
 6. The production cost of 100- and 200-row pages.
 7. Whether each uncertain POST in the intake later succeeded. Not reconciled here; the handler noted it as open.
+8. The Mini-to-TrueNAS network path on 11-06. No round-trip or packet-loss record from that day was read. The relay errors were all deadline expiries, with no dial or connection errors (R1). That bounds an outage but not a slow path.
 
 ## Prevention (t2)
 
