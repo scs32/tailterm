@@ -20,6 +20,15 @@ import (
 // hook as tool input. None is run, so no process is ever signalled. The one
 // command the file does run is the documented jq summary, on temp files.
 
+// The classifier's caller is fixed for every test in this package, so no
+// result depends on the user running it or on USER and LOGNAME, which the
+// verification matrix leaves unset (bug wi_de679d2a42cdaec2, REQUEST
+// #59152). It is set before any test starts, so no hook goroutine reads it
+// while it changes. TestToolDenyPkillOptionEnd passes its own callers.
+const toolDenyTestUID, toolDenyTestName = "4242", "tt-test-caller"
+
+func init() { toolDenyCaller = toolDenyUser{toolDenyTestUID, toolDenyTestName} }
+
 func bashPre(id, command string) map[string]any {
 	return map[string]any{"session_id": "s1", "tool_use_id": id, "tool_name": "Bash", "tool_input": map[string]any{"command": command}}
 }
@@ -123,6 +132,9 @@ func TestToolDenyClassify(t *testing.T) {
 		// nothing, and "$USER" cannot be told from the text, so the rule
 		// fires. This was a near-miss.
 		{"host-pkill", `pkill -u "$USER" -f vite`},
+		// The fixed test caller is the one the rules see.
+		{"host-pkill", `pkill -U ` + toolDenyTestName + ` node`},
+		{"host-pkill", `pkill -u ` + toolDenyTestUID + ` -f node`},
 	}
 	for _, c := range fires {
 		t.Run("fires/"+c.command, func(t *testing.T) {
