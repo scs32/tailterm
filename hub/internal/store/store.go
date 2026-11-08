@@ -25,7 +25,9 @@ import (
 const Global = "*"
 
 type Store struct {
-	writeMu    sync.Mutex
+	// writeMu serializes writes; it times how long each Lock waited so the
+	// hub's minute timing line can report write-lock contention.
+	writeMu    timedMutex
 	jevEnabled atomic.Bool
 	MaxAgents  int
 	db         *sql.DB
@@ -103,6 +105,44 @@ func Open(path string) (*Store, error) {
 }
 
 func (s *Store) Close() error { return s.db.Close() }
+
+// timedMutex is a sync.Mutex that counts its Lock calls and sums how long each
+// waited for the lock.
+type timedMutex struct {
+	mu        sync.Mutex
+	locks     atomic.Int64
+	waitNanos atomic.Int64
+}
+
+func (m *timedMutex) Lock() {
+	start := time.Now()
+	m.mu.Lock()
+	m.waitNanos.Add(int64(time.Since(start)))
+	m.locks.Add(1)
+}
+
+func (m *timedMutex) Unlock() { m.mu.Unlock() }
+
+// PoolStats are cumulative counters for the store's one database connection
+// and its write lock, read by the hub's minute timing line, which diffs them.
+type PoolStats struct {
+	// WaitCount and WaitDuration are database/sql's waits for the connection;
+	// InUse is whether the connection is checked out now.
+	WaitCount    int64
+	WaitDuration time.Duration
+	InUse        int
+	// WriteLocks counts write-lock acquisitions and WriteLockWait sums the
+	// time each waited for the lock.
+	WriteLocks    int64
+	WriteLockWait time.Duration
+}
+
+// PoolStats reads the connection pool and write-lock counters.
+func (s *Store) PoolStats() PoolStats {
+	db := s.db.Stats()
+	return PoolStats{WaitCount: db.WaitCount, WaitDuration: db.WaitDuration, InUse: db.InUse,
+		WriteLocks: s.writeMu.locks.Load(), WriteLockWait: time.Duration(s.writeMu.waitNanos.Load())}
+}
 
 // Changed returns a channel closed the next time the given task (or Global) changes.
 func (s *Store) Changed(key string) <-chan struct{} {

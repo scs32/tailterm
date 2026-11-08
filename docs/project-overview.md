@@ -530,6 +530,25 @@ are not counted. The agent and run are self-declared, so this is fairness agains
 accidents, not a security boundary: a `tt` older than this change sends neither
 and shares its node's lane.
 
+The hub logs request timing to its container log. Each request slower than
+`TAILTERM_SLOW_REQUEST_THRESHOLD` (a Go duration, default `1s`) prints
+`hub slow request method=GET route="GET /v1/tasks/{id}/agents/{aid}" status=200
+total_ms=5123 admission_ms=4980 admitted=yes`. At most 60 of these lines print a
+minute; the next printed line adds `held_back=N` for the lines skipped. Once a
+minute in which any request was timed, it prints `hub requests minute` with
+`requests`, `slow`, summed `total_ms` and `admission_ms`, `slowest_route` and
+`slowest_ms`, `inflight` and `waiting` for a slot at that moment, the store's
+connection waits over the minute (`db_waits`, `db_wait_ms`) and `db_in_use` now,
+write-lock acquisitions and their summed wait (`write_locks`,
+`write_lock_wait_ms`), and `slow_held_back`. Lines name only the method and route
+pattern, never a path value, query, header, body, token, caller key, agent or run.
+What they do not measure: a single request's store or write-lock wait (only the
+minute totals); admission wait also counts identity and routing before the slot;
+a request refused or unidentified before admission (429, 503, 403) prints
+`admitted=no` with no split; the events long polls are never timed or counted.
+The container log is lost when a release recreates the container, so copy it out
+before a release if it is needed.
+
 When a team queue listing times out, the relay queue tick keeps acting on its last
 good listing, whatever its age, for the teams it already lists as launching or
 running, and reads each of those entries again by itself before acting. It starts

@@ -5,6 +5,7 @@
 // TAILTERM_TCP_LISTEN normal TCP listener; disables embedded Tailscale
 // TAILTERM_TOKEN_FILE required credential file for TCP mode
 // TAILTERM_MAX_AGENTS active agent limit per task (1..32)
+// TAILTERM_SLOW_REQUEST_THRESHOLD request time above which the hub logs a slow-request line (default 1s)
 //
 //	TS_AUTHKEY        Tailscale auth key (first start only; state persists)
 //	TS_HOSTNAME       tailnet hostname (default tailterm-hub)
@@ -117,6 +118,10 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	monitorConfig, err := scheduleMonitorConfig()
+	if err != nil {
+		log.Fatal(err)
+	}
+	slowThreshold, err := server.RequestTimingThreshold(os.Getenv)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -245,8 +250,13 @@ func main() {
 		}
 	}
 
+	// Request timing: a line for each slow request and one a minute.
+	handler, timing := server.New(st, identity).WithRequestTiming(server.RequestTimingConfig{
+		Threshold: slowThreshold, Stats: st.PoolStats,
+	})
+	go timing.Run(ctx)
 	srv := &http.Server{
-		Handler:           server.New(st, identity),
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		// Long-polls wait up to 30 s; leave headroom.
 		WriteTimeout: 45 * time.Second,
