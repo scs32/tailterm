@@ -6817,8 +6817,8 @@ func TestWorktreeCleanupSessionTempProcessProbe(t *testing.T) {
 	// and when applying, and is named by pid, start and command name only.
 	// A process with only an open file inside keeps the other folder.
 	p := sessionProcs(t,
-		procRow(4321, 1, 4300, homeUID, "795:01.02", command)+procRow(4322, 77, 4322, homeUID, "0:01.00", "/bin/cat"),
-		"p4321\nfcwd\nn"+scratch(folderA)+"\nf3\nn/dev/null\np4322\nfcwd\nn/\nf4\nn"+filepath.Join(scratch(folderB), "probe.txt")+"\n")
+		procRow(4321, 1, 4300, homeUID, "795:01.02", command)+procRow(4322, 77, 4322, homeUID, "0:01.00", "/bin/cat")+procRow(271, 1, 271, -2, "0:00.04", "/usr/libexec/dhcp6d"),
+		"p271\nfcwd\nn"+scratch(folderA)+"\np4321\nfcwd\nn"+scratch(folderA)+"\nf3\nn/dev/null\np4322\nfcwd\nn/\nf4\nn"+filepath.Join(scratch(folderB), "probe.txt")+"\n")
 	for _, apply := range []bool{false, true} {
 		got := f.pass(t, state, apply)
 		a := requireDecision(t, got, folderA, "kept", keepInUse)
@@ -6881,8 +6881,9 @@ func TestWorktreeCleanupSessionTempProcessProbe(t *testing.T) {
 	p.procs = procRow(homeSweepPID, 90, homeSweepPID, homeUID, "0:00.01", "tt team queue sweep-worktrees") +
 		procRow(90, 1, 90, homeUID, "0:00.10", "/bin/zsh") +
 		procRow(5000, 1, 5000, homeUID+1, "0:00.10", "/bin/sleep") +
-		procRow(5001, 1, 5001, homeUID, "0:00.10", "/bin/ls "+scratch(folderA))
-	p.lsof = "p100\nfcwd\nn" + scratch(folderA) + "\np90\nfcwd\nn" + scratch(folderB) + "\np5000\nfcwd\nn" + scratch(folderA) + "\np5001\nfcwd\nn/\n"
+		procRow(5001, 1, 5001, homeUID, "0:00.10", "/bin/ls "+scratch(folderA)) +
+		procRow(271, 1, 271, -2, "0:00.04", "/usr/libexec/dhcp6d")
+	p.lsof = "p100\nfcwd\nn" + scratch(folderA) + "\np271\nfcwd\nn" + scratch(folderB) + "\np90\nfcwd\nn" + scratch(folderB) + "\np5000\nfcwd\nn" + scratch(folderA) + "\np5001\nfcwd\nn/\n"
 	if got := f.pass(t, state, false); got[folderA].Action != "would-remove" || got[folderB].Action != "would-remove" {
 		t.Fatalf("dry run with no process inside: %+v %+v", got[folderA], got[folderB])
 	}
@@ -6948,11 +6949,12 @@ func TestWorktreeCleanupSweepOrphanReport(t *testing.T) {
 		procRow(208, 77, 208, homeUID, "0:00.50", "node /repo/scripts/watch.mjs") +
 		procRow(209, 1, 209, homeUID, "0:00.50", "/bin/sleep 1000") +
 		procRow(210, 1, 210, homeUID+1, "0:00.50", "/bin/sleep 1000") +
-		procRow(211, 1, 211, homeUID, "0:03.00", "/usr/local/go/bin/go test ./cmd/tt")
+		procRow(211, 1, 211, homeUID, "0:03.00", "/usr/local/go/bin/go test ./cmd/tt") +
+		procRow(271, 1, 271, -2, "0:00.04", "/usr/libexec/dhcp6d")
 	lsof := "p201\nfcwd\nn" + tombstone + "\np202\nfcwd\nn" + tombstone + "\np203\nfcwd\nn" + deleted +
 		"\np204\nfcwd\nn" + session + "\np205\nfcwd\nn" + isolated + "\np206\nfcwd\nn" + hostLock +
 		"\np207\nfcwd\nn" + otherFixture + "\np208\nfcwd\nn" + session + "\np209\nfcwd\nn" + unrelated +
-		"\np210\nfcwd\nn" + tombstone + "\np211\nfcwd\nn" + verifierHome + "\n"
+		"\np210\nfcwd\nn" + tombstone + "\np211\nfcwd\nn" + verifierHome + "\np271\nfcwd\nn" + tombstone + "\n"
 	// The sweep itself sits in the tombstone too, and is never listed.
 	p := sessionProcs(t, rows, lsof)
 	p.lsof = strings.Replace(p.lsof, "p100\nfcwd\nn/\n", "p100\nfcwd\nn"+tombstone+"\n", 1)
@@ -6999,7 +7001,7 @@ func TestWorktreeCleanupSweepOrphanReport(t *testing.T) {
 			t.Fatalf("dry run lacks %q:\n%s", line, text)
 		}
 	}
-	for _, leak := range []string{"not-a-real-secret", ".env", "pid=208 ", "pid=209 ", "pid=210 ", "pid=100 "} {
+	for _, leak := range []string{"not-a-real-secret", ".env", "pid=208 ", "pid=209 ", "pid=210 ", "pid=100 ", "pid=271 ", "orphan processes not listed"} {
 		if strings.Contains(text, leak) {
 			t.Fatalf("dry run prints %q:\n%s", leak, text)
 		}
