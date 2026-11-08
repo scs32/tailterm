@@ -4740,7 +4740,11 @@ var sessionProcessProbes = nativeHomeProbes
 var userTempDir = os.TempDir
 
 var (
-	hostProcessRow = regexp.MustCompile(`^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\S+\s+\S+\s+\d+\s+\d+:\d+:\d+\s+\d+)\s+(\S+)\s+(.*)$`)
+	// hostProcessRow is one ps row: pid, ppid, pgid, uid, elapsed time,
+	// CPU time and command. Elapsed time ([[dd-]hh:]mm:ss) is printed the
+	// same in every locale, unlike lstart, so the start is computed from it.
+	hostProcessRow = regexp.MustCompile(`^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+((?:\d+-)?(?:\d+:)?\d+:\d+)\s+(\S+)\s(.*)$`)
+	elapsedField   = regexp.MustCompile(`^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$`)
 	scriptArgument = regexp.MustCompile(`\.(js|mjs|cjs|ts|mts|cts|py|rb|pl|sh)$`)
 )
 
@@ -4764,28 +4768,63 @@ func processName(command string) string {
 	return name
 }
 
+// parseElapsed reads ps's elapsed time, [[dd-]hh:]mm:ss.
+func parseElapsed(field string) (time.Duration, bool) {
+	m := elapsedField.FindStringSubmatch(field)
+	if m == nil {
+		return 0, false
+	}
+	n := make([]int64, 4)
+	for i, v := range m[1:] {
+		if v != "" {
+			n[i], _ = strconv.ParseInt(v, 10, 64)
+		}
+	}
+	if n[3] > 59 || (m[2] != "" && n[2] > 59) {
+		return 0, false
+	}
+	return time.Duration(((n[0]*24+n[1])*60+n[2])*60+n[3]) * time.Second, true
+}
+
 // probeHostProcesses lists this user's processes, minus pids 0 and 1 and
 // the sweep and its ancestors, with each one's cwd and open paths from lsof:
 // the ps and lsof route of probeVerifierHomes. Any command failing fails the
-// probe.
+// probe, and so does a listing it cannot read: a line that is not a row, or
+// no row for the sweep itself. An unread listing would look like a host
+// with no processes and keep nothing.
 func probeHostProcesses(p homeProbes) ([]hostProcess, error) {
-	listing, err := p.run("ps", "-axww", "-o", "pid=,ppid=,pgid=,uid=,lstart=,time=,command=")
+	listing, err := p.run("ps", "-axww", "-o", "pid=,ppid=,pgid=,uid=,etime=,time=,command=")
 	if err != nil {
 		return nil, err
 	}
+	at := p.now()
 	all := map[int]*hostProcess{}
 	uids := map[int]int{}
 	for _, line := range strings.Split(listing, "\n") {
-		m := hostProcessRow.FindStringSubmatch(line)
-		if m == nil {
+		if strings.TrimSpace(line) == "" {
 			continue
+		}
+		m := hostProcessRow.FindStringSubmatch(line)
+		elapsed, ok := time.Duration(0), m != nil
+		if ok {
+			elapsed, ok = parseElapsed(m[5])
+		}
+		if !ok {
+			if len(line) > 80 {
+				line = line[:80]
+			}
+			return nil, fmt.Errorf("ps printed a line that could not be read: %q", strings.TrimSpace(line))
 		}
 		pid, _ := strconv.Atoi(m[1])
 		ppid, _ := strconv.Atoi(m[2])
 		pgid, _ := strconv.Atoi(m[3])
 		uid, _ := strconv.Atoi(m[4])
-		all[pid] = &hostProcess{PID: pid, PPID: ppid, PGID: pgid, Start: strings.Join(strings.Fields(m[5]), " "), CPU: m[6], Name: processName(m[7])}
+		start := at.Add(-elapsed).UTC().Format("2006-01-02T15:04:05Z")
+		all[pid] = &hostProcess{PID: pid, PPID: ppid, PGID: pgid, Start: start, CPU: m[6], Name: processName(m[7])}
 		uids[pid] = uid
+	}
+	if all[p.self] == nil {
+		return nil, errors.New("ps did not list the sweep itself")
 	}
 	excluded := map[int]bool{0: true, 1: true}
 	for pid := p.self; pid > 1 && !excluded[pid]; {
@@ -4878,11 +4917,12 @@ const (
 // make under the user temp directory and /tmp, most specific first, with
 // the file that makes each when known.
 var testTempPrefixes = []struct{ prefix, hint string }{
-	{"tailterm-isolation-evidence-test-", "tests/isolated-tailterm-runner.test.js (removed)"},
-	{"tailterm-isolated-", "tests/isolated-tailterm-runner.test.js (removed)"},
+	// No file at tasks-hub makes these two; the runner that did never landed.
+	{"tailterm-isolation-evidence-test-", ""},
+	{"tailterm-isolated-", ""},
 	{"tailterm-verifier-", "scripts/verify-matrix.mjs, an older verifier home"},
 	{"matrix-host-lock-repo-", "tests/matrix-host-lock.test.js"},
-	{"tv-", "scripts/verify-matrix.mjs verifier home"},
+	{"tv-", "scripts/verify-matrix.mjs, tests/matrix-host-lock.test.js, tests/verification-2.test.js or tests/verification-6.test.js"},
 	{"tailterm-", ""},
 }
 
