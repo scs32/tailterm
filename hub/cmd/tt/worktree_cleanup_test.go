@@ -48,13 +48,19 @@ func init() {
 }
 
 func quietSessionProbes() homeProbes {
-	return (&fakeHomeProcs{platform: "darwin", procs: procRow(homeSweepPID, 90, homeSweepPID, homeUID, "0:00.01", "tt team queue sweep-worktrees"), lsof: "p100\nfcwd\nn/\n"}).probes()
+	return (&fakeHomeProcs{platform: "darwin", procs: procRow(homeSweepPID, 90, homeSweepPID, homeUID, "0:00.01", "tt team queue sweep-worktrees"), lsof: "p100\nfcwd\nn/\n", now: procClock}).probes()
 }
 
+// procClock is the fake probes' clock; every procRow process started a day
+// before it, at procStart.
+var procClock = time.Date(2026, 11, 8, 8, 34, 12, 0, time.UTC)
+
+const procStart = "2026-11-07T08:34:12Z"
+
 // procRow is one line of the fake ps listing the process probe reads:
-// pid, ppid, pgid, uid, start (lstart), CPU time and command.
+// pid, ppid, pgid, uid, elapsed time (one day), CPU time and command.
 func procRow(pid, ppid, pgid, uid int, cpu, command string) string {
-	return fmt.Sprintf("%5d %5d %5d %5d Sun Nov  8 00:34:12 2026 %10s %s\n", pid, ppid, pgid, uid, cpu, command)
+	return fmt.Sprintf("%5d %5d %5d %5d %11s %10s %s\n", pid, ppid, pgid, uid, "1-00:00:00", cpu, command)
 }
 
 func strayHomeProbes() homeProbes {
@@ -4105,7 +4111,7 @@ func (p *fakeHomeProcs) probes() homeProbes {
 				key = "env"
 			case slicesContains(args, "pid=,etimes="):
 				key = "starts"
-			case slicesContains(args, "pid=,ppid=,pgid=,uid=,lstart=,time=,command="):
+			case slicesContains(args, "pid=,ppid=,pgid=,uid=,etime=,time=,command="):
 				key = "procs"
 			default:
 				key = "ps"
@@ -6771,7 +6777,7 @@ func TestWorktreeCleanupArtifactScratchKeepsTranscripts(t *testing.T) {
 // the orphan report, and returns it so a test can change it between passes.
 func sessionProcs(t *testing.T, procs, lsof string) *fakeHomeProcs {
 	t.Helper()
-	p := &fakeHomeProcs{platform: "darwin", procs: procRow(homeSweepPID, 90, homeSweepPID, homeUID, "0:00.01", "tt team queue sweep-worktrees") + procs, lsof: "p100\nfcwd\nn/\n" + lsof}
+	p := &fakeHomeProcs{platform: "darwin", procs: procRow(homeSweepPID, 90, homeSweepPID, homeUID, "0:00.01", "tt team queue sweep-worktrees") + procs, lsof: "p100\nfcwd\nn/\n" + lsof, now: procClock}
 	old := sessionProcessProbes
 	sessionProcessProbes = p.probes
 	t.Cleanup(func() { sessionProcessProbes = old })
@@ -6816,7 +6822,7 @@ func TestWorktreeCleanupSessionTempProcessProbe(t *testing.T) {
 	for _, apply := range []bool{false, true} {
 		got := f.pass(t, state, apply)
 		a := requireDecision(t, got, folderA, "kept", keepInUse)
-		want := "process 4321 (node exit-probe.mjs, started Sun Nov 8 00:34:12 2026) has its cwd in the folder"
+		want := "process 4321 (node exit-probe.mjs, started 2026-11-07T08:34:12Z) has its cwd in the folder"
 		if a.Detail != want || a.Kind != kindSessionTemp {
 			t.Fatalf("apply=%v: detail %q, want %q", apply, a.Detail, want)
 		}
@@ -6825,7 +6831,7 @@ func TestWorktreeCleanupSessionTempProcessProbe(t *testing.T) {
 				t.Fatalf("detail leaks %q: %q", leak, a.Detail)
 			}
 		}
-		if b := requireDecision(t, got, folderB, "kept", keepInUse); !strings.Contains(b.Detail, "process 4322 (cat, started Sun Nov 8 00:34:12 2026) has an open file in the folder") {
+		if b := requireDecision(t, got, folderB, "kept", keepInUse); !strings.Contains(b.Detail, "process 4322 (cat, started 2026-11-07T08:34:12Z) has an open file in the folder") {
 			t.Fatalf("apply=%v: open file detail %q", apply, b.Detail)
 		}
 		requireExists(t, filepath.Join(scratch(folderA), "probe.txt"), true)
@@ -6845,6 +6851,29 @@ func TestWorktreeCleanupSessionTempProcessProbe(t *testing.T) {
 		}
 	}
 	p.fail = ""
+
+	// A listing the probe cannot read fails it too, rather than reading as
+	// a host with no processes: a day-first lstart row as en_GB prints it,
+	// any other line that is not a row, or no row for the sweep itself.
+	good := p.procs
+	sweepRow := procRow(homeSweepPID, 90, homeSweepPID, homeUID, "0:00.01", "tt team queue sweep-worktrees")
+	for _, bad := range []struct{ procs, want string }{
+		{sweepRow + " 4321     1  4300   501 Sun  8 Nov 00:52:01 2026   795:01.02 node exit-probe.mjs\n", "process probe: ps printed a line that could not be read: "},
+		{sweepRow + "garbage\n", `process probe: ps printed a line that could not be read: "garbage"`},
+		{sweepRow + procRow(4321, 1, 4300, homeUID, "0:00.01", "node")[:12] + " 25:99 0:00.01 node\n", "process probe: ps printed a line that could not be read: "},
+		{procRow(4321, 1, 4300, homeUID, "795:01.02", command), "process probe: ps did not list the sweep itself"},
+		{"", "process probe: ps did not list the sweep itself"},
+	} {
+		p.procs = bad.procs
+		got := f.pass(t, state, true)
+		for _, folder := range []string{folderA, folderB} {
+			if d := requireDecision(t, got, folder, "kept", keepFailed); !strings.Contains(d.Detail, bad.want) || strings.Contains(d.Detail, "not-a-real-secret") {
+				t.Fatalf("listing %q: detail %q, want %q", bad.procs, d.Detail, bad.want)
+			}
+			requireExists(t, filepath.Join(scratch(folder), "probe.txt"), true)
+		}
+	}
+	p.procs = good
 
 	// Another user's process, the sweep itself and its ancestors, and a
 	// process that only names the folder in its arguments keep nothing:
@@ -6901,7 +6930,8 @@ func TestWorktreeCleanupSweepOrphanReport(t *testing.T) {
 	hostLock := filepath.Join(userTemp, "matrix-host-lock-repo-q1w2")
 	otherFixture := filepath.Join(userTemp, "tailterm-board-compose-zz")
 	unrelated := filepath.Join(userTemp, "TestSomething123")
-	for _, dir := range []string{tombstone, session, isolated, hostLock, otherFixture, unrelated} {
+	verifierHome := filepath.Join(homes, "tv-AbC123", "home")
+	for _, dir := range []string{tombstone, session, isolated, hostLock, otherFixture, unrelated, verifierHome} {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			t.Fatal(err)
 		}
@@ -6917,24 +6947,26 @@ func TestWorktreeCleanupSweepOrphanReport(t *testing.T) {
 		procRow(207, 1, 207, homeUID, "0:00.50", "node fixture.mjs") +
 		procRow(208, 77, 208, homeUID, "0:00.50", "node /repo/scripts/watch.mjs") +
 		procRow(209, 1, 209, homeUID, "0:00.50", "/bin/sleep 1000") +
-		procRow(210, 1, 210, homeUID+1, "0:00.50", "/bin/sleep 1000")
+		procRow(210, 1, 210, homeUID+1, "0:00.50", "/bin/sleep 1000") +
+		procRow(211, 1, 211, homeUID, "0:03.00", "/usr/local/go/bin/go test ./cmd/tt")
 	lsof := "p201\nfcwd\nn" + tombstone + "\np202\nfcwd\nn" + tombstone + "\np203\nfcwd\nn" + deleted +
 		"\np204\nfcwd\nn" + session + "\np205\nfcwd\nn" + isolated + "\np206\nfcwd\nn" + hostLock +
 		"\np207\nfcwd\nn" + otherFixture + "\np208\nfcwd\nn" + session + "\np209\nfcwd\nn" + unrelated +
-		"\np210\nfcwd\nn" + tombstone + "\n"
+		"\np210\nfcwd\nn" + tombstone + "\np211\nfcwd\nn" + verifierHome + "\n"
 	// The sweep itself sits in the tombstone too, and is never listed.
 	p := sessionProcs(t, rows, lsof)
 	p.lsof = strings.Replace(p.lsof, "p100\nfcwd\nn/\n", "p100\nfcwd\nn"+tombstone+"\n", 1)
 	verifyHomeTempRoot = func() string { return homes }
 
 	want := []orphanProcess{
-		{PID: 201, PGID: 200, PPID: 1, Start: "Sun Nov 8 00:34:12 2026", CPU: "795:01.02", Command: "node exit-probe.mjs", Cwd: tombstone, Kind: orphanTombstone},
-		{PID: 202, PGID: 202, PPID: 77, Start: "Sun Nov 8 00:34:12 2026", CPU: "0:02.00", Command: "zsh", Cwd: tombstone, Kind: orphanTombstone},
-		{PID: 203, PGID: 203, PPID: 1, Start: "Sun Nov 8 00:34:12 2026", CPU: "1:00.00", Command: "node b-case.test.js", Cwd: deleted, Kind: orphanDeleted},
-		{PID: 204, PGID: 204, PPID: 1, Start: "Sun Nov 8 00:34:12 2026", CPU: "0:10.00", Command: "node watch.mjs", Cwd: session, Kind: orphanSession},
-		{PID: 205, PGID: 205, PPID: 1, Start: "Sun Nov 8 00:34:12 2026", CPU: "749:00.00", Command: "node isolated-runner-launch-supervisor.mjs", Cwd: isolated, Kind: orphanTestTemp, Hint: "tests/isolated-tailterm-runner.test.js (removed)"},
-		{PID: 206, PGID: 206, PPID: 1, Start: "Sun Nov 8 00:34:12 2026", CPU: "0:00.50", Command: "git", Cwd: hostLock, Kind: orphanTestTemp, Hint: "tests/matrix-host-lock.test.js"},
-		{PID: 207, PGID: 207, PPID: 1, Start: "Sun Nov 8 00:34:12 2026", CPU: "0:00.50", Command: "node fixture.mjs", Cwd: otherFixture, Kind: orphanTestTemp},
+		{PID: 201, PGID: 200, PPID: 1, Start: procStart, CPU: "795:01.02", Command: "node exit-probe.mjs", Cwd: tombstone, Kind: orphanTombstone},
+		{PID: 202, PGID: 202, PPID: 77, Start: procStart, CPU: "0:02.00", Command: "zsh", Cwd: tombstone, Kind: orphanTombstone},
+		{PID: 203, PGID: 203, PPID: 1, Start: procStart, CPU: "1:00.00", Command: "node b-case.test.js", Cwd: deleted, Kind: orphanDeleted},
+		{PID: 204, PGID: 204, PPID: 1, Start: procStart, CPU: "0:10.00", Command: "node watch.mjs", Cwd: session, Kind: orphanSession},
+		{PID: 205, PGID: 205, PPID: 1, Start: procStart, CPU: "749:00.00", Command: "node isolated-runner-launch-supervisor.mjs", Cwd: isolated, Kind: orphanTestTemp, Hint: ""},
+		{PID: 206, PGID: 206, PPID: 1, Start: procStart, CPU: "0:00.50", Command: "git", Cwd: hostLock, Kind: orphanTestTemp, Hint: "tests/matrix-host-lock.test.js"},
+		{PID: 207, PGID: 207, PPID: 1, Start: procStart, CPU: "0:00.50", Command: "node fixture.mjs", Cwd: otherFixture, Kind: orphanTestTemp},
+		{PID: 211, PGID: 211, PPID: 1, Start: procStart, CPU: "0:03.00", Command: "go", Cwd: verifierHome, Kind: orphanTestTemp, Hint: "scripts/verify-matrix.mjs, tests/matrix-host-lock.test.js, tests/verification-2.test.js or tests/verification-6.test.js"},
 	}
 	got, fault := sweepOrphanReport()
 	if fault != "" || !reflect.DeepEqual(got, want) {
@@ -6956,10 +6988,10 @@ func TestWorktreeCleanupSweepOrphanReport(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, line := range []string{
-		`orphan tombstone pid=201 pgid=200 ppid=1 started "Sun Nov 8 00:34:12 2026" cpu=795:01.02 command "node exit-probe.mjs" cwd ` + tombstone + "\n",
-		`orphan deleted-folder pid=203 pgid=203 ppid=1 started "Sun Nov 8 00:34:12 2026" cpu=1:00.00 command "node b-case.test.js" cwd ` + deleted + "\n",
+		`orphan tombstone pid=201 pgid=200 ppid=1 started "2026-11-07T08:34:12Z" cpu=795:01.02 command "node exit-probe.mjs" cwd ` + tombstone + "\n",
+		`orphan deleted-folder pid=203 pgid=203 ppid=1 started "2026-11-07T08:34:12Z" cpu=1:00.00 command "node b-case.test.js" cwd ` + deleted + "\n",
 		`orphan session-temp pid=204 pgid=204 ppid=1 `,
-		`orphan test-temp pid=205 pgid=205 ppid=1 started "Sun Nov 8 00:34:12 2026" cpu=749:00.00 command "node isolated-runner-launch-supervisor.mjs" cwd ` + isolated + " (made by tests/isolated-tailterm-runner.test.js (removed))\n",
+		`orphan test-temp pid=205 pgid=205 ppid=1 started "2026-11-07T08:34:12Z" cpu=749:00.00 command "node isolated-runner-launch-supervisor.mjs" cwd ` + isolated + "\n",
 		`orphan test-temp pid=206 `,
 		"dry run: nothing changed",
 	} {
@@ -6983,6 +7015,14 @@ func TestWorktreeCleanupSweepOrphanReport(t *testing.T) {
 		t.Fatalf("json orphans %+v (%v)", dry.Orphans, err)
 	}
 
+	// An unreadable listing is a probe failure too, not an empty report.
+	saved := p.procs
+	p.procs = strings.Replace(saved, procRow(201, 1, 200, homeUID, "795:01.02", exitProbe), "  201     1   200   501 So. 8 Nov. 00:52:01 2026 795:01.02 node exit-probe.mjs\n", 1)
+	if got, fault := sweepOrphanReport(); got != nil || !strings.Contains(fault, "process probe: ps printed a line that could not be read") {
+		t.Fatalf("unreadable listing: orphans %+v fault %q", got, fault)
+	}
+	p.procs = saved
+
 	// A probe failure is reported, and the dry run still succeeds.
 	p.fail = "lsof"
 	text, err = captureSweepStdout(t, func() error {
@@ -7003,7 +7043,87 @@ func TestWorktreeCleanupSweepOrphanReport(t *testing.T) {
 		t.Fatalf("apply: %v calls %q\n%s", err, p.calls, text)
 	}
 	requireNoEnvironmentRead(t, p)
-	for _, dir := range []string{tombstone, session, isolated, hostLock, otherFixture, unrelated} {
+	for _, dir := range []string{tombstone, session, isolated, hostLock, otherFixture, unrelated, verifierHome} {
 		requireExists(t, dir, true)
 	}
+}
+
+// ps's elapsed time reads the same in every locale; anything else is not a
+// row.
+func TestWorktreeCleanupSessionTempProcessElapsed(t *testing.T) {
+	for field, want := range map[string]time.Duration{
+		"00:00":       0,
+		"01:02":       62 * time.Second,
+		"01:02:03":    time.Hour + 2*time.Minute + 3*time.Second,
+		"3-01:02:03":  3*24*time.Hour + time.Hour + 2*time.Minute + 3*time.Second,
+		"45-00:00:00": 45 * 24 * time.Hour,
+	} {
+		if got, ok := parseElapsed(field); !ok || got != want {
+			t.Fatalf("%q: %v %v, want %v", field, got, ok, want)
+		}
+	}
+	for _, field := range []string{"", "5", "1:60", "1:61:00", "Sun", "00:52:01 2026", "1-2", "01:02.5"} {
+		if got, ok := parseElapsed(field); ok {
+			t.Fatalf("%q read as %v", field, got)
+		}
+	}
+}
+
+// Closeout deletes session temp folders directly (no tombstone) and shares
+// the probe: a live process inside keeps its folder in use, recorded in the
+// receipt, until it is gone.
+func TestWorktreeCleanupSessionTempCloseoutKeepsLiveProcess(t *testing.T) {
+	r := newCleanupRepo(t)
+	const host = "fixture"
+	const task = "tsk_c1ea0c1ea0c1ea5b"
+	cwd := r.queuePath("queue-a5a0000c")
+	folder := filepath.Join(r.tempRoot(), claudeScratchKey(cwd))
+	scratch := filepath.Join(folder, "5e55-session", "scratchpad")
+	writeFixtureFile(t, filepath.Join(scratch, "probe.txt"), "c\n")
+	finished := api.TeamQueueEntry{ID: "tqe_a5a0_closeout", TaskID: task, ItemID: "wi_a5a0a5a0a5a0a5a0", State: "finished", Host: host, Cwd: cwd, Repository: r.common,
+		Acceptance: &api.TeamIntegrationAcceptance{Repository: r.common, Worktree: cwd}}
+	hub := &cleanupHub{
+		queues:  map[string]api.TeamQueueList{task: {Entries: []api.TeamQueueEntry{finished}}},
+		details: map[string]api.TaskDetail{task: {Task: api.Task{ID: task, Status: api.TaskOpen}}},
+	}
+	server := httptest.NewServer(hub)
+	defer server.Close()
+	c, err := api.NewClient(server.URL, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := sessionProcs(t, procRow(4321, 1, 4300, homeUID, "795:01.02", "node --test /repo/tests/b-case.test.js"), "p4321\nfcwd\nn"+scratch+"\n")
+	closeout := func() string {
+		t.Helper()
+		closeoutWorktreeChecks.Delete(finished.ID)
+		var stderr strings.Builder
+		restore := captureStderr(t, &stderr)
+		err := closeoutWorktrees(context.Background(), c, host, api.TeamQueueList{}, hub.queues[task], finished, nil)
+		restore()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return stderr.String()
+	}
+	said := closeout()
+	want := "kept in-use " + folder + ": process 4321 (node b-case.test.js, started " + procStart + ") has its cwd in the folder"
+	if !strings.Contains(said, want) {
+		t.Fatalf("closeout said %q, want %q", said, want)
+	}
+	requireExists(t, filepath.Join(scratch, "probe.txt"), true)
+	rec, ok := receiptFor(readCleanupReceipts(t), folder)
+	if !ok || rec.Action != "kept" || rec.Reason != keepInUse || rec.Kind != kindSessionTemp || !strings.Contains(rec.Detail, "process 4321 (node b-case.test.js") {
+		t.Fatalf("receipt %+v %v", rec, ok)
+	}
+	// With the process gone, the next closeout deletes the folder directly.
+	p.procs = procRow(homeSweepPID, 90, homeSweepPID, homeUID, "0:00.01", "tt relay")
+	p.lsof = "p100\nfcwd\nn/\n"
+	if said := closeout(); !strings.Contains(said, "removed "+folder) {
+		t.Fatalf("closeout said %q", said)
+	}
+	requireExists(t, folder, false)
+	if intents, _ := loadDetachIntents(); len(intents) != 0 {
+		t.Fatalf("closeout left detach intents %+v", intents)
+	}
+	requireNoEnvironmentRead(t, p)
 }
