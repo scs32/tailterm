@@ -499,6 +499,11 @@ func (b *Bridge) answer(ctx context.Context, taskID string, in discord.Interacti
 				return decisionLookupReply(seq, dErr)
 			}
 		}
+		if strings.TrimSpace(text) != "" {
+			if r, ok := b.replayClosedAnswer(ctx, taskID, in, ref, text); ok {
+				return r
+			}
+		}
 	}
 	if err != nil {
 		return lookupReply(err)
@@ -510,12 +515,67 @@ func (b *Bridge) answer(ctx context.Context, taskID string, in discord.Interacti
 	if r, done := ownerOutcome(err); done {
 		return r
 	}
+	return b.confirmObligationAnswer(ctx, in, o.MessageSeq, text, out)
+}
+
+// obligationID reports whether ref has the shape of a hub obligation ID
+// ("obl_" and 16 hex digits), so only such a ref goes into a hub path.
+func obligationID(ref string) bool {
+	hex, ok := strings.CutPrefix(ref, "obl_")
+	return ok && len(hex) == 16 && strings.Trim(hex, "0123456789abcdef") == ""
+}
+
+// confirmObligationAnswer posts a stored obligation /answer in the channel.
+func (b *Bridge) confirmObligationAnswer(ctx context.Context, in discord.Interaction, obligationSeq int64, text string, out api.OwnerActionResult) reply {
 	seq := int64(0)
 	if out.Message != nil {
 		seq = out.Message.Seq
 	}
 	mk := marker(seq, 1, 1, "")
-	return b.confirmInChannel(ctx, in, mk, truncate(fmt.Sprintf("**owner** answered #%d on the recipient's behalf:\n%s", o.MessageSeq, text), contentLimit-len(mk)-1)+"\n"+mk)
+	return b.confirmInChannel(ctx, in, mk, truncate(fmt.Sprintf("**owner** answered #%d on the recipient's behalf:\n%s", obligationSeq, text), contentLimit-len(mk)-1)+"\n"+mk)
+}
+
+// replayClosedAnswer finishes a resumed /answer whose answer the hub stored
+// before a crash: the obligation is closed now, so the open lookup misses
+// it. The answer is sent again with the same request ID, which returns the
+// saved result only for this interaction's own answer; a closed obligation
+// answered any other way is refused, and ok is false so the caller replies
+// "Already handled". A message number is looked up among its obligations in
+// any state; an obligation ID is tried as given.
+func (b *Bridge) replayClosedAnswer(ctx context.Context, taskID string, in discord.Interaction, ref, text string) (reply, bool) {
+	type candidate struct {
+		id  string
+		seq int64
+	}
+	ref = strings.TrimPrefix(strings.TrimSpace(ref), "#")
+	var candidates []candidate
+	if seq, err := strconv.ParseInt(ref, 10, 64); err == nil && seq > 0 {
+		list, err := b.cfg.Hub.ListObligationsFrom(ctx, taskID, "", seq, seq)
+		if err != nil {
+			return ephemeral("⚠️ %s.", hubMessage(err)), true
+		}
+		for _, o := range list {
+			if o.State == api.ObligationClosed && o.MessageSeq == seq {
+				candidates = append(candidates, candidate{o.ID, o.MessageSeq})
+			}
+		}
+	} else if obligationID(ref) {
+		candidates = append(candidates, candidate{id: ref})
+	}
+	for _, c := range candidates {
+		out, err := b.cfg.Hub.AnswerObligation(ctx, taskID, c.id, api.ObligationAnswerRequest{Text: text, RequestID: "discord-interaction-" + in.ID})
+		if err == nil {
+			if out.Obligation != nil {
+				c.seq = out.Obligation.MessageSeq
+			}
+			return b.confirmObligationAnswer(ctx, in, c.seq, text, out), true
+		}
+		var h *api.HTTPError
+		if !errors.As(err, &h) || (h.Status != http.StatusConflict && h.Status != http.StatusNotFound) {
+			return ephemeral("⚠️ %s.", hubMessage(err)), true // unknown, never "handled"
+		}
+	}
+	return reply{}, false
 }
 
 // confirmInChannel posts an answer's confirmation in the interaction's

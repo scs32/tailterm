@@ -452,3 +452,78 @@ func TestDecisionSlashAnswer(t *testing.T) {
 		t.Fatalf("/answer on nothing = %q", got)
 	}
 }
+
+// slashAnswer runs /answer and returns the reply the owner was shown.
+func (h *harness) slashAnswer(id, ref, text string) string {
+	return editContent(h.interact(discord.Interaction{ID: id, Type: discord.InteractionCommand, Data: discord.InteractionData{Name: "answer",
+		Options: []discord.InteractionOption{stringOption("obligation", ref), stringOption("text", text)}}}))
+}
+
+// wi_6ac93c7e030b5dad review b1 (#59303): a crash after the hub stored an
+// obligation /answer but before the channel post. The resumed interaction
+// finds the obligation closed, replays the answer by its request ID and
+// posts the confirmation once, by message number or obligation ID. A closed
+// obligation answered elsewhere still reads "Already handled" and posts
+// nothing.
+func TestObligationSlashAnswerResumedAfterStore(t *testing.T) {
+	h := newHarness(t)
+	mapping, err := h.b.cfg.State.MappingByChannel(h.ctx, h.channel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const text = "Use the static fixture."
+	for i, byID := range []bool{false, true} {
+		question := h.post(typed(h.builder, h.lead, api.EnvelopeKindQuestion, fmt.Sprintf("Which fixture should test %d use", i)))
+		o, err := h.b.obligation(h.ctx, h.task.ID, itoa(question.Seq))
+		if err != nil {
+			t.Fatal(err)
+		}
+		id := fmt.Sprintf("98000000000000002%d", i)
+		// The first run stored the answer, then the bridge died.
+		stored, err := h.b.cfg.Hub.AnswerObligation(h.ctx, h.task.ID, o.ID, api.ObligationAnswerRequest{Text: text, RequestID: "discord-interaction-" + id})
+		if err != nil || stored.Message == nil {
+			t.Fatalf("store the answer: %+v %v", stored, err)
+		}
+		ref := "#" + itoa(question.Seq)
+		if byID {
+			ref = o.ID
+		}
+		in := discord.Interaction{ID: id, Type: discord.InteractionCommand, GuildID: "guild", ChannelID: h.channel, Token: "token-" + id,
+			Member: &discord.Member{User: &discord.User{ID: ownerID}}, Data: discord.InteractionData{Name: "answer",
+				Options: []discord.InteractionOption{stringOption("obligation", ref), stringOption("text", text)}}}
+		mk := marker(stored.Message.Seq, 1, 1, "")
+		want := fmt.Sprintf("**owner** answered #%d on the recipient's behalf:\n%s\n%s", question.Seq, text, mk)
+		before := len(h.boardMessages())
+		for run := 0; run < 2; run++ { // the resume, then a second resume
+			h.b.runInteraction(h.ctx, mapping, in, true)
+			if got := editContent(h.fake.lastEdit(in.Token)); got != want {
+				t.Fatalf("byID=%v run %d: resumed reply = %q, want %q", byID, run, got, want)
+			}
+			if posts := h.postsWith(mk); len(posts) != 1 || posts[0].Content != want {
+				t.Fatalf("byID=%v run %d: channel confirmation = %+v, want one %q", byID, run, posts, want)
+			}
+		}
+		if len(h.boardMessages()) != before {
+			t.Fatalf("byID=%v: the replay stored another message", byID)
+		}
+	}
+
+	// Answered elsewhere (another request ID): nothing to replay.
+	question := h.post(typed(h.builder, h.lead, api.EnvelopeKindQuestion, "Which fixture should the last test use"))
+	o, err := h.b.obligation(h.ctx, h.task.ID, itoa(question.Seq))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.b.cfg.Hub.AnswerObligation(h.ctx, h.task.ID, o.ID, api.ObligationAnswerRequest{Text: "Answered in TailOS.", RequestID: "tailos-answer-1"}); err != nil {
+		t.Fatal(err)
+	}
+	lines, board := len(h.lines()), len(h.boardMessages())
+	for i, ref := range []string{itoa(question.Seq), o.ID} {
+		if got := h.slashAnswer(fmt.Sprintf("98000000000000003%d", i), ref, text); got != "✔️ Already handled: that obligation is closed or was moved." {
+			t.Fatalf("/answer %s answered elsewhere = %q", ref, got)
+		}
+	}
+	if len(h.lines()) != lines || len(h.boardMessages()) != board {
+		t.Fatal("an obligation answered elsewhere posted or stored again")
+	}
+}
