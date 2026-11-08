@@ -1010,12 +1010,14 @@ asking for a re-provision. A stop during the load check prints a line only when
 its checkout could not be restored (`load-unproven`, above).
 
 **Failed CLI calls.** When a call of the configured `tt` fails, the journal
-directory keeps the evidence in `cli-failures.json`, mode 0600 (the Mini host
-setup and rollback run another binary, so they are kept in the job journal
-instead; see "A failed Mini host setup"): for each
+directory keeps the evidence in `cli-failures.json`, mode 0600: for each
 failure `at`, `jobId`, `agentId`, `runId`, the exact `argv`, `cwd`, `exitCode`,
 `signal`, `errorCode`, the last 16384 bytes of `stderr`, `stderrBytes`,
-`stderrTruncated`, `count` and `lastAt`. The newest 20 distinct failures are
+`stderrTruncated`, `count` and `lastAt`. The Mini host setup call runs the
+candidate artifact, not the configured `tt`, so its output is kept only in the
+job journal. The default Mini host rollback runs the installed `tt`, which is
+the deployer's configured `tt`, so a failed rollback is kept in both places (see
+"A failed Mini host setup"). The newest 20 distinct failures are
 kept; a repeat raises `count` and `lastAt` only. `argv` can hold Board text and
 private paths, so none of it leaves the file. The Board gets "A deployer CLI
 call failed" with `Deployer CLI call failed: REASON (release JOB). The exact
