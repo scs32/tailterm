@@ -11,6 +11,7 @@ import (
 	"github.com/scs32/tailterm/hub/internal/server"
 	"github.com/scs32/tailterm/hub/internal/spawn"
 	"github.com/scs32/tailterm/hub/internal/store"
+	"io"
 	"maps"
 	"net/http"
 	"net/http/httptest"
@@ -4204,6 +4205,166 @@ func TestRelaySlowPassLogsPhaseTimes(t *testing.T) {
 		if strings.Contains(line, rotationLoopSentinel) || strings.Contains(line, "?") {
 			t.Fatalf("slow pass line carries a query or private text: %q", line)
 		}
+	}
+}
+
+// relayPlantedQuery is a query each hourly-line test call carries; no line may
+// print it.
+const relayPlantedQuery = "token=relay-planted-query-text"
+
+// The hourly hub call line counts the calls relayTimedTransport times: calls,
+// calls over 2s and 5s, failed calls and the slowest call. It prints one line
+// per ended hour with calls, none for an hour without, and never a query
+// (wi_2548742fe8e262c6).
+func TestRelayHourlyHubCallsCountTimedCalls(t *testing.T) {
+	clock := newRelayTestClock(t)
+	took := map[string]time.Duration{"/v1/fast": 500 * time.Millisecond, "/v1/over2": 2500 * time.Millisecond, "/v1/over5": 6 * time.Second}
+	var served atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		served.Add(1)
+		clock.advance(took[r.URL.Path])
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	t.Cleanup(server.Close)
+	var hours relayHubCallHours
+	pass := newRelayPassTiming(&hours)
+	client := &http.Client{Transport: relayTimedTransport{base: http.DefaultTransport, pass: pass}}
+	call := func(ctx context.Context, path string) error {
+		req, err := http.NewRequestWithContext(ctx, "GET", server.URL+path+"?"+relayPlantedQuery, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := client.Do(req)
+		if err == nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+		return err
+	}
+	var printed []string
+	flush := func() []string {
+		lines := hours.lines(clock.Now())
+		printed = append(printed, lines...)
+		return lines
+	}
+	for _, path := range []string{"/v1/fast", "/v1/over2", "/v1/over5"} {
+		if err := call(context.Background(), path); err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+	}
+	// A deadline already past fails the round trip before it reaches the hub.
+	expired, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	if err := call(expired, "/v1/failed"); err == nil {
+		t.Fatal("a call past its deadline succeeded")
+	}
+	if got := served.Load(); got != 3 {
+		t.Fatalf("hub requests = %d, want the three calls only", got)
+	}
+	if lines := flush(); len(lines) != 0 {
+		t.Fatalf("lines before the hour ends = %q, want none", lines)
+	}
+	// The first pass after 04:00-05:00 ends prints that hour once.
+	clock.advance(time.Hour)
+	lines := flush()
+	if len(lines) != 1 {
+		t.Fatalf("lines after the hour ends = %q, want one", lines)
+	}
+	want := regexp.MustCompile(`^\[tt relay\] 2026-10-25T05:00:09Z hub calls 04Z: 4 calls, 2 over 2s, 1 over 5s, 1 failed; slowest GET /v1/over5 6\.0s$`)
+	if !want.MatchString(lines[0]) {
+		t.Fatalf("hourly line = %q, want %s", lines[0], want)
+	}
+	if lines := flush(); len(lines) != 0 {
+		t.Fatalf("second pass in the same hour printed %q, want nothing", lines)
+	}
+	// 05Z and 06Z had no calls: no line for them.
+	clock.advance(2 * time.Hour)
+	if lines := flush(); len(lines) != 0 {
+		t.Fatalf("hours without calls printed %q, want nothing", lines)
+	}
+	// Two hours that ended before one pass each print their own line.
+	if err := call(context.Background(), "/v1/fast"); err != nil {
+		t.Fatal(err)
+	}
+	clock.advance(time.Hour)
+	if err := call(context.Background(), "/v1/over2"); err != nil {
+		t.Fatal(err)
+	}
+	clock.advance(time.Hour)
+	lines = flush()
+	if len(lines) != 2 || !strings.Contains(lines[0], " hub calls 07Z: 1 calls, 0 over 2s, 0 over 5s, 0 failed; slowest GET /v1/fast 0.5s") || !strings.Contains(lines[1], " hub calls 08Z: 1 calls, 1 over 2s, 0 over 5s, 0 failed; slowest GET /v1/over2 2.5s") {
+		t.Fatalf("two ended hours printed %q, want one line each, oldest first", lines)
+	}
+	for _, line := range printed {
+		if strings.Contains(line, "relay-planted-query-text") || strings.Contains(line, "?") {
+			t.Fatalf("hourly line carries a query: %q", line)
+		}
+	}
+	// The pass's own slowest call is still kept for its slow-pass line.
+	if pass.call != "GET /v1/over5" || pass.callTook != 6*time.Second {
+		t.Fatalf("pass slowest call = %q %s, want GET /v1/over5 6s", pass.call, pass.callTook)
+	}
+}
+
+// The relay loop prints the hourly line at the end of the first pass after the
+// hour ends, from its timed calls to the bound agent, and nothing before it.
+func TestRelayLoopPrintsHourlyHubCallsAfterTheHour(t *testing.T) {
+	clock := newRelayTestClock(t)
+	stubRelayTeamQueue(t, func(context.Context) error { return nil })
+	steward := func(context.Context) error { return nil }
+	handler := func(context.Context) error { return nil }
+	var passes int
+	var afterFirst []string
+	pause := func() bool {
+		passes++
+		if passes == 1 {
+			clock.advance(time.Hour)
+			return true
+		}
+		return false
+	}
+	f := newRotationLoopFixture(t, handler, steward, pause)
+	var agentPath string
+	hook := func(r *http.Request) {
+		if r.Method == "GET" && r.URL.Path == agentPath {
+			clock.advance(3 * time.Second)
+		}
+	}
+	f.onAgentRead.Store(&hook)
+	paths, _ := filepath.Glob(filepath.Join(relayDir(), "*.binding.json"))
+	data, err := os.ReadFile(paths[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var b runtimeBinding
+	if err := json.Unmarshal(data, &b); err != nil {
+		t.Fatal(err)
+	}
+	agentPath = "/v1/tasks/" + b.Task + "/agents/" + b.Agent
+	stderr, err := captureRelayOutput(t, true, func() error { return cmdRelay(nil) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(stderr, "\n") {
+		if strings.Contains(line, " hub calls ") {
+			afterFirst = append(afterFirst, line)
+		}
+		if strings.Contains(line, " slow pass ") {
+			t.Fatalf("a fast pass printed a slow pass line: %q", line)
+		}
+	}
+	if passes != 2 || len(afterFirst) != 1 {
+		t.Fatalf("hourly lines over %d passes crossing one hour = %q, want one:\n%s", passes, afterFirst, stderr)
+	}
+	m := regexp.MustCompile(`^\[tt relay\] 2026-10-25T05:\S+Z hub calls 04Z: (\d+) calls, (\d+) over 2s, 0 over 5s, 0 failed; slowest GET ` + regexp.QuoteMeta(agentPath) + ` 3\.0s$`).FindStringSubmatch(afterFirst[0])
+	if m == nil || m[2] == "0" {
+		t.Fatalf("hourly line = %q, want the first hour's agent reads over 2s", afterFirst[0])
+	}
+	if calls, _ := strconv.Atoi(m[1]); calls < 1 {
+		t.Fatalf("hourly line counted %d calls", calls)
+	}
+	if strings.Contains(afterFirst[0], rotationLoopSentinel) {
+		t.Fatalf("hourly line carries private text: %q", afterFirst[0])
 	}
 }
 

@@ -1357,8 +1357,9 @@ var (
 	relayClaudeRetryStart = startClaudeRetryWatch
 	// relayTeamQueue is the team queue tick the loop runs in its own pass.
 	relayTeamQueue = relayTeamQueueTick
-	// relayPassClock times the loop's phases for its slow-pass lines only; no
-	// wake, retirement or activity decision reads it.
+	// relayPassClock times the loop's phases and hub calls for its slow-pass
+	// and hourly hub call lines only; no wake, retirement or activity decision
+	// reads it.
 	relayPassClock = time.Now
 )
 
@@ -1560,11 +1561,14 @@ type relayPassTiming struct {
 	stepTook time.Duration
 	call     string
 	callTook time.Duration
+
+	// hours, when set, also counts each timed hub call for the hourly line.
+	hours *relayHubCallHours
 }
 
-func newRelayPassTiming() *relayPassTiming {
+func newRelayPassTiming(hours *relayHubCallHours) *relayPassTiming {
 	now := relayPassClock()
-	return &relayPassTiming{start: now, lapAt: now}
+	return &relayPassTiming{start: now, lapAt: now, hours: hours}
 }
 
 // lap ends the step that ran since the last lap and keeps the slowest. An
@@ -1629,8 +1633,8 @@ func (p *relayPassTiming) line(now time.Time, limit *relaySlowLimiter) string {
 }
 
 // relayTimedTransport times each hub round trip for the pass's slow-pass
-// line. It sits under the request budget, so its time leaves out the wait for
-// a budget token.
+// line and the loop's hourly hub call line. It sits under the request budget,
+// so its time leaves out the wait for a budget token.
 type relayTimedTransport struct {
 	base http.RoundTripper
 	pass *relayPassTiming
@@ -1639,8 +1643,91 @@ type relayTimedTransport struct {
 func (t relayTimedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	began := relayPassClock()
 	resp, err := t.base.RoundTrip(req)
-	t.pass.noteCall(req.Method, req.URL.Path, relayPassClock().Sub(began))
+	took := relayPassClock().Sub(began)
+	t.pass.noteCall(req.Method, req.URL.Path, took)
+	t.pass.hours.note(req.Method, req.URL.Path, took, err != nil)
 	return resp, err
+}
+
+// The relay loop prints one line per UTC hour that had timed hub calls, at
+// the end of the first pass after the hour ends (wi_2548742fe8e262c6). It
+// counts only the calls relayTimedTransport times and makes no call of its own.
+const (
+	relayHubCallOver     = 2 * time.Second
+	relayHubCallSlowOver = 5 * time.Second
+)
+
+// relayHubCallHours keeps the hourly hub call counts. It lives as long as the
+// relay loop, so a call of a visit that outlives its pass still counts, and
+// its lock orders each call against the line that ends its hour. It keeps
+// the method and path of the slowest call only: never a query, header, body
+// or message text.
+type relayHubCallHours struct {
+	mu    sync.Mutex
+	cur   relayHubCallHour
+	ended []relayHubCallHour // hours ended with calls, not printed yet
+}
+
+type relayHubCallHour struct {
+	hour                        time.Time
+	calls, over2, over5, failed int
+	slowest                     string
+	slowestTook                 time.Duration
+}
+
+// note counts one timed call in the hour it ended in. A failed call is a
+// transport error or a deadline; its time counts like any other call's.
+func (h *relayHubCallHours) note(method, path string, took time.Duration, failed bool) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.roll(relayPassClock())
+	c := &h.cur
+	c.calls++
+	if took > relayHubCallOver {
+		c.over2++
+	}
+	if took > relayHubCallSlowOver {
+		c.over5++
+	}
+	if failed {
+		c.failed++
+	}
+	if c.slowest == "" || took > c.slowestTook {
+		c.slowest, c.slowestTook = method+" "+path, took
+	}
+}
+
+// roll ends the current hour when now is in a later one. A clock that steps
+// back keeps counting into the current hour.
+func (h *relayHubCallHours) roll(now time.Time) {
+	hour := now.UTC().Truncate(time.Hour)
+	if !hour.After(h.cur.hour) {
+		return
+	}
+	if h.cur.calls > 0 {
+		h.ended = append(h.ended, h.cur)
+	}
+	h.cur = relayHubCallHour{hour: hour}
+}
+
+// lines returns one line for each ended hour that had calls, oldest first,
+// and forgets them. An hour without calls has no line.
+func (h *relayHubCallHours) lines(now time.Time) []string {
+	if h == nil {
+		return nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.roll(now)
+	var out []string
+	for _, c := range h.ended {
+		out = append(out, fmt.Sprintf("[tt relay] %s hub calls %sZ: %d calls, %d over 2s, %d over 5s, %d failed; slowest %s %.1fs", now.UTC().Format(time.RFC3339), c.hour.Format("15"), c.calls, c.over2, c.over5, c.failed, c.slowest, c.slowestTook.Seconds()))
+	}
+	h.ended = nil
+	return out
 }
 
 // timeRelayClient times c's hub calls for pass. Call it before
@@ -1782,13 +1869,14 @@ func cmdRelay(args []string) error {
 	var rotation relayRotationPass
 	var sweep relaySweepPass
 	var slowPasses relaySlowLimiter
+	var hubCalls relayHubCallHours
 	var visitPool relayVisitPool
 	var cleanupSkips int
 	promptDeps := nativeRuntimePromptDeps()
 	var lastClaudeRetry, lastPendingBind, lastWindowSize time.Time
 	var claudeRetryCursor int
 	for {
-		pass := newRelayPassTiming()
+		pass := newRelayPassTiming(&hubCalls)
 		holdForCleanup := false
 		if !*status {
 			rotation.collect(&queueBackoff, false)
@@ -1974,6 +2062,9 @@ func cmdRelay(args []string) error {
 			relayProviderUsage(hubs, time.Now().UTC())
 			pass.end = pass.lap("provider usage").Sub(endAt)
 			if line := pass.line(relayPassClock(), &slowPasses); line != "" {
+				fmt.Fprintln(os.Stderr, line)
+			}
+			for _, line := range hubCalls.lines(relayPassClock()) {
 				fmt.Fprintln(os.Stderr, line)
 			}
 		}
