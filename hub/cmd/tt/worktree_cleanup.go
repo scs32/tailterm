@@ -2359,9 +2359,8 @@ func cleanupSessionTemp(in worktreeCleanupInputs, main string, temp []sessionTem
 		return nil
 	}
 	root := canonicalPath(in.TempRoot)
-	decisions := make([]worktreeDecision, len(temp))
-	var pending []int
-	for i, t := range temp {
+	decisions := make([]worktreeDecision, 0, len(temp))
+	for _, t := range temp {
 		d := worktreeDecision{Path: t.Folder, Kind: kindSessionTemp}
 		reason, detail, uncitable := classifySessionTemp(in, main, t, inUse, linked, cited, cleared, touched, art, now)
 		if reason != "" {
@@ -2370,27 +2369,7 @@ func cleanupSessionTemp(in worktreeCleanupInputs, main string, temp []sessionTem
 				// The sweep reports their size, so they cannot grow unseen.
 				d.Bytes = worktreeBytes(t.Folder, nil)
 			}
-		} else {
-			pending = append(pending, i)
-		}
-		decisions[i] = d
-	}
-	if len(pending) == 0 {
-		return decisions
-	}
-	// One process probe for every folder still removable: a live process
-	// with its cwd or an open file inside keeps the folder, and a probe
-	// failure keeps them all.
-	procs, probeErr := probeHostProcesses(sessionProcessProbes())
-	for _, i := range pending {
-		t, d := temp[i], &decisions[i]
-		if probeErr != nil {
-			d.Action, d.Reason, d.Detail = "kept", keepFailed, "process probe: "+probeErr.Error()
-			continue
-		}
-		spellings := []string{t.Folder, filepath.Join(filepath.Clean(in.TempRoot), filepath.Base(t.Folder))}
-		if hit := processInFolder(procs, spellings); hit != "" {
-			d.Action, d.Reason, d.Detail = "kept", keepInUse, hit
+			decisions = append(decisions, d)
 			continue
 		}
 		d.Action, d.Detail, d.Bytes = "would-remove", "sessions started in "+t.Cwd, worktreeBytes(t.Folder, nil)
@@ -2407,6 +2386,7 @@ func cleanupSessionTemp(in worktreeCleanupInputs, main string, temp []sessionTem
 				d.Action = "removed"
 			}
 		}
+		decisions = append(decisions, d)
 	}
 	return decisions
 }
@@ -2663,10 +2643,6 @@ type worktreeSweepFolders struct {
 type worktreeSweepReport struct {
 	Worktrees []worktreeDecision  `json:"worktrees"`
 	Totals    worktreeSweepTotals `json:"totals"`
-	// Orphans and OrphanFault are the dry run's orphan report
-	// (sweepOrphanReport): the processes listed, or why the probe failed.
-	Orphans     []orphanProcess `json:"orphans,omitempty"`
-	OrphanFault string          `json:"orphanFault,omitempty"`
 }
 
 // sweepHubState is every queue entry and agent the hub knows: the sweep's
@@ -2928,10 +2904,6 @@ func cmdTeamQueueSweepWorktrees(e env, args []string) error {
 			strays, strayRoot = strays+1, d.strayRoot
 		}
 	}
-	if !*apply {
-		// Report only: the sweep never signals a process.
-		report.Orphans, report.OrphanFault = sweepOrphanReport()
-	}
 	if strays > 0 {
 		noun := map[bool]string{true: "checkout is", false: "checkouts are"}[strays == 1]
 		fmt.Fprintf(os.Stderr, "tt: %d detached %s under an item folder but outside the artifacts root %s; kept. Check --artifacts or TAILTERM_ARTIFACTS\n", strays, noun, strayRoot)
@@ -2953,12 +2925,6 @@ func cmdTeamQueueSweepWorktrees(e env, args []string) error {
 		default:
 			fmt.Printf("%s %s\n", d.Action, d.Path)
 		}
-	}
-	for _, o := range report.Orphans {
-		fmt.Println(orphanLine(o))
-	}
-	if report.OrphanFault != "" {
-		fmt.Printf("orphan processes not listed: %s\n", report.OrphanFault)
 	}
 	var parts []string
 	for _, action := range []string{"removed", "would-remove", "trimmed", "would-trim", "pruned", "would-prune", "kept"} {
@@ -4709,331 +4675,6 @@ func probeVerifierHomes(p homeProbes, homes []*verifierHome) (hits, notes map[st
 		}
 	}
 	return hits, notes, nil
-}
-
-// Host processes in session temp and test temp folders (wi_a5a0f85be6169593).
-//
-// A test run that outlives its session (its parent is launchd) holds a cwd
-// the hub never recorded. Before a session temp folder is removed, one probe
-// of this user's processes keeps every folder a live process has its cwd or
-// an open file in; a probe failure keeps every pending folder. The dry run
-// also lists the processes such a removal, or an earlier one, already
-// orphaned. The sweep only reports them: it never signals a process.
-
-// hostProcess is one of this user's processes as the probe saw it. Name is
-// argv[0]'s base and the script it runs, never another argument, and the
-// probe never reads an environment.
-type hostProcess struct {
-	PID, PPID, PGID int
-	Start, CPU      string
-	Name            string
-	Cwd             string
-	Files           []string
-}
-
-// sessionProcessProbes are the probes the session temp check and the orphan
-// report use. Tests replace them.
-var sessionProcessProbes = nativeHomeProbes
-
-// userTempDir is the user temp directory the test fixtures make their
-// folders in. Tests replace it.
-var userTempDir = os.TempDir
-
-var (
-	// hostProcessRow is one ps row: pid, ppid, pgid, uid, elapsed time,
-	// CPU time and command. Elapsed time ([[dd-]hh:]mm:ss) is printed the
-	// same in every locale, unlike lstart, so the start is computed from it.
-	// The uid may be negative: macOS ps prints nobody as -2.
-	hostProcessRow = regexp.MustCompile(`^\s*(\d+)\s+(\d+)\s+(\d+)\s+(-?\d+)\s+((?:\d+-)?(?:\d+:)?\d+:\d+)\s+(\S+)\s(.*)$`)
-	elapsedField   = regexp.MustCompile(`^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$`)
-	scriptArgument = regexp.MustCompile(`\.(js|mjs|cjs|ts|mts|cts|py|rb|pl|sh)$`)
-)
-
-// processName is a command line's name: argv[0]'s base, and the base of the
-// first script argument when there is one.
-func processName(command string) string {
-	fields := strings.Fields(command)
-	if len(fields) == 0 {
-		return ""
-	}
-	name := filepath.Base(fields[0])
-	for _, f := range fields[1:] {
-		if !strings.HasPrefix(f, "-") && scriptArgument.MatchString(f) {
-			name += " " + filepath.Base(f)
-			break
-		}
-	}
-	if len(name) > 80 {
-		name = name[:80]
-	}
-	return name
-}
-
-// parseElapsed reads ps's elapsed time, [[dd-]hh:]mm:ss.
-func parseElapsed(field string) (time.Duration, bool) {
-	m := elapsedField.FindStringSubmatch(field)
-	if m == nil {
-		return 0, false
-	}
-	n := make([]int64, 4)
-	for i, v := range m[1:] {
-		if v != "" {
-			n[i], _ = strconv.ParseInt(v, 10, 64)
-		}
-	}
-	if n[3] > 59 || (m[2] != "" && n[2] > 59) {
-		return 0, false
-	}
-	return time.Duration(((n[0]*24+n[1])*60+n[2])*60+n[3]) * time.Second, true
-}
-
-// probeHostProcesses lists this user's processes, minus pids 0 and 1 and
-// the sweep and its ancestors, with each one's cwd and open paths from lsof:
-// the ps and lsof route of probeVerifierHomes. Any command failing fails the
-// probe, and so does a listing it cannot read: a line that is not a row, or
-// no row for the sweep itself. An unread listing would look like a host
-// with no processes and keep nothing.
-func probeHostProcesses(p homeProbes) ([]hostProcess, error) {
-	listing, err := p.run("ps", "-axww", "-o", "pid=,ppid=,pgid=,uid=,etime=,time=,command=")
-	if err != nil {
-		return nil, err
-	}
-	at := p.now()
-	all := map[int]*hostProcess{}
-	uids := map[int]int{}
-	for _, line := range strings.Split(listing, "\n") {
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-		m := hostProcessRow.FindStringSubmatch(line)
-		elapsed, ok := time.Duration(0), m != nil
-		if ok {
-			elapsed, ok = parseElapsed(m[5])
-		}
-		if !ok {
-			if len(line) > 80 {
-				line = line[:80]
-			}
-			return nil, fmt.Errorf("ps printed a line that could not be read: %q", strings.TrimSpace(line))
-		}
-		pid, _ := strconv.Atoi(m[1])
-		ppid, _ := strconv.Atoi(m[2])
-		pgid, _ := strconv.Atoi(m[3])
-		uid, _ := strconv.Atoi(m[4])
-		start := at.Add(-elapsed).UTC().Format("2006-01-02T15:04:05Z")
-		all[pid] = &hostProcess{PID: pid, PPID: ppid, PGID: pgid, Start: start, CPU: m[6], Name: processName(m[7])}
-		uids[pid] = uid
-	}
-	if all[p.self] == nil {
-		return nil, errors.New("ps did not list the sweep itself")
-	}
-	excluded := map[int]bool{0: true, 1: true}
-	for pid := p.self; pid > 1 && !excluded[pid]; {
-		excluded[pid] = true
-		if all[pid] == nil {
-			break
-		}
-		pid = all[pid].PPID
-	}
-	table := map[int]*hostProcess{}
-	for pid, proc := range all {
-		if uids[pid] == p.uid && !excluded[pid] {
-			table[pid] = proc
-		}
-	}
-	files, err := p.run("lsof", "-nP", "-w", "-u", strconv.Itoa(p.uid), "-F", "pfn")
-	if err != nil {
-		return nil, err
-	}
-	var cur *hostProcess
-	fd := ""
-	for _, l := range strings.Split(files, "\n") {
-		switch {
-		case strings.HasPrefix(l, "p"):
-			pid, _ := strconv.Atoi(l[1:])
-			cur, fd = table[pid], ""
-		case strings.HasPrefix(l, "f"):
-			fd = l[1:]
-		case strings.HasPrefix(l, "n") && cur != nil:
-			name := l[1:]
-			if !filepath.IsAbs(name) {
-				continue
-			}
-			if fd == "cwd" {
-				cur.Cwd = name
-			} else {
-				cur.Files = append(cur.Files, name)
-			}
-		}
-	}
-	out := make([]hostProcess, 0, len(table))
-	for _, proc := range table {
-		out = append(out, *proc)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].PID < out[j].PID })
-	return out, nil
-}
-
-// processInFolder says how the first process, by pid, with its cwd or an
-// open path inside the folder keeps it, or "". spellings are the folder's
-// names.
-func processInFolder(procs []hostProcess, spellings []string) string {
-	within := func(p string) bool {
-		p = strings.TrimSuffix(p, " (deleted)")
-		for _, s := range spellings {
-			if s != "" && pathWithin(p, s) {
-				return true
-			}
-		}
-		return false
-	}
-	for _, proc := range procs {
-		what := ""
-		if within(proc.Cwd) {
-			what = "its cwd"
-		} else {
-			for _, f := range proc.Files {
-				if within(f) {
-					what = "an open file"
-					break
-				}
-			}
-		}
-		if what != "" {
-			return fmt.Sprintf("process %d (%s, started %s) has %s in the folder", proc.PID, proc.Name, proc.Start, what)
-		}
-	}
-	return ""
-}
-
-// Orphan kinds: where a listed process's cwd lies.
-const (
-	orphanTombstone = "tombstone"
-	orphanDeleted   = "deleted-folder"
-	orphanSession   = "session-temp"
-	orphanTestTemp  = "test-temp"
-)
-
-// testTempPrefixes are the folder prefixes Tailterm's tests and verifier
-// make under the user temp directory and /tmp, most specific first, with
-// the file that makes each when known.
-var testTempPrefixes = []struct{ prefix, hint string }{
-	// No file at tasks-hub makes these two; the runner that did never landed.
-	{"tailterm-isolation-evidence-test-", ""},
-	{"tailterm-isolated-", ""},
-	{"tailterm-verifier-", "scripts/verify-matrix.mjs, an older verifier home"},
-	{"matrix-host-lock-repo-", "tests/matrix-host-lock.test.js"},
-	{"tv-", "scripts/verify-matrix.mjs, tests/matrix-host-lock.test.js, tests/verification-2.test.js or tests/verification-6.test.js"},
-	{"tailterm-", ""},
-}
-
-// orphanProcess is one line of the dry run's orphan report.
-type orphanProcess struct {
-	PID     int    `json:"pid"`
-	PGID    int    `json:"pgid"`
-	PPID    int    `json:"ppid"`
-	Start   string `json:"start"`
-	CPU     string `json:"cpu"`
-	Command string `json:"command"`
-	Cwd     string `json:"cwd"`
-	Kind    string `json:"kind"`
-	Hint    string `json:"hint,omitempty"`
-}
-
-// findOrphanProcesses lists the processes whose cwd is in a folder that no
-// longer exists or inside a tombstone, and the launchd children (parent pid
-// 1) whose cwd is in a session temp folder under tempRoot or a test temp
-// folder directly under one of testRoots.
-func findOrphanProcesses(procs []hostProcess, tempRoot string, testRoots []string) []orphanProcess {
-	spellings := func(root string) []string {
-		if root == "" || !filepath.IsAbs(root) {
-			return nil
-		}
-		out := []string{filepath.Clean(root)}
-		if c := canonicalPath(root); c != out[0] {
-			out = append(out, c)
-		}
-		return out
-	}
-	tempRoots := spellings(tempRoot)
-	var testDirs []string
-	for _, r := range testRoots {
-		testDirs = append(testDirs, spellings(r)...)
-	}
-	var out []orphanProcess
-	for _, proc := range procs {
-		cwd := proc.Cwd
-		if cwd == "" {
-			continue
-		}
-		deleted := strings.HasSuffix(cwd, " (deleted)")
-		cwd = strings.TrimSuffix(cwd, " (deleted)")
-		if _, err := os.Lstat(cwd); err != nil && errors.Is(err, fs.ErrNotExist) {
-			deleted = true
-		}
-		hint := ""
-		inTest := false
-		for _, root := range testDirs {
-			rel, err := filepath.Rel(root, cwd)
-			if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
-				continue
-			}
-			top := strings.Split(rel, string(filepath.Separator))[0]
-			for _, t := range testTempPrefixes {
-				if strings.HasPrefix(top, t.prefix) {
-					inTest, hint = true, t.hint
-					break
-				}
-			}
-			if inTest {
-				break
-			}
-		}
-		inTombstone := false
-		for _, part := range strings.Split(cwd, string(filepath.Separator)) {
-			if strings.HasPrefix(part, tombstonePrefix) {
-				inTombstone = true
-			}
-		}
-		inSession := false
-		for _, root := range tempRoots {
-			inSession = inSession || (cwd != root && pathWithin(cwd, root))
-		}
-		kind := ""
-		switch {
-		case deleted:
-			kind = orphanDeleted
-		case inTombstone:
-			kind = orphanTombstone
-		case proc.PPID == 1 && inSession:
-			kind = orphanSession
-		case proc.PPID == 1 && inTest:
-			kind = orphanTestTemp
-		default:
-			continue
-		}
-		out = append(out, orphanProcess{PID: proc.PID, PGID: proc.PGID, PPID: proc.PPID, Start: proc.Start, CPU: proc.CPU, Command: proc.Name, Cwd: cwd, Kind: kind, Hint: hint})
-	}
-	return out
-}
-
-// sweepOrphanReport is the dry run's orphan report: the processes
-// findOrphanProcesses lists, or the probe's failure.
-func sweepOrphanReport() ([]orphanProcess, string) {
-	procs, err := probeHostProcesses(sessionProcessProbes())
-	if err != nil {
-		return nil, "process probe: " + err.Error()
-	}
-	return findOrphanProcesses(procs, claudeTempRoot(), []string{userTempDir(), verifyHomeTempRoot()}), ""
-}
-
-// orphanLine prints one orphan for the dry run.
-func orphanLine(o orphanProcess) string {
-	line := fmt.Sprintf("orphan %s pid=%d pgid=%d ppid=%d started %q cpu=%s command %q cwd %s", o.Kind, o.PID, o.PGID, o.PPID, o.Start, o.CPU, o.Command, o.Cwd)
-	if o.Hint != "" {
-		line += " (made by " + o.Hint + ")"
-	}
-	return line
 }
 
 // Matrix output binaries.
