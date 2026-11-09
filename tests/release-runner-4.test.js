@@ -378,7 +378,7 @@ test("h1 a fence check refused for a stale heartbeat before publication waits wi
   at(0);const f=fixture(),commit=change(f,"client/a.js","a"),j=claimed(f,commit),c=config(f,j),a=beating([call]);
   assert.deepEqual(await runRelease(c,a),heartbeatWaiting(j.id),`check ${call}`);
   assert.equal(a.fences,call);assert.deepEqual(a.calls,[],"nothing refused, merged, deployed or escalated");assert.equal(git(f.cwd,"rev-parse","tasks-hub"),f.base);
-  assert.deepEqual(JSON.parse(readFileSync(heartbeatFile(c),"utf8")),{version:1,jobId:j.id,agentId:"agt_fixture",runId:"run_fixture",since:HB_START,boundMs:15*MIN});
+  assert.deepEqual(JSON.parse(readFileSync(heartbeatFile(c),"utf8")),{version:1,jobId:j.id,agentId:"agt_fixture",runId:"run_fixture",reconciliations:0,since:HB_START,boundMs:15*MIN});
   assert.equal(statSync(heartbeatFile(c)).mode&0o777,0o600);
   // A new job has no journal yet and gets none; a check refused just before publication leaves the resumable inputs wait.
   if(call<3)assert.ok(!existsSync(c.journalPath),`check ${call}`);
@@ -406,7 +406,7 @@ test("h2 the wait is bounded at 15 minutes from its first refusal, also across a
  await assert.rejects(runRelease(c,a),/Release refused before publication/);
  assert.equal(a.fences,2);assert.deepEqual(a.calls,["refuse","escalate"]);assert.deepEqual(escalation,{jobId:j.id,outcome:"refused",reason:HB_BOUND});
  const journal=journalAt(c);assert.equal(journal.phase,"refused");assert.equal(journal.refusalReason,HB_BOUND);assert.deepEqual(journal.failure,{step:"fence",reason:HB_BOUND});assert.deepEqual(journal.effects,[]);assert.notEqual(journal.published,true);
- assert.equal(git(f.cwd,"rev-parse","tasks-hub"),f.base);
+ assert.equal(git(f.cwd,"rev-parse","tasks-hub"),f.base);assert.ok(!existsSync(heartbeatFile(c)),"the bound refusal removes the wait");
  // A check that passes at the bound ends the wait instead, and the release goes on.
  heartbeatWait.boundMs=bound;at(0);const g=fixture(),later=change(g,"client/a.js","a"),d=config(g,claimed(g,later));
  assert.equal((await runRelease(d,beating([2]))).outcome,"waiting_heartbeat");
@@ -422,6 +422,20 @@ test("h3 a passing check ends the wait, so a later stale heartbeat starts a new 
  // A wait of another claim of the job is not this claim's: it starts again.
  const other=JSON.parse(readFileSync(heartbeatFile(c),"utf8"));writeFileSync(heartbeatFile(c),JSON.stringify({...other,runId:"run_other",since:HB_START}));
  at(30*MIN);assert.deepEqual(await runRelease(c,beating([1])),heartbeatWaiting(j.id,new Date(Date.parse(HB_START)+30*MIN).toISOString()));
+});
+test("h3 a claim that ended mid-wait leaves no wait for a later claim of the same run, while a generation adopted within the claim keeps it",async t=>{
+ for(const disposition of ["set_aside","unclaimed"]){
+  const at=heartbeatClock(t),f=fixture(),j=claimed(f,change(f,"client/a.js","a")),c=config(f,j);
+  assert.deepEqual(await runRelease(c,beating([1])),heartbeatWaiting(j.id),disposition);assert.ok(!existsSync(c.journalPath));
+  // Five minutes on, the same claim at an adopted generation: the same wait.
+  at(5*MIN);assert.deepEqual(await runRelease({...c,job:{...j,generation:j.generation+1}},beating([1])),heartbeatWaiting(j.id),disposition);
+  // The handler ends the claim with no journal to archive; forty minutes on the same deployer run claims the job again.
+  const again={...j,generation:j.generation+3,reconciliations:[{disposition,jobId:j.id,agentId:j.agentId,runId:j.runId}]};
+  assert.equal(setAsideJournal(c.journalPath,{...again,state:"verified"}),"none",disposition);
+  at(45*MIN);const a=beating([1,2]),since=new Date(Date.parse(HB_START)+45*MIN).toISOString();
+  assert.deepEqual(await runRelease({...c,job:again},a),heartbeatWaiting(j.id,since),disposition);assert.equal(a.fences,1);assert.deepEqual(a.calls,[],disposition);
+  assert.equal(JSON.parse(readFileSync(heartbeatFile(c),"utf8")).reconciliations,1,disposition);
+ }
 });
 test("h4 after publication or an effect a stale heartbeat is still a failure, named for its cause, and starts no wait",async t=>{
  heartbeatClock(t);

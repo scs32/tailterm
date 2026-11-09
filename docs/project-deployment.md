@@ -1375,13 +1375,16 @@ waits for the deployer heartbeat", which names the hub's reason (request id
 answered with the original).
 
 - **Bound.** The wait's start and its bound, 15 minutes, are kept beside the
-  job journal in `rel_ID.json.heartbeat-wait` (mode 0600) for that exact claim
-  (job, agent and run), so a restarted runner keeps the same start and bound.
-  A check still refused so 15 minutes after the first such refusal refuses the
-  job unpublished with `release fence lost: deployment heartbeat stale for 15
-  min`. At the poll's first check the bound only lets the run go on to its next
-  check, under the host lock; that check refuses the job if it is still
-  refused so.
+  job journal in `rel_ID.json.heartbeat-wait` (mode 0600) for that exact claim,
+  so a restarted runner keeps the same start and bound. The claim is the job,
+  agent and run and the job's count of reconciliations: the hub adds one
+  whenever a claim ends (unclaimed, set aside, requeued or refused), so a later
+  claim, even by the same run, starts a new wait, while a generation adopted
+  within the claim keeps it. A check still refused so 15 minutes after the
+  first such refusal refuses the job unpublished with `release fence lost:
+  deployment heartbeat stale for 15 min` and removes the file. At the poll's
+  first check the bound only lets the run go on to its next check, under the
+  host lock; that check refuses the job if it is still refused so.
 - **End.** Any check the hub answers otherwise ends the wait and removes the
   file. A check that passes lets the release go on from its journal; a later
   stale heartbeat starts a new wait with its own bound and notice.

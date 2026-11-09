@@ -244,14 +244,19 @@ export const transportWait = {escalateMs: 600000, now: () => Date.now()};
 // claimed job that the hub refused only with "deployment heartbeat stale",
 // while nothing is published, merged is not sent and no effect is journaled.
 // Its start and bound are kept beside the job journal, in
-// JOURNAL/rel_ID.json.heartbeat-wait (0600), for this exact claim (job, agent
-// and run), so a restarted runner goes on with the same bound. A fence check
-// the hub answers otherwise ends it. A check still refused so boundMs after
-// the start refuses the job. Tests replace now.
+// JOURNAL/rel_ID.json.heartbeat-wait (0600), for this exact claim, so a
+// restarted runner goes on with the same bound. The claim is the job, agent
+// and run and the job's count of reconciliations: the hub adds one whenever a
+// claim ends (unclaimed, set aside, requeued or refused), so a later claim of
+// the same run never inherits the wait, while a generation adopted within the
+// claim keeps it. A fence check the hub answers otherwise ends it. A check
+// still refused so boundMs after the start refuses the job and removes the
+// file. Tests replace now.
 export const heartbeatWait = {boundMs: 900000, now: () => Date.now()};
 const HEARTBEAT_STALE_REASON = "release fence lost: deployment heartbeat stale";
+const claimReconciliations = job => Array.isArray(job?.reconciliations) ? job.reconciliations.length : 0;
 function readHeartbeatWait(path, job) {
-  try { const wait = JSON.parse(readFileSync(path, "utf8")); return wait?.version === 1 && wait.jobId === job.id && wait.agentId === job.agentId && wait.runId === job.runId && Number.isFinite(Date.parse(wait.since)) && Number.isSafeInteger(wait.boundMs) && wait.boundMs > 0 ? wait : null; } catch { return null; }
+  try { const wait = JSON.parse(readFileSync(path, "utf8")); return wait?.version === 1 && wait.jobId === job.id && wait.agentId === job.agentId && wait.runId === job.runId && wait.reconciliations === claimReconciliations(job) && Number.isFinite(Date.parse(wait.since)) && Number.isSafeInteger(wait.boundMs) && wait.boundMs > 0 ? wait : null; } catch { return null; }
 }
 // The routine notice of one heartbeat wait: one per job and wait, keyed by
 // when the wait began, so a restart's resend is answered with the original.
@@ -992,7 +997,7 @@ export async function runRelease(config, adapter) {
     if(!unpublished(journal))throw releaseError(HEARTBEAT_STALE_REASON);
     const now=heartbeatWait.now();
     let wait=readHeartbeatWait(heartbeatPath,job);
-    if(!wait){wait={version:1,jobId:job.id,agentId:job.agentId,runId:job.runId,since:new Date(now).toISOString(),boundMs:heartbeatWait.boundMs};save(heartbeatPath,wait);}
+    if(!wait){wait={version:1,jobId:job.id,agentId:job.agentId,runId:job.runId,reconciliations:claimReconciliations(job),since:new Date(now).toISOString(),boundMs:heartbeatWait.boundMs};save(heartbeatPath,wait);}
     return {since:wait.since,boundMs:wait.boundMs,due:now-Date.parse(wait.since)>=wait.boundMs};
   };
   const heartbeatWaiting=wait=>({jobId:job.id,outcome:"waiting_heartbeat",heartbeat:{since:wait.since,boundMs:wait.boundMs}});
@@ -1067,7 +1072,7 @@ export async function runRelease(config, adapter) {
     noteAdopted();
     if(ok==="heartbeat-stale"){
       const wait=heartbeatTurn(state);
-      if(wait.due)throw releaseError(`${HEARTBEAT_STALE_REASON} for ${Math.round(wait.boundMs/60000)} min`);
+      if(wait.due){rmSync(heartbeatPath,{force:true});throw releaseError(`${HEARTBEAT_STALE_REASON} for ${Math.round(wait.boundMs/60000)} min`);}
       throw Object.assign(releaseError("deployment heartbeat stale"),{heartbeatWait:wait});
     }
     if(!ok)throw releaseError("release fence lost");
