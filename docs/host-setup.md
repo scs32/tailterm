@@ -35,7 +35,7 @@ Each run works through seven steps and prints one line per step with its state.
 | `claude-hooks` | Merges the four Tailterm hooks into `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR`). |
 | `claude-usage` | Installs the [Claude usage capture](#claude-usage-capture) status line and its command. |
 | `relay-service` | Installs the inbox relay as a launchd service and starts or restarts it. |
-| `doctor` | Runs `tt doctor`: tmux, installed runtimes, the hub and whether the relay is running. |
+| `doctor` | Runs `tt doctor`: tmux, installed runtimes, the hub and whether the relay is running. The hub check makes up to 3 tries, each with its own 5 s deadline, and starts a try only within 30 s of the first, so it takes at most 35 s. A hub that answers on a later try passes as `OK hub reachable (slow: answered on try N after S s)`; a 4xx answer (a wrong URL or token) fails at once; no answer within the window fails as `FAIL hub: <last error>`. `tt doctor` and the `--rollback` doctor use the same rule. |
 
 States: `current` (nothing to do), `installed`, `updated`, `failed`, and from
 `--check` also `missing`, `outdated` and `conflict`. The `claude-usage` step

@@ -126,12 +126,18 @@ func newHostSandbox(t *testing.T, homeName string) *hostSandbox {
 		probe                       func() bool
 		relayWait, stopWait, poll   time.Duration
 		relayProbe                  time.Duration
-	}{hostSetupLaunchctl, hostSetupSudo, hostSetupGOOS, spawn.Tmux, hostSetupRuntimes, hostSetupUID, relayRunningProbe, hostSetupRelayWait, hostSetupStopWait, hostSetupPoll, hostSetupRelayProbe}
+		hubTries                    int
+		hubWindow, hubBackoff       time.Duration
+	}{hostSetupLaunchctl, hostSetupSudo, hostSetupGOOS, spawn.Tmux, hostSetupRuntimes, hostSetupUID, relayRunningProbe, hostSetupRelayWait, hostSetupStopWait, hostSetupPoll, hostSetupRelayProbe, doctorHubTries, doctorHubWindow, doctorHubBackoff}
 	t.Cleanup(func() {
 		hostSetupLaunchctl, hostSetupSudo, hostSetupGOOS, spawn.Tmux, hostSetupRuntimes = old.launchctl, old.sudo, old.goos, old.tmux, old.runtimes
 		hostSetupUID, relayRunningProbe = old.uid, old.probe
 		hostSetupRelayWait, hostSetupStopWait, hostSetupPoll, hostSetupRelayProbe = old.relayWait, old.stopWait, old.poll, old.relayProbe
+		doctorHubTries, doctorHubWindow, doctorHubBackoff = old.hubTries, old.hubWindow, old.hubBackoff
 	})
+	// The doctor's hub retries keep their production count and window; only
+	// the pause between tries is shortened.
+	doctorHubBackoff = 10 * time.Millisecond
 	hostSetupLaunchctl, hostSetupSudo, hostSetupGOOS, spawn.Tmux = filepath.Join(fake, "launchctl"), filepath.Join(fake, "sudo"), "darwin", filepath.Join(fake, "tmux")
 	hostSetupRuntimes = func() []string { return []string{"claude", "codex"} }
 	hostSetupRelayWait, hostSetupStopWait, hostSetupPoll = 0, 300*time.Millisecond, 10*time.Millisecond
@@ -1115,6 +1121,190 @@ func TestDoctorChecks(t *testing.T) {
 	if out, code := s.run("--from", v1); code != 1 || !strings.Contains(out, "failed     doctor") || !strings.Contains(out, "failed: relay") || !strings.Contains(out, "installed  binary") {
 		t.Fatalf("host setup with the relay down exited %d:\n%s", code, out)
 	}
+}
+
+// productionHubDeadline gives writeStatus its real 5 s per try for the rest
+// of the test, instead of the package's raised test floor.
+func productionHubDeadline(t *testing.T) {
+	previous := minCommandTimeout
+	minCommandTimeout = productionMinCommandTimeout
+	t.Cleanup(func() { minCommandTimeout = previous })
+}
+
+// doctorHub is a fake hub for the doctor's hub check. Each whoami or agent
+// read is numbered from 1; answer decides what that read gets. "hang" holds
+// the read until the caller gives up, so it costs writeStatus's full 5 s.
+type doctorHub struct {
+	url   string
+	mu    sync.Mutex
+	paths []string
+}
+
+func newDoctorHub(t *testing.T, answer func(path string, n int) string) *doctorHub {
+	t.Helper()
+	h := &doctorHub{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h.mu.Lock()
+		h.paths = append(h.paths, r.URL.Path)
+		n := 0
+		for _, p := range h.paths {
+			if p == r.URL.Path {
+				n++
+			}
+		}
+		h.mu.Unlock()
+		switch answer(r.URL.Path, n) {
+		case "hang":
+			<-r.Context().Done()
+		case "401":
+			w.WriteHeader(http.StatusUnauthorized)
+			fmt.Fprint(w, `{"error":"unauthorized"}`)
+		case "500":
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprint(w, `{"error":"boom"}`)
+		case "whoami":
+			fmt.Fprint(w, `{"node":"sandbox","user":"tester"}`)
+		case "agent":
+			fmt.Fprint(w, `{"id":"agt_doctor","name":"doctor","status":"running","unread":2}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	h.url = server.URL
+	t.Setenv(spawn.EnvHub, server.URL)
+	return h
+}
+
+func (h *doctorHub) count(path string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	n := 0
+	for _, p := range h.paths {
+		if p == path {
+			n++
+		}
+	}
+	return n
+}
+
+// The doctor's hub check gives a slow hub more tries inside a bounded window
+// before it fails: host setup, its rollback and tt doctor share the rule.
+func TestDoctorHubRetry(t *testing.T) {
+	const whoami = "/v1/whoami"
+	t.Run("slow on the first try", func(t *testing.T) {
+		productionHubDeadline(t)
+		s := newHostSandbox(t, "home")
+		s.holdRelayLock()
+		// whoami 1 (setup v1, try 1) and 4 (the rollback, try 1) hang.
+		hub := newDoctorHub(t, func(path string, n int) string {
+			if path == whoami && (n == 1 || n == 4) {
+				return "hang"
+			}
+			return "whoami"
+		})
+		out, code := s.run("--from", s.artifact("tt-v1"))
+		if code != 0 || !strings.Contains(out, "current    doctor") || !strings.Contains(out, "OK hub reachable (slow: answered on try 2 after ") {
+			t.Fatalf("host setup with a hub slow once exited %d:\n%s", code, out)
+		}
+		if got := hub.count(whoami); got != 2 {
+			t.Fatalf("whoami calls after setup = %d, want 2", got)
+		}
+		if n := strings.Count(out, "hub      "+hub.url); n != 1 {
+			t.Fatalf("status lines printed %d times, want once (the answering try only):\n%s", n, out)
+		}
+		if strings.Contains(out, "FAIL hub") {
+			t.Fatalf("a hub that answered on a retry reported a failure:\n%s", out)
+		}
+		// The rollback's doctor step follows the same rule.
+		if out := s.mustRun("--from", s.artifact("tt-v2")); !strings.Contains(out, "OK hub reachable\n") {
+			t.Fatalf("a quick hub was not reported plainly:\n%s", out)
+		}
+		out, code = s.run("--rollback")
+		if code != 0 || !strings.Contains(out, "host rollback: ok") || !strings.Contains(out, "OK hub reachable (slow: answered on try 2 after ") {
+			t.Fatalf("rollback with a hub slow once exited %d:\n%s", code, out)
+		}
+		if got := hub.count(whoami); got != 5 {
+			t.Fatalf("whoami calls = %d, want 5", got)
+		}
+	})
+	t.Run("hangs on every try", func(t *testing.T) {
+		productionHubDeadline(t)
+		s := newHostSandbox(t, "home")
+		s.holdRelayLock()
+		hub := newDoctorHub(t, func(string, int) string { return "hang" })
+		// Each hung try costs writeStatus's own 5 s; a 6 s window starts a
+		// second try at about 5 s and no third one after it.
+		doctorHubWindow = 6 * time.Second
+		start := time.Now()
+		out, code := s.run("--from", s.artifact("tt-v1"))
+		took := time.Since(start)
+		if code != 1 || !strings.Contains(out, "failed     doctor") || !strings.Contains(out, "failed: hub") || !strings.Contains(out, "FAIL hub: ") || !strings.Contains(out, "deadline exceeded") {
+			t.Fatalf("host setup with a hung hub exited %d:\n%s", code, out)
+		}
+		if got := hub.count(whoami); got != 2 {
+			t.Fatalf("whoami calls = %d, want 2 (the window stops a third)", got)
+		}
+		if bound := doctorHubWindow + 5*time.Second + 2*time.Second; took > bound {
+			t.Fatalf("host setup took %v, more than the window plus one try (%v)", took, bound)
+		}
+		if n := strings.Count(out, "hub      "+hub.url); n != 1 || strings.Count(out, "FAIL hub") != 1 {
+			t.Fatalf("want one set of status lines and one FAIL hub:\n%s", out)
+		}
+	})
+	t.Run("at most three tries", func(t *testing.T) {
+		newHostSandbox(t, "home")
+		hub := newDoctorHub(t, func(string, int) string { return "500" })
+		out, err := captureStdout(t, func() error { return cmdDoctor(readEnv()) })
+		if doctorExitCode(err) != 1 || !strings.Contains(err.Error(), "failed: hub") || !strings.Contains(out, "FAIL hub: hub unreachable: hub: 500 boom") {
+			t.Fatalf("doctor with a failing hub: %v\n%s", err, out)
+		}
+		if got := hub.count(whoami); got != 3 {
+			t.Fatalf("whoami calls = %d, want 3", got)
+		}
+	})
+	t.Run("a 4xx fails with no retry", func(t *testing.T) {
+		newHostSandbox(t, "home")
+		hub := newDoctorHub(t, func(string, int) string { return "401" })
+		out, err := captureStdout(t, func() error { return cmdDoctor(readEnv()) })
+		if doctorExitCode(err) != 1 || !strings.Contains(err.Error(), "failed: hub") || !strings.Contains(out, "FAIL hub: hub unreachable: hub: 401 unauthorized") {
+			t.Fatalf("doctor with a 401 hub: %v\n%s", err, out)
+		}
+		if got := hub.count(whoami); got != 1 {
+			t.Fatalf("whoami calls = %d, want 1 (no retry on a 4xx)", got)
+		}
+	})
+	t.Run("agent read hangs once", func(t *testing.T) {
+		productionHubDeadline(t)
+		// rel_c50abf69b93742ae: whoami answered, the agent read on the same
+		// 5 s context did not, and the release rolled back.
+		s := newHostSandbox(t, "home")
+		s.holdRelayLock()
+		const agentPath = "/v1/tasks/tsk_doctor/agents/agt_doctor"
+		hub := newDoctorHub(t, func(path string, n int) string {
+			switch {
+			case path == whoami:
+				return "whoami"
+			case path == agentPath && n == 1:
+				return "hang"
+			case path == agentPath:
+				return "agent"
+			}
+			return ""
+		})
+		t.Setenv(spawn.EnvTask, "tsk_doctor")
+		t.Setenv(spawn.EnvAgent, "agt_doctor")
+		out, code := s.run("--from", s.artifact("tt-v1"))
+		if code != 0 || !strings.Contains(out, "current    doctor") || !strings.Contains(out, "OK hub reachable (slow: answered on try 2 after ") || !strings.Contains(out, "status   running") {
+			t.Fatalf("host setup with the agent read hung once exited %d:\n%s", code, out)
+		}
+		if hub.count(whoami) != 2 || hub.count(agentPath) != 2 {
+			t.Fatalf("whoami %d and agent reads %d, want 2 each", hub.count(whoami), hub.count(agentPath))
+		}
+		if n := strings.Count(out, "caller   sandbox (tester)"); n != 1 {
+			t.Fatalf("caller line printed %d times, want once:\n%s", n, out)
+		}
+	})
 }
 
 func TestHostSetupHubConfig(t *testing.T) {

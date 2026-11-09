@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -508,6 +509,48 @@ func ownerHelperBriefing(t api.Task, name, selfPath string, agents []api.Agent, 
 	return b + "\n" + strings.TrimRight(prompt, "\n") + "\n"
 }
 
+// The doctor's hub check makes at most doctorHubTries tries, and starts a try
+// only while less than doctorHubWindow has passed since the first began, so it
+// ends within the window plus one try. The pause before the next try starts
+// at doctorHubBackoff and doubles. Tests shorten all three.
+var (
+	doctorHubTries   = 3
+	doctorHubWindow  = 30 * time.Second
+	doctorHubBackoff = 2 * time.Second
+)
+
+// doctorHubCheck is runDoctor's hub check. Each try runs writeStatus afresh,
+// with its own client and 5 s deadline, so one slow hub answer does not fail
+// the check. A 4xx answer (a wrong URL or token) fails at once. Only the
+// answering or last try's status lines are written.
+func doctorHubCheck(w io.Writer, e env) error {
+	start := time.Now()
+	pause := doctorHubBackoff
+	var out bytes.Buffer
+	for try := 1; ; try++ {
+		out.Reset()
+		err := writeStatus(&out, e)
+		if err == nil {
+			_, _ = w.Write(out.Bytes())
+			if try == 1 {
+				fmt.Fprintln(w, "OK hub reachable")
+			} else {
+				fmt.Fprintf(w, "OK hub reachable (slow: answered on try %d after %.1f s)\n", try, time.Since(start).Seconds())
+			}
+			return nil
+		}
+		var refused *api.HTTPError
+		clientError := errors.As(err, &refused) && refused.Status >= 400 && refused.Status < 500
+		if clientError || try >= doctorHubTries || time.Since(start)+pause >= doctorHubWindow {
+			_, _ = w.Write(out.Bytes())
+			fmt.Fprintf(w, "FAIL hub: %v\n", err)
+			return err
+		}
+		time.Sleep(pause)
+		pause *= 2
+	}
+}
+
 func cmdDoctor(e env) error {
 	if failed := runDoctor(os.Stdout, e, 0); len(failed) > 0 {
 		return &exitError{code: 1, err: fmt.Errorf("doctor: failed: %s", strings.Join(failed, ", "))}
@@ -530,11 +573,8 @@ func runDoctor(w io.Writer, e env, relayWait time.Duration) []string {
 		fmt.Fprintf(w, "OK tmux %.2f\n", v)
 	}
 	fmt.Fprintf(w, "Installed runtimes: %s\n", or(strings.Join(hostSetupRuntimes(), ", "), "none"))
-	if err := writeStatus(w, e); err != nil {
-		fmt.Fprintf(w, "FAIL hub: %v\n", err)
+	if err := doctorHubCheck(w, e); err != nil {
 		failed = append(failed, "hub")
-	} else {
-		fmt.Fprintln(w, "OK hub reachable")
 	}
 	if waitForRelay(relayWait) {
 		fmt.Fprintln(w, "OK relay running")
