@@ -804,6 +804,25 @@ test("drain m3 a refused job's attempt left started is settled across a runner r
  assert.deepEqual(dirs.map(d=>JSON.parse(readFileSync(join(d,"run.json"),"utf8"))).map(x=>[x.state,x.reason]),[["ended","receipt"],["ended","no-receipt"]]);
  assert.equal(h.record().state,"restart");assert.equal(second.execs.length,1);assert.equal(h.claims().length,0);
 });
+test("drain m3 review b1 an old refused attempt the matrix rules hold with its pid gone or with no pid does not keep a fresh process draining, and its record is left as the rules left it",async t=>{
+ const r=codeRepo(t),h=codeHost(t,r.cwd);r.at(r.a,r.b);
+ const a=new HostAdapter(h.config,{}),child=spawn(process.execPath,["-e","0"],{stdio:"ignore"}),pid=child.pid,started=a.processStartTime(pid);
+ await drainExit(child);
+ // Started, its pid gone, with no sidecar and no lock entry: held ("check group state cannot be shown").
+ const dir=drainAttempt(h,"rel_old_refused"),run={version:1,state:"started",launchedAt:Date.now()-86400000,priority:"release",hostWaitMs:60000,boundMs:3600000,pid,processStartedAt:started,groups:[]};
+ mkdirSync(dir,{recursive:true});a.saveRun(dir,run);
+ // Starting with no pid: held ("matrix run launch unconfirmed").
+ const sdir=drainAttempt(h,"rel_old_starting"),srun={version:1,state:"starting",launchedAt:Date.now()-86400000,priority:"release",hostWaitMs:60000,boundMs:3600000,groups:[]};
+ mkdirSync(sdir,{recursive:true});a.saveRun(sdir,srun);
+ for(const id of ["rel_old_refused","rel_old_starting"])codeJournal(h,id,{phase:"refused",refusalReason:"release fence lost"});
+ h.setJobs([drainRefused("rel_old_refused"),drainRefused("rel_old_starting"),verifiedJob("rel_next")]);
+ // Two fresh processes of the run, each with no matrix child: each restarts.
+ const execs=[];for(let i=0;i<2;i++){const g=codeGate(r.codeA);await h.poll(g.gate);execs.push(g.execs.length);assert.equal(h.record().state,"restart",String(i));assert.equal(h.record().cause,undefined,String(i));}
+ assert.deepEqual(execs,[1,1]);assert.equal(h.claims().length,0);
+ // Neither record ended or was stopped: the starting one is byte for byte as written, the started one gains only the rules' own goneAt.
+ const now=JSON.parse(readFileSync(join(dir,"run.json"),"utf8"));assert.ok(Number.isSafeInteger(now.goneAt));delete now.goneAt;assert.deepEqual(now,run);
+ assert.deepEqual(JSON.parse(readFileSync(join(sdir,"run.json"),"utf8")),srun);
+});
 test("drain m5 a settled job's blocked journal of this run is finalized only on an exact match; nothing else changes and nothing is deleted",async t=>{
  const r=codeRepo(t),h=codeHost(t,r.cwd,LIST_FAILS),{gate,execs}=codeGate(r.codeA);r.at(r.a,r.a);
  const released=drainSettled("rel_released",{state:"released",receipt:drainReceipt("rel_released",{outcome:"released",targets:[{target:"hub",artifactSHA256:"a".repeat(64),release:"hub-release",outcome:"released"}]})});

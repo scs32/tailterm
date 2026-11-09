@@ -431,20 +431,31 @@ export function matrixCause(children = MATRIX_CHILDREN) {
 }
 // A refused job's integrated attempts whose run record is not ended (m3):
 // a job refused while its matrix child ran leaves the record started. Each is
-// settled by resolveMatrixRun's own rules, never stopped early; those still
-// not ended are returned, and keep a stale runner draining. An attempt
-// directory that cannot be listed or read counts as not ended.
+// passed to resolveMatrixRun with its own rules (stop false, so a proven run
+// past its bound takes their stop path), which ends what it can. One it
+// leaves unsettled is returned, and keeps a stale runner draining, only while
+// its recorded pid is alive by the test those rules use for a run with no
+// child: the pid is not gone and its start time does not name another
+// process. One held with its pid gone or with no pid (a launch never
+// confirmed, an unreadable record or attempt directory) is left as the rules
+// left it and does not hold the runner (wi_a66c0780fc4b40f0 review b1).
+const recordedPidAlive = (adapter, run) => {
+  const pid = drainPid(run?.pid);
+  if (pid === null || adapter.pidGone(pid)) return false;
+  return !(startKey(run.processStartedAt) !== null && startMatch(run.processStartedAt, adapter.processStartTime(pid)) === "other");
+};
 export function settleRefusedAttempts(adapter, journalDirectory, jobs) {
   const left = [];
   for (const job of jobs) {
     if (job?.state !== "refused" || !DRAIN_JOB.test(job.id || "")) continue;
     const base = join(journalDirectory, job.id + "-integrated-verification");let names;
-    try { names = readdirSync(base).sort(); } catch (error) { if (error.code !== "ENOENT") left.push({jobId: job.id, attempt: "unknown", pid: null}); continue; }
+    try { names = readdirSync(base).sort(); } catch { continue; }
     for (const name of names) {
       const dir = join(base, name), run = readRun(dir);
       if (run === null || run.state === "ended") continue;
       let settled = false;try { settled = adapter.resolveMatrixRun(dir, run) === "ended"; } catch {}
-      if (!settled) left.push({jobId: job.id, attempt: drainAttempt(name), pid: drainPid(run.pid)});
+      let alive = false;try { alive = !settled && recordedPidAlive(adapter, run); } catch { alive = !settled; }
+      if (alive) left.push({jobId: job.id, attempt: drainAttempt(name), pid: drainPid(run.pid)});
     }
   }
   return left;
@@ -2703,7 +2714,7 @@ export function restartGeneration(config,code,published){
 // What holds a draining runner (wi_a66c0780fc4b40f0 m4), kept to fixed
 // shapes: activeJobs, the ids of claimed, merged and blocked jobs; matrix,
 // the live matrix runs of this process and a refused job's unsettled
-// attempts, each with job id, attempt (its commit cut to 12 hex) and pid;
+// attempts whose pid is alive, each with job id, attempt (its commit cut to 12 hex) and pid;
 // lockJob, the job the host release lock names; journal, on the journal path,
 // this run's journals that are not final, or "unreadable". Null for none.
 const DRAIN_SHORT_ATTEMPT=/^([a-f0-9]{12}-r[0-9]{1,6}|unknown)$/,drainIds=v=>Array.isArray(v)&&v.length?v.slice(0,16).map(drainJob):null;

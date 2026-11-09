@@ -861,11 +861,18 @@ keeps the deployer draining, and a running matrix run is never stopped for a
 restart. A job refused while its matrix run was still going leaves that
 attempt's `run.json` `started` (m3). Every poll with a ledger settles each
 such attempt of a `refused` job by the same matrix run rules: once the pid is
-gone it ends as `receipt` or `no-receipt`, while the pid is alive it stays
-`started` and the deployer drains, and an attempt those rules hold (its check
-groups cannot be shown stopped) drains too. Nothing is signalled that those
-rules would not signal anyway. This also covers a restarted deployer, which
-has no child of the run.
+gone it ends as `receipt` or `no-receipt`, and while the pid is alive it stays
+`started` and the deployer drains. The rules are applied as for a waiting run
+(no early stop), so a live run whose pid is proven its own and that is past its
+bound takes their stop path: SIGTERM, then SIGKILL after the grace. Before this
+check no code stopped a refused job's run. An attempt the rules leave unsettled
+holds the deployer only while its recorded pid is alive by the rules' own test
+(not gone, and its start time does not name another process). One they hold
+with its pid gone (its check groups cannot be shown stopped) or with no pid (a
+launch never confirmed, or an unreadable record) does not hold a restart and is
+not in the drain cause; its `run.json` is left as the rules left it (review b1).
+Nothing is signalled that those rules would not signal anyway. This also covers
+a restarted deployer, which has no child of the run.
 
 A stale deployer that is not idle still restarts when its only owned job is
 held (wi_876c1eb560903f04): the ledger's only `claimed`, `merged` or `blocked`
@@ -979,7 +986,7 @@ continues from the generation this record holds.
 A `draining` record also names what holds it (wi_a66c0780fc4b40f0 m4), with
 fixed shapes only: `cause` holds `activeJobs` (the ids of `claimed`, `merged`
 and `blocked` jobs), `matrix` (each live matrix run of this process and each
-unsettled attempt of a refused job, as `jobId`, `attempt` with its commit cut
+unsettled attempt of a refused job whose pid is alive, as `jobId`, `attempt` with its commit cut
 to 12 characters, and `pid`), `lockJob` (the job the host release lock names,
 `unknown` when it cannot be read) and, without a ledger, `journal` (this run's
 journals that are not final, or `unreadable`), each only when it holds.
