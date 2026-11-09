@@ -348,7 +348,7 @@ def hub_compose(deployment: dict[str, Any], binary_destination: str) -> dict[str
                 "environment": environment,
                 "volumes": volumes,
                 "mem_limit": "512m",
-                "cpus": "1.0",
+                "cpus": "2.0",
             }
         }
     }

@@ -104,7 +104,7 @@ export const oldName=e=>failureReason(e)==="Input manifest has no generation in 
 // The production hub service as hub_compose prints it for a plain plan.
 export const HUB_SERVICE={image:"gcr.io/distroless/static-debian12:nonroot",user:"950:950",restart:"unless-stopped",entrypoint:["/opt/tailterm-hub"],read_only:true,cap_drop:["ALL"],security_opt:["no-new-privileges:true"],ports:["100.116.238.37:18765:18765"],
  environment:{TAILTERM_TCP_LISTEN:"0.0.0.0:18765",TAILTERM_STATE:"/state",SQLITE_TMPDIR:"/state",TAILTERM_TOKEN_FILE:"/run/hub-token",TAILTERM_MAX_AGENTS:"32"},
- volumes:["/mnt/deepfreeze/tailterm-hub/releases/fixture/tailterm-hub:/opt/tailterm-hub:ro","/mnt/deepfreeze/tailterm-hub/state:/state","/mnt/deepfreeze/tailterm-hub/hub-token:/run/hub-token:ro"],mem_limit:"512m",cpus:"1.0"};
+ volumes:["/mnt/deepfreeze/tailterm-hub/releases/fixture/tailterm-hub:/opt/tailterm-hub:ro","/mnt/deepfreeze/tailterm-hub/state:/state","/mnt/deepfreeze/tailterm-hub/hub-token:/run/hub-token:ro"],mem_limit:"512m",cpus:"2.0"};
 
 // Journal retention (j1-j3). A rehearsal fixture: an imported backup copy and a
 // migration binary in a private journal directory, with the container run

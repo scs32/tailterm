@@ -277,7 +277,7 @@ test("c1 the argv built from the real hub_compose carries every production const
  for(const service of [plain,full]){
   const argv=rehearsalArgv(service,where),env=argv.flatMap((x,i)=>x==="-e"?[argv[i+1]]:[]),mounts=argv.flatMap((x,i)=>x==="-v"?[argv[i+1]]:[]),pair=flag=>argv[argv.indexOf(flag)+1];
   assert.deepEqual(argv.slice(0,7),["container","run","--rm","--progress","none","--name","tt-rehearsal-rel_compose"]);
-  assert.ok(argv.includes("--read-only"));assert.equal(pair("--user"),"950:950");assert.equal(pair("--cap-drop"),"ALL");assert.equal(pair("--memory"),"512M");assert.equal(pair("--cpus"),"1");assert.equal(pair("--workdir"),"/");
+  assert.ok(argv.includes("--read-only"));assert.equal(pair("--user"),"950:950");assert.equal(pair("--cap-drop"),"ALL");assert.equal(pair("--memory"),"512M");assert.equal(pair("--cpus"),"2");assert.equal(pair("--workdir"),"/");
   assert.deepEqual(env,Object.entries(service.environment).map(([k,v])=>`${k}=${v}`).sort());assert.ok(env.includes("SQLITE_TMPDIR=/state"));
   assert.deepEqual(mounts,["/journal/rel_compose-migration:/opt/tailterm-hub:ro","/journal/copy.state:/state"]);
   assert.deepEqual(argv.slice(-5),["--entrypoint","/opt/tailterm-hub",service.image,"--migrate-only","/state/hub.sqlite"]);assert.equal(service.image,"gcr.io/distroless/static-debian12:nonroot");

@@ -2656,7 +2656,7 @@ and maps it:
 | `read_only: true` | `--read-only` |
 | `cap_drop: ["ALL"]` | `--cap-drop ALL` |
 | `mem_limit` (`512m`) | `--memory 512M` |
-| `cpus` (`1.0`) | `--cpus 1` (rounded up to a whole CPU) |
+| `cpus` (`2.0`) | `--cpus 2` (rounded up to a whole CPU) |
 | `environment` | one `-e NAME=VALUE` for every entry, `SQLITE_TMPDIR=/state` included |
 | `entrypoint` | `--entrypoint /opt/tailterm-hub`, with the candidate binary mounted there read-only |
 | the `/state` volume | the job's private rehearsal state directory, holding the copy as `hub.sqlite` |
