@@ -256,8 +256,10 @@ export const transportWait = {escalateMs: 600000, now: () => Date.now()};
 // journaled effect (wi_c364c054cc8757d0: the handler lookup of the inputs and
 // integrated matrix import requests, the batch calls) joins the same wait, or
 // starts one that names it as call. A wait with a call is not ended by a
-// passing check, as the refused call is not answered yet; it ends at the
-// first poll that meets no stale refusal (runRelease).
+// passing check, as the refused call is not answered yet; it ends once a
+// poll with no stale refusal has that call answered by the hub, or the job
+// is published or settled (runRelease). A poll that never reached the call,
+// one that ended on a transport failure among them, keeps it.
 export const heartbeatWait = {boundMs: 900000, now: () => Date.now()};
 const HEARTBEAT_STALE_REASON = "release fence lost: deployment heartbeat stale";
 const HEARTBEAT_CALL = /^[a-z][a-z-]{0,31}$/;
@@ -1024,14 +1026,20 @@ export async function liveCheck(adapter, target, policy, sleep=ms=>new Promise(r
 // One host release lock per deployment checkout and project.
 const hostLockPath=(cwd,job)=>join(tmpdir(),"tailterm-release-locks",digest(cwd+"\0"+(job.taskId||"fixture"))+".lock");
 // One poll of a job. A heartbeat wait a call other than the check was refused
-// in (wi_c364c054cc8757d0) ends once a poll meets no stale refusal: it has
-// gone past that call, or waits for something else first.
+// in (wi_c364c054cc8757d0) ends only on evidence that call was answered: a
+// poll with no stale refusal in which the hub answered that operation (the
+// host adapter's answered calls, or a settled batch call), or a journal past
+// it (published, merged sent, or settled). Any other poll keeps its start.
 export async function runRelease(config, adapter) {
-  const turn={stale:false};
+  const turn={stale:false,answered:new Set()};
   try{return await releaseTurn(config,adapter,turn);}
   finally{
-    const path=typeof config?.journalPath==="string"?config.journalPath+".heartbeat-wait":null;
-    if(path && !turn.stale && config.job && readHeartbeatWait(path,config.job)?.call)rmSync(path,{force:true});
+    const path=typeof config?.journalPath==="string"?config.journalPath+".heartbeat-wait":null,wait=path && !turn.stale && config.job?readHeartbeatWait(path,config.job):null;
+    if(wait?.call){
+      let journal;try{journal=JSON.parse(readFileSync(config.journalPath,"utf8"));}catch{}
+      const past=journal?.published===true || journal?.mergedSent===true || ["complete","refused"].includes(journal?.phase);
+      if(past || turn.answered.has(wait.call) || adapter?.answered?.has?.(wait.call)===true)rmSync(path,{force:true});
+    }
   }
 }
 async function releaseTurn(config, adapter, turn) {
@@ -1198,7 +1206,7 @@ async function releaseTurn(config, adapter, turn) {
     for(let attempt=0;attempt<2;attempt++){
       // A call refused for a stale heartbeat stays sending: the run waits (the
       // catch below) and the next poll replays it unchanged.
-      try{await adapter.batch(record.op,{entryId:record.entryId,commit:record.commit},record.generation);record.status="done";checkpoint();return true;}catch(error){if(error?.heartbeatStale===true && unpublished(state))throw error;}
+      try{await adapter.batch(record.op,{entryId:record.entryId,commit:record.commit},record.generation);turn.answered.add(record.op);record.status="done";checkpoint();return true;}catch(error){if(error?.heartbeatStale===true && unpublished(state))throw error;}
     }
     let generation;try{generation=await adapter.generation();}catch{}
     if(generation!==record.generation)throw Object.assign(releaseError("Release batch call unconfirmed"),{batchWait:true});
@@ -1844,7 +1852,9 @@ export class HostAdapter {
     // during an open transport wait (transportWait).
     const cli=this.config.tt||"tt",began=Date.now();
     for(let tries=1;;tries++){
-      try{return execFileSync(argv[0],argv.slice(1),{cwd,encoding:"utf8",stdio:["ignore","pipe","pipe"],maxBuffer:256*1024*1024,timeout:tries===1?timeout:Math.min(timeout,cliRetry.windowMs)});}
+      // A deployment operation the hub answered is kept by name: the
+      // evidence that ends a heartbeat wait the call was refused in.
+      try{const out=execFileSync(argv[0],argv.slice(1),{cwd,encoding:"utf8",stdio:["ignore","pipe","pipe"],maxBuffer:256*1024*1024,timeout:tries===1?timeout:Math.min(timeout,cliRetry.windowMs)});if(argv[0]===cli && argv[1]==="deployment")(this.answered??=new Set()).add(argv[2]);return out;}
       catch(error){
         const cause=argv[0]===cli?transportCause(error):null,failed=new Error("Host operation failed");failed.releaseReason=childReason(argv,error,cli,cause?{cause,tries}:null);
         let kept=null;

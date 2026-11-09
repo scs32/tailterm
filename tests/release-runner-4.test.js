@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,existsSync,statSync,readdirSync,rmSync,renameSync} from "node:fs";
 import {tmpdir} from "node:os";
 import {join,dirname} from "node:path";
-import {runRelease,HostAdapter,publishedCode,codeDecision,heldRestartJob,codeRecord,codeNotice,heartbeatWait,heartbeatWaitNotice,serveDeployment} from "../scripts/release-runner.mjs";
+import {runRelease,HostAdapter,publishedCode,codeDecision,heldRestartJob,codeRecord,codeNotice,heartbeatWait,heartbeatWaitNotice,serveDeployment,cliRetry} from "../scripts/release-runner.mjs";
 import {createHash} from "node:crypto";
 
 // Release batching (wi_50e80d45647b342a slice one).
@@ -609,6 +609,21 @@ test("hc5 a batch call or a batch's matrix import refused for a stale heartbeat 
  assert.deepEqual(await runRelease(c,a),callWaiting("rel_b1"));
  journal=batchJournal(c);assert.equal(journal.phase,"waiting_matrix");assert.deepEqual(journal.batch.jobs.map(j=>j.jobId),["rel_b1","rel_b2"]);assert.equal(journal.batchFallback,undefined);assert.ok(!a.calls.includes("batch-drop"));assert.deepEqual(c.solo,[]);
  at(MIN);assert.equal((await runRelease(c,a)).outcome,"released");assert.deepEqual(batchJournal(c).batch.jobs.map(j=>j.jobId),["rel_b1","rel_b2"]);
+});
+test("hc6 a poll that ended on a transport failure before the refused call keeps the call's wait: the same start and notice, and the bound from the first refusal",async t=>{
+ const sleep=cliRetry.sleep;cliRetry.sleep=()=>{};t.after(()=>{cliRetry.sleep=sleep;});
+ const TRANSPORT='tt: Post "http://hub.invalid/v1/x": context deadline exceeded';
+ // The entry check, the inputs detail read, then the window read fail in transport between handler refusals.
+ for(const [op,outcome] of [["check","waiting_transport"],["get","waiting_inputs"],["window","waiting_window"]]){
+  const at=heartbeatClock(t),h=staleHub(t);h.refusing(["handler"]);
+  const first=await h.release(h.adapter());assert.deepEqual(first,callWaiting("rel_stale"),op);const saved=readFileSync(h.waitFile,"utf8");
+  at(5*MIN);h.refusing([op],TRANSPORT);assert.equal((await h.release(h.adapter())).outcome,outcome,op);
+  assert.equal(readFileSync(h.waitFile,"utf8"),saved,`${op}: the unanswered call keeps its wait`);
+  at(10*MIN);h.refusing(["handler"]);const third=await h.release(h.adapter());
+  assert.deepEqual(third,callWaiting("rel_stale"),op);assert.equal(heartbeatWaitNotice("rel_stale",third.heartbeat).requestId,heartbeatWaitNotice("rel_stale",first.heartbeat).requestId,op);
+  at(15*MIN);await assert.rejects(h.release(h.adapter()),/Release refused before publication/,op);
+  const journal=h.journal();assert.equal(journal.refusalReason,HB_BOUND,op);assert.deepEqual(journal.failure,{step:"inputs",reason:HB_BOUND},op);assert.equal(h.saved().state,"refused",op);assert.ok(!existsSync(h.waitFile),op);
+ }
 });
 test("the streamed file hash equals a whole-file hash at every chunk boundary",t=>{
  const home=mkdtempSync(join(tmpdir(),"release-file-hash-"));t.after(()=>rmSync(home,{recursive:true,force:true}));

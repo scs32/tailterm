@@ -1461,8 +1461,11 @@ as any failed refuse is. Progress reports are best effort and never wait.
   from its journal; a later stale heartbeat starts a new wait with its own
   bound and notice. A wait another call was refused in is not ended by a
   passing check, since that call is not answered yet: a check refused while
-  it lasts is the same wait, and it ends at the first poll that meets no
-  stale refusal.
+  it lasts is the same wait. It ends only once a poll with no stale refusal
+  has that call answered by the hub, or the job is published, sent `merged`
+  or settled. A poll that never reached the call, such as one that ended on
+  a transport failure of the check, a read or the window, keeps its start,
+  notice and bound.
 - **Unchanged.** Any other refusal is a lost fence as before (a claim of
   another run, a claim that is gone, a generation still changed after the one
   re-read, any other text). Once the release is published or an effect is
