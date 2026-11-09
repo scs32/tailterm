@@ -1429,6 +1429,22 @@ waits for the deployer heartbeat", which names the hub's reason (request id
 `rel_ID-heartbeat-wait-HASH` of the wait's start, so a restart's resend is
 answered with the original).
 
+The wait covers every pre-publication deployment call, not only the fence
+check (wi_c364c054cc8757d0). Any `tt deployment` call the runner makes before
+publication, `merged` and any journaled effect that the hub refuses with
+"deployment heartbeat stale" is the same wait, with the same file, start,
+bound and notice: the handler lookup (`tt deployment handler`) of the inputs
+import request and of the integrated matrix import request (a batch's too,
+which is then not dropped), and the batch calls `batch-open`, `batch-add` and
+`batch-drop` (which stay journaled as sending, so no member is dropped). The
+job keeps its claim and journal in the phase it was in (`waiting_inputs`,
+`waiting_matrix` or `batching`), and the next poll makes the call again under
+its existing request id. A wait such a call started names it in the file
+(`call`), in the notice ("refuses its tt deployment handler call") and on the
+terminal. At the bound the job is refused with the same reason, at the step
+whose call was refused. A refuse call refused so is retried by the next poll
+as any failed refuse is. Progress reports are best effort and never wait.
+
 - **Bound.** The wait's start and its bound, 15 minutes, are kept beside the
   job journal in `rel_ID.json.heartbeat-wait` (mode 0600) for that exact claim,
   so a restarted runner keeps the same start and bound. The claim is the job,
@@ -1440,9 +1456,13 @@ answered with the original).
   deployment heartbeat stale for 15 min` and removes the file. At the poll's
   first check the bound only lets the run go on to its next check, under the
   host lock; that check refuses the job if it is still refused so.
-- **End.** Any check the hub answers otherwise ends the wait and removes the
-  file. A check that passes lets the release go on from its journal; a later
-  stale heartbeat starts a new wait with its own bound and notice.
+- **End.** Any check the hub answers otherwise ends a wait only checks were
+  refused in and removes the file. A check that passes lets the release go on
+  from its journal; a later stale heartbeat starts a new wait with its own
+  bound and notice. A wait another call was refused in is not ended by a
+  passing check, since that call is not answered yet: a check refused while
+  it lasts is the same wait, and it ends at the first poll that meets no
+  stale refusal.
 - **Unchanged.** Any other refusal is a lost fence as before (a claim of
   another run, a claim that is gone, a generation still changed after the one
   re-read, any other text). Once the release is published or an effect is

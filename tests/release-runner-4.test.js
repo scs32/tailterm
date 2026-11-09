@@ -15,7 +15,7 @@ import {planWithPreservation} from "../scripts/verify-matrix.mjs";
 import {openSync as openFile,ftruncateSync,closeSync as closeFile} from "node:fs";
 import {randomBytes} from "node:crypto";
 import {fileSHA256,FILE_HASH_CHUNK_BYTES,buildInputs as buildReleaseInputs} from "../scripts/release-inputs.mjs";
-import {releaseReply,git,fixture,change,job,fake,config,hash,recorded,ignorePrerequisites,placePrerequisites,ended,idle,CODE_AGENT,CODE_RUN,SAFE_TEXT,codeRepo,codeHost,verifiedJob,codeGate,codeSends,heldOwn,heldJournal,HELD_SUBJECT,DRAINING_SUBJECT,batchConfig,batchJournal,matrixRepo,race,integratedPlan,covers,matrixFake,moveTip,hostPlan,checkIds,acceptDocs,stale,claimed,advancing,journalAt,refusable,nativeFixture,hubJob,batchJobs,daemonHub} from "./release-runner-fixtures.mjs";
+import {releaseReply,git,fixture,change,job,fake,config,hash,recorded,ignorePrerequisites,placePrerequisites,ended,idle,CODE_AGENT,CODE_RUN,SAFE_TEXT,codeRepo,codeHost,verifiedJob,codeGate,codeSends,heldOwn,heldJournal,HELD_SUBJECT,DRAINING_SUBJECT,batchConfig,batchJournal,matrixRepo,race,integratedPlan,covers,matrixFake,moveTip,hostPlan,checkIds,acceptDocs,stale,claimed,advancing,journalAt,refusable,nativeFixture,hubJob,batchJobs,batchFake,daemonHub} from "./release-runner-fixtures.mjs";
 import {chmodSync} from "node:fs";
 test("held s1 each failed guard leaves the stale runner draining as before: no re-exec, no checkout move, the same notice, and its own job is still run",async t=>{
  const lockOf=cwd=>join(tmpdir(),"tailterm-release-locks",hash(cwd+"\0fixture")+".lock");
@@ -487,6 +487,128 @@ const r=require('child_process').spawnSync(${JSON.stringify(h.config.tt)},a,{std
  // The heartbeat is fresh again: the next poll releases from its journal and sends no further wait notice.
  rmSync(flag);at(2*MIN);await poll();
  assert.equal(h.read().jobs[0].state,"released");assert.equal(sends().length,2);assert.ok(!existsSync(join(h.home,"rel_b1.json.heartbeat-wait")));
+});
+// A stale heartbeat on a deployment call other than the check
+// (wi_c364c054cc8757d0, k1-k4). staleHub: the real host adapter over a fake hub
+// CLI holding one claimed job, a new adapter per poll as after a restart. Each
+// operation in refusing (check, handler, merged, ...) is answered with its
+// stderr and exit 1, by default the hub's 409 heartbeat stale. diverged moves
+// tasks-hub first, so the release runs an integrated matrix; the run is stubbed
+// to end at once with an eligible receipt, so the next poll sends its import.
+const STALE_409="tt: hub: 409 conflict: release: deployment heartbeat stale",INPUTS_ASK="send:Import immutable inputs for this release job",MATRIX_ASK="send:Import verification for the integrated release commit";
+function staleHub(t,{diverged=false}={}){
+ const f=fixture(),commit=change(f,"client/a.js","a"),home=mkdtempSync(join(tmpdir(),"release-stale-call-"));t.after(()=>{for(const d of [home,f.cwd,f.origin])rmSync(d,{recursive:true,force:true});});
+ if(diverged){git(f.cwd,"checkout","--quiet","tasks-hub");change(f,"client/c.js","c");}
+ const tt=join(home,"tt"),log=join(home,"calls.jsonl"),jobPath=join(home,"job.json"),refusingPath=join(home,"refusing.json");
+ const claimed={...job(f,commit),id:"rel_stale",itemId:"wi_0123456789abcdef",itemRevision:1,orderMessageSeq:7,generation:2,agentId:"agt_fixture",runId:"run_fixture"};
+ writeFileSync(jobPath,JSON.stringify(claimed));writeFileSync(refusingPath,"{}");
+ writeFileSync(tt,"#!"+process.execPath+`\nconst fs=require('fs'),a=process.argv.slice(2),flag=n=>a[a.indexOf(n)+1],op=a[0]==='send'?'send:'+flag('--subject'):a[1]||a[0];
+fs.appendFileSync(${JSON.stringify(log)},JSON.stringify({op,argv:a})+'\\n');
+const refused=JSON.parse(fs.readFileSync(${JSON.stringify(refusingPath)},'utf8'))[op];if(refused){fs.writeSync(2,refused+'\\n');process.exit(1);}
+const job=JSON.parse(fs.readFileSync(${JSON.stringify(jobPath)},'utf8')),save=()=>{fs.writeFileSync(${JSON.stringify(jobPath)},JSON.stringify(job));console.log(JSON.stringify(job));};
+if(a[0]==='send')process.exit(0);
+if(op==='handler')console.log(JSON.stringify({id:'agt_0123abcd'}));
+else if(op==='window')console.log('null');
+else if(['get','check'].includes(op))console.log(JSON.stringify(job));
+else if(op==='merged'){job.state='merged';job.generation++;job.integratedCommit=flag('--commit');save();}
+else if(op==='refuse'){job.state='refused';job.generation++;save();}
+else if(op==='finish'){const r=JSON.parse(fs.readFileSync(flag('--file'),'utf8'));job.state=r.outcome;job.generation++;job.receipt=r;save();}
+else process.exit(2);`);chmodSync(tt,0o755);
+ const saved=()=>JSON.parse(readFileSync(jobPath,"utf8")),journal=join(home,"rel_stale.json");
+ const endedRun=(job,current,dir)=>{writeFileSync(join(dir,"run.json"),JSON.stringify({version:1,state:"ended",reason:"receipt"}));writeFileSync(join(dir,"receipt.json"),JSON.stringify({environment:{},checks:[{exitCode:0}]}));return false;};
+ const adapter=(over={})=>Object.assign(new HostAdapter({cwd:f.cwd,tt,journalDirectory:home},saved()),{releaseTools:async()=>{},prepare:async()=>({release:"fixture-release",artifactSHA256:"b".repeat(64)}),deploy:async()=>{},check:async()=>true,rollback:async()=>true,retain:async()=>{},jobInputs:()=>({targets:{}}),launchMatrixRun:endedRun},over);
+ const calls=()=>existsSync(log)?readFileSync(log,"utf8").trim().split("\n").filter(Boolean).map(l=>JSON.parse(l)):[];
+ return {f,commit,home,claimed,tip:git(f.cwd,"rev-parse","refs/heads/tasks-hub"),saved,adapter,calls,ops:name=>calls().filter(c=>c.op===name),journal:()=>JSON.parse(readFileSync(journal,"utf8")),waitFile:journal+".heartbeat-wait",
+  refusing:(ops,stderr=STALE_409)=>writeFileSync(refusingPath,JSON.stringify(Object.fromEntries(ops.map(op=>[op,stderr])))),
+  bind:fields=>writeFileSync(jobPath,JSON.stringify({...saved(),...fields})),release:a=>runRelease({...config(f,claimed),journalPath:journal},a)};
+}
+const callWaiting=(id,since=HB_START,call="handler")=>({jobId:id,outcome:"waiting_heartbeat",heartbeat:{since,boundMs:15*MIN,call}});
+const askId=c=>c.argv[c.argv.indexOf("--request-id")+1];
+const unrefused=(h,phase)=>{
+ const journal=h.journal();assert.equal(journal.phase,phase);assert.notEqual(journal.published,true);assert.notEqual(journal.mergedSent,true);assert.deepEqual(journal.effects,[]);assert.equal(journal.refusalReason,undefined);assert.equal(journal.failure,undefined);
+ assert.equal(h.saved().state,"claimed");assert.equal(h.ops("refuse").length,0);assert.equal(h.ops("merged").length,0);assert.equal(git(h.f.cwd,"rev-parse","refs/heads/tasks-hub"),h.tip,"tasks-hub not moved");
+};
+test("hc1 the inputs import request's handler lookup refused for a stale heartbeat before publication waits with its claim, and the next poll sends the request under its id",async t=>{
+ const at=heartbeatClock(t),h=staleHub(t);h.refusing(["handler"]);
+ assert.deepEqual(await h.release(h.adapter()),callWaiting("rel_stale"));
+ unrefused(h,"waiting_inputs");assert.equal(h.ops("handler").length,1);assert.equal(h.ops(INPUTS_ASK).length,0);
+ assert.deepEqual(JSON.parse(readFileSync(h.waitFile,"utf8")),{version:1,jobId:"rel_stale",agentId:"agt_fixture",runId:"run_fixture",reconciliations:0,since:HB_START,boundMs:15*MIN,call:"handler"});
+ assert.equal(statSync(h.waitFile).mode&0o777,0o600);
+ // The heartbeat is fresh again: the next poll sends the request under its id, and a poll with no stale refusal ends the wait.
+ at(5*MIN);h.refusing([]);assert.deepEqual(await h.release(h.adapter()),{jobId:"rel_stale",outcome:"waiting_inputs"});
+ assert.deepEqual(h.ops(INPUTS_ASK).map(askId),[`rel_stale-g2-inputs-${h.commit}`]);assert.ok(!existsSync(h.waitFile));
+ h.bind({inputsCommit:h.commit,inputsDigest:"d".repeat(64)});
+ assert.equal((await h.release(h.adapter())).outcome,"released");assert.equal(h.saved().state,"released");assert.equal(h.ops("refuse").length,0);
+});
+test("hc1 the integrated matrix import request's handler lookup refused for a stale heartbeat waits in its matrix phase, and the next poll sends the import under its id",async t=>{
+ const at=heartbeatClock(t),h=staleHub(t,{diverged:true});h.refusing(["handler"]);
+ at(-MIN);assert.deepEqual(await h.release(h.adapter()),{jobId:"rel_stale",outcome:"waiting_matrix"},"the matrix run starts");assert.equal(h.ops("handler").length,0);
+ at(0);assert.deepEqual(await h.release(h.adapter()),callWaiting("rel_stale"));
+ unrefused(h,"waiting_matrix");assert.equal(h.ops("handler").length,1);assert.equal(h.ops(MATRIX_ASK).length,0);assert.ok(existsSync(h.waitFile));
+ at(5*MIN);h.refusing([]);assert.deepEqual(await h.release(h.adapter()),{jobId:"rel_stale",outcome:"waiting_matrix"});
+ assert.deepEqual(h.ops(MATRIX_ASK).map(askId),[`rel_stale-integrated-matrix-${h.journal().integrated}`]);assert.notEqual(h.journal().integrated,h.commit);assert.ok(!existsSync(h.waitFile));
+});
+test("hc2 a handler refusal and the check refusals after it are one wait: one file, one notice and one bound from the first refusal",async t=>{
+ const at=heartbeatClock(t),h=staleHub(t);h.refusing(["handler"]);
+ const first=await h.release(h.adapter());assert.deepEqual(first,callWaiting("rel_stale"));const saved=readFileSync(h.waitFile,"utf8");
+ // The next poll's check is refused too: the same wait, untouched, and the same notice.
+ at(5*MIN);h.refusing(["check","handler"]);const second=await h.release(h.adapter());assert.deepEqual(second,callWaiting("rel_stale"));
+ assert.equal(h.ops("check").length,3,"two checks of the first poll, the refused entry check of the second");assert.equal(h.ops("handler").length,1);assert.equal(readFileSync(h.waitFile,"utf8"),saved);
+ const notice=heartbeatWaitNotice("rel_stale",first.heartbeat);assert.deepEqual(heartbeatWaitNotice("rel_stale",second.heartbeat),notice);
+ assert.match(notice.text,/refuses its tt deployment handler call with "deployment heartbeat stale"/);assert.match(notice.text,/refused with "release fence lost: deployment heartbeat stale for 15 min"/);
+ // A passing check alone does not end a wait a call was refused in: the handler, still refused, keeps the first start.
+ at(10*MIN);h.refusing(["handler"]);assert.deepEqual(await h.release(h.adapter()),callWaiting("rel_stale"));assert.equal(readFileSync(h.waitFile,"utf8"),saved);
+ // At the bound from the first refusal, the handler still refused refuses the job unpublished with the check's reason.
+ at(15*MIN);await assert.rejects(h.release(h.adapter()),/Release refused before publication/);
+ const journal=h.journal();assert.equal(journal.phase,"refused");assert.equal(journal.refusalReason,HB_BOUND);assert.deepEqual(journal.failure,{step:"inputs",reason:HB_BOUND});assert.deepEqual(journal.effects,[]);
+ assert.equal(h.saved().state,"refused");assert.equal(h.ops("refuse").length,1);assert.equal(h.ops(INPUTS_ASK).length,0);assert.ok(!existsSync(h.waitFile));assert.equal(git(h.f.cwd,"rev-parse","refs/heads/tasks-hub"),h.f.base);
+});
+test("hc3 a handler refusal's bound holds across runner restarts, and a check still refused at that bound refuses the job",async t=>{
+ const at=heartbeatClock(t),bound=heartbeatWait.boundMs;t.after(()=>{heartbeatWait.boundMs=bound;});
+ const h=staleHub(t);h.refusing(["handler"]);assert.deepEqual(await h.release(h.adapter()),callWaiting("rel_stale"));const saved=readFileSync(h.waitFile,"utf8");
+ // Each poll is a new adapter, as a restarted runner, and reads the saved start and bound, which a bound changed in code since does not move.
+ heartbeatWait.boundMs=60*MIN;h.refusing(["check","handler"]);
+ for(const ms of [MIN,14*MIN,15*MIN-1]){at(ms);assert.deepEqual(await h.release(h.adapter()),callWaiting("rel_stale"),`${ms} ms`);assert.equal(readFileSync(h.waitFile,"utf8"),saved);unrefused(h,"waiting_inputs");}
+ at(15*MIN);await assert.rejects(h.release(h.adapter()),/Release refused before publication/);
+ const journal=h.journal();assert.equal(journal.refusalReason,HB_BOUND);assert.deepEqual(journal.failure,{step:"fence",reason:HB_BOUND});assert.equal(h.saved().state,"refused");assert.ok(!existsSync(h.waitFile));
+ // A poll with no stale refusal ends a call's wait instead, and a later refusal starts a new one with its own bound.
+ const g=staleHub(t);at(0);g.refusing(["handler"]);await g.release(g.adapter());
+ at(20*MIN);g.refusing([]);heartbeatWait.boundMs=bound;assert.equal((await g.release(g.adapter())).outcome,"waiting_inputs");assert.ok(!existsSync(g.waitFile));
+ at(25*MIN);g.refusing(["handler"]);assert.deepEqual(await g.release(g.adapter()),callWaiting("rel_stale",new Date(Date.parse(HB_START)+25*MIN).toISOString()));
+});
+test("hc4 after publication or an effect a stale heartbeat on another call is a failure as before and starts no wait, and any other refusal is handled as today",async t=>{
+ heartbeatClock(t);
+ // merged refused once the release is published: blocked for reconciliation, never refused or waiting.
+ const p=staleHub(t);p.bind({inputsCommit:p.commit,inputsDigest:"d".repeat(64)});p.refusing(["merged"]);
+ await assert.rejects(p.release(p.adapter()));
+ let journal=p.journal();assert.equal(journal.published,true);assert.equal(journal.phase,"blocked");assert.equal(journal.refusalReason,undefined);assert.equal(p.ops("refuse").length,0);assert.ok(!existsSync(p.waitFile));
+ // The rollback bug request's handler lookup after a failed live check: rolled back as before, its request not sent, and no wait.
+ const e=staleHub(t);e.bind({inputsCommit:e.commit,inputsDigest:"d".repeat(64)});e.refusing(["handler"]);
+ await assert.rejects(e.release(e.adapter({check:async()=>false})));
+ journal=e.journal();assert.equal(journal.phase,"blocked");assert.equal(journal.outcome,"rolled_back");assert.equal(journal.effects.length,1);assert.equal(journal.revert.bugRequestId,undefined);assert.ok(journal.bugRequestAttempted);
+ assert.equal(e.ops("refuse").length,0);assert.ok(!existsSync(e.waitFile));
+ // Another 409 on the handler before publication is refused as today, named for the failed call.
+ const o=staleHub(t);o.refusing(["handler"],"tt: hub: 409 conflict: release: available exact deployment run required");
+ await assert.rejects(o.release(o.adapter()),/Release refused before publication/);
+ journal=o.journal();assert.equal(journal.refusalReason,"tt deployment handler exit 1");assert.deepEqual(journal.failure.step,"inputs");assert.ok(!existsSync(o.waitFile));
+});
+test("hc5 a batch call or a batch's matrix import refused for a stale heartbeat waits instead of dropping a member or the batch, and the next poll replays it",async t=>{
+ const at=heartbeatClock(t),staleError=call=>Object.assign(new Error("Host operation failed"),{releaseReason:`tt deployment ${call} exit 1`,heartbeatStale:true,heartbeatCall:call});
+ // batch-add of the member refused once: the declaration waits with its call journaled as sending, and the next poll replays it unchanged.
+ let b=batchJobs([["client/a.js","a"],["client/b.js","b"]]),a=batchFake(b.lead),c=batchConfig(b,2),inner=a.batch,staleAdds=1;
+ a.batch=async(op,fields,generation)=>{if(op==="batch-add" && fields.entryId==="tqe_b2" && staleAdds-->0){a.calls.push("stale:"+op);throw staleError(op);}return inner(op,fields,generation);};
+ assert.deepEqual(await runRelease(c,a),callWaiting("rel_b1",HB_START,"batch-add"));
+ let journal=batchJournal(c),pending=journal.batchOps.at(-1);
+ assert.equal(journal.phase,"batching");assert.deepEqual([pending.op,pending.status,pending.entryId],["batch-add","sending","tqe_b2"]);assert.equal(journal.batchDropped,undefined);assert.ok(!a.calls.includes("refuse"));
+ at(MIN);const r=await runRelease(c,a);assert.equal(r.outcome,"released");
+ journal=batchJournal(c);assert.deepEqual(journal.batch.jobs.map(j=>j.jobId),["rel_b1","rel_b2"]);assert.equal(a.ops.filter(o=>o.op==="batch-add" && o.entryId==="tqe_b2").length,1);assert.equal(a.ops.find(o=>o.entryId==="tqe_b2").generation,pending.generation);
+ assert.ok(!existsSync(c.journalPath+".heartbeat-wait"));
+ // The batch's matrix import refused so: it waits in its matrix phase, the batch stands, and no drop is sent.
+ at(0);b=batchJobs([["client/a.js","a"],["client/b.js","b"]]);a=batchFake(b.lead);c=batchConfig(b,2);let refusals=1;
+ a.verifyIntegrated=async j=>{if(refusals-->0)throw staleError("handler");a.calls.push("verify");return true;};
+ assert.deepEqual(await runRelease(c,a),callWaiting("rel_b1"));
+ journal=batchJournal(c);assert.equal(journal.phase,"waiting_matrix");assert.deepEqual(journal.batch.jobs.map(j=>j.jobId),["rel_b1","rel_b2"]);assert.equal(journal.batchFallback,undefined);assert.ok(!a.calls.includes("batch-drop"));assert.deepEqual(c.solo,[]);
+ at(MIN);assert.equal((await runRelease(c,a)).outcome,"released");assert.deepEqual(batchJournal(c).batch.jobs.map(j=>j.jobId),["rel_b1","rel_b2"]);
 });
 test("the streamed file hash equals a whole-file hash at every chunk boundary",t=>{
  const home=mkdtempSync(join(tmpdir(),"release-file-hash-"));t.after(()=>rmSync(home,{recursive:true,force:true}));

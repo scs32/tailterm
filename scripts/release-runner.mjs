@@ -252,19 +252,28 @@ export const transportWait = {escalateMs: 600000, now: () => Date.now()};
 // claim keeps it. A fence check the hub answers otherwise ends it. A check
 // still refused so boundMs after the start refuses the job and removes the
 // file. Tests replace now.
+// Any other tt deployment call refused so before publication, merged and any
+// journaled effect (wi_c364c054cc8757d0: the handler lookup of the inputs and
+// integrated matrix import requests, the batch calls) joins the same wait, or
+// starts one that names it as call. A wait with a call is not ended by a
+// passing check, as the refused call is not answered yet; it ends at the
+// first poll that meets no stale refusal (runRelease).
 export const heartbeatWait = {boundMs: 900000, now: () => Date.now()};
 const HEARTBEAT_STALE_REASON = "release fence lost: deployment heartbeat stale";
+const HEARTBEAT_CALL = /^[a-z][a-z-]{0,31}$/;
 const claimReconciliations = job => Array.isArray(job?.reconciliations) ? job.reconciliations.length : 0;
 function readHeartbeatWait(path, job) {
-  try { const wait = JSON.parse(readFileSync(path, "utf8")); return wait?.version === 1 && wait.jobId === job.id && wait.agentId === job.agentId && wait.runId === job.runId && wait.reconciliations === claimReconciliations(job) && Number.isFinite(Date.parse(wait.since)) && Number.isSafeInteger(wait.boundMs) && wait.boundMs > 0 ? wait : null; } catch { return null; }
+  try { const wait = JSON.parse(readFileSync(path, "utf8")); return wait?.version === 1 && wait.jobId === job.id && wait.agentId === job.agentId && wait.runId === job.runId && wait.reconciliations === claimReconciliations(job) && Number.isFinite(Date.parse(wait.since)) && Number.isSafeInteger(wait.boundMs) && wait.boundMs > 0 && (wait.call === undefined || HEARTBEAT_CALL.test(wait.call)) ? wait : null; } catch { return null; }
 }
 // The routine notice of one heartbeat wait: one per job and wait, keyed by
 // when the wait began, so a restart's resend is answered with the original.
+// A wait a call other than the check started names that call.
 export function heartbeatWaitNotice(jobId, wait) {
-  if (!/^rel_[A-Za-z0-9_-]{1,64}$/.test(jobId || "") || !Number.isFinite(Date.parse(wait?.since)) || !Number.isSafeInteger(wait?.boundMs) || wait.boundMs <= 0) return null;
+  if (!/^rel_[A-Za-z0-9_-]{1,64}$/.test(jobId || "") || !Number.isFinite(Date.parse(wait?.since)) || !Number.isSafeInteger(wait?.boundMs) || wait.boundMs <= 0 || (wait.call !== undefined && !HEARTBEAT_CALL.test(wait.call))) return null;
   const since = new Date(wait.since).toISOString(), minutes = Math.round(wait.boundMs / 60000);
+  const [refused, again, still] = wait.call ? [`its tt deployment ${wait.call} call`, "calls again", "If its calls are"] : ["its fence check", "checks again", "If the check is"];
   return {requestId: `${jobId}-heartbeat-wait-${createHash("sha256").update(since).digest("hex").slice(0, 12)}`, jobId, wake: WAKE.routine, subject: "A release job waits for the deployer heartbeat",
-    text: `Release ${jobId} waits: since ${since} the hub refuses its fence check with "deployment heartbeat stale", because the heartbeat of the deployer is more than 90 seconds old by the hub clock. Nothing is published; the job keeps its claim and journal, and every poll checks again. If the check is still refused ${minutes} minutes after that start, the job is refused with "${HEARTBEAT_STALE_REASON} for ${minutes} min". See Claim freshness in docs/project-deployment.md.`};
+    text: `Release ${jobId} waits: since ${since} the hub refuses ${refused} with "deployment heartbeat stale", because the heartbeat of the deployer is more than 90 seconds old by the hub clock. Nothing is published; the job keeps its claim and journal, and every poll ${again}. ${still} still refused ${minutes} minutes after that start, the job is refused with "${HEARTBEAT_STALE_REASON} for ${minutes} min". See Claim freshness in docs/project-deployment.md.`};
 }
 // A held claim notice's owner-helper lookup that failed is not repeated for
 // rosterMs (wi_56ac00ba2854fa3d c3). Tests replace now.
@@ -1014,7 +1023,18 @@ export async function liveCheck(adapter, target, policy, sleep=ms=>new Promise(r
 // sanitized and bounded by pushStderr. The receipt holds at most its sha256.
 // One host release lock per deployment checkout and project.
 const hostLockPath=(cwd,job)=>join(tmpdir(),"tailterm-release-locks",digest(cwd+"\0"+(job.taskId||"fixture"))+".lock");
+// One poll of a job. A heartbeat wait a call other than the check was refused
+// in (wi_c364c054cc8757d0) ends once a poll meets no stale refusal: it has
+// gone past that call, or waits for something else first.
 export async function runRelease(config, adapter) {
+  const turn={stale:false};
+  try{return await releaseTurn(config,adapter,turn);}
+  finally{
+    const path=typeof config?.journalPath==="string"?config.journalPath+".heartbeat-wait":null;
+    if(path && !turn.stale && config.job && readHeartbeatWait(path,config.job)?.call)rmSync(path,{force:true});
+  }
+}
+async function releaseTurn(config, adapter, turn) {
   const {cwd,job,baselines,journalPath}=config;
   const policy={startupMs:60000,failures:3,intervalMs:5000,relayCleanMs:30000,...config.testPolicy};
   if(!job || !(["claimed","merged"].includes(job.state)) || !sha(job.commit) || !/^[a-f0-9]{64}$/.test(job.verificationDigest||""))throw releaseError("Claimed verified job required");
@@ -1035,27 +1055,30 @@ export async function runRelease(config, adapter) {
     adopted++;return true;
   };
   // A check the hub answers, other than a stale heartbeat, ends a heartbeat
-  // wait; "heartbeat-stale" is returned as it is.
+  // wait only checks were refused in; "heartbeat-stale" is returned as it is.
   const heartbeatPath=journalPath+".heartbeat-wait";
   const held=async journal=>{
     let fenced=await adapter.fence(job);
     if(fenced==="generation-changed" && await adopt(journal))fenced=await adapter.fence(job);
     if(fenced==="heartbeat-stale")return fenced;
-    rmSync(heartbeatPath,{force:true});
+    if(!readHeartbeatWait(heartbeatPath,job)?.call)rmSync(heartbeatPath,{force:true});
     return fenced===true;
   };
   // A check refused for a stale heartbeat (wi_ad646ec936acb9bc) before
   // publication: the wait this exact claim has, or a new one starting now,
   // and whether its bound has passed. Once published or an effect is
   // journaled, it is a failure named for that cause.
-  const heartbeatTurn=journal=>{
+  // A refused call other than the check (wi_c364c054cc8757d0) joins the wait
+  // this claim has, or starts one naming that call.
+  const heartbeatTurn=(journal,call)=>{
     if(!unpublished(journal))throw releaseError(HEARTBEAT_STALE_REASON);
+    turn.stale=true;
     const now=heartbeatWait.now();
     let wait=readHeartbeatWait(heartbeatPath,job);
-    if(!wait){wait={version:1,jobId:job.id,agentId:job.agentId,runId:job.runId,reconciliations:claimReconciliations(job),since:new Date(now).toISOString(),boundMs:heartbeatWait.boundMs};save(heartbeatPath,wait);}
-    return {since:wait.since,boundMs:wait.boundMs,due:now-Date.parse(wait.since)>=wait.boundMs};
+    if(!wait){wait={version:1,jobId:job.id,agentId:job.agentId,runId:job.runId,reconciliations:claimReconciliations(job),since:new Date(now).toISOString(),boundMs:heartbeatWait.boundMs,...(HEARTBEAT_CALL.test(call||"")?{call}:{})};save(heartbeatPath,wait);}
+    return {since:wait.since,boundMs:wait.boundMs,...(wait.call?{call:wait.call}:{}),due:now-Date.parse(wait.since)>=wait.boundMs};
   };
-  const heartbeatWaiting=wait=>({jobId:job.id,outcome:"waiting_heartbeat",heartbeat:{since:wait.since,boundMs:wait.boundMs}});
+  const heartbeatWaiting=wait=>({jobId:job.id,outcome:"waiting_heartbeat",heartbeat:{since:wait.since,boundMs:wait.boundMs,...(wait.call?{call:wait.call}:{})}});
   // A fence check that could not reach the hub after its tries is not a lost
   // fence (wi_f2e585b63f57b6f8): while nothing is published and no effect is
   // journaled the job waits for the next poll, claimed and unrefused, with its
@@ -1173,7 +1196,9 @@ export async function runRelease(config, adapter) {
   };
   const settleBatchOp=async record=>{
     for(let attempt=0;attempt<2;attempt++){
-      try{await adapter.batch(record.op,{entryId:record.entryId,commit:record.commit},record.generation);record.status="done";checkpoint();return true;}catch{}
+      // A call refused for a stale heartbeat stays sending: the run waits (the
+      // catch below) and the next poll replays it unchanged.
+      try{await adapter.batch(record.op,{entryId:record.entryId,commit:record.commit},record.generation);record.status="done";checkpoint();return true;}catch(error){if(error?.heartbeatStale===true && unpublished(state))throw error;}
     }
     let generation;try{generation=await adapter.generation();}catch{}
     if(generation!==record.generation)throw Object.assign(releaseError("Release batch call unconfirmed"),{batchWait:true});
@@ -1336,6 +1361,8 @@ export async function runRelease(config, adapter) {
       let verified,failure;
       try{verified=await adapter.verifyIntegrated(batchJob());}catch(error){failure=error;}
       if(verified===true){staged=null;state.phase="integrated";checkpoint();return null;}
+      // A stale heartbeat on the import request waits (the catch below) instead of dropping the batch.
+      if(failure?.heartbeatStale===true)throw failure;
       if(failure){
         const reason=failureReason(failure);
         const fell=await fallback(reason==="batch-plan-uncovered"?reason:"batch-matrix-failed",reason,failure);
@@ -1537,6 +1564,15 @@ export async function runRelease(config, adapter) {
   } catch (error) {
     // A resumed refusal that failed or finished above is not refused again.
     if(refusing)throw error;
+    // Any other tt deployment call the hub refused for a stale heartbeat
+    // before publication, merged and any effect (wi_c364c054cc8757d0) is the
+    // check's wait: the same file, start and bound, waiting below; at the
+    // bound it refuses the job with the check's reason, at the failed step.
+    if(error?.heartbeatStale===true && !error.heartbeatWait && unpublished(state)){
+      const wait=heartbeatTurn(state,error.heartbeatCall);
+      if(wait.due){rmSync(heartbeatPath,{force:true});error=releaseError(`${HEARTBEAT_STALE_REASON} for ${Math.round(wait.boundMs/60000)} min`);}
+      else error.heartbeatWait=wait;
+    }
     // An unreached fence check before publication: the job waits. The journal
     // stays in a phase the next poll resumes (the wait for inputs when the
     // check came just before publication), and the checkout is left as it is.
@@ -1818,7 +1854,7 @@ export class HostAdapter {
         if(cause)failed.transport=true;
         if(argv[0]===cli)failed.refusal=refusalText(error.stderr);
         if(argv[0]===cli && argv[1]==="deployment" && generationChanged(error))failed.generationChanged=true;
-        if(argv[0]===cli && argv[1]==="deployment" && heartbeatStale(error))failed.heartbeatStale=true;
+        if(argv[0]===cli && argv[1]==="deployment" && heartbeatStale(error)){failed.heartbeatStale=true;failed.heartbeatCall=argv[2];}
         if(argv[0]===cli && argv[1]==="deployment" && ((argv[2]==="refuse" && argv.includes("--reason")) || (argv[2]==="block" && argv.includes("--revert-outcome")) || (argv[2]==="finish" && argv.includes("--batch-dropped"))) && refusalRefused(error))failed.refusalRefused=true;
         if(kept)this.cliFailures.push(cause?{...kept,transport:true}:kept);
         if(HOST_CALLS.includes(output))failed.hostOutput=hostOutput(output,error);
@@ -3197,7 +3233,7 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
   const heartbeatNotify=(reader,job,wait)=>{
     const notice=heartbeatWaitNotice(job?.id,wait);
     if(!notice || posted.has(notice.requestId))return;
-    if(!posted.has(`said ${notice.requestId}`)){posted.add(`said ${notice.requestId}`);process.stderr.write("Release waits: the hub refused the fence check for a stale deployer heartbeat; nothing is published and the next poll checks again.\n");}
+    if(!posted.has(`said ${notice.requestId}`)){posted.add(`said ${notice.requestId}`);process.stderr.write(wait?.call?`Release waits: the hub refused tt deployment ${wait.call} for a stale deployer heartbeat; nothing is published and the next poll calls again.\n`:"Release waits: the hub refused the fence check for a stale deployer heartbeat; nothing is published and the next poll checks again.\n");}
     try{failureSend(say,reader,notice);posted.add(notice.requestId);}
     catch{process.stderr.write("Heartbeat wait notice not posted; the next poll retries.\n");}
   };
