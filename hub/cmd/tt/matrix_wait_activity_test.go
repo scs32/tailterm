@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1023,7 +1024,13 @@ func TestMatrixWaitDeploymentProgressReportBounded(t *testing.T) {
 		"a restarted run": {agent: func(a api.Agent) api.Agent { a.RunID = "run_fedcba9876543210"; return a }},
 	} {
 		t.Run(name, func(t *testing.T) {
-			var reports []api.ActivityReport
+			// The handler appends while the test reads after cmdDeployment
+			// returns; in the hung hub case the handler is still running then
+			// (wi_1f792e27bd5e154a), so both sides share saved under mu.
+			var (
+				mu    sync.Mutex
+				saved []api.ActivityReport
+			)
 			hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
 				switch {
@@ -1034,7 +1041,9 @@ func TestMatrixWaitDeploymentProgressReportBounded(t *testing.T) {
 				case r.Method == "POST" && r.URL.Path == "/v1/tasks/"+task+"/agents/"+deployer.ID+"/activity":
 					var report api.ActivityReport
 					_ = json.NewDecoder(r.Body).Decode(&report)
-					reports = append(reports, report)
+					mu.Lock()
+					saved = append(saved, report)
+					mu.Unlock()
 					if c.activity != nil {
 						c.activity(w, r)
 						return
@@ -1064,6 +1073,9 @@ func TestMatrixWaitDeploymentProgressReportBounded(t *testing.T) {
 			if took > deployerMatrixWaitBound+2*time.Second {
 				t.Fatalf("progress took %v", took)
 			}
+			mu.Lock()
+			reports := append([]api.ActivityReport(nil), saved...)
+			mu.Unlock()
 			if len(reports) != c.reports {
 				t.Fatalf("%d activity reports, want %d", len(reports), c.reports)
 			}
