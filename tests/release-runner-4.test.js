@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,existsSync,statSync,readdirSync,rmSync,renameSync} from "node:fs";
 import {tmpdir} from "node:os";
 import {join,dirname} from "node:path";
-import {runRelease,HostAdapter,publishedCode,codeDecision,heldRestartJob,codeRecord,codeNotice} from "../scripts/release-runner.mjs";
+import {runRelease,HostAdapter,publishedCode,codeDecision,heldRestartJob,codeRecord,codeNotice,heartbeatWait,heartbeatWaitNotice,serveDeployment} from "../scripts/release-runner.mjs";
 import {createHash} from "node:crypto";
 
 // Release batching (wi_50e80d45647b342a slice one).
@@ -15,7 +15,8 @@ import {planWithPreservation} from "../scripts/verify-matrix.mjs";
 import {openSync as openFile,ftruncateSync,closeSync as closeFile} from "node:fs";
 import {randomBytes} from "node:crypto";
 import {fileSHA256,FILE_HASH_CHUNK_BYTES,buildInputs as buildReleaseInputs} from "../scripts/release-inputs.mjs";
-import {releaseReply,git,fixture,change,job,fake,config,hash,recorded,ignorePrerequisites,placePrerequisites,ended,idle,CODE_AGENT,CODE_RUN,SAFE_TEXT,codeRepo,codeHost,verifiedJob,codeGate,codeSends,heldOwn,heldJournal,HELD_SUBJECT,DRAINING_SUBJECT,batchConfig,batchJournal,matrixRepo,race,integratedPlan,covers,matrixFake,moveTip,hostPlan,checkIds,acceptDocs,stale,claimed,advancing,journalAt,refusable,nativeFixture,hubJob} from "./release-runner-fixtures.mjs";
+import {releaseReply,git,fixture,change,job,fake,config,hash,recorded,ignorePrerequisites,placePrerequisites,ended,idle,CODE_AGENT,CODE_RUN,SAFE_TEXT,codeRepo,codeHost,verifiedJob,codeGate,codeSends,heldOwn,heldJournal,HELD_SUBJECT,DRAINING_SUBJECT,batchConfig,batchJournal,matrixRepo,race,integratedPlan,covers,matrixFake,moveTip,hostPlan,checkIds,acceptDocs,stale,claimed,advancing,journalAt,refusable,nativeFixture,hubJob,batchJobs,daemonHub} from "./release-runner-fixtures.mjs";
+import {chmodSync} from "node:fs";
 test("held s1 each failed guard leaves the stale runner draining as before: no re-exec, no checkout move, the same notice, and its own job is still run",async t=>{
  const lockOf=cwd=>join(tmpdir(),"tailterm-release-locks",hash(cwd+"\0fixture")+".lock");
  const attempt=(h,run)=>{const dir=join(h.home,"rel_held-integrated-verification","d".repeat(40)+"-r1");mkdirSync(dir,{recursive:true});writeFileSync(join(dir,"run.json"),run);};
@@ -362,6 +363,116 @@ test("g2 g3 through the host adapter: the stuck check and refuse of the incident
  const d={...config(g,lost.job),journalPath:join(m.home,"rel_fixture.json")};
  await assert.rejects(runRelease(d,lost),/release fence lost/);
  assert.deepEqual(m.calls(),["deployment check 2","deployment get"]);assert.equal(lost.job.generation,2);assert.ok(!existsSync(d.journalPath));assert.equal(git(g.cwd,"rev-parse","tasks-hub"),g.base);
+});
+// A stale deployer heartbeat (wi_ad646ec936acb9bc, f1-f4). beating answers
+// "heartbeat-stale" on the listed fence calls (1-based), else true; the fence
+// calls of a fast-forward release are entry, start, publish, prepare, deploy.
+const beating=staleCalls=>{const a=fake();a.fences=0;a.fence=async()=>staleCalls.includes(++a.fences)?"heartbeat-stale":true;return a;};
+const HB_START="2026-11-09T15:00:00.000Z",MIN=60000,HB_BOUND="release fence lost: deployment heartbeat stale for 15 min";
+const heartbeatFile=c=>c.journalPath+".heartbeat-wait";
+const heartbeatClock=t=>{const now=heartbeatWait.now;let at=Date.parse(HB_START);heartbeatWait.now=()=>at;t.after(()=>{heartbeatWait.now=now;});return ms=>{at=Date.parse(HB_START)+ms;};};
+const heartbeatWaiting=(id,since=HB_START)=>({jobId:id,outcome:"waiting_heartbeat",heartbeat:{since,boundMs:15*MIN}});
+test("h1 a fence check refused for a stale heartbeat before publication waits with its claim, and the next passing check goes on from its journal",async t=>{
+ const at=heartbeatClock(t);
+ for(const call of [1,2,3]){
+  at(0);const f=fixture(),commit=change(f,"client/a.js","a"),j=claimed(f,commit),c=config(f,j),a=beating([call]);
+  assert.deepEqual(await runRelease(c,a),heartbeatWaiting(j.id),`check ${call}`);
+  assert.equal(a.fences,call);assert.deepEqual(a.calls,[],"nothing refused, merged, deployed or escalated");assert.equal(git(f.cwd,"rev-parse","tasks-hub"),f.base);
+  assert.deepEqual(JSON.parse(readFileSync(heartbeatFile(c),"utf8")),{version:1,jobId:j.id,agentId:"agt_fixture",runId:"run_fixture",since:HB_START,boundMs:15*MIN});
+  assert.equal(statSync(heartbeatFile(c)).mode&0o777,0o600);
+  // A new job has no journal yet and gets none; a check refused just before publication leaves the resumable inputs wait.
+  if(call<3)assert.ok(!existsSync(c.journalPath),`check ${call}`);
+  else{const journal=journalAt(c);assert.equal(journal.phase,"waiting_inputs");assert.notEqual(journal.published,true);assert.notEqual(journal.mergedSent,true);assert.deepEqual(journal.effects,[]);assert.equal(journal.refusalReason,undefined);assert.equal(journal.failure,undefined);}
+  // The host lock was released, so the next poll checks again; it passes, ends the wait and releases.
+  at(5*MIN);const b=beating([]),receipt=await runRelease(c,b);
+  assert.equal(receipt.outcome,"released");assert.deepEqual(b.calls,["merged","deploy:tailos","finish"]);assert.equal(journalAt(c).phase,"complete");
+  assert.ok(!existsSync(heartbeatFile(c)),"a passing check ends the wait");assert.equal(git(f.cwd,"rev-parse","tasks-hub"),commit);
+ }
+});
+test("h2 the wait is bounded at 15 minutes from its first refusal, also across a restart, and then the job is refused with that reason",async t=>{
+ const at=heartbeatClock(t),bound=heartbeatWait.boundMs;t.after(()=>{heartbeatWait.boundMs=bound;});
+ const f=fixture(),commit=change(f,"client/a.js","a"),j=claimed(f,commit),c=config(f,j);
+ assert.deepEqual(await runRelease(c,beating([3])),heartbeatWaiting(j.id));
+ const saved=readFileSync(heartbeatFile(c),"utf8");
+ // Each later poll is a restarted runner: it reads the saved start and bound, which a bound changed in code since does not move.
+ heartbeatWait.boundMs=60*MIN;
+ for(const ms of [MIN,14*MIN,15*MIN-1]){
+  at(ms);const a=beating([1,2,3,4,5]);
+  assert.deepEqual(await runRelease(c,a),heartbeatWaiting(j.id),`${ms} ms`);assert.equal(a.fences,1,"the entry check waits with nothing touched");assert.deepEqual(a.calls,[]);
+  assert.equal(readFileSync(heartbeatFile(c),"utf8"),saved);assert.equal(journalAt(c).phase,"waiting_inputs");
+ }
+ // At the bound the entry check goes on to the next one, under the host lock; still refused, the job is refused unpublished.
+ at(15*MIN);const a=beating([1,2,3,4,5]);let escalation;a.escalate=async d=>{escalation=d;a.calls.push("escalate");};
+ await assert.rejects(runRelease(c,a),/Release refused before publication/);
+ assert.equal(a.fences,2);assert.deepEqual(a.calls,["refuse","escalate"]);assert.deepEqual(escalation,{jobId:j.id,outcome:"refused",reason:HB_BOUND});
+ const journal=journalAt(c);assert.equal(journal.phase,"refused");assert.equal(journal.refusalReason,HB_BOUND);assert.deepEqual(journal.failure,{step:"fence",reason:HB_BOUND});assert.deepEqual(journal.effects,[]);assert.notEqual(journal.published,true);
+ assert.equal(git(f.cwd,"rev-parse","tasks-hub"),f.base);
+ // A check that passes at the bound ends the wait instead, and the release goes on.
+ heartbeatWait.boundMs=bound;at(0);const g=fixture(),later=change(g,"client/a.js","a"),d=config(g,claimed(g,later));
+ assert.equal((await runRelease(d,beating([2]))).outcome,"waiting_heartbeat");
+ at(20*MIN);const b=beating([1]);assert.equal((await runRelease(d,b)).outcome,"released");assert.equal(b.fences,6,"the stale entry check, then every check of a release");assert.ok(!b.calls.includes("refuse"));assert.ok(!existsSync(heartbeatFile(d)));
+});
+test("h3 a passing check ends the wait, so a later stale heartbeat starts a new one with its own bound",async t=>{
+ const at=heartbeatClock(t),f=fixture(),j=claimed(f,change(f,"client/a.js","a")),c=config(f,j);
+ assert.deepEqual(await runRelease(c,beating([3])),heartbeatWaiting(j.id));
+ // Ten minutes on, the entry and start checks pass and the one before publication is refused again: a new wait from now.
+ at(10*MIN);const since=new Date(Date.parse(HB_START)+10*MIN).toISOString();
+ assert.deepEqual(await runRelease(c,beating([3])),heartbeatWaiting(j.id,since));
+ at(16*MIN);const a=beating([1,2,3]);assert.deepEqual(await runRelease(c,a),heartbeatWaiting(j.id,since),"six minutes into the new wait");assert.deepEqual(a.calls,[]);
+ // A wait of another claim of the job is not this claim's: it starts again.
+ const other=JSON.parse(readFileSync(heartbeatFile(c),"utf8"));writeFileSync(heartbeatFile(c),JSON.stringify({...other,runId:"run_other",since:HB_START}));
+ at(30*MIN);assert.deepEqual(await runRelease(c,beating([1])),heartbeatWaiting(j.id,new Date(Date.parse(HB_START)+30*MIN).toISOString()));
+});
+test("h4 after publication or an effect a stale heartbeat is still a failure, named for its cause, and starts no wait",async t=>{
+ heartbeatClock(t);
+ for(const [call,effects] of [[4,0],[5,1]]){
+  const f=fixture(),a=beating([call]),c=config(f,claimed(f,change(f,"client/a.js","a")));
+  await assert.rejects(runRelease(c,a));
+  assert.ok(!a.calls.includes("refuse"),`check ${call}`);const journal=journalAt(c);
+  assert.equal(journal.published,true);assert.equal(journal.effects.length,effects);assert.equal(journal.phase,"blocked");
+  assert.equal(journal.failure.reason,"release fence lost: deployment heartbeat stale");assert.equal(journal.refusalReason,undefined);assert.ok(!existsSync(heartbeatFile(c)),`check ${call}`);
+ }
+});
+test("h5 only the hub's heartbeat stale text is a heartbeat wait; another refusal is a lost fence and ends an open wait",async t=>{
+ const at=heartbeatClock(t);
+ for(const [conflict,answer] of [["conflict: release: deployment heartbeat stale","heartbeat-stale"],["conflict: release: generation changed","generation-changed"],["conflict: release: available exact deployment run required",false],["conflict: release: deployment heartbeat stale for run_other",false],["conflict: release: job rel_fixture is claimed by another run",false]]){
+  const n=nativeFixture(hubJob(3),{conflict});assert.equal(await new HostAdapter(n.config,hubJob(2)).fence(),answer,conflict);
+ }
+ // A wait is open; the next poll's start check is refused for another reason: a plain lost fence, refused, and the wait ends.
+ const f=fixture(),j=claimed(f,change(f,"client/a.js","a")),c=config(f,j);
+ assert.deepEqual(await runRelease(c,beating([3])),heartbeatWaiting(j.id));
+ at(MIN);const a=fake();let n=0;a.fence=async()=>++n===1;
+ await assert.rejects(runRelease(c,a),/Release refused before publication/);
+ assert.deepEqual(a.calls,["refuse","escalate"]);assert.equal(journalAt(c).refusalReason,"release fence lost");assert.ok(!existsSync(heartbeatFile(c)));
+ // A generation still changed after the one re-read is a lost fence as before, wait or not.
+ const g=fixture(),d=config(g,claimed(g,change(g,"client/a.js","a"))),b=advancing([1,2,3]);
+ await assert.rejects(runRelease(d,b),/release fence lost$/);assert.equal(b.rereads,1);assert.ok(!existsSync(heartbeatFile(d)));
+});
+test("h1 through the deployer: the hub's 409 heartbeat stale waits, one notice per job and wait names it, and the release goes on once the heartbeat is fresh",async t=>{
+ const at=heartbeatClock(t),b=batchJobs([["client/a.js","a"]]),h=daemonHub(b);
+ // The hub CLI answers every check with the hub's 409 while the flag file exists.
+ const flag=join(h.home,"stale"),log=join(h.home,"outer.jsonl"),tt=join(h.home,"tt-heartbeat");
+ writeFileSync(tt,"#!"+process.execPath+`
+const fs=require('fs'),a=process.argv.slice(2);fs.appendFileSync(${JSON.stringify(log)},JSON.stringify(a)+'\\n');
+if(a[0]==='deployment'&&a[1]==='check'&&fs.existsSync(${JSON.stringify(flag)})){process.stderr.write('tt: hub: 409 conflict: release: deployment heartbeat stale\\n');process.exit(1);}
+const r=require('child_process').spawnSync(${JSON.stringify(h.config.tt)},a,{stdio:'inherit'});process.exit(r.status??1);`);chmodSync(tt,0o755);
+ const cfg={...h.config,tt};writeFileSync(h.configPath,JSON.stringify(cfg));writeFileSync(flag,"");
+ const calls=()=>readFileSync(log,"utf8").trim().split("\n").map(l=>JSON.parse(l)),sends=()=>calls().filter(a=>a[0]==="send" && a.includes("A release job waits for the deployer heartbeat"));
+ const write=process.stderr.write;let err="";process.stderr.write=chunk=>{err+=chunk;return true;};
+ const poll=()=>serveDeployment(cfg,{once:true,configPath:h.configPath,release:h.release});
+ try{await poll();at(MIN);await poll();}finally{process.stderr.write=write;}
+ assert.equal(h.read().jobs[0].state,"claimed");assert.ok(!calls().some(a=>["refuse","merged"].includes(a[1])));
+ assert.equal(calls().filter(a=>a[1]==="check").length,2,"one refused check per poll");
+ const notice=heartbeatWaitNotice("rel_b1",{since:HB_START,boundMs:15*MIN});
+ assert.equal(sends().length,2,"each poll is a new process here, and sends the same request");
+ for(const s of sends()){assert.equal(s[s.indexOf("--request-id")+1],notice.requestId);assert.equal(s[s.indexOf("--text")+1],notice.text);assert.ok(s.includes("release-job=rel_b1"));assert.ok(s.includes("wake=routine"));}
+ assert.match(notice.text,/refuses its fence check with "deployment heartbeat stale"/);assert.match(notice.text,/refused with "release fence lost: deployment heartbeat stale for 15 min"/);
+ assert.equal(err.split("Release waits: the hub refused the fence check for a stale deployer heartbeat").length-1,2);assert.ok(!err.includes("Release held"));
+ // Another wait of the job is another notice.
+ assert.notEqual(heartbeatWaitNotice("rel_b1",{since:"2026-11-09T16:00:00.000Z",boundMs:15*MIN}).requestId,notice.requestId);
+ // The heartbeat is fresh again: the next poll releases from its journal and sends no further wait notice.
+ rmSync(flag);at(2*MIN);await poll();
+ assert.equal(h.read().jobs[0].state,"released");assert.equal(sends().length,2);assert.ok(!existsSync(join(h.home,"rel_b1.json.heartbeat-wait")));
 });
 test("the streamed file hash equals a whole-file hash at every chunk boundary",t=>{
  const home=mkdtempSync(join(tmpdir(),"release-file-hash-"));t.after(()=>rmSync(home,{recursive:true,force:true}));

@@ -1358,6 +1358,41 @@ is too short by itself to make a deployer silent.
 other fenced calls, when the deployer's heartbeat is more than 90 seconds old
 ("deployment heartbeat stale"). Both rules read the hub's own clock.
 
+**A stale heartbeat waits (wi_ad646ec936acb9bc).** A slow hub can make the
+heartbeat stale while the deployer is alive. The runner tells that refusal of
+its fence check apart by the hub's 409 text, as it does `generation changed`.
+While nothing is published, `merged` is not sent and no effect is journaled,
+it is a heartbeat wait, not a lost fence: the job keeps its claim and journal
+(a new job still gets none; a check refused just before publication leaves
+`waiting_inputs`), the host lock is released as after any wait, the release
+returns `waiting_heartbeat`, and the next poll checks again. The poll's
+progress report names the wait `transport`, since the hub knows no heartbeat
+wait. The terminal prints "Release waits: the hub refused the fence check for
+a stale deployer heartbeat; nothing is published and the next poll checks
+again." and the Board gets one routine notice per job and wait, "A release job
+waits for the deployer heartbeat", which names the hub's reason (request id
+`rel_ID-heartbeat-wait-HASH` of the wait's start, so a restart's resend is
+answered with the original).
+
+- **Bound.** The wait's start and its bound, 15 minutes, are kept beside the
+  job journal in `rel_ID.json.heartbeat-wait` (mode 0600) for that exact claim
+  (job, agent and run), so a restarted runner keeps the same start and bound.
+  A check still refused so 15 minutes after the first such refusal refuses the
+  job unpublished with `release fence lost: deployment heartbeat stale for 15
+  min`. At the poll's first check the bound only lets the run go on to its next
+  check, under the host lock; that check refuses the job if it is still
+  refused so.
+- **End.** Any check the hub answers otherwise ends the wait and removes the
+  file. A check that passes lets the release go on from its journal; a later
+  stale heartbeat starts a new wait with its own bound and notice.
+- **Unchanged.** Any other refusal is a lost fence as before (a claim of
+  another run, a claim that is gone, a generation still changed after the one
+  re-read, any other text). Once the release is published or an effect is
+  journaled, a stale heartbeat is a failure as before, named `release fence
+  lost: deployment heartbeat stale`, and starts no wait. The silent, restart,
+  hung and stale-code checks above are untouched: a dead runner makes no fenced
+  call at all.
+
 #### A hung runner
 
 A release runner can stop while its `tt wrap` wrapper goes on sending the
@@ -1735,7 +1770,8 @@ re-read, then one more refuse at the new generation.
 
 **A lost fence.** Anything else is a lost fence, as before: a claim that now
 names another agent or run, a job that is no longer claimed, a changed pin, a
-failed re-read, any other check error, a second `generation changed` after the
+failed re-read, any other check error except a stale heartbeat before
+publication (A stale heartbeat waits, above), a second `generation changed` after the
 one re-read, and any generation change once the release is published or an
 effect is journaled. The runner never re-reads twice for one call, and it never
 continues or refuses for another agent or run. The one re-read after
@@ -1757,6 +1793,9 @@ What an operator sees:
 | Adopted, release continues                       | nothing                                                   | `generationAdoptions` counts the adoptions; the phases go on as usual                                         | nothing; the rejected call is kept in `cli-failures.json` and is named only if the release is later held |
 | Lost fence at the poll's first check             | `Release held; inspect handler fence and private journal` | unchanged                                                                                                     | "A deployer CLI call failed"                                                                             |
 | Lost fence later, nothing published              | the same line                                             | `refusalReason: release fence lost`; `refused`, or `refusing` with `refuseFailure` when the refuse failed too | "Release refused before publication" once refused, and "A deployer CLI call failed"                      |
+| Stale heartbeat, nothing published               | "Release waits: the hub refused the fence check for a stale deployer heartbeat; ..." | unchanged (a check just before publication leaves `waiting_inputs`); the wait's start and bound in `rel_ID.json.heartbeat-wait` | "A release job waits for the deployer heartbeat", once per job and wait |
+| Stale heartbeat for 15 min, nothing published    | `Release held; inspect handler fence and private journal` | `refusalReason: release fence lost: deployment heartbeat stale for 15 min`; `refused`, or `refusing` with `refuseFailure` | "Release refused before publication" with that reason |
+| Stale heartbeat after publication or an effect   | the same line                                             | `failure.reason: release fence lost: deployment heartbeat stale`; the existing revert, rollback and `blocked` records | the existing rollback notices |
 | Refuse retried in the same run                   | the same line, for the refusal itself                     | `refused` and `generationAdoptions`                                                                           | "Release refused before publication" with the original reason                                            |
 | Refusal resumed by a later poll                  | the same line at each poll until it completes             | `refused`; `refuseRecovered` holds the earlier `refuseFailure`                                                | "Release refused before publication" with the original reason                                            |
 | Generation change after publication or an effect | the same line                                             | the existing revert, rollback and `blocked` records                                                           | the existing rollback notices                                                                            |
