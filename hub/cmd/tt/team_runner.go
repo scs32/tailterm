@@ -1786,19 +1786,58 @@ func uncertainMemberTrace(ctx context.Context, m teamLaunchMember) (string, erro
 // reconcileRestore settles a member spawn that registered and then timed out
 // reading its work-item context, before any session (wi_0cf7c5232a7d6636).
 // The exact agent and run, read back closed, is taken back with a fresh
-// identity and the launch backs off. A registration that is open, differs or
-// cannot be read back without a relay record keeps the never-respawn rule; a
-// read that times out is remembered and tried again after the backoff.
+// identity and the launch backs off. One read back starting, with no tmux
+// session or relay state for it on this host, is closed by exact run first
+// and then taken back the same way (wi_b74c9e82ee747a82). A registration
+// that is open otherwise, differs or cannot be read back without a relay
+// record keeps the never-respawn rule; a read or close that times out is
+// remembered and tried again after the backoff.
 func (r teamRunner) reconcileRestore(ctx context.Context, c *api.Client, q api.TeamQueueEntry, i int, m teamLaunchMember, cause error) error {
 	key := launchRetryKey(c.Base, q.TaskID, q.ID)
 	f := m.Fields
+	remember := func(step string, err error) error {
+		r.retries.noteRestore(key, &restoreFault{member: i, agent: f.AgentID, run: m.RunID, cause: cause.Error()})
+		return fmt.Errorf("%v; %s %s: %w", cause, step, f.AgentID, err)
+	}
+	exact := func(a api.Agent) bool {
+		return a.ID == f.AgentID && a.TaskID == q.TaskID && a.RunID == m.RunID && a.Name == f.Name && a.WorkItem != nil && a.WorkItem.ItemID == q.ItemID && a.WorkItem.ItemRevision == q.ItemRevision && a.WorkItem.WorkOrderMessage.Seq == q.OrderMessageSeq
+	}
 	a, err := c.GetAgent(ctx, q.TaskID, f.AgentID)
 	if hubTransportFault(err) && r.retries != nil {
-		r.retries.noteRestore(key, &restoreFault{member: i, agent: f.AgentID, run: m.RunID, cause: cause.Error()})
-		return fmt.Errorf("%v; read back registration %s: %w", cause, f.AgentID, err)
+		return remember("read back registration", err)
 	}
-	if err == nil && (a.ID != f.AgentID || a.TaskID != q.TaskID || a.RunID != m.RunID || a.Name != f.Name || a.WorkItem == nil || a.WorkItem.ItemID != q.ItemID || a.WorkItem.ItemRevision != q.ItemRevision || a.WorkItem.WorkOrderMessage.Seq != q.OrderMessageSeq) {
+	if err == nil && !exact(a) {
 		err = errors.New("exact agent registration differs from frozen member")
+	} else if err == nil && a.Status == api.AgentStarting {
+		// The spawn returned before any session, but its own close did not
+		// land. With no local trace of the member, the runner closes the
+		// exact run itself; any trace, or one it cannot check, keeps the
+		// never-respawn rule.
+		trace, traceErr := uncertainMemberTrace(ctx, m)
+		switch {
+		case traceErr != nil:
+			err = fmt.Errorf("registration is starting; local trace check: %v", traceErr)
+		case trace != "":
+			err = fmt.Errorf("registration is starting; local trace found: %s", trace)
+		default:
+			_, closeErr := c.CloseAgent(ctx, q.TaskID, f.AgentID, m.RunID)
+			if hubTransportFault(closeErr) && r.retries != nil {
+				return remember("close starting registration", closeErr)
+			}
+			if closeErr != nil {
+				err = fmt.Errorf("close of starting registration refused: %w", closeErr)
+				break
+			}
+			a, err = c.GetAgent(ctx, q.TaskID, f.AgentID)
+			if hubTransportFault(err) && r.retries != nil {
+				return remember("read back closed registration", err)
+			}
+			if err == nil && !exact(a) {
+				err = errors.New("exact agent registration differs from frozen member after its close")
+			} else if err == nil && a.Status != api.AgentClosed {
+				err = fmt.Errorf("registration is %s after its close, not closed", a.Status)
+			}
+		}
 	} else if err == nil && a.Status != api.AgentClosed {
 		err = fmt.Errorf("registration is %s, not closed", a.Status)
 	}

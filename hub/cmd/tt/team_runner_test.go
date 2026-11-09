@@ -4977,6 +4977,10 @@ type restoreFixture struct {
 	stall      *unansweredOnce
 	// register is the fake registration without the context read.
 	register func(env, []string) error
+	// sessions and sessionsErr are the fake tmux session list the local
+	// trace check reads; the host's tmux server is never listed.
+	sessions    []ownedSession
+	sessionsErr error
 }
 
 func newRestoreFixture(t *testing.T) *restoreFixture {
@@ -5024,7 +5028,16 @@ func newRestoreFixture(t *testing.T) *restoreFixture {
 	}
 	x.runner.retries = &launchRetryBook{}
 	x.runner.now = func() time.Time { return x.now }
+	previous := queueMemberSessions
+	queueMemberSessions = func(context.Context) ([]ownedSession, error) { return x.sessions, x.sessionsErr }
+	t.Cleanup(func() { queueMemberSessions = previous })
 	return x
+}
+
+// closes counts the exact-run closes the runner sent through the fault hub;
+// the fixture's own spawn close goes to the inner hub and is not counted.
+func (x *restoreFixture) closes() int {
+	return x.hub.hits("DELETE", "/v1/tasks/"+x.f.task.ID+"/agents/")
 }
 
 func (x *restoreFixture) tick(t *testing.T, after time.Duration) error {
@@ -5108,23 +5121,228 @@ func TestTeamRunnerSpawnRestoreTimeoutRelaunchesClosedMember(t *testing.T) {
 	x.running(t, old)
 }
 
-// q2, q3: a registration still open after the fault is uncertain: the entry
-// fails at once and the member is never respawned.
+// q2, q3, wi_b74c9e82ee747a82 s3: a registration still open after the fault
+// with any status but starting, or starting with a local trace of the member
+// or with a trace check that cannot read the session list or relay
+// directory, is uncertain: the entry fails at once, the runner sends no close
+// and no take-back, and the member is never respawned.
 func TestTeamRunnerSpawnRestoreTimeoutNeverRespawnsOpenRegistration(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(x *restoreFixture, agent string)
+		want  string
+	}{
+		{name: "running", want: "registration is running, not closed", setup: func(x *restoreFixture, agent string) {
+			status := api.AgentRunning
+			if _, err := x.f.c.UpdateAgent(context.Background(), x.f.task.ID, agent, api.UpdateAgentRequest{Status: &status}); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "tagged session", want: "local trace found: session", setup: func(x *restoreFixture, agent string) {
+			x.sessions = []ownedSession{{Name: "correction-lead-0", Agent: agent}}
+		}},
+		{name: "relay state", want: "local trace found: relay state", setup: func(x *restoreFixture, agent string) {
+			if err := os.WriteFile(filepath.Join(relayDir(), "hub-"+agent+".binding.json"), []byte("{}"), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "session list error", want: "local trace check: list sessions", setup: func(x *restoreFixture, _ string) {
+			x.sessionsErr = errors.New("tmux server unreadable")
+		}},
+		{name: "relay directory unreadable", want: "local trace check: read relay state", setup: func(x *restoreFixture, _ string) {
+			path := filepath.Join(t.TempDir(), "relay-file")
+			if err := os.WriteFile(path, nil, 0600); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("TAILTERM_RELAY_STATE", path)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			x := newRestoreFixture(t)
+			x.keepOpen = true
+			x.afterFault = func(agent string) { tc.setup(x, agent) }
+			if err := x.tick(t, 0); err == nil || !strings.Contains(err.Error(), "never respawn") || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("open registration: %v", err)
+			}
+			got, journal := x.entry(t)
+			if got.State != "failed" || !strings.Contains(got.Failure, "never respawn") || got.EscalationSeq == 0 || x.hub.count("unattempt") != 0 || x.closes() != 0 || journal.Members[0].State != "uncertain" {
+				t.Fatalf("entry %s failure %q unattempts %d closes %d members %+v", got.State, got.Failure, x.hub.count("unattempt"), x.closes(), journal.Members)
+			}
+			for i := 0; i < 3; i++ {
+				_ = x.tick(t, launchRetryMaxDelay)
+			}
+			if x.attempts != 1 || x.closes() != 0 || x.hub.count("unattempt") != 0 {
+				t.Fatalf("respawned an uncertain member: %d attempts, %d closes", x.attempts, x.closes())
+			}
+		})
+	}
+}
+
+// wi_b74c9e82ee747a82 s1: a registration the spawn's own close left
+// starting, with no session and no relay state for it on this host, is
+// closed by its exact run, read back closed, taken back once and relaunched
+// under a fresh identity after the backoff. The entry is never failed.
+func TestTeamRunnerSpawnRestoreTimeoutClosesStartingRegistrationWithoutTrace(t *testing.T) {
 	x := newRestoreFixture(t)
 	x.keepOpen = true
-	if err := x.tick(t, 0); err == nil || !strings.Contains(err.Error(), "never respawn") || !strings.Contains(err.Error(), "not closed") {
-		t.Fatalf("open registration: %v", err)
+	var old string
+	x.afterFault = func(agent string) {
+		old = agent
+		if a, err := x.f.c.GetAgent(context.Background(), x.f.task.ID, agent); err != nil || a.Status != api.AgentStarting {
+			t.Fatalf("registration left by the spawn %+v %v", a, err)
+		}
 	}
-	got, journal := x.entry(t)
-	if got.State != "failed" || !strings.Contains(got.Failure, "never respawn") || got.EscalationSeq == 0 || x.hub.count("unattempt") != 0 || journal.Members[0].State != "uncertain" {
-		t.Fatalf("entry %s failure %q unattempts %d members %+v", got.State, got.Failure, x.hub.count("unattempt"), journal.Members)
+	if err := x.tick(t, 0); err == nil || !strings.Contains(err.Error(), "closed before any session") {
+		t.Fatalf("starting registration: %v", err)
 	}
-	for i := 0; i < 3; i++ {
-		_ = x.tick(t, launchRetryMaxDelay)
+	member := x.held(t, "after the close", "unstarted")
+	if x.closes() != 1 || x.hub.count("unattempt") != 1 || member.Fields.AgentID == old {
+		t.Fatalf("closes=%d unattempts=%d member=%s old=%s", x.closes(), x.hub.count("unattempt"), member.Fields.AgentID, old)
 	}
-	if x.attempts != 1 {
-		t.Fatalf("respawned an uncertain member: %d attempts", x.attempts)
+	if a, err := x.f.c.GetAgent(context.Background(), x.f.task.ID, old); err != nil || a.Status != api.AgentClosed {
+		t.Fatalf("old registration %+v %v", a, err)
+	}
+	if err := x.tick(t, launchRetryFirstDelay-time.Second); err != nil || x.attempts != 1 {
+		t.Fatalf("tick inside the backoff: %v attempts=%d", err, x.attempts)
+	}
+	if err := x.tick(t, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	x.running(t, old)
+	if x.closes() != 1 || x.hub.count("unattempt") != 1 {
+		t.Fatalf("after the relaunch: closes=%d unattempts=%d", x.closes(), x.hub.count("unattempt"))
+	}
+}
+
+// wi_b74c9e82ee747a82 s2: a close of a starting registration, or its
+// read-back, that meets a hub fault is remembered and tried again after the
+// backoff; the entry never fails meanwhile. A close that landed with its
+// answer lost reads back closed and is not sent again. A relay that
+// restarted has no record and keeps the never-respawn rule.
+func TestTeamRunnerSpawnRestoreStartingCloseFaultRetries(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		restart  bool
+		landed   bool
+		readBack bool
+		closes   int
+	}{
+		{name: "close dropped", closes: 2},
+		{name: "close landed unanswered", landed: true, closes: 1},
+		{name: "read-back dropped", readBack: true, closes: 1},
+		{name: "close dropped then restart", restart: true, closes: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			x := newRestoreFixture(t)
+			x.keepOpen = true
+			var fault *unansweredOnce
+			var old string
+			x.afterFault = func(agent string) {
+				old = agent
+				path := "/v1/tasks/" + x.f.task.ID + "/agents/" + agent
+				switch {
+				case tc.readBack:
+					// The first read-back answers; the one after the close
+					// is dropped.
+					reads := 0
+					fault = x.hub.unanswered(func(r *http.Request) bool {
+						if r.Method != "GET" || r.URL.Path != path {
+							return false
+						}
+						reads++
+						return reads == 2
+					}, true)
+				case tc.landed:
+					// The close lands and its answer is dropped.
+					fault = x.hub.landedOnce(func(r *http.Request) bool { return r.Method == "DELETE" && r.URL.Path == path })
+					x.hub.srv.Config.SetKeepAlivesEnabled(false)
+					x.hub.mu.Lock()
+					fault.drop = true
+					x.hub.mu.Unlock()
+				default:
+					fault = x.hub.unanswered(func(r *http.Request) bool { return r.Method == "DELETE" && r.URL.Path == path }, true)
+				}
+			}
+			err := x.tick(t, 0)
+			step := "close starting registration"
+			if tc.readBack {
+				step = "read back closed registration"
+			}
+			if err == nil || !strings.Contains(err.Error(), step) || strings.Contains(err.Error(), "never respawn") {
+				t.Fatalf("hub fault: %v", err)
+			}
+			x.held(t, "after the hub fault", "uncertain")
+			key := launchRetryKey(x.hub.c.Base, x.f.task.ID, x.q.ID)
+			if !x.hub.fired(fault) || x.hub.count("unattempt") != 0 || x.runner.retries.pendingRestore(key) == nil {
+				t.Fatalf("hub fault was not remembered: fired=%v unattempts=%d", x.hub.fired(fault), x.hub.count("unattempt"))
+			}
+			if tc.restart {
+				x.runner.retries = &launchRetryBook{}
+				// As the production check: the spawn created no session.
+				x.runner.owned = func(context.Context, env, api.Agent) error { return errors.New("exact owned session missing") }
+				if err := x.tick(t, launchRetryFirstDelay); err == nil || !strings.Contains(err.Error(), "never respawn") {
+					t.Fatalf("restarted relay: %v", err)
+				}
+				got, _ := x.entry(t)
+				if got.State != "failed" || x.hub.count("unattempt") != 0 || x.closes() != tc.closes {
+					t.Fatalf("restarted relay entry %s unattempts %d closes %d", got.State, x.hub.count("unattempt"), x.closes())
+				}
+				_ = x.tick(t, launchRetryMaxDelay)
+				if x.attempts != 1 {
+					t.Fatalf("respawned after a restart: %d attempts", x.attempts)
+				}
+				return
+			}
+			if err := x.tick(t, launchRetryFirstDelay-time.Second); err != nil || x.hub.count("unattempt") != 0 {
+				t.Fatalf("tick inside the backoff: %v", err)
+			}
+			if err := x.tick(t, time.Second); err == nil || !strings.Contains(err.Error(), "closed before any session") {
+				t.Fatalf("reconcile after the backoff: %v", err)
+			}
+			x.held(t, "after the reconcile", "unstarted")
+			if x.hub.count("unattempt") != 1 || x.closes() != tc.closes || x.runner.retries.pendingRestore(key) != nil {
+				t.Fatalf("reconcile: unattempts=%d closes=%d", x.hub.count("unattempt"), x.closes())
+			}
+			if err := x.tick(t, launchRetryDelay(2)); err != nil {
+				t.Fatal(err)
+			}
+			x.running(t, old)
+		})
+	}
+}
+
+// wi_b74c9e82ee747a82 s2: a close of a starting registration the hub
+// refuses, or one still not closed when read back after its close, fails the
+// entry under the never-respawn rule with that cause and no take-back.
+func TestTeamRunnerSpawnRestoreStartingCloseRefusedFails(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		want   string
+	}{
+		{name: "refused", status: 409, want: "close of starting registration refused"},
+		{name: "still open", status: 200, want: "registration is starting after its close, not closed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			x := newRestoreFixture(t)
+			x.keepOpen = true
+			x.afterFault = func(agent string) {
+				x.hub.refuseOnce(func(r *http.Request) bool {
+					return r.Method == "DELETE" && r.URL.Path == "/v1/tasks/"+x.f.task.ID+"/agents/"+agent
+				}, tc.status, "close not applied")
+			}
+			if err := x.tick(t, 0); err == nil || !strings.Contains(err.Error(), "never respawn") || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("close outcome: %v", err)
+			}
+			got, journal := x.entry(t)
+			if got.State != "failed" || !strings.Contains(got.Failure, tc.want) || x.hub.count("unattempt") != 0 || x.closes() != 1 || journal.Members[0].State != "uncertain" {
+				t.Fatalf("entry %s failure %q unattempts %d closes %d", got.State, got.Failure, x.hub.count("unattempt"), x.closes())
+			}
+			_ = x.tick(t, launchRetryMaxDelay)
+			if x.attempts != 1 || x.closes() != 1 {
+				t.Fatalf("respawned: %d attempts, %d closes", x.attempts, x.closes())
+			}
+		})
 	}
 }
 

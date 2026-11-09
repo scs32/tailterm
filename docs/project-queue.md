@@ -1245,10 +1245,22 @@ longer fail the entry:
   and order that reads `closed` is taken back with `unattempt`: the hub gives
   the member a fresh agent and run ID (and moves the item's lead reservation
   when it is the first member), returns it to `unstarted`, and the launch
-  backs off as above before spawning it again. A registration that is open or
-  differs fails the entry under the never-respawn rule. If the read-back itself
-  meets a hub fault, the relay remembers the member in memory and reconciles it
-  after the backoff; after a relay restart that record is gone, so the member
+  backs off as above before spawning it again. An exact registration that
+  still reads `starting`, because the spawn's own close did not land, is
+  checked for a local trace the same way as a member read back as not found
+  (below): a tmux session on this host tagged with its agent or run, or relay
+  state naming either. With neither, the runner closes that exact agent and
+  run itself, reads it back, and once it reads `closed` takes it back with
+  `unattempt` as above (wi_b74c9e82ee747a82). A close the hub refuses, or a
+  read-back still not `closed` after the close, fails the entry under the
+  never-respawn rule with that cause. This applies only to `starting` with no
+  local trace: any other open status (`running`, `idle`, `needs_input` and
+  the rest), a registration that differs, a local trace, or a trace check that
+  cannot read the session list or relay directory fails the entry under the
+  never-respawn rule, with no close and no take-back. If the read-back, the
+  close or the read-back after it meets a hub fault, the relay remembers the
+  member in memory and reconciles it after the backoff; after a relay restart
+  that record is gone, so the member
   stays `uncertain` and is never respawned. A spawn whose hub call got no
   answer, such as a registration refused in transport while the hub restarts
   or a lost registration response, leaves the member `uncertain` and backs off
