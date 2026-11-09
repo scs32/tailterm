@@ -403,8 +403,52 @@ export function matrixRunUnsettled(journalDirectory, job) {
 }
 // Matrix runs this process started, by attempt directory. The daemon builds a
 // new adapter every poll, so the live child (the proof that a pid is ours)
-// is kept for the life of the process, until its attempt ends.
-const MATRIX_CHILDREN = new Map();
+// is kept for the life of the process, until its attempt ends. Only live
+// children are in MATRIX_CHILDREN, the count idleness reads
+// (wi_a66c0780fc4b40f0 m2): on its exit event a child moves to
+// MATRIX_EXITED, where resolveMatrixRun still finds it as the same proof,
+// until its attempt ends.
+const MATRIX_CHILDREN = new Map(), MATRIX_EXITED = new Map();
+const childExited = child => typeof child?.exitCode === "number" || typeof child?.signalCode === "string";
+// The gate turn's sweep: a child that has exited moves to MATRIX_EXITED, and
+// an entry whose attempt record says ended goes. A live child stays, and
+// nothing is signalled.
+export function pruneMatrixChildren(children = MATRIX_CHILDREN, exited = MATRIX_EXITED) {
+  for (const [dir, child] of [...children]) {
+    if (childExited(child)) { children.delete(dir); exited.set(dir, child); }
+    else if (readRun(dir)?.state === "ended") children.delete(dir);
+  }
+  for (const dir of [...exited.keys()]) if (readRun(dir)?.state === "ended") exited.delete(dir);
+}
+// The matrix runs a draining runner waits for, as fixed-shape fields only:
+// the job id and attempt from the attempt directory (its commit cut to 12
+// hex) and the pid.
+const DRAIN_JOB = /^rel_[A-Za-z0-9_-]{1,64}$/, drainJob = id => DRAIN_JOB.test(id || "") ? id : "unknown";
+const drainAttempt = name => ATTEMPT.test(name || "") ? name.slice(0, 12) + name.slice(40) : "unknown";
+const drainPid = pid => Number.isSafeInteger(pid) && pid > 0 ? pid : null;
+export function matrixCause(children = MATRIX_CHILDREN) {
+  return [...children].map(([dir, child]) => ({jobId: drainJob(basename(dirname(dir)).replace(/-integrated-verification$/, "")), attempt: drainAttempt(basename(dir)), pid: drainPid(child?.pid)}));
+}
+// A refused job's integrated attempts whose run record is not ended (m3):
+// a job refused while its matrix child ran leaves the record started. Each is
+// settled by resolveMatrixRun's own rules, never stopped early; those still
+// not ended are returned, and keep a stale runner draining. An attempt
+// directory that cannot be listed or read counts as not ended.
+export function settleRefusedAttempts(adapter, journalDirectory, jobs) {
+  const left = [];
+  for (const job of jobs) {
+    if (job?.state !== "refused" || !DRAIN_JOB.test(job.id || "")) continue;
+    const base = join(journalDirectory, job.id + "-integrated-verification");let names;
+    try { names = readdirSync(base).sort(); } catch (error) { if (error.code !== "ENOENT") left.push({jobId: job.id, attempt: "unknown", pid: null}); continue; }
+    for (const name of names) {
+      const dir = join(base, name), run = readRun(dir);
+      if (run === null || run.state === "ended") continue;
+      let settled = false;try { settled = adapter.resolveMatrixRun(dir, run) === "ended"; } catch {}
+      if (!settled) left.push({jobId: job.id, attempt: drainAttempt(name), pid: drainPid(run.pid)});
+    }
+  }
+  return left;
+}
 // One wait notice per position, list length and holder. Only fixed-shape
 // names from the lock file reach the text.
 // change counts the places the run has had (kept in its attempt record), so a
@@ -1706,7 +1750,7 @@ export class HostAdapter {
     // The TailOS poller's fetch and clock; tests replace them.
     this.probeDeps={fetchJSON:hostDeps.fetchJSON,sleep:hostDeps.sleep,now:hostDeps.now};this.probeWaits=new Map();
     // What the last poll saw: a wait on the host list, or a held run.
-    this.matrixChildren=MATRIX_CHILDREN;this.matrixWait=null;this.matrixHeld=null;
+    this.matrixChildren=MATRIX_CHILDREN;this.matrixExited=MATRIX_EXITED;this.matrixWait=null;this.matrixHeld=null;
     // Failed calls of the configured CLI this adapter recorded privately.
     this.cliFailures=[];
     // A failed Mini host rollback call's redacted output, by target.
@@ -1921,7 +1965,10 @@ export class HostAdapter {
       const child=spawn(argv[0],argv.slice(1),{cwd:this.config.cwd,detached:true,stdio:["ignore",out,err],env:{...process.env,TAILTERM_MATRIX_RELEASE:"1"}});
       child.on("error",()=>{});
       if(!Number.isSafeInteger(child.pid))throw releaseError("Matrix run not started");
-      child.unref();this.matrixChildren.set(dir,child);return child.pid;
+      // On exit the child leaves the live set but stays this run's proof.
+      const children=this.matrixChildren,exited=this.matrixExited;
+      child.once("exit",()=>{if(children.get(dir)===child){children.delete(dir);exited?.set(dir,child);}});
+      child.unref();children.set(dir,child);return child.pid;
     }finally{closeSync(out);closeSync(err);}
   }
   saveRun(dir,run){save(join(dir,"run.json"),run);}
@@ -1968,11 +2015,11 @@ export class HostAdapter {
   // names another process, so the run is gone. Held means the run could not
   // be confirmed stopped; the job then keeps the fence until it can.
   resolveMatrixRun(dir,run,stop=false){
-    const now=this.now(),child=this.matrixChildren.get(dir),found=this.matrixEntry(dir,run),sidecar=this.matrixSidecar(dir);
+    const now=this.now(),child=this.matrixChildren.get(dir)??this.matrixExited?.get(dir),found=this.matrixEntry(dir,run),sidecar=this.matrixSidecar(dir);
     const persist=()=>{try{this.saveRun(dir,run);return true;}catch{return false;}};
     const alive=()=>[...new Set([...(run.snapshot?.groups||[]),...(run.groups||[])])].filter(g=>!this.groupGone(g));
     const held=(reason,pid=run.pid)=>{persist();this.matrixHeld={attempt:basename(dir),pid:pid??null,groups:run.state==="started"?alive():[],reason};return "held";};
-    const end=(reason,refusal)=>{Object.assign(run,{state:"ended",reason,endedAt:now,...(refusal?{refusal}:{})});if(!persist())return "waiting";this.matrixChildren.delete(dir);return "ended";};
+    const end=(reason,refusal)=>{Object.assign(run,{state:"ended",reason,endedAt:now,...(refusal?{refusal}:{})});if(!persist())return "waiting";this.matrixChildren.delete(dir);this.matrixExited?.delete(dir);return "ended";};
     // A run that was not stopped and left a receipt ended normally, whatever
     // the record knew of it; the receipt's eligibility is checked at import.
     const ending=()=>run.stopRequestedAt?end("stopped","Integrated matrix run exceeded its bound"):existsSync(join(dir,"receipt.json"))?end("receipt"):sidecar?.outcome==="wait-expired"?end("wait-expired","Verification host wait expired"):end("no-receipt","Integrated matrix run ended without a receipt");
@@ -2495,19 +2542,59 @@ export function heldRestartJob({jobs,details,agent,run,journalDirectory,lock,mat
 // Archived journals and input manifests are not journals here. False on any
 // doubt, an unreadable journal included.
 const FINAL_PHASES=["complete","refused"];
-export function journalIdle({journalDirectory,cwd,agent,run,lastLock,matrixChildren}){
+export function journalIdle(args){return journalCause(args)===null;}
+// Why journalIdle is false (wi_a66c0780fc4b40f0 m4), or null when it is
+// true: matrix, this process's live matrix children (matrix, as matrixCause
+// gives them); journal, the ids of this run's journals that are not final,
+// or "unreadable" on any doubt; lockJob, the job a host release lock names
+// ("unknown" when it cannot be read).
+export function journalCause({journalDirectory,cwd,agent,run,lastLock,matrixChildren,matrix}){
+  const cause={};
+  if(matrixChildren!==0)cause.matrix=Array.isArray(matrix)?matrix:[];
   try{
-    if(matrixChildren!==0 || !agent || !run)return false;
-    const locks=new Set(lastLock?[lastLock]:[]);
-    for(const name of readdirSync(journalDirectory)){
+    if(!agent || !run)throw releaseError("no agent or run");
+    const locks=new Set(lastLock?[lastLock]:[]),open=[];
+    for(const name of readdirSync(journalDirectory).sort()){
       if(!/^rel_[A-Za-z0-9_-]{1,64}\.json$/.test(name) || name.endsWith("-inputs.json"))continue;
       const journal=JSON.parse(readFileSync(join(journalDirectory,name),"utf8"));
-      if(!journal || typeof journal!=="object")return false;
+      if(!journal || typeof journal!=="object")throw releaseError("journal unreadable");
       locks.add(hostLockPath(cwd,{taskId:journal.taskId}));
-      if(journal.agentId===agent && journal.runId===run && !FINAL_PHASES.includes(journal.phase))return false;
+      if(journal.agentId===agent && journal.runId===run && !FINAL_PHASES.includes(journal.phase))open.push(name.slice(0,-5));
     }
-    return ![...locks].some(lock=>existsSync(lock));
-  }catch{return false;}
+    if(open.length)cause.journal=open;
+    const lock=[...locks].find(l=>existsSync(l));if(lock)cause.lockJob=lockJob(lock);
+  }catch{cause.journal="unreadable";}
+  return Object.keys(cause).length?cause:null;
+}
+// The job id a host release lock file names, or "unknown".
+function lockJob(lock){try{return drainJob(JSON.parse(readFileSync(lock,"utf8"))?.jobId);}catch{return "unknown";}}
+// A settled job's journal left blocked (wi_a66c0780fc4b40f0 m5): a job that
+// rolled back after publication goes back to phase blocked once its receipt
+// is saved, and stays so, which keeps journalIdle false for good. At a poll
+// with a readable ledger, a journal of this agent and run in phase blocked
+// is moved to complete when its ledger job is rolled_back or released with a
+// full receipt (fullReleaseReceipt) whose commit and verification digest
+// match the journal's receipt, and whose job, agent, run, task and pause
+// generation match the journal, as reconcileReceipts checks a pending one.
+// Anything else leaves the journal as it is. Nothing is deleted. A write
+// that fails leaves the journal for the next poll.
+const SETTLED_JOURNAL_STATES=["rolled_back","released"];
+const finalizable=(journal,summary,agent,run)=>journal?.phase==="blocked" && !!agent && !!run && journal.jobId===summary?.id && journal.agentId===agent && journal.runId===run && SETTLED_JOURNAL_STATES.includes(summary?.state);
+export function finalizeSettledJournals(config,jobs,details,agent,run){
+  const done=[];
+  for(const summary of jobs){
+    if(!SETTLED_JOURNAL_STATES.includes(summary?.state) || !DRAIN_JOB.test(summary.id||""))continue;
+    const path=join(config.journalDirectory,summary.id+".json");
+    try{
+      if(!existsSync(path))continue;
+      const journal=JSON.parse(readFileSync(path,"utf8")),job=details.get(summary.id);
+      if(!finalizable(journal,summary,agent,run) || !job || job.id!==summary.id || !SETTLED_JOURNAL_STATES.includes(job.state) || !fullReleaseReceipt(job.receipt,job))continue;
+      if(journal.commit!==job.commit || job.agentId!==agent || job.runId!==run || (journal.taskId!==undefined && journal.taskId!==job.taskId) || (journal.pauseGeneration!==undefined && journal.pauseGeneration!==job.pauseGeneration))continue;
+      if(job.receipt.commit!==(job.integratedCommit||job.commit) || job.receipt.verificationDigest!==job.verificationDigest || journal.receipt?.commit!==job.receipt.commit || journal.receipt.verificationDigest!==job.receipt.verificationDigest)continue;
+      journal.phase="complete";save(path,journal);done.push(summary.id);
+    }catch{}
+  }
+  return done;
 }
 // Journal phases a clean stop may unclaim: the claim waits for the handler's
 // own step (the inputs binding or the integrated matrix import) or for the
@@ -2613,6 +2700,50 @@ export function restartGeneration(config,code,published){
   if(code.restartFor?.digest!==published.digest)code.restartFor={digest:published.digest,generation:Math.max(generationOf(code.restartGeneration),recordedGeneration(readCodeRecord(config)))+1};
   return code.restartFor.generation;
 }
+// What holds a draining runner (wi_a66c0780fc4b40f0 m4), kept to fixed
+// shapes: activeJobs, the ids of claimed, merged and blocked jobs; matrix,
+// the live matrix runs of this process and a refused job's unsettled
+// attempts, each with job id, attempt (its commit cut to 12 hex) and pid;
+// lockJob, the job the host release lock names; journal, on the journal path,
+// this run's journals that are not final, or "unreadable". Null for none.
+const DRAIN_SHORT_ATTEMPT=/^([a-f0-9]{12}-r[0-9]{1,6}|unknown)$/,drainIds=v=>Array.isArray(v)&&v.length?v.slice(0,16).map(drainJob):null;
+export function drainCause(c){
+  if(!c || typeof c!=="object" || Array.isArray(c))return null;
+  const out={},active=drainIds(c.activeJobs);
+  if(active)out.activeJobs=active;
+  if(Array.isArray(c.matrix))out.matrix=c.matrix.slice(0,16).map(m=>({jobId:drainJob(m?.jobId),attempt:DRAIN_SHORT_ATTEMPT.test(m?.attempt||"")?m.attempt:"unknown",pid:drainPid(m?.pid)}));
+  if(c.lockJob!==undefined)out.lockJob=drainJob(c.lockJob);
+  if(c.journal!==undefined)out.journal=c.journal==="unreadable"?"unreadable":drainIds(c.journal)||"unreadable";
+  return Object.keys(out).length?out:null;
+}
+// The draining record's cause fields. cause is what holds now; noticeCause is
+// what the draining notice named when this drain was first seen, kept for
+// the drain so a resend after a new process of the run is the same notice;
+// quietSince is when no claimed, merged or blocked job was first seen in this
+// drain (the journal path knows of none); stuckCause, once quietSince is
+// DRAIN_ATTENTION_MS old, is what the one attention notice names. A change of
+// cause alone keeps checkedAt, the time draining was first seen.
+const DRAIN_ATTENTION_MS=30*60000,DRAIN_FIELDS=["cause","noticeCause","quietSince","stuckCause"];
+function drainFields(record,prior,cause,now){
+  const same=prior?.state==="draining" && prior.agentId===record.agentId && prior.runId===record.runId && prior.loaded?.digest===record.loaded?.digest && prior.current?.digest===record.current?.digest;
+  const kept=k=>same?drainCause(prior[k]):null,since=same && RFC3339.test(prior.quietSince||"")?prior.quietSince:null;
+  if(cause)record.cause=cause;
+  const named=kept("noticeCause")||cause;if(named)record.noticeCause=named;
+  if(!cause?.activeJobs)record.quietSince=since||new Date(now).toISOString();
+  const stuck=kept("stuckCause")||(record.quietSince && now-Date.parse(record.quietSince)>=DRAIN_ATTENTION_MS?cause:null);if(stuck)record.stuckCause=stuck;
+  const bare=r=>JSON.stringify(Object.fromEntries(Object.entries(r).filter(([k])=>!DRAIN_FIELDS.includes(k) && k!=="checkedAt")));
+  if(same && RFC3339.test(prior.checkedAt||"") && bare(prior)===bare(record))record.checkedAt=prior.checkedAt;
+}
+// The cause as notice text: fixed words, hub ids, 12-hex prefixes and pids.
+function drainText(c){
+  const cause=drainCause(c);if(!cause)return null;
+  const parts=[];
+  if(cause.activeJobs)parts.push(`active releases ${cause.activeJobs.join(", ")}`);
+  if(cause.matrix)parts.push(cause.matrix.length?`matrix runs ${cause.matrix.map(m=>`${m.jobId} attempt ${m.attempt} pid ${m.pid??"unknown"}`).join(", ")}`:"a matrix run of this process");
+  if(cause.lockJob)parts.push(`the host release lock of ${cause.lockJob}`);
+  if(cause.journal)parts.push(cause.journal==="unreadable"?"a journal that cannot be read":`journals not final ${cause.journal.join(", ")}`);
+  return parts.join("; ");
+}
 // JOURNAL/runner-code.json (0600): the code this process loaded and the
 // published code it was last compared with, and the latest restart
 // generation of this run when there is one. A load-failed refusal also says
@@ -2630,6 +2761,7 @@ export function codeRecord(config,code,decision,published){
   const generation=Math.max(generationOf(code.restartFor?.generation),generationOf(code.restartGeneration),recordedGeneration(prior));
   const record={version:1,agentId:process.env.TAILTERM_AGENT||null,runId:process.env.TAILTERM_RUN||null,pid:process.pid,startedAt:code.startedAt,checkedAt:iso(code.now()),state:decision.state,...(decision.reason?{reason:decision.reason}:{}),...(decision.state==="restart"&&decision.heldJob?{heldJob:decision.heldJob}:{}),
     ...(["load-failed","load-unproven"].includes(decision.reason)?{checkout:decision.checkout==="restored"?"restored":"not-restored",...(sha(decision.loadedCommit)?{loadedCommit:decision.loadedCommit}:{})}:{}),loaded,current,changed:loaded&&current?RUNNER_CODE_FILES.filter(n=>loaded.files[n]!==current.files[n]):[],...(loaded&&code.restartedFrom&&[loaded.digest,scriptsDigest(loaded.files)].includes(code.marker)?{restartedFrom:code.restartedFrom}:{}),...(generation?{restartGeneration:generation}:{})};
+  if(decision.state==="draining" && decision.cause)drainFields(record,prior,drainCause(decision.cause),code.now());
   if(prior && unchecked(prior)===unchecked(record))return prior;
   save(path,record);return record;
 }
@@ -2642,14 +2774,16 @@ export function codeRecord(config,code,decision,published){
 const RESTART_ACTION="Action: run tt deployment setup for the deployer with its current run as predecessor (docs/project-deployment.md).";
 const short=v=>HEX64.test(v||"")||sha(v)?v.slice(0,12):"none";
 export function codeNotice(record,kind=record?.state){
-  if(!["draining","restart","restarted","refused"].includes(kind))return null;
+  if(!["draining","stuck","restart","restarted","refused"].includes(kind))return null;
   const run=NAME(record.runId),loaded=short(record.loaded?.digest),current=short(record.current?.digest),reason=CODE_REASONS.includes(record.reason)?record.reason:"unclassified";
   const changed=(Array.isArray(record.changed)?record.changed:[]).filter(n=>RUNNER_CODE_FILES.includes(n)).join(", ")||"none";
   const seen=`Deployer run ${run} loaded scripts ${loaded}; ${record.current?`published tasks-hub ${short(record.current.commit)} has ${current}`:"the published tasks-hub scripts could not be read"}. Changed: ${changed}.`;
   const generation=generationOf(record.restartGeneration),restartId=["restart","restarted"].includes(kind) && generation>=2?`-r${generation}`:"";
   const unrestored=kind==="refused" && reason==="load-failed" && record.checkout!=="restored";
   const requestId=`runner-code-${run}-${loaded}-${current}-${kind}${kind==="refused"?"-"+reason:restartId}${unrestored?"-not-restored":""}`;
-  if(kind==="draining")return {requestId,wake:WAKE.routine,subject:"Deployer code is out of date; it restarts itself after the current release",text:`${seen} It claims no new release, and restarts itself onto the published scripts once no release, matrix run or host release lock is active.`};
+  if(kind==="draining"){const holds=drainText(record.noticeCause);return {requestId,wake:WAKE.routine,subject:"Deployer code is out of date; it restarts itself after the current release",text:`${seen} It claims no new release, and restarts itself onto the published scripts once no release, matrix run or host release lock is active.${holds?` Waiting for: ${holds}.`:""}`};}
+  // One per published digest: drained 30 min with no claimed, merged or blocked job.
+  if(kind==="stuck"){const holds=drainText(record.stuckCause);if(!holds || record.state!=="draining")return null;return {requestId,wake:WAKE.attention,subject:"Deployer has drained for 30 minutes with no active release",text:`${seen} For 30 minutes it has claimed no release and had no claimed, merged or blocked job, and it does not restart while it waits for: ${holds}. Action: check that each one named has ended (docs/project-deployment.md).`};}
   // A restart with a held job is its own notice and names the job.
   if(kind==="restart" && record.heldJob!==undefined){const job=NAME(record.heldJob);return {requestId:`${requestId}-held-${job}`,wake:WAKE.routine,subject:"Deployer is restarting itself onto the published scripts with a held job",text:`${seen} Its only owned release ${job} is held, with no release effects, nothing published, no unsettled matrix run and no host release lock, so it restarts itself now with that held job and the same agent and run; the published scripts then run the job. A notice that it runs the published scripts follows; if none arrives the deployer did not come back. ${RESTART_ACTION}`};}
   if(kind==="restart")return {requestId,wake:WAKE.routine,subject:"Deployer is restarting itself onto the published scripts",text:`${seen} No release is active, so it restarts itself now with the same agent and run. A notice that it runs the published scripts follows; if none arrives the deployer did not come back. ${RESTART_ACTION}`};
@@ -2695,7 +2829,9 @@ export function progressCode(record){
   if(!CODE_STATES.includes(record?.state) || (record.state==="refused" && !CODE_REASONS.includes(record.reason)) || !RFC3339.test(record.checkedAt||""))return null;
   const loaded=record.loaded?.digest,published=record.current?.digest,refused=record.state==="refused";
   return {state:record.state,...(refused?{reason:record.reason}:{}),...(refused && record.reason==="load-failed"?{checkout:record.checkout==="restored"?"restored":"not-restored"}:{}),
-    ...(HEX64.test(loaded||"")?{loaded:loaded.slice(0,12)}:{}),...(HEX64.test(published||"")?{published:published.slice(0,12)}:{}),since:record.checkedAt};
+    ...(HEX64.test(loaded||"")?{loaded:loaded.slice(0,12)}:{}),...(HEX64.test(published||"")?{published:published.slice(0,12)}:{}),since:record.checkedAt,
+    // The drain cause stays in this process: the hub report has no field for it yet.
+    ...(record.state==="draining" && drainCause(record.cause)?{cause:drainCause(record.cause)}:{})};
 }
 const CODE_LINES={draining:"Deployer code is out of date; no new release is claimed and a restart follows the active work.\n",restart:"Deployer restarting itself onto the published scripts.\n",refused:"Deployer code is out of date and it cannot restart itself; no release is claimed until it is re-provisioned.\n",
   restored:"Deployer code is out of date and the published runner does not load; its checkout is back on the loaded commit and no release is claimed until a published runner loads.\n",
@@ -3179,13 +3315,22 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
     // leaves no earlier poll's state on the reports after it.
     progressState.code=null;
     let published=null;try{published=code.published(config.cwd);}catch{}
-    let idle,held=null;
+    // Only live matrix children count (m2): one that exited, or whose
+    // attempt ended, is dropped first. The cause names what holds (m4).
+    pruneMatrixChildren();
+    let idle,held=null,cause;
     if(ledger){
-      const {jobs,details,lock}=ledger;
-      idle=!jobs.some(j=>["claimed","merged","blocked"].includes(j.state)) && MATRIX_CHILDREN.size===0 && !existsSync(lock);
-      held=idle?null:heldRestartJob({jobs,details,agent:process.env.TAILTERM_AGENT,run:process.env.TAILTERM_RUN,journalDirectory:config.journalDirectory,lock,matrixChildren:MATRIX_CHILDREN.size});
-    }else idle=journalIdle({journalDirectory:config.journalDirectory,cwd:config.cwd,agent:process.env.TAILTERM_AGENT,run:process.env.TAILTERM_RUN,lastLock,matrixChildren:MATRIX_CHILDREN.size});
+      const {jobs,details,lock,refusedRuns=[]}=ledger,active=jobs.filter(j=>["claimed","merged","blocked"].includes(j.state)).map(j=>drainJob(j.id)).sort();
+      const matrix=[...matrixCause(),...refusedRuns];
+      cause={...(active.length?{activeJobs:active}:{}),...(matrix.length?{matrix}:{}),...(existsSync(lock)?{lockJob:lockJob(lock)}:{})};
+      idle=Object.keys(cause).length===0;
+      held=idle || refusedRuns.length?null:heldRestartJob({jobs,details,agent:process.env.TAILTERM_AGENT,run:process.env.TAILTERM_RUN,journalDirectory:config.journalDirectory,lock,matrixChildren:MATRIX_CHILDREN.size});
+    }else{
+      cause=journalCause({journalDirectory:config.journalDirectory,cwd:config.cwd,agent:process.env.TAILTERM_AGENT,run:process.env.TAILTERM_RUN,lastLock,matrixChildren:MATRIX_CHILDREN.size,matrix:matrixCause()});
+      idle=cause===null;
+    }
     let decision=codeDecision({loaded:code.loaded,published,idle,marker:code.marker,held});
+    if(decision.state==="draining")decision={...decision,cause};
     // A re-exec that failed in this process is not tried again for the same
     // published code, so its refusal is not rewritten on every poll.
     if(decision.state==="restart" && code.execFailed===published.digest)decision={state:"refused",reason:"exec-failed"};
@@ -3237,6 +3382,7 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
     // claim (below), so a poll with nothing to claim stays silent.
     if(codeNow.state==="current"){if(codeNow.restartedFrom)codeNotify(reader,codeNow,"restarted");}
     else if(codeNow.reason!=="published-unreadable")codeNotify(reader,codeNow);
+    if(codeNow.state==="draining" && codeNow.stuckCause)codeNotify(reader,codeNow,"stuck");
     progressState.code=progressCode(codeNow);
     return codeNow;
   };
@@ -3269,9 +3415,11 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
         const lockedJob=existsSync(lock)?JSON.parse(readFileSync(lock,"utf8")).jobId:null;
         try{
           for(const summary of jobs){
-            const path=join(config.journalDirectory,summary.id+".json");
-            const pending=existsSync(path) && ["finishing","receipt_pending"].includes(JSON.parse(readFileSync(path,"utf8")).phase);
-            if(summary.id===selected?.id || ["claimed","merged","blocked"].includes(summary.state) || pending || summary.id===lockedJob){
+            const path=join(config.journalDirectory,summary.id+".json"),journal=existsSync(path)?JSON.parse(readFileSync(path,"utf8")):null;
+            const pending=journal!==null && ["finishing","receipt_pending"].includes(journal.phase);
+            // A settled job whose journal of this run is still blocked (m5).
+            const settled=finalizable(journal,summary,process.env.TAILTERM_AGENT,process.env.TAILTERM_RUN);
+            if(summary.id===selected?.id || ["claimed","merged","blocked"].includes(summary.state) || pending || settled || summary.id===lockedJob){
               details.set(summary.id,readReleaseDetail(read,summary));
             }
           }
@@ -3292,9 +3440,12 @@ export async function serveDeployment(config,{once=false,signal,configPath,relea
     const {jobs,baselines,details,lock}=ledger;lastLock=lock;
     const recovery=[...details.values()];
     reconcileReceipts(config,recovery);reconcileHostLocks(config,recovery);
+    finalizeSettledJournals(config,jobs,details,process.env.TAILTERM_AGENT,process.env.TAILTERM_RUN);
+    // A refused job's attempt left started (m3) is settled every poll.
+    const refusedRuns=settleRefusedAttempts(reader,config.journalDirectory,jobs);
     try{pruneJournal(config,jobs,{keepDists:[baselines.tailos]});}catch{process.stderr.write("Journal retention sweep failed; remaining backup copies kept.\n");}
     let codeNow=null;
-    if(code){codeNow=await gateTurn(reader,{jobs,details,lock});if(codeNow===STOP)return;}
+    if(code){codeNow=await gateTurn(reader,{jobs,details,lock,refusedRuns});if(codeNow===STOP)return;}
     // The windows the probes read, from the same file, before any claim: an
     // invalid one claims nothing and starts no claimed release this poll.
     const badWindow=invalidWindow(configPath?JSON.parse(readFileSync(configPath,"utf8")):config);

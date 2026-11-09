@@ -4,8 +4,8 @@ import assert from "node:assert/strict";
 import {mkdtempSync,mkdirSync,copyFileSync,writeFileSync,readFileSync,chmodSync,existsSync,statSync,readdirSync,rmSync,realpathSync} from "node:fs";
 import {tmpdir} from "node:os";
 import {join,dirname,resolve} from "node:path";
-import {execFileSync,execFile,spawnSync} from "node:child_process";
-import {refusalText,heldClaimNotice,integrateCandidate,integrateBatch,NO_CHANGE,publishIntegration,revertCommit,moveReleaseRef,runRelease,HostAdapter,serveDeployment,releaseError,compatibilityArgv,dispatchCompatibility,validateNativeRelease,failureReason,failureDetail,matrixWaitNotice,RUNNER_CODE_FILES,LOADED_CODE,CODE_REASONS,codeDigest,diskCode,publishedCode,codeDecision,prepareCode,restoreCode,runnerCodeGate,codeRecord,codeNotice,progressCode,cliFailureNotice,cliRetry,transportWait,transportWaitNotice,heldRetry,journalIdle,runnerLoads} from "../scripts/release-runner.mjs";
+import {execFileSync,execFile,spawn,spawnSync} from "node:child_process";
+import {refusalText,heldClaimNotice,integrateCandidate,integrateBatch,NO_CHANGE,publishIntegration,revertCommit,moveReleaseRef,runRelease,HostAdapter,serveDeployment,releaseError,compatibilityArgv,dispatchCompatibility,validateNativeRelease,failureReason,failureDetail,matrixWaitNotice,RUNNER_CODE_FILES,LOADED_CODE,CODE_REASONS,codeDigest,diskCode,publishedCode,codeDecision,prepareCode,restoreCode,runnerCodeGate,codeRecord,codeNotice,progressCode,cliFailureNotice,cliRetry,transportWait,transportWaitNotice,heldRetry,journalIdle,journalCause,pruneMatrixChildren,runnerLoads} from "../scripts/release-runner.mjs";
 import {acquireHostLock,readHostState as rawReadHostState,holdersOf} from "../scripts/verify-matrix-host-lock.mjs";
 import {createHash} from "node:crypto";
 import {RELEASE_READ_ATTEMPTS,wranglerBin} from "../scripts/release-inputs.mjs";
@@ -675,7 +675,9 @@ test("code a6 the private record names loaded and current code, is 0600 and is n
  const path=join(h.home,"runner-code.json"),first=statSync(path),record=h.record();
  assert.equal(first.mode&0o777,0o600);
  assert.deepEqual(record,{version:1,agentId:CODE_AGENT,runId:CODE_RUN,pid:process.pid,startedAt:"2026-10-06T06:00:00.000Z",checkedAt:"2026-10-06T06:00:00.000Z",state:"draining",
-  loaded:{digest:r.codeA.digest,files:r.codeA.files},current:{commit:r.b,digest:r.codeB.digest,files:r.codeB.files},changed:["release-runner.mjs"]});
+  loaded:{digest:r.codeA.digest,files:r.codeA.files},current:{commit:r.b,digest:r.codeB.digest,files:r.codeB.files},changed:["release-runner.mjs"],
+  // What holds the drain, and what the draining notice named (wi_a66c0780fc4b40f0 m4).
+  cause:{activeJobs:["rel_own"]},noticeCause:{activeJobs:["rel_own"]}});
  assert.equal(record.loaded.digest,codeDigest(record.loaded.files));assert.notEqual(record.loaded.digest,record.current.digest);
  now+=30000;await h.poll(gate);assert.equal(statSync(path).ino,first.ino);assert.deepEqual(h.record(),record);
  // A changed state is a new record; reason and restartedFrom appear only when they apply.
@@ -718,6 +720,143 @@ test("code a7 every code notice is safe text with 12-hex digests and only watche
  assert.deepEqual(codeDecision({loaded:r.codeA,published:r.codeB,idle:true,marker:r.codeB.digest}),{state:"refused",reason:"restart-did-not-refresh"});
  assert.deepEqual(codeDecision({loaded:r.codeA,published:null,idle:true}),{state:"refused",reason:"published-unreadable"});
  assert.deepEqual(codeDecision({loaded:null,published:r.codeB,idle:true}),{state:"refused",reason:"loaded-unreadable"});
+});
+// A stale runner that drains for good (wi_a66c0780fc4b40f0). Fixtures only:
+// a temp journal directory, a fake tt and short node children of this test
+// process that exit by themselves; nothing is signalled.
+const DRAIN_COMMIT="e".repeat(40),DRAIN_DIGEST="f".repeat(64),drainAttempt=(h,id,n=0)=>join(h.home,id+"-integrated-verification",`${DRAIN_COMMIT}-r${n}`);
+// An integrated matrix child started through the adapter's own launch, with
+// the run record launchMatrixRun saves for it. It exits after ms.
+function drainChild(t,h,dir,ms){
+ mkdirSync(dir,{recursive:true});const a=new HostAdapter(h.config,{}),pid=a.startMatrixRun([process.execPath,"-e",`setTimeout(()=>{},${ms})`],dir),child=a.matrixChildren.get(dir);
+ t.after(()=>a.matrixChildren.delete(dir));
+ a.saveRun(dir,{version:1,state:"started",launchedAt:Date.now(),priority:"release",hostWaitMs:60000,boundMs:3600000,pid,processStartedAt:a.processStartTime(pid),groups:[]});
+ return {pid,child,children:a.matrixChildren};
+}
+const drainExit=child=>child.exitCode!==null||child.signalCode!==null?Promise.resolve():new Promise(done=>child.once("exit",()=>done()));
+// What the run writes on leaving the host list: its pid and join time.
+const drainSidecar=(dir,pid)=>writeFileSync(join(dir,"host-lock.json"),JSON.stringify({outcome:"released",pid,requestedAt:new Date(Date.now()-60000).toISOString()}));
+const drainRefused=(id="rel_refused")=>({id,state:"refused",generation:4,commit:"c".repeat(40),agentId:CODE_AGENT,runId:CODE_RUN});
+const drainReceipt=(id,over={})=>({version:1,jobId:id,commit:DRAIN_COMMIT,verificationDigest:DRAIN_DIGEST,outcome:"rolled_back",targets:[{target:"hub",artifactSHA256:"a".repeat(64),release:"hub-release",outcome:"rolled_back"}],...over});
+const drainSettled=(id="rel_settled",over={})=>({id,state:"rolled_back",generation:6,commit:"c".repeat(40),integratedCommit:DRAIN_COMMIT,verificationDigest:DRAIN_DIGEST,agentId:CODE_AGENT,runId:CODE_RUN,receipt:drainReceipt(id),...over});
+const drainJournal=(h,id,over={})=>codeJournal(h,id,{phase:"blocked",outcome:"rolled_back",integrated:DRAIN_COMMIT,published:true,receipt:drainReceipt(id),...over});
+const drainPhase=(h,id)=>JSON.parse(readFileSync(join(h.home,id+".json"),"utf8")).phase;
+test("drain m1a a refused job's integrated matrix child that exited does not keep a stale runner draining: the next gate restarts",async t=>{
+ for(const reason of ["Integrated matrix receipt is not eligible","release fence lost: deployment heartbeat stale for 10 min"]){
+  const r=codeRepo(t),h=codeHost(t,r.cwd),{gate,execs}=codeGate(r.codeA);r.at(r.a,r.b);
+  // Refused while its child runs: the attempt record still says started.
+  const dir=drainAttempt(h,"rel_refused"),{pid,child,children}=drainChild(t,h,dir,200);
+  codeJournal(h,"rel_refused",{phase:"refused",refusalReason:reason});h.setJobs([drainRefused(),verifiedJob("rel_next")]);
+  await drainExit(child);drainSidecar(dir,pid);
+  await h.poll(gate);
+  assert.equal(h.record().state,"restart",reason);assert.equal(execs.length,1,reason);assert.equal(h.claims().length,0,reason);assert.equal(children.has(dir),false,reason);
+ }
+});
+test("drain m1b with an unreadable ledger, a blocked journal of a job the last ledger showed settled with a full receipt does not keep journalIdle false",async t=>{
+ const r=codeRepo(t),h=codeHost(t,r.cwd,LIST_FAILS),{gate,execs}=codeGate(r.codeA);r.at(r.a,r.a);
+ drainJournal(h,"rel_settled");h.setJobs([drainSettled()]);
+ // A readable poll with current code shows the job rolled back with its full receipt.
+ await h.poll(gate);assert.equal(h.record().state,"current");
+ const base={journalDirectory:h.home,cwd:r.cwd,agent:CODE_AGENT,run:CODE_RUN,lastLock:null,matrixChildren:0};
+ assert.equal(journalIdle(base),true);
+ // Then the scripts are published and the list cannot be read: the runner restarts.
+ r.at(r.a,r.b);failList(h);await h.poll(gate);
+ assert.equal(h.record().state,"restart");assert.equal(execs.length,1);
+});
+test("drain m2 a live matrix child keeps a stale runner draining, is never signalled, and is named",async t=>{
+ const r=codeRepo(t),h=codeHost(t,r.cwd),{gate,execs}=codeGate(r.codeA);r.at(r.a,r.b);
+ const dir=drainAttempt(h,"rel_live"),{pid,child,children}=drainChild(t,h,dir,4000);h.setJobs([verifiedJob("rel_next")]);
+ await h.poll(gate);await h.poll(gate);
+ assert.equal(h.record().state,"draining");assert.equal(execs.length,0);assert.equal(h.claims().length,0);assert.equal(children.get(dir),child);
+ assert.equal(child.exitCode,null);assert.equal(child.signalCode,null);assert.equal(JSON.parse(readFileSync(join(dir,"run.json"),"utf8")).state,"started");
+ const named={matrix:[{jobId:"rel_live",attempt:"eeeeeeeeeeee-r0",pid}]};
+ assert.deepEqual(h.record().cause,named);assert.deepEqual(progressCode(h.record()).cause,named);
+ const [notice]=codeSends(h);assert.equal(codeSends(h).length,1);assert.match(notice.text,SAFE_TEXT);assert.ok(!/[a-f0-9]{13}/.test(notice.text));
+ assert.ok(notice.text.endsWith(` Waiting for: matrix runs rel_live attempt eeeeeeeeeeee-r0 pid ${pid}.`),notice.text);
+ await drainExit(child);assert.equal(child.exitCode,0);
+});
+test("drain m2 an exited child leaves the live set on its exit event and stays the proof resolveMatrixRun ends its attempt by; the gate sweep drops exited and ended entries",async t=>{
+ const r=codeRepo(t),h=codeHost(t,r.cwd),dir=drainAttempt(h,"rel_exit"),{pid,child,children}=drainChild(t,h,dir,100),a=new HostAdapter(h.config,{});
+ t.after(()=>a.matrixExited.delete(dir));
+ await drainExit(child);assert.equal(children.has(dir),false);assert.equal(a.matrixExited.get(dir),child);
+ drainSidecar(dir,pid);const run=JSON.parse(readFileSync(join(dir,"run.json"),"utf8"));
+ assert.equal(a.resolveMatrixRun(dir,run),"ended");assert.equal(run.reason,"no-receipt");assert.equal(a.matrixExited.has(dir),false);
+ // The sweep alone, over its own maps: exited moves, ended goes, live stays.
+ const live=new Map(),gone=new Map(),at=n=>{const d=drainAttempt(h,"rel_sweep",n);mkdirSync(d,{recursive:true});return d;};
+ const [d1,d2,d3,d4]=[1,2,3,4].map(at);writeFileSync(join(d2,"run.json"),JSON.stringify({state:"ended"}));writeFileSync(join(d3,"run.json"),JSON.stringify({state:"started"}));writeFileSync(join(d4,"run.json"),JSON.stringify({state:"ended"}));
+ const exited={exitCode:1,signalCode:null},killed={exitCode:null,signalCode:"SIGTERM"},running={exitCode:null,signalCode:null};
+ live.set(d1,exited).set(d2,running).set(d3,running).set("code-fixture-key",{});gone.set(d4,killed).set(join(h.home,"x"),killed);
+ pruneMatrixChildren(live,gone);
+ assert.deepEqual([...live.keys()],[d3,"code-fixture-key"]);assert.deepEqual([...gone.keys()],[join(h.home,"x"),d1]);
+});
+test("drain m3 a refused job's attempt left started is settled across a runner restart: a live pid drains, a gone one ends as receipt or no-receipt",async t=>{
+ const r=codeRepo(t),h=codeHost(t,r.cwd),a=new HostAdapter(h.config,{});r.at(r.a,r.b);
+ // Started by an earlier process of the run: this one holds no child of it.
+ const child=spawn(process.execPath,["-e","setTimeout(()=>{},1500)"],{stdio:"ignore"}),pid=child.pid,started=a.processStartTime(pid);
+ const dirs=[0,1].map(n=>{const d=drainAttempt(h,"rel_refused",n);mkdirSync(d,{recursive:true});a.saveRun(d,{version:1,state:"started",launchedAt:Date.now(),priority:"release",hostWaitMs:60000,boundMs:3600000,pid,processStartedAt:started,groups:[]});return d;});
+ writeFileSync(join(dirs[0],"receipt.json"),"{}");codeJournal(h,"rel_refused",{phase:"refused",refusalReason:"release fence lost"});h.setJobs([drainRefused(),verifiedJob("rel_next")]);
+ const first=codeGate(r.codeA);await h.poll(first.gate);
+ assert.equal(h.record().state,"draining");assert.equal(first.execs.length,0);
+ assert.deepEqual(h.record().cause,{matrix:[{jobId:"rel_refused",attempt:"eeeeeeeeeeee-r0",pid},{jobId:"rel_refused",attempt:"eeeeeeeeeeee-r1",pid}]});
+ for(const d of dirs)assert.equal(JSON.parse(readFileSync(join(d,"run.json"),"utf8")).state,"started");
+ await drainExit(child);assert.equal(child.exitCode,0);assert.equal(child.signalCode,null);for(const d of dirs)drainSidecar(d,pid);
+ const second=codeGate(r.codeA);await h.poll(second.gate);
+ assert.deepEqual(dirs.map(d=>JSON.parse(readFileSync(join(d,"run.json"),"utf8"))).map(x=>[x.state,x.reason]),[["ended","receipt"],["ended","no-receipt"]]);
+ assert.equal(h.record().state,"restart");assert.equal(second.execs.length,1);assert.equal(h.claims().length,0);
+});
+test("drain m5 a settled job's blocked journal of this run is finalized only on an exact match; nothing else changes and nothing is deleted",async t=>{
+ const r=codeRepo(t),h=codeHost(t,r.cwd,LIST_FAILS),{gate,execs}=codeGate(r.codeA);r.at(r.a,r.a);
+ const released=drainSettled("rel_released",{state:"released",receipt:drainReceipt("rel_released",{outcome:"released",targets:[{target:"hub",artifactSHA256:"a".repeat(64),release:"hub-release",outcome:"released"}]})});
+ drainJournal(h,"rel_settled");drainJournal(h,"rel_released",{outcome:"released",receipt:released.receipt});
+ drainJournal(h,"rel_digest",{receipt:drainReceipt("rel_digest",{verificationDigest:"0".repeat(64)})});
+ drainJournal(h,"rel_commit",{commit:"d".repeat(40)});
+ drainJournal(h,"rel_noreceipt",{receipt:undefined});
+ drainJournal(h,"rel_partial");
+ drainJournal(h,"rel_otherrun",{runId:"run_other"});
+ drainJournal(h,"rel_active");
+ h.setJobs([drainSettled(),released,drainSettled("rel_digest"),drainSettled("rel_commit"),drainSettled("rel_noreceipt"),drainSettled("rel_partial",{receipt:drainReceipt("rel_partial",{targets:[{target:"hub"}]})}),
+  drainSettled("rel_otherrun",{runId:"run_other"}),{id:"rel_active",state:"blocked",generation:3,commit:"c".repeat(40),agentId:CODE_AGENT,runId:CODE_RUN}]);
+ const names=()=>readdirSync(h.home).filter(n=>n.startsWith("rel_")).sort(),before=names();
+ await h.poll(gate);
+ assert.deepEqual(["rel_settled","rel_released","rel_digest","rel_commit","rel_noreceipt","rel_partial","rel_otherrun","rel_active"].map(id=>drainPhase(h,id)),["complete","complete","blocked","blocked","blocked","blocked","blocked","blocked"]);
+ assert.deepEqual(names(),before);
+ // The journal path then names this run's journals that stay unfinished.
+ r.at(r.a,r.b);failList(h);await h.poll(gate);
+ assert.equal(h.record().state,"draining");assert.equal(execs.length,0);
+ assert.deepEqual(h.record().cause,{journal:["rel_active","rel_commit","rel_digest","rel_noreceipt","rel_partial"]});
+ assert.ok(codeSends(h)[0].text.endsWith(" Waiting for: journals not final rel_active, rel_commit, rel_digest, rel_noreceipt, rel_partial."));
+ // The predicate's cause, with every holder at once.
+ const lock=taskLock(r.cwd,"tsk_m5");mkdirSync(dirname(lock),{recursive:true});writeFileSync(lock,JSON.stringify({jobId:"rel_locked"}));t.after(()=>rmSync(lock,{force:true}));
+ assert.deepEqual(journalCause({journalDirectory:h.home,cwd:r.cwd,agent:CODE_AGENT,run:CODE_RUN,lastLock:lock,matrixChildren:1,matrix:[{jobId:"rel_m",attempt:"eeeeeeeeeeee-r0",pid:7}]}),
+  {matrix:[{jobId:"rel_m",attempt:"eeeeeeeeeeee-r0",pid:7}],journal:["rel_active","rel_commit","rel_digest","rel_noreceipt","rel_partial"],lockJob:"rel_locked"});
+ writeFileSync(join(h.home,"rel_bad.json"),"{not json");assert.deepEqual(journalCause({journalDirectory:h.home,cwd:r.cwd,agent:CODE_AGENT,run:CODE_RUN,lastLock:null,matrixChildren:0}),{journal:"unreadable"});
+});
+test("drain m4 the record and progress code state name what holds a drain; after 30 min with no claimed, merged or blocked job one attention notice names it",async t=>{
+ const r=codeRepo(t),h=codeHost(t,r.cwd);r.at(r.a,r.b);let now=Date.parse("2026-11-09T06:00:00Z");
+ const lock=taskLock(r.cwd,"tsk_m4");mkdirSync(dirname(lock),{recursive:true});writeFileSync(lock,JSON.stringify({jobId:"rel_locked"}));t.after(()=>rmSync(lock,{force:true}));
+ const next={...verifiedJob("rel_next"),taskId:"tsk_m4"},blocked={id:"rel_blocked",state:"blocked",generation:3,commit:"d".repeat(40),taskId:"tsk_m4"};
+ // A blocked job and the lock: both named, and no quiet clock runs.
+ h.setJobs([next,blocked]);const {gate}=codeGate(r.codeA,{now:()=>now});await h.poll(gate);
+ const first=h.record();assert.equal(first.state,"draining");assert.deepEqual(first.cause,{activeJobs:["rel_blocked"],lockJob:"rel_locked"});assert.equal(first.quietSince,undefined);
+ assert.deepEqual(progressCode(first),{state:"draining",loaded:r.codeA.digest.slice(0,12),published:r.codeB.digest.slice(0,12),since:"2026-11-09T06:00:00.000Z",cause:{activeJobs:["rel_blocked"],lockJob:"rel_locked"}});
+ // The blocked job settles; only the lock holds. A changed cause keeps checkedAt and the first notice's cause.
+ h.setJobs([next]);now+=60000;await h.poll(gate);
+ assert.deepEqual(h.record().cause,{lockJob:"rel_locked"});assert.equal(h.record().checkedAt,first.checkedAt);assert.deepEqual(h.record().noticeCause,first.cause);assert.equal(h.record().quietSince,"2026-11-09T06:01:00.000Z");
+ const quiet=Date.parse("2026-11-09T06:01:00Z"),stuck=()=>codeSends(h).filter(s=>s.requestId.endsWith("-stuck"));
+ now=quiet+29*60000;await h.poll(gate);assert.equal(stuck().length,0);
+ now=quiet+30*60000;await h.poll(gate);now+=60000;await h.poll(gate);
+ assert.equal(stuck().length,1);const [s]=stuck();
+ assert.equal(s.requestId,`runner-code-${CODE_RUN}-${r.codeA.digest.slice(0,12)}-${r.codeB.digest.slice(0,12)}-stuck`);assert.equal(s.subject,"Deployer has drained for 30 minutes with no active release");
+ assert.match(s.text,SAFE_TEXT);assert.ok(s.text.includes("it does not restart while it waits for: the host release lock of rel_locked."),s.text);
+ assert.ok(h.calls().filter(c=>c.argv[0]==="send"&&c.argv.includes(s.requestId)).every(c=>c.argv.includes("--ref")&&c.argv.includes("wake=attention")));
+ // A new process of the run resends the same notice, under the same id and text, so the hub replays it.
+ await h.poll(codeGate(r.codeA,{now:()=>now}).gate);assert.equal(stuck().length,2);assert.deepEqual(stuck()[1],s);
+ // The draining notice was sent once per process, naming what held when the drain was first seen.
+ const drains=codeSends(h).filter(x=>x.requestId.endsWith("-draining"));assert.equal(drains.length,2);assert.deepEqual(drains[1],drains[0]);
+ assert.ok(drains[0].text.endsWith(" Waiting for: active releases rel_blocked; the host release lock of rel_locked."),drains[0].text);
+ // A newly published digest is a new drain: a new quiet clock and no attention notice yet.
+ const C=codeCommit(r,r.b,"// release-runner.mjs c\n");git(r.cwd,"update-ref","refs/heads/tasks-hub",C.commit);await h.poll(gate);
+ assert.equal(h.record().quietSince,new Date(now).toISOString());assert.equal(h.record().stuckCause,undefined);assert.equal(stuck().length,2);
 });
 test("code a8 a real re-exec keeps the process, agent and run, and claims once only after the checkout moved",async t=>{
  const r=codeRepo(t,true),h=codeHost(t,r.cwd);r.at(r.a,r.b);h.setJobs([verifiedJob()]);

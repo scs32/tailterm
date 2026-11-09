@@ -847,10 +847,25 @@ local ref moves. A change to any other file does not count.
 - `refused`: it cannot compare or cannot restart. It claims no release, with
   one of the reasons below, and keeps polling.
 
-Idle means all three: no job of the project is `claimed`, `merged` or
-`blocked`, this process has no matrix run, and no host release lock exists. In
-every state but `current` a `verified` job stays unclaimed and its journal is
-not archived.
+Idle means all of these: no job of the project is `claimed`, `merged` or
+`blocked`, this process has no live matrix run, no integrated attempt of a
+`refused` job is unsettled, and no host release lock exists. In every state but
+`current` a `verified` job stays unclaimed and its journal is not archived.
+
+Only live matrix runs count (wi_a66c0780fc4b40f0 m2). A matrix child of this
+process leaves the live set on its exit event, and each code check first drops
+any child that has exited or whose attempt record (`run.json`) is `ended`. The
+exited child is still what proves the attempt's pid was this process's run
+until that attempt ends, so the matrix run rules are unchanged. A live child
+keeps the deployer draining, and a running matrix run is never stopped for a
+restart. A job refused while its matrix run was still going leaves that
+attempt's `run.json` `started` (m3). Every poll with a ledger settles each
+such attempt of a `refused` job by the same matrix run rules: once the pid is
+gone it ends as `receipt` or `no-receipt`, while the pid is alive it stays
+`started` and the deployer drains, and an attempt those rules hold (its check
+groups cannot be shown stopped) drains too. Nothing is signalled that those
+rules would not signal anyway. This also covers a restarted deployer, which
+has no child of the run.
 
 A stale deployer that is not idle still restarts when its only owned job is
 held (wi_876c1eb560903f04): the ledger's only `claimed`, `merged` or `blocked`
@@ -869,10 +884,21 @@ It records `runner-code.json` and posts its `draining` or `refused` notice. With
 no ledger, idle is read from the deployer's own journal directory instead: no
 job journal (`rel_ID.json`, not an archived journal or an `-inputs.json`
 manifest) of this agent and run is in a phase other than `complete` or
-`refused`, every such journal parses, this process has no matrix child, and no
+`refused`, every such journal parses, this process has no live matrix child, and no
 host release lock exists at the lock path of any journal's task or at the lock
 path of the last job list this process read. Only then does it restart; there
 is no held job without a ledger. Otherwise it drains.
+
+A job that rolled back after publication puts its journal back in `blocked`
+once its receipt is saved, so without a step of its own that journal would keep
+this check false for good. At every poll with a ledger, a journal of this agent
+and run in `blocked` is moved to `complete` (wi_a66c0780fc4b40f0 m5) when its
+job is `rolled_back` or `released` with a full receipt whose commit and
+verification digest match the journal's receipt, and whose job id, agent, run,
+task and pause generation match the journal, as for a pending receipt above.
+Anything else leaves the journal as it is, and the drain cause then names it.
+A journal of a job that is still active, or of another run, is never changed,
+and nothing is deleted.
 
 **Restart.** A deployer that was told to stop does not restart. Otherwise it
 first prepares the checkout: `git status --porcelain` must be empty (ignored
@@ -950,8 +976,22 @@ or after a stop during the load check whose checkout could not be restored
 run has restarted. A restarted image learns its generation from the re-exec
 environment (`TAILTERM_RUNNER_REEXEC_GEN`); a new process of the same run
 continues from the generation this record holds.
+A `draining` record also names what holds it (wi_a66c0780fc4b40f0 m4), with
+fixed shapes only: `cause` holds `activeJobs` (the ids of `claimed`, `merged`
+and `blocked` jobs), `matrix` (each live matrix run of this process and each
+unsettled attempt of a refused job, as `jobId`, `attempt` with its commit cut
+to 12 characters, and `pid`), `lockJob` (the job the host release lock names,
+`unknown` when it cannot be read) and, without a ledger, `journal` (this run's
+journals that are not final, or `unreadable`), each only when it holds.
+`noticeCause` is what the draining notice named when this drain was first seen,
+kept for the drain so that a new process of the run resends the same notice.
+`quietSince` is when the drain first had no `claimed`, `merged` or `blocked`
+job (a poll without a ledger knows of none), and `stuckCause` is the cause the
+attention notice below named. A drain is the same while the agent, run,
+loaded and published digests stay the same.
 It is rewritten only when something other than `checkedAt` changes, so
-`checkedAt` is when the current state was first seen. Each release job's
+`checkedAt` is when the current state was first seen; a change of cause alone
+keeps it. Each release job's
 journal also records, in `code`, the `loaded` and `current` digests of the
 runner that last ran it.
 
@@ -963,7 +1003,10 @@ runner sends carries `--code-state` (`current`, `draining`, `restart` or
 12-character prefixes of the loaded and published digests, left out when
 unreadable) and `--code-since`, this record's `checkedAt`. The report before
 the first check carries none, a `stopped` state is never sent, and a record
-whose state or reason the hub does not know sends no code at all. `tt
+whose state or reason the hub does not know sends no code at all. The drain
+cause is in the runner's own code state for its reports (`progressCode`), but
+the report the hub receives does not carry it yet: `tt deployment progress` has
+no flag for it, so the arguments are unchanged. `tt
 deployment list` then shows it as `deployer.code`, and for `refused` its
 `action` names the recovery step:
 
@@ -984,7 +1027,12 @@ The Board gets one notice per state, loaded digest and published digest. Only
 set and the fixed reason tokens reach its text:
 
 - "Deployer code is out of date; it restarts itself after the current release"
-  (`draining`).
+  (`draining`). Its text ends "Waiting for: ..." naming `noticeCause`.
+- "Deployer has drained for 30 minutes with no active release" (an attention
+  notice, id `runner-code-RUN-LOADED-CURRENT-stuck`): once a drain has gone 30
+  minutes with no `claimed`, `merged` or `blocked` job, one notice per published
+  digest names what it still waits for (`stuckCause`). Check that each one named
+  has ended.
 - "Deployer is restarting itself onto the published scripts" (`restart`). If no
   "Deployer now runs the published scripts" notice follows, the deployer did
   not come back: re-provision.
